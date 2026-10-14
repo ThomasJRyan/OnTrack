@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "ontrack",
+  "project_id": "da74ef24-575b-44ca-90f8-a6a2958b8c55"
+}
