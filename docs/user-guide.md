@@ -27,7 +27,7 @@ Issues are shown in rounded, colour-coded panes. Open appears first and closed l
 
 ## Browsing and controls
 
-The left pane lists all returned issues, including closed ones, without the CLI's usual list cap. Each entry shows its ID, priority, status, and title. The right pane presents the selected issue as a readable record: narrative fields use Markdown formatting, while metadata, comments, relationships, and unfamiliar nested values remain available as you scroll.
+The left pane lists all returned issues, including closed ones, without the CLI's usual list cap. Each entry shows its colour-coded issue type, priority, status, and a white title; IDs remain available in the selected issue's full detail record. The right pane presents narrative fields as Markdown, while metadata, comments, relationships, and unfamiliar nested values remain available as you scroll.
 
 | Input | Action |
 | --- | --- |

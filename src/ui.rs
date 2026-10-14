@@ -33,6 +33,43 @@ fn status_color(status: &str) -> Color {
         _ => Color::Rgb(125, 168, 235),
     }
 }
+fn row_issue_type(bead: &crate::beads::Bead) -> String {
+    ["issue_type", "type"]
+        .into_iter()
+        .find_map(|field| {
+            bead.data
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty())
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+fn row_type_color(kind: &str) -> Color {
+    match kind.to_ascii_lowercase().as_str() {
+        "task" => TEAL,
+        "bug" => Color::Rgb(255, 123, 123),
+        "feature" => Color::Rgb(103, 177, 255),
+        "epic" => Color::Rgb(197, 145, 255),
+        "chore" => Color::Rgb(168, 207, 125),
+        "decision" => Color::Rgb(240, 141, 197),
+        "spike" => Color::Rgb(255, 192, 115),
+        "story" => Color::Rgb(119, 204, 219),
+        "milestone" => Color::Rgb(145, 170, 220),
+        _ => MUTED,
+    }
+}
+fn row_priority_color(priority: u64) -> Color {
+    match priority {
+        0 => Color::Rgb(255, 105, 105),
+        1 => Color::Rgb(255, 159, 105),
+        2 => GOLD,
+        3 => Color::Rgb(138, 197, 169),
+        4 => MUTED,
+        _ => MUTED,
+    }
+}
 pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen>, app: &mut App) {
     let a = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG)), a);
@@ -206,22 +243,40 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
                 let screen_y = split[0].y + (natural_y - app.list_offset) as u16;
                 let selected = app.selected == Some(i);
                 let content = if line == 0 {
-                    format!(
-                        "{}{}  P{}  ·  {}",
-                        if selected { "› " } else { "  " },
-                        bead.id,
-                        bead.priority,
-                        bead.status
-                    )
+                    let kind = row_issue_type(bead);
+                    let status = if bead.status.trim().is_empty() {
+                        "unknown"
+                    } else {
+                        bead.status.as_str()
+                    };
+                    Line::from(vec![
+                        Span::styled(
+                            if selected { "› " } else { "  " },
+                            Style::default()
+                                .fg(if selected { TEAL } else { MUTED })
+                                .add_modifier(if selected {
+                                    Modifier::BOLD
+                                } else {
+                                    Modifier::empty()
+                                }),
+                        ),
+                        Span::styled(kind.clone(), Style::default().fg(row_type_color(&kind))),
+                        Span::raw("  "),
+                        Span::styled(
+                            format!("P{}", bead.priority),
+                            Style::default().fg(row_priority_color(bead.priority)),
+                        ),
+                        Span::styled("  ·  ", Style::default().fg(MUTED)),
+                        Span::styled(status, Style::default().fg(status_color(status))),
+                    ])
                 } else {
-                    format!("  {}", bead.title)
+                    Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(bead.title.clone(), Style::default().fg(Color::White)),
+                    ])
                 };
                 f.render_widget(
-                    Paragraph::new(content).style(Style::default().fg(if selected {
-                        color
-                    } else {
-                        INK
-                    })),
+                    Paragraph::new(content),
                     Rect::new(
                         split[0].x + 1,
                         screen_y,
@@ -803,7 +858,7 @@ mod tests {
                 title: "Title is visible".into(),
                 status: "closed".into(),
                 priority: 1,
-                data: json!({"unknown":{"n":5},"comments":[{"body":"hello comment"}],"unicode":"界界界界界界界界界界"}),
+                data: json!({"issue_type":"task","unknown":{"n":5},"comments":[{"body":"hello comment"}],"unicode":"界界界界界界界界界界"}),
             }],
             collapsed: std::collections::HashSet::new(),
             focused_group: None,
@@ -847,7 +902,8 @@ mod tests {
     fn renders_exact_two_line_issue_with_status_and_full_nested_data() {
         let mut a = app();
         let (s, _) = draw((120, 40), &mut a);
-        assert!(s.contains("demo-1  P1  ·  closed"));
+        assert!(s.contains("task  P1  ·  closed"));
+        assert!(!s.contains("demo-1  P1"));
         assert!(s.contains("Title is visible"));
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         let mut splash = None;
@@ -860,7 +916,7 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
         };
-        assert!(line(5).contains("demo-1  P1  ·  closed"));
+        assert!(line(5).contains("task  P1  ·  closed"));
         assert!(line(6).contains("Title is visible"));
         assert_eq!(buffer[(a.list_rect.x, a.list_rect.y)].symbol(), "╭");
         assert_eq!(
@@ -868,6 +924,10 @@ mod tests {
             status_color("closed")
         );
         assert!(line(a.list_rect.y).contains("CLOSED"));
+        assert_eq!(buffer[(a.list_rect.x + 3, 5)].fg, row_type_color("task"));
+        assert_eq!(buffer[(a.list_rect.x + 9, 5)].fg, row_priority_color(1));
+        assert_eq!(buffer[(a.list_rect.x + 16, 5)].fg, status_color("closed"));
+        assert_eq!(buffer[(a.list_rect.x + 3, 6)].fg, Color::White);
         let group = crate::app::list_layout(&a.beads, &a.collapsed)
             .groups
             .remove(0);
@@ -877,6 +937,38 @@ mod tests {
         for x in ["unknown", "comments", "hello comment", "界", "5"] {
             assert!(s.contains(x), "{x}")
         }
+    }
+    #[test]
+    fn issue_type_fallback_priority_bounds_and_title_color_are_safe() {
+        assert_eq!(row_type_color("task"), TEAL);
+        assert_eq!(row_type_color("bug"), Color::Rgb(255, 123, 123));
+        assert_eq!(row_type_color("feature"), Color::Rgb(103, 177, 255));
+        assert_eq!(row_type_color("epic"), Color::Rgb(197, 145, 255));
+        assert_eq!(row_type_color("chore"), Color::Rgb(168, 207, 125));
+        assert_eq!(row_type_color("private-kind"), MUTED);
+        assert_eq!(row_issue_type(&app().beads[0]), "task");
+        let mut bead = app().beads[0].clone();
+        bead.data = json!({"type":"bespoke"});
+        assert_eq!(row_issue_type(&bead), "bespoke");
+        bead.data = json!({"issue_type":null,"type":"bug"});
+        assert_eq!(row_issue_type(&bead), "bug");
+        bead.data = json!({"issue_type":"  ","type":" feature "});
+        assert_eq!(row_issue_type(&bead), "feature");
+        bead.data = json!({"issue_type":null});
+        assert_eq!(row_issue_type(&bead), "unknown");
+        assert_eq!(row_priority_color(u64::MAX), MUTED);
+        let mut a = app();
+        a.selected = None;
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut splash = None;
+        terminal
+            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .unwrap();
+        let y = a.list_rect.y + 4;
+        assert_eq!(
+            terminal.backend().buffer()[(a.list_rect.x + 3, y)].fg,
+            Color::White
+        );
     }
     #[test]
     fn stable_status_colors_and_scrolled_last_group_render_in_small_viewport() {

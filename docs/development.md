@@ -80,3 +80,5 @@ Create and delete are explicit, asynchronous CLI operations. The create form use
 ## Status-grouped list
 
 List results are sorted deterministically by status (open first, closed last, other statuses alphabetically), then ID. `list_layout` in `src/app.rs` is the shared geometry model for navigation, viewport scrolling, mouse hit-testing, and rendering. Group collapse state is keyed by status and retained across refreshes while that status remains present. Keep selected IDs aligned with detail/delete actions when changing this view.
+
+The list row's first line derives issue type from the retained `Bead.data` (`issue_type`, with `type` as a fallback); it does not replace the internal bead ID. Type, priority, and status spans each have a semantic colour helper in `src/ui.rs`. Preserve white title text independently of selection emphasis and keep missing/custom types safe to display.
