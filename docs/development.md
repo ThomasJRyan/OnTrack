@@ -37,9 +37,11 @@ Detail parsing selects the requested ID, rejects duplicate matching records, and
 
 `App` uses standard-library channels and one background thread for blocking CLI calls. The UI loop receives available responses, draws, and polls input with a short timeout rather than waiting for subprocess completion.
 
+Automatic refresh uses the same public read-only list/show commands above. Schedule the next poll roughly one second after the previous refresh completes, including reloading the selected detail; do not accumulate timer-driven requests while refresh work is in flight. This is polling, not an event stream: slow CLI calls extend refresh latency. No watcher, extra dependency, configuration, or optional Beads events setup is required. Manual `r` and successful create/delete operations still request an immediate refresh.
+
 The background worker executes each request in channel order. It does not coalesce or reorder requests, so mutation commands cannot be lost. Responses for a show ID other than the current selection are ignored.
 
-Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Errors retain available cached data and are displayed in the footer. The presentation layer renders narrative Markdown via `tui-markdown`; all remaining fields, including unknown nested values, remain represented. Rendered text drives both wrapping and scroll bounds.
+Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Automatic updates also retain group collapse state, focus, scroll positions within current bounds, and active form input. Failed list/detail refreshes retain the last loaded data or available snapshot, display errors in the footer, and retry automatically. The presentation layer renders narrative Markdown via `tui-markdown`; all remaining fields, including unknown nested values, remain represented. Rendered text drives both wrapping and scroll bounds.
 
 Keep CLI calls off the input/render loop and preserve stale-response filtering when changing the worker. The worker is not joined on quit, so terminal cleanup does not wait for a slow CLI call; in-flight commands are not cancelled on quit.
 
@@ -52,6 +54,8 @@ Run interactive checks in a real terminal or a PTY, not an ordinary non-interact
 ## Tests and required checks
 
 Tests are inline in the source modules. They cover CLI arguments and parsing, form input and mutation state, navigation and focus, mouse selection, cached/stale detail behavior, quit-key recognition, and rendering using ratatui's `TestBackend`.
+
+For automatic refresh, check external list/detail changes without manual input, completion-based scheduling without a request backlog, cached-data retention and recovery after transient errors, and preservation of selection, collapsed groups, focus, scrolling, and form input. Keep immediate refresh after mutations and stale-detail response filtering covered too.
 
 Run all required gates from the repository root:
 

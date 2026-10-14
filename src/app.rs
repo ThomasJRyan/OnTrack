@@ -12,6 +12,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
 pub(super) enum Request {
     List,
     Show(String, u64),
@@ -45,6 +47,9 @@ pub struct App {
     pub mutation_busy: bool,
     pub modal_ready: bool,
     pub preferred_id: Option<String>,
+    pub(super) refresh_inflight: bool,
+    pub(super) refresh_pending: bool,
+    pub(super) next_refresh: Instant,
     pub(super) requests: mpsc::Sender<Request>,
     pub(super) responses: mpsc::Receiver<Response>,
 }
@@ -154,6 +159,9 @@ impl App {
             mutation_busy: false,
             modal_ready: true,
             preferred_id: None,
+            refresh_inflight: false,
+            refresh_pending: false,
+            next_refresh: Instant::now(),
             requests: tx,
             responses,
         };
@@ -161,10 +169,45 @@ impl App {
         a
     }
     fn refresh(&mut self) {
-        self.list_loading = true;
-        self.list_error = None;
-        self.detail_offset = 0;
-        let _ = self.requests.send(Request::List);
+        self.refresh_at(Instant::now());
+    }
+    fn refresh_at(&mut self, now: Instant) {
+        if self.refresh_inflight {
+            // Explicit refreshes and mutation invalidations need one newer snapshot.
+            self.refresh_pending = true;
+        } else {
+            self.start_refresh(now);
+        }
+    }
+    fn poll_refresh(&mut self, now: Instant) {
+        if !self.refresh_inflight && now >= self.next_refresh {
+            self.start_refresh(now);
+        }
+    }
+    fn start_refresh(&mut self, now: Instant) {
+        self.refresh_inflight = true;
+        if self.requests.send(Request::List).is_err() {
+            self.refresh_inflight = false;
+            self.list_loading = false;
+            self.list_error = Some("Refresh could not be queued; retrying".into());
+            self.next_refresh = now + REFRESH_INTERVAL;
+        }
+    }
+    fn refresh_detail(&mut self) {
+        let Some(bead) = self.selected.and_then(|i| self.beads.get(i)) else {
+            return;
+        };
+        // Every snapshot invalidates older shows, even when the list is unchanged:
+        // comments and other show-only fields can change independently.
+        self.detail_seq = self.detail_seq.wrapping_add(1);
+        if self
+            .requests
+            .send(Request::Show(bead.id.clone(), self.detail_seq))
+            .is_err()
+        {
+            self.detail_loading = false;
+            self.detail_error = Some("Details could not be queued; retrying".into());
+        }
     }
     fn select(&mut self, index: usize) {
         self.focused_group = None;
@@ -285,9 +328,14 @@ impl App {
         }
     }
     fn receive(&mut self) {
+        self.receive_at(Instant::now());
+    }
+    fn receive_at(&mut self, now: Instant) {
         while let Ok(r) = self.responses.try_recv() {
             match r {
                 Response::List(res) => {
+                    self.refresh_inflight = false;
+                    self.next_refresh = now + REFRESH_INTERVAL;
                     self.list_loading = false;
                     match res {
                         Ok(items) => {
@@ -311,24 +359,45 @@ impl App {
                             });
                             self.collapsed
                                 .retain(|s| self.beads.iter().any(|b| &b.status == s));
-                            let preferred = self
-                                .preferred_id
-                                .take()
-                                .and_then(|id| self.beads.iter().position(|b| b.id == id));
-                            self.clear_selection();
-                            self.focused_group = None;
+                            // An in-flight pre-mutation snapshot must not consume
+                            // the new ID before the trailing refresh can see it.
+                            let preferred = if self.refresh_pending {
+                                None
+                            } else {
+                                self.preferred_id
+                                    .take()
+                                    .and_then(|id| self.beads.iter().position(|b| b.id == id))
+                            };
+                            let same_id = id
+                                .as_ref()
+                                .and_then(|id| self.beads.iter().position(|b| &b.id == id));
+                            // Indices may now refer to different beads. Only the
+                            // surviving ID can reuse the existing detail and scroll.
+                            self.selected = None;
                             if let Some(i) = preferred {
+                                self.focused_group = None;
                                 self.collapsed.remove(&self.beads[i].status);
-                                self.select(i);
+                                if Some(i) == same_id {
+                                    self.selected = Some(i);
+                                    self.refresh_detail();
+                                } else {
+                                    self.select(i);
+                                }
                             } else if let Some(status) =
                                 group.filter(|s| self.beads.iter().any(|b| &b.status == s))
                             {
                                 self.focus_group(status);
-                            } else if let Some(i) =
-                                id.and_then(|id| self.beads.iter().position(|b| b.id == id))
-                            {
-                                self.select(i);
+                            } else if let Some(i) = same_id {
+                                self.focused_group = None;
+                                if self.collapsed.contains(&self.beads[i].status) {
+                                    self.focus_group(self.beads[i].status.clone());
+                                } else {
+                                    self.selected = Some(i);
+                                    self.refresh_detail();
+                                }
                             } else {
+                                self.clear_selection();
+                                self.focused_group = None;
                                 let targets = list_layout(&self.beads, &self.collapsed).targets;
                                 if let Some(i) = targets.iter().find_map(|t| match t.row {
                                     DisplayRow::Bead(i) => Some(i),
@@ -346,6 +415,9 @@ impl App {
                             self.list_error = None;
                         }
                         Err(e) => self.list_error = Some(e.to_string()),
+                    }
+                    if std::mem::take(&mut self.refresh_pending) {
+                        self.start_refresh(now);
                     }
                 }
                 Response::Show(id, seq, res) => {
@@ -375,7 +447,7 @@ impl App {
                             self.notice = Some(format!("Created {id}"));
                             self.modal = None;
                             self.preferred_id = Some(id);
-                            self.refresh();
+                            self.refresh_at(now);
                         }
                         Err(e) => {
                             self.notice = Some(format!("Create failed: {e}"));
@@ -388,7 +460,7 @@ impl App {
                         Ok(()) => {
                             self.notice = Some("Bead deleted".into());
                             self.modal = None;
-                            self.refresh();
+                            self.refresh_at(now);
                         }
                         Err(e) => self.notice = Some(format!("Delete failed: {e}")),
                     }
@@ -796,6 +868,7 @@ pub fn run(t: &mut Tui) -> std::io::Result<()> {
     let mut app = App::new();
     loop {
         app.receive();
+        app.poll_refresh(Instant::now());
         t.draw(|f| ui::render(f, start.elapsed(), &mut splash, &mut app))?;
         if let Some(e) = event::poll_event(Duration::from_millis(35))? {
             match e {
@@ -855,6 +928,9 @@ mod tests {
             mutation_busy: false,
             modal_ready: true,
             preferred_id: None,
+            refresh_inflight: false,
+            refresh_pending: false,
+            next_refresh: Instant::now(),
             requests: tx,
             responses,
         }
@@ -878,6 +954,329 @@ mod tests {
         a.responses = rx;
         tx.send(response).unwrap();
         a.receive();
+    }
+    fn connected_app() -> (App, mpsc::Receiver<Request>, mpsc::Sender<Response>) {
+        let mut a = app();
+        let (requests, rx) = mpsc::channel();
+        let (tx, responses) = mpsc::channel();
+        a.requests = requests;
+        a.responses = responses;
+        (a, rx, tx)
+    }
+    fn take_show(rx: &mpsc::Receiver<Request>, expected_id: &str) -> u64 {
+        match rx.try_recv() {
+            Ok(Request::Show(id, seq)) => {
+                assert_eq!(id, expected_id);
+                seq
+            }
+            _ => panic!("missing show for {expected_id}"),
+        }
+    }
+    #[test]
+    fn startup_and_interval_polling_wait_for_completion_without_queue_growth() {
+        let (mut a, rx, tx) = connected_app();
+        a.beads.clear();
+        a.clear_selection();
+        a.list_loading = true;
+        let now = Instant::now();
+        a.refresh_at(now);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        assert!(a.list_loading);
+        for elapsed in [0, 1, 10, 100] {
+            a.poll_refresh(now + Duration::from_secs(elapsed));
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(!a.refresh_pending);
+        let completed = now + Duration::from_secs(100);
+        tx.send(Response::List(Ok(vec![]))).unwrap();
+        a.receive_at(completed);
+        assert!(!a.list_loading);
+        assert!(!a.refresh_inflight);
+        a.poll_refresh(completed + REFRESH_INTERVAL - Duration::from_nanos(1));
+        assert!(rx.try_recv().is_err());
+        a.poll_refresh(completed + REFRESH_INTERVAL);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        assert!(!a.list_loading, "empty background polls must not flicker");
+        a.poll_refresh(completed + REFRESH_INTERVAL * 10);
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn repeated_manual_refreshes_coalesce_into_one_trailing_snapshot() {
+        let (mut a, rx, tx) = connected_app();
+        let now = Instant::now();
+        a.refresh_at(now);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        for _ in 0..20 {
+            press(&mut a, KeyCode::Char('r'));
+        }
+        assert!(rx.try_recv().is_err());
+        assert!(a.refresh_pending);
+        tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+        a.receive_at(now);
+        take_show(&rx, "b0");
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        assert!(!a.refresh_pending);
+        a.poll_refresh(now + REFRESH_INTERVAL * 20);
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+        a.receive_at(now + REFRESH_INTERVAL * 20);
+        take_show(&rx, "b0");
+        assert!(rx.try_recv().is_err());
+        assert!(!a.refresh_inflight);
+    }
+    #[test]
+    fn mutations_invalidate_older_inflight_snapshot_and_keep_created_id_for_followup() {
+        for create in [true, false] {
+            let (mut a, rx, tx) = connected_app();
+            let now = Instant::now();
+            a.refresh_at(now);
+            assert!(matches!(rx.try_recv(), Ok(Request::List)));
+            tx.send(if create {
+                Response::Created(Ok("new-id".into()))
+            } else {
+                Response::Deleted(Ok(()))
+            })
+            .unwrap();
+            a.receive_at(now);
+            assert!(a.refresh_pending);
+            assert!(rx.try_recv().is_err());
+            tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+            a.receive_at(now);
+            take_show(&rx, "b0");
+            assert!(matches!(rx.try_recv(), Ok(Request::List)));
+            assert_eq!(a.preferred_id.as_deref(), create.then_some("new-id"));
+            let mut items = a.beads.clone();
+            if create {
+                let mut new = items[0].clone();
+                new.id = "new-id".into();
+                items.push(new);
+            } else {
+                items.remove(0);
+            }
+            tx.send(Response::List(Ok(items))).unwrap();
+            a.receive_at(now);
+            take_show(&rx, if create { "new-id" } else { "b1" });
+            assert!(rx.try_recv().is_err());
+            assert!(a.preferred_id.is_none());
+        }
+    }
+    #[test]
+    fn unchanged_polls_preserve_detail_scroll_focus_collapsed_groups_and_modals() {
+        for modal in [
+            None,
+            Some(Modal::Create(CreateForm {
+                title: "unfinished draft".into(),
+                description: "keep this".into(),
+                cursor: 3,
+                dropdown: Some(2),
+                ..Default::default()
+            })),
+            Some(Modal::ConfirmDelete {
+                id: "b0".into(),
+                title: "issue 0".into(),
+            }),
+        ] {
+            let (mut a, rx, tx) = connected_app();
+            a.beads[3].status = "closed".into();
+            a.collapsed.insert("closed".into());
+            a.focus_detail = true;
+            a.list_offset = 7;
+            a.detail_offset = 23;
+            a.detail = Some(json!({"id":"b0", "comments":[{"body":"keep me"}]}));
+            a.modal = modal.clone();
+            a.modal_ready = false;
+            a.notice = Some("keep notice".into());
+            let detail = a.detail.clone();
+            let now = Instant::now();
+            a.poll_refresh(now);
+            assert!(matches!(rx.try_recv(), Ok(Request::List)));
+            assert!(!a.list_loading);
+            assert!(!a.detail_loading);
+            tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+            a.receive_at(now);
+            let seq = take_show(&rx, "b0");
+            assert!(!a.detail_loading);
+            assert_eq!(a.detail, detail);
+            assert_eq!(a.selected, Some(0));
+            assert_eq!(a.collapsed, HashSet::from(["closed".into()]));
+            assert!(a.focus_detail);
+            assert_eq!((a.list_offset, a.detail_offset), (7, 23));
+            assert_eq!(a.modal, modal);
+            assert!(!a.modal_ready);
+            assert_eq!(a.notice.as_deref(), Some("keep notice"));
+            // Show-only changes must be observed even though the list was identical.
+            let updated = json!({"id":"b0", "comments":[{"body":"new comment"}]});
+            tx.send(Response::Show("b0".into(), seq, Ok(updated.clone())))
+                .unwrap();
+            a.receive_at(now);
+            assert_eq!(a.detail, Some(updated));
+            assert_eq!((a.list_offset, a.detail_offset), (7, 23));
+            assert_eq!(a.modal, modal);
+        }
+    }
+    #[test]
+    fn unchanged_poll_preserves_focused_group_and_does_not_request_details() {
+        let (mut a, rx, tx) = connected_app();
+        a.focus_group("open".into());
+        a.collapsed.insert("open".into());
+        a.focus_detail = true;
+        a.list_offset = 4;
+        let now = Instant::now();
+        a.poll_refresh(now);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+        a.receive_at(now);
+        assert_header(&a, "open");
+        assert!(a.collapsed.contains("open"));
+        assert!(a.focus_detail);
+        assert_eq!(a.list_offset, 4);
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn polling_applies_external_metadata_additions_and_removals_by_id() {
+        let (mut a, rx, tx) = connected_app();
+        a.select(2);
+        take_show(&rx, "b2");
+        a.detail_offset = 12;
+        a.list_offset = 3;
+        let now = Instant::now();
+        a.poll_refresh(now);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        let mut items = a.beads.clone();
+        items[2].title = "externally renamed".into();
+        items[2].priority = 0;
+        items[2].status = "blocked".into();
+        items[2].data = json!({"id":"b2", "labels":["external"], "assignee":"someone"});
+        let mut added = items[0].clone();
+        added.id = "added".into();
+        items.push(added);
+        items.retain(|b| b.id != "b1");
+        items.reverse();
+        tx.send(Response::List(Ok(items))).unwrap();
+        a.receive_at(now);
+        let selected = &a.beads[a.selected.unwrap()];
+        assert_eq!(selected.id, "b2");
+        assert_eq!(selected.title, "externally renamed");
+        assert_eq!(selected.priority, 0);
+        assert_eq!(selected.status, "blocked");
+        assert_eq!(selected.data["assignee"], "someone");
+        assert!(a.beads.iter().any(|b| b.id == "added"));
+        assert!(!a.beads.iter().any(|b| b.id == "b1"));
+        assert_eq!((a.list_offset, a.detail_offset), (3, 12));
+        let seq = take_show(&rx, "b2");
+        let updated = a.beads[a.selected.unwrap()].data.clone();
+        tx.send(Response::Show("b2".into(), seq, Ok(updated.clone())))
+            .unwrap();
+        a.receive_at(now);
+        assert_eq!(a.detail, Some(updated));
+        a.poll_refresh(now + REFRESH_INTERVAL);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        let items = a.beads.iter().filter(|b| b.id != "b2").cloned().collect();
+        tx.send(Response::List(Ok(items))).unwrap();
+        a.receive_at(now + REFRESH_INTERVAL);
+        assert_eq!(a.beads[a.selected.unwrap()].id, "added");
+        take_show(&rx, "added");
+    }
+    #[test]
+    fn transient_list_and_show_errors_keep_data_and_retry_until_success() {
+        let (mut a, rx, tx) = connected_app();
+        let now = Instant::now();
+        let old_data = a.detail.clone();
+        let old_ids = a.beads.iter().map(|b| b.id.clone()).collect::<Vec<_>>();
+        a.detail_offset = 9;
+        a.poll_refresh(now);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        tx.send(Response::List(Err(std::io::Error::other("list offline"))))
+            .unwrap();
+        a.receive_at(now);
+        assert_eq!(a.list_error.as_deref(), Some("list offline"));
+        assert_eq!(a.detail, old_data);
+        assert_eq!(
+            a.beads.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
+            old_ids
+        );
+        a.poll_refresh(now + REFRESH_INTERVAL);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        assert_eq!(a.list_error.as_deref(), Some("list offline"));
+        tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+        a.receive_at(now + REFRESH_INTERVAL);
+        assert!(a.list_error.is_none());
+        let seq = take_show(&rx, "b0");
+        tx.send(Response::Show(
+            "b0".into(),
+            seq,
+            Err(std::io::Error::other("show offline")),
+        ))
+        .unwrap();
+        a.receive_at(now + REFRESH_INTERVAL);
+        assert_eq!(a.detail_error.as_deref(), Some("show offline"));
+        assert_eq!(a.detail, old_data);
+        assert_eq!(a.detail_offset, 9);
+        a.poll_refresh(now + REFRESH_INTERVAL * 2);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+        a.receive_at(now + REFRESH_INTERVAL * 2);
+        let seq = take_show(&rx, "b0");
+        assert_eq!(a.detail_error.as_deref(), Some("show offline"));
+        let recovered = json!({"id":"b0", "comments":["recovered"]});
+        tx.send(Response::Show("b0".into(), seq, Ok(recovered.clone())))
+            .unwrap();
+        a.receive_at(now + REFRESH_INTERVAL * 2);
+        assert_eq!(a.detail, Some(recovered));
+        assert!(a.detail_error.is_none());
+        assert_eq!(a.detail_offset, 9);
+    }
+    #[test]
+    fn newer_snapshots_reject_older_detail_successes_and_errors_for_same_id() {
+        let (mut a, rx, tx) = connected_app();
+        let now = Instant::now();
+        a.poll_refresh(now);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+        a.receive_at(now);
+        let old_seq = take_show(&rx, "b0");
+        a.poll_refresh(now + REFRESH_INTERVAL);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        let mut items = a.beads.clone();
+        items[0].title = "new snapshot".into();
+        tx.send(Response::List(Ok(items))).unwrap();
+        a.receive_at(now + REFRESH_INTERVAL);
+        let new_seq = take_show(&rx, "b0");
+        assert_ne!(old_seq, new_seq);
+        let current = json!({"id":"b0", "description":"new detail"});
+        tx.send(Response::Show("b0".into(), new_seq, Ok(current.clone())))
+            .unwrap();
+        tx.send(Response::Show(
+            "b0".into(),
+            old_seq,
+            Ok(json!({"stale":true})),
+        ))
+        .unwrap();
+        tx.send(Response::Show(
+            "b0".into(),
+            old_seq,
+            Err(std::io::Error::other("stale error")),
+        ))
+        .unwrap();
+        a.receive_at(now + REFRESH_INTERVAL);
+        assert_eq!(a.detail, Some(current));
+        assert!(a.detail_error.is_none());
+    }
+    #[test]
+    fn disconnected_request_channel_does_not_latch_refresh_inflight() {
+        let mut a = app();
+        let now = Instant::now();
+        a.refresh_at(now);
+        assert!(!a.refresh_inflight);
+        assert!(!a.list_loading);
+        assert!(a.list_error.is_some());
+        let (requests, rx) = mpsc::channel();
+        a.requests = requests;
+        a.poll_refresh(now + REFRESH_INTERVAL - Duration::from_nanos(1));
+        assert!(rx.try_recv().is_err());
+        a.poll_refresh(now + REFRESH_INTERVAL);
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        assert!(a.refresh_inflight);
     }
     #[test]
     fn layout_has_physical_geometry_and_only_interactive_targets() {
@@ -1260,6 +1659,7 @@ mod tests {
     fn successful_refresh_preserves_selection_and_clears_empty_details() {
         let mut a = app();
         a.selected = Some(2);
+        a.detail = Some(a.beads[2].data.clone());
         a.detail_offset = 20;
         let (tx, rx) = mpsc::channel();
         a.responses = rx;
@@ -1270,7 +1670,7 @@ mod tests {
         .unwrap();
         a.receive();
         assert_eq!(a.beads[a.selected.unwrap()].id, "b2");
-        assert_eq!(a.detail_offset, 0);
+        assert_eq!(a.detail_offset, 20);
 
         a.detail_error = Some("old error".into());
         a.detail_loading = true;
@@ -1324,19 +1724,21 @@ mod tests {
         let mut a = app();
         a.select(2);
         let old_seq = a.detail_seq;
+        let old_detail = a.detail.clone();
         let mut items = a.beads.clone();
         items[2].status = "closed".into();
         items[2].data = json!({"id": "b2", "description": "updated detail"});
         items.reverse();
         respond(&mut a, Response::List(Ok(items)));
-        assert_bead(&a, "b2");
+        assert_eq!(a.beads[a.selected.unwrap()].id, "b2");
+        assert_eq!(a.detail, old_detail);
         assert_eq!(a.selected, Some(3));
         assert_eq!(a.detail_offset, 0);
         respond(
             &mut a,
             Response::Show("b2".into(), old_seq, Ok(json!({"stale": true}))),
         );
-        assert_bead(&a, "b2");
+        assert_eq!(a.detail, old_detail);
         press(&mut a, KeyCode::Char('d'));
         assert!(matches!(&a.modal, Some(Modal::ConfirmDelete { id, .. }) if id == "b2"));
         press(&mut a, KeyCode::Esc);

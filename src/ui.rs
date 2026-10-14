@@ -912,6 +912,9 @@ mod tests {
             mutation_busy: false,
             modal_ready: true,
             preferred_id: None,
+            refresh_inflight: false,
+            refresh_pending: false,
+            next_refresh: std::time::Instant::now(),
             requests: tx,
             responses,
         }
