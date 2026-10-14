@@ -136,6 +136,27 @@ fn move_vertical(s: &str, cursor: usize, down: bool) -> usize {
             .nth(column)
             .map_or(end - start, |(i, _)| i)
 }
+
+/// Return the next choice index, wrapping in either direction.
+fn cycle_choice(index: usize, choices: usize, forward: bool) -> usize {
+    assert!(
+        choices > 0,
+        "a choice control must have at least one option"
+    );
+    if forward {
+        (index % choices + 1) % choices
+    } else {
+        (index % choices + choices - 1) % choices
+    }
+}
+
+fn cycle_theme(theme: Theme, forward: bool) -> Theme {
+    let index = Theme::ALL
+        .iter()
+        .position(|choice| *choice == theme)
+        .unwrap_or(0);
+    Theme::ALL[cycle_choice(index, Theme::ALL.len(), forward)]
+}
 impl App {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel::<Request>();
@@ -642,12 +663,17 @@ impl App {
                             (*focus + 2) % 3
                         };
                     }
-                    Left | Up if *focus == 0 => {
+                    Left | Right if *focus == 0 => {
+                        *draft = cycle_theme(*draft, key.code == Right);
+                        *error = None;
+                        self.theme = *draft;
+                    }
+                    Up if *focus == 0 => {
                         *draft = Theme::Dark;
                         *error = None;
                         self.theme = *draft;
                     }
-                    Right | Down if *focus == 0 => {
+                    Down if *focus == 0 => {
                         *draft = Theme::Light;
                         *error = None;
                         self.theme = *draft;
@@ -707,7 +733,17 @@ impl App {
                         form.priority = (form.priority + 1).min(4)
                     }
                 }
-                Left | Right => {}
+                Left | Right => {
+                    if which == 2 {
+                        form.issue_type = cycle_choice(
+                            form.issue_type,
+                            beads::BEAD_TYPES.len(),
+                            key.code == Right,
+                        );
+                    } else {
+                        form.priority = cycle_choice(form.priority, 5, key.code == Right);
+                    }
+                }
                 Enter | Char(' ') => {
                     form.dropdown = None;
                     form.dropdown_original = None;
@@ -746,19 +782,11 @@ impl App {
                 });
             }
             Left | Right if form.focus == 2 => {
-                let count = beads::BEAD_TYPES.len();
-                form.issue_type = if key.code == Left {
-                    (form.issue_type + count - 1) % count
-                } else {
-                    (form.issue_type + 1) % count
-                };
+                form.issue_type =
+                    cycle_choice(form.issue_type, beads::BEAD_TYPES.len(), key.code == Right);
             }
             Left | Right if form.focus == 3 => {
-                form.priority = if key.code == Left {
-                    (form.priority + 4) % 5
-                } else {
-                    (form.priority + 1) % 5
-                };
+                form.priority = cycle_choice(form.priority, 5, key.code == Right);
             }
             Enter if form.focus == 4 => {
                 if !form.title.trim().is_empty() {
@@ -2345,7 +2373,12 @@ mod tests {
             panic!()
         };
         assert_eq!(form.dropdown, Some(2));
+        press(&mut a, KeyCode::Left);
+        assert!(
+            matches!(a.modal, Some(Modal::Create(ref f)) if f.issue_type == beads::BEAD_TYPES.len() - 1)
+        );
         press(&mut a, KeyCode::Esc);
+        assert!(matches!(a.modal, Some(Modal::Create(ref f)) if f.issue_type == 0));
 
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Right); // P2 -> P3
@@ -2360,6 +2393,33 @@ mod tests {
         assert!(matches!(a.modal, Some(Modal::Create(ref f)) if f.priority == 4));
         press(&mut a, KeyCode::Enter);
         assert!(matches!(a.modal, Some(Modal::Create(ref f)) if f.dropdown == Some(3)));
+        press(&mut a, KeyCode::Right);
+        assert!(matches!(a.modal, Some(Modal::Create(ref f)) if f.priority == 0));
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(a.modal, Some(Modal::Create(ref f)) if f.priority == 0 && f.dropdown.is_none())
+        );
+    }
+
+    #[test]
+    fn choice_cycling_wraps_both_directions_and_settings_open_cancel_restores() {
+        assert_eq!(cycle_choice(0, 3, false), 2);
+        assert_eq!(cycle_choice(2, 3, true), 0);
+
+        let mut a = app();
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Left); // Closed focused setting wraps Dark -> Light.
+        assert_eq!(a.theme, Theme::Light);
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Right); // Open setting wraps Light -> Dark.
+        assert_eq!(a.theme, Theme::Dark);
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.theme, Theme::Light, "Esc restores the opening choice");
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Left);
+        assert_eq!(a.theme, Theme::Dark);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.theme, Theme::Dark, "Enter keeps the preview");
     }
 
     #[test]

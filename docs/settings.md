@@ -25,7 +25,7 @@ non-object JSON, unknown themes, and non-string theme values are errors.
 ## Changing the theme
 
 Press `s` to open settings. The Theme dropdown starts focused. `Enter` or `Space`
-opens it; Left / Right changes the choice and previews it immediately. `Enter`
+opens it; Left / Right changes the choice with wraparound and previews it immediately, whether the list is open or closed. `Enter`
 keeps the current preview and closes the dropdown. `Esc` while the dropdown is
 open restores the choice from when it opened; `Esc` again cancels Settings and
 restores the saved theme. Use `Tab` / `Shift+Tab` to focus Save or Cancel, then

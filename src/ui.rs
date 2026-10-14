@@ -119,9 +119,9 @@ fn themed_type_color(kind: &str, theme: Theme) -> Color {
 }
 fn settings_hint(dropdown_open: bool) -> &'static str {
     if dropdown_open {
-        "← / → or ↑ / ↓ choose · Enter keep · Esc revert · Tab / Shift+Tab actions"
+        "← / → cycle · ↑ / ↓ choose · Enter keep · Esc revert · Tab / Shift+Tab actions"
     } else {
-        "Tab / Shift+Tab focus · Enter / Space open · ← / → preview · Enter activate · Esc cancel"
+        "Tab / Shift+Tab focus · ← / → cycle · Enter / Space open · Esc cancel"
     }
 }
 fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
@@ -939,7 +939,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 };
                 let feedback = truncate_display(
                     feedback.unwrap_or(
-                        "Tab moves · ←/→ changes Type/Priority · Enter opens · Esc cancels",
+                        "Tab moves · ←/→ cycles focused choices · Enter opens · Esc cancels",
                     ),
                     rows[4].width as usize,
                 );

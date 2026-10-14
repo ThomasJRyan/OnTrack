@@ -19,6 +19,8 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 
 Theme is explicit app state (`App::theme`) threaded into rendering; do not introduce global or thread-local palette state. Keep Dark as the existing default look. New colors need readable Light equivalents for surfaces, text, semantic metadata, startup splash, details, and dialogs. Settings preview a draft but commit `App::settings` only after `settings::save_to` succeeds; cancellation restores the committed theme. Tests should use isolated settings paths rather than changing process-wide environment variables.
 
+Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
+
 The `s` settings dialog previews Dark/Light appearance across the browser and splash. Saving is explicit; Esc discards the draft. Config read/write errors are presented in the UI and must not be reported as successful saves.
 
 ## Beads CLI contract
