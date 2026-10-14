@@ -1,10 +1,10 @@
-use crate::{app::App, beads::Bead};
+use crate::app::{App, DisplayRow};
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use ratatui_splash_screen::{SplashConfig, SplashScreen};
 use std::time::Duration;
@@ -22,26 +22,16 @@ pub fn new_splash() -> Option<SplashScreen> {
     })
     .ok()
 }
-fn item(b: &Bead, selected: bool) -> ListItem<'static> {
-    let status = if b.status.is_empty() {
-        "unknown"
-    } else {
-        &b.status
-    };
-    let lead = if selected { "› " } else { "  " };
-    ListItem::new(vec![
-        Line::from(vec![
-            Span::styled(lead, Style::default().fg(TEAL)),
-            Span::styled(
-                format!("{}  P{}  ·  {}", b.id, b.priority, status),
-                Style::default().fg(GOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(b.title.clone(), Style::default().fg(INK)),
-        ]),
-    ])
+fn status_color(status: &str) -> Color {
+    match status {
+        "open" => TEAL,
+        "closed" => Color::Rgb(255, 123, 123),
+        "in_progress" => GOLD,
+        "blocked" => Color::Rgb(255, 123, 123),
+        "deferred" => Color::Rgb(145, 170, 220),
+        "unknown" | "" => MUTED,
+        _ => Color::Rgb(125, 168, 235),
+    }
 }
 pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen>, app: &mut App) {
     let a = f.area();
@@ -105,39 +95,143 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
         .split(v[1]);
     app.list_rect = split[0];
     app.detail_rect = split[1];
-    let visible = (split[0].height.saturating_sub(2) / 2) as usize;
-    app.list_offset = app.list_offset.min(app.beads.len().saturating_sub(visible));
-    if let Some(i) = app.selected {
-        if i < app.list_offset {
-            app.list_offset = i
-        }
-        if visible > 0 && i >= app.list_offset + visible {
-            app.list_offset = i + 1 - visible
+    let layout = crate::app::list_layout(&app.beads, &app.collapsed);
+    let viewport = split[0].height as usize;
+    let focused_target = app
+        .focused_group
+        .as_ref()
+        .and_then(|status| {
+            layout
+                .targets
+                .iter()
+                .find(|t| matches!(&t.row, DisplayRow::Group(s) if s == status))
+        })
+        .or_else(|| {
+            app.selected
+                .and_then(|i| layout.targets.iter().find(|t| t.row == DisplayRow::Bead(i)))
+        });
+    if let Some(target) = focused_target {
+        let keep = target.height.min(viewport);
+        if target.y < app.list_offset {
+            app.list_offset = target.y;
+        } else if target.y + keep > app.list_offset + viewport {
+            app.list_offset = target.y + keep - viewport;
         }
     }
-    let items = app
-        .beads
-        .iter()
-        .map(|b| {
-            item(
-                b,
-                app.selected
-                    .is_some_and(|i| app.beads.get(i).is_some_and(|s| s.id == b.id)),
-            )
-        })
-        .collect::<Vec<_>>();
-    let lb = Block::default()
-        .title(format!(" ISSUES · {} ", app.beads.len()))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(if !app.focus_detail { TEAL } else { MUTED }));
-    let list = List::new(items)
-        .block(lb)
-        .highlight_style(Style::default().bg(Color::Rgb(31, 54, 58)));
-    let mut state = ListState::default()
-        .with_selected(app.selected)
-        .with_offset(app.list_offset);
-    f.render_stateful_widget(list, split[0], &mut state);
-    app.list_offset = state.offset();
+    app.list_offset = app.list_offset.min(layout.height.saturating_sub(viewport));
+    for group in &layout.groups {
+        let natural_top = group.y;
+        let natural_bottom = group.y + group.height;
+        let clip_top = natural_top.max(app.list_offset);
+        let clip_bottom = natural_bottom.min(app.list_offset + viewport);
+        if clip_top >= clip_bottom {
+            continue;
+        }
+        let color = status_color(&group.status);
+        let border = Style::default().fg(color);
+        // Draw the sides only over the true intersection. Top and bottom are
+        // drawn at their natural rows, so scrolling never creates fake edges.
+        let side_y = split[0].y + clip_top.saturating_sub(app.list_offset) as u16;
+        let side_h = (clip_bottom - clip_top) as u16;
+        for x in [split[0].x, split[0].x + split[0].width.saturating_sub(1)] {
+            let side_lines = (0..side_h).map(|_| Line::from("│")).collect::<Vec<_>>();
+            f.render_widget(
+                Paragraph::new(side_lines).style(border),
+                Rect::new(x, side_y, 1, side_h),
+            );
+        }
+        if natural_top >= app.list_offset && natural_top < app.list_offset + viewport {
+            let y = split[0].y + (natural_top - app.list_offset) as u16;
+            let label = if group.status.is_empty() {
+                "UNKNOWN".to_owned()
+            } else {
+                group.status.to_uppercase()
+            };
+            let focused = app.focused_group.as_deref() == Some(group.status.as_str());
+            let marker = if group.collapsed { "▸" } else { "▾" };
+            let title_style = if focused {
+                Style::default()
+                    .fg(BG)
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color).add_modifier(Modifier::BOLD)
+            };
+            let title = truncate_display(
+                &format!(" {marker} {label} · {} ", group.indices.len()),
+                split[0].width.saturating_sub(2) as usize,
+            );
+            let fill = (split[0].width.saturating_sub(2) as usize)
+                .saturating_sub(Span::raw(title.as_str()).width());
+            let top = Line::from(vec![
+                Span::styled("╭", border),
+                Span::styled(title, title_style),
+                Span::styled("─".repeat(fill), border),
+                Span::styled("╮", border),
+            ]);
+            f.render_widget(
+                Paragraph::new(top),
+                Rect::new(split[0].x, y, split[0].width, 1),
+            );
+        }
+        if natural_bottom > app.list_offset && natural_bottom <= app.list_offset + viewport {
+            let y = split[0].y + (natural_bottom - 1 - app.list_offset) as u16;
+            f.render_widget(
+                Paragraph::new(format!(
+                    "╰{}╯",
+                    "─".repeat(split[0].width.saturating_sub(2) as usize)
+                ))
+                .style(border),
+                Rect::new(split[0].x, y, split[0].width, 1),
+            );
+        }
+        for target in layout
+            .targets
+            .iter()
+            .filter(|t| matches!(&t.row,DisplayRow::Bead(i) if group.indices.contains(i)))
+        {
+            let DisplayRow::Bead(i) = target.row else {
+                continue;
+            };
+            let bead = &app.beads[i];
+            for line in 0..target.height {
+                let natural_y = target.y + line;
+                if natural_y < app.list_offset
+                    || natural_y >= app.list_offset + viewport
+                    || natural_y <= group.y
+                    || natural_y >= natural_bottom - 1
+                {
+                    continue;
+                }
+                let screen_y = split[0].y + (natural_y - app.list_offset) as u16;
+                let selected = app.selected == Some(i);
+                let content = if line == 0 {
+                    format!(
+                        "{}{}  P{}  ·  {}",
+                        if selected { "› " } else { "  " },
+                        bead.id,
+                        bead.priority,
+                        bead.status
+                    )
+                } else {
+                    format!("  {}", bead.title)
+                };
+                f.render_widget(
+                    Paragraph::new(content).style(Style::default().fg(if selected {
+                        color
+                    } else {
+                        INK
+                    })),
+                    Rect::new(
+                        split[0].x + 1,
+                        screen_y,
+                        split[0].width.saturating_sub(2),
+                        1,
+                    ),
+                );
+            }
+        }
+    }
     let selected = app.selected.and_then(|i| app.beads.get(i));
     let detail = app.detail.as_ref().or_else(|| selected.map(|b| &b.data));
     let inner_width = split[1].width.saturating_sub(2).max(1);
@@ -711,6 +805,8 @@ mod tests {
                 priority: 1,
                 data: json!({"unknown":{"n":5},"comments":[{"body":"hello comment"}],"unicode":"界界界界界界界界界界"}),
             }],
+            collapsed: std::collections::HashSet::new(),
+            focused_group: None,
             selected: Some(0),
             detail: None,
             focus_detail: false,
@@ -764,11 +860,124 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
         };
-        assert!(line(3).contains("demo-1  P1  ·  closed"));
-        assert!(line(4).contains("Title is visible"));
+        assert!(line(5).contains("demo-1  P1  ·  closed"));
+        assert!(line(6).contains("Title is visible"));
+        assert_eq!(buffer[(a.list_rect.x, a.list_rect.y)].symbol(), "╭");
+        assert_eq!(
+            buffer[(a.list_rect.x, a.list_rect.y)].fg,
+            status_color("closed")
+        );
+        assert!(line(a.list_rect.y).contains("CLOSED"));
+        let group = crate::app::list_layout(&a.beads, &a.collapsed)
+            .groups
+            .remove(0);
+        let bottom = a.list_rect.y + (group.y + group.height - 1 - a.list_offset) as u16;
+        assert_eq!(buffer[(a.list_rect.x, bottom)].symbol(), "╰");
+        assert!(line(bottom).contains("╯"));
         for x in ["unknown", "comments", "hello comment", "界", "5"] {
             assert!(s.contains(x), "{x}")
         }
+    }
+    #[test]
+    fn stable_status_colors_and_scrolled_last_group_render_in_small_viewport() {
+        assert_eq!(status_color("custom"), Color::Rgb(125, 168, 235));
+        assert_eq!(status_color("open"), TEAL);
+        assert_eq!(status_color("closed"), Color::Rgb(255, 123, 123));
+        let mut a = app();
+        a.beads = (0..15)
+            .map(|i| crate::beads::Bead {
+                id: format!("b{i}"),
+                title: format!("item {i}"),
+                status: if i == 14 { "closed" } else { "open" }.into(),
+                priority: 2,
+                data: json!({}),
+            })
+            .collect();
+        a.selected = Some(14);
+        let (shown, _) = draw((52, 14), &mut a);
+        assert!(shown.contains("CLOSED"));
+        assert!(shown.contains("b14"));
+        assert!(a.list_offset > 0);
+    }
+    #[test]
+    fn expanded_panes_enclose_rows_and_follow_status_order() {
+        let mut a = app();
+        a.beads[0].status = "closed".into();
+        a.beads.push(crate::beads::Bead {
+            id: "open-2".into(),
+            title: "open title".into(),
+            status: "open".into(),
+            priority: 2,
+            data: json!({}),
+        });
+        a.selected = Some(0);
+        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+        assert_eq!(
+            layout
+                .groups
+                .iter()
+                .map(|g| g.status.as_str())
+                .collect::<Vec<_>>(),
+            ["open", "closed"]
+        );
+        assert_eq!(
+            layout.groups[0].height,
+            4 + 2 * layout.groups[0].indices.len()
+        );
+        assert_eq!(
+            layout.groups[1].y,
+            layout.groups[0].y + layout.groups[0].height
+        );
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut splash = None;
+        terminal
+            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let closed_y = a.list_rect.y + (layout.groups[1].y - a.list_offset) as u16;
+        let line = (0..100)
+            .map(|x| buf[(x, closed_y)].symbol())
+            .collect::<String>();
+        assert!(line.contains("CLOSED"));
+        let bottom = closed_y + layout.groups[1].height as u16 - 1;
+        assert_eq!(buf[(a.list_rect.x, bottom)].symbol(), "╰");
+        assert_eq!(buf[(a.list_rect.x, bottom)].fg, status_color("closed"));
+        assert!(buf[(a.list_rect.x, closed_y + 3)].symbol() == "│");
+    }
+    #[test]
+    fn partial_scrolled_issue_line_has_no_fabricated_pane_edges() {
+        let mut a = app();
+        a.beads = (0..8)
+            .map(|i| crate::beads::Bead {
+                id: format!("long-{i}"),
+                title: format!("visible-title-{i}"),
+                status: "open".into(),
+                priority: 2,
+                data: json!({}),
+            })
+            .collect();
+        a.selected = None;
+        a.detail = None;
+        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+        let target = layout
+            .targets
+            .iter()
+            .find(|t| t.row == DisplayRow::Bead(0))
+            .unwrap();
+        a.list_offset = target.y + 1;
+        let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
+        let mut splash = None;
+        terminal
+            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let first_visible = a.list_rect.y;
+        let line = (0..a.list_rect.width)
+            .map(|x| buf[(a.list_rect.x + x, first_visible)].symbol())
+            .collect::<String>();
+        assert!(line.contains("visible-title-0"));
+        assert!(!line.contains("╭") && !line.contains("╰"));
+        assert_eq!(buf[(a.list_rect.x, first_visible)].symbol(), "│");
     }
     #[test]
     fn markdown_description_is_readable_and_styled_in_detail_pane() {

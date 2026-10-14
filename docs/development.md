@@ -72,6 +72,11 @@ cargo test ui::tests
 ```
 
 Unit tests do not replace an interactive terminal cleanup check. When changing functionality, update the relevant Markdown guides under `docs/` and keep the README concise, preserving its controls and links to detailed documentation.
+
 ## Mutations
 
 Create and delete are explicit, asynchronous CLI operations. The create form uses the Beads type vocabulary and P0–P4 priorities; deletion requires a second, affirmative confirmation and never cascades. Each worker request is processed in channel order, without batching mutations together, and the UI disables repeat submissions while one is in flight. The CLI adapter is defined in `src/beads.rs`; the UI only calls its create/delete functions and refreshes the normal list/detail views after success.
+
+## Status-grouped list
+
+List results are sorted deterministically by status (open first, closed last, other statuses alphabetically), then ID. `list_layout` in `src/app.rs` is the shared geometry model for navigation, viewport scrolling, mouse hit-testing, and rendering. Group collapse state is keyed by status and retained across refreshes while that status remains present. Keep selected IDs aligned with detail/delete actions when changing this view.

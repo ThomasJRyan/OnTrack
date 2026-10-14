@@ -16,7 +16,7 @@ Rust 1.88 or newer, the `bd` command-line tool, and a Beads workspace. A termina
 cargo run
 ```
 
-Use `↑` / `↓` to select issues, or click a visible row. Press `n` to create a bead or `d` to permanently delete the selection (confirmation required). Press `r` to refresh. Press `q`, `Esc`, or `Ctrl+C` to quit outside a form. See the [user guide](docs/user-guide.md) for form controls and safety details.
+Issues are grouped into coloured, collapsible status panes (open first, closed last). Use `↑` / `↓` to move through issues and group titles; press `Space` to collapse or expand the focused group, or click its pane title. Press `n` to create a bead or `d` to permanently delete the selected issue (confirmation required). Press `r` to refresh. Press `q`, `Esc`, or `Ctrl+C` to quit outside a form. See the [user guide](docs/user-guide.md) for details.
 
 See the [user guide](docs/user-guide.md) for setup and troubleshooting, the [development guide](docs/development.md) for architecture and checks, and the [official Beads documentation](https://beads.gascity.com) for workspace setup.
 

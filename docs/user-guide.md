@@ -21,14 +21,19 @@ To browse another workspace, build with `cargo build`, change to that workspace,
 
 A brief splash precedes the browser. Issue loading starts in the background; quit keys work during startup too.
 
+## Status groups
+
+Issues are shown in rounded, colour-coded panes. Open appears first and closed last; other and unrecognized statuses remain grouped alphabetically. An empty status is labelled unknown. Pane titles show the status and count. Use `↑` / `↓` to move through group titles and visible issues. Press `Space` on a group title or issue to collapse/expand that status; clicking the pane title does the same. Collapsing a selected issue clears its detail selection; expanding the focused group selects its first issue. Collapse state is retained across refreshes while groups still exist.
+
 ## Browsing and controls
 
 The left pane lists all returned issues, including closed ones, without the CLI's usual list cap. Each entry shows its ID, priority, status, and title. The right pane presents the selected issue as a readable record: narrative fields use Markdown formatting, while metadata, comments, relationships, and unfamiliar nested values remain available as you scroll.
 
 | Input | Action |
 | --- | --- |
-| `↑` / `↓` with the list focused | Select the previous / next issue; selection stops at the ends. |
-| Left-click a visible issue row | Select it and focus the list. |
+| `↑` / `↓` with the list focused | Move through group titles and visible issues. |
+| `Space` on a group or issue | Collapse or expand that status group. |
+| Left-click a pane title / visible issue row | Toggle the group / select the issue. |
 | `Tab` | Toggle pane focus. |
 | `←` / `→` | Focus the list / details pane. |
 | `↑` / `↓` with details focused | Scroll details one line. |

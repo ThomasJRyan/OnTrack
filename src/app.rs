@@ -6,6 +6,7 @@ use crate::{
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::{
+    collections::HashSet,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -25,6 +26,8 @@ pub(super) enum Response {
 }
 pub struct App {
     pub beads: Vec<Bead>,
+    pub collapsed: HashSet<String>,
+    pub focused_group: Option<String>,
     pub selected: Option<usize>,
     pub detail: Option<serde_json::Value>,
     pub focus_detail: bool,
@@ -132,6 +135,8 @@ impl App {
         });
         let mut a = Self {
             beads: vec![],
+            collapsed: HashSet::new(),
+            focused_group: None,
             selected: None,
             detail: None,
             focus_detail: false,
@@ -162,12 +167,17 @@ impl App {
         let _ = self.requests.send(Request::List);
     }
     fn select(&mut self, index: usize) {
+        self.focused_group = None;
         if self.beads.is_empty() {
-            self.selected = None;
-            self.detail = None;
+            self.clear_selection();
             return;
         }
         let index = index.min(self.beads.len() - 1);
+        let status = normalized_status(&self.beads[index].status).to_owned();
+        if self.collapsed.contains(&status) {
+            self.focus_group(status);
+            return;
+        }
         if self.selected == Some(index) {
             return;
         }
@@ -181,14 +191,66 @@ impl App {
             .requests
             .send(Request::Show(self.beads[index].id.clone(), self.detail_seq));
     }
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.detail = None;
+        self.detail_loading = false;
+        self.detail_error = None;
+        self.detail_offset = 0;
+    }
+    fn focus_group(&mut self, status: String) {
+        self.clear_selection();
+        self.focused_group = Some(status);
+    }
     fn step(&mut self, d: isize) {
-        if let Some(i) = self.selected {
-            self.select(
-                i.saturating_add_signed(d)
-                    .min(self.beads.len().saturating_sub(1)),
-            )
-        } else if !self.beads.is_empty() {
-            self.select(0)
+        let targets = list_layout(&self.beads, &self.collapsed).targets;
+        if targets.is_empty() {
+            self.clear_selection();
+            self.focused_group = None;
+            return;
+        }
+        let current = self
+            .focused_group
+            .as_ref()
+            .and_then(|s| {
+                targets
+                    .iter()
+                    .position(|t| matches!(&t.row, DisplayRow::Group(g) if g == s))
+            })
+            .or_else(|| {
+                self.selected
+                    .and_then(|i| targets.iter().position(|t| t.row == DisplayRow::Bead(i)))
+            })
+            .unwrap_or(0);
+        let next = current.saturating_add_signed(d).min(targets.len() - 1);
+        match &targets[next].row {
+            DisplayRow::Group(status) => self.focus_group(status.clone()),
+            DisplayRow::Bead(i) => self.select(*i),
+        }
+    }
+    fn toggle_selected_group(&mut self) {
+        if let Some(status) = self.focused_group.clone().or_else(|| {
+            self.selected
+                .and_then(|i| self.beads.get(i))
+                .map(|b| normalized_status(&b.status).to_owned())
+        }) {
+            self.toggle_group(status);
+        }
+    }
+    fn toggle_group(&mut self, status: String) {
+        if self.collapsed.remove(&status) {
+            if let Some(i) = self
+                .beads
+                .iter()
+                .position(|b| normalized_status(&b.status) == status)
+            {
+                self.select(i);
+            } else {
+                self.focus_group(status);
+            }
+        } else {
+            self.collapsed.insert(status.clone());
+            self.focus_group(status);
         }
     }
     fn receive(&mut self) {
@@ -202,27 +264,53 @@ impl App {
                                 .selected
                                 .and_then(|i| self.beads.get(i))
                                 .map(|b| b.id.clone());
-                            self.beads = items;
-                            self.selected = self
+                            let group = self.focused_group.clone();
+                            self.beads = items
+                                .into_iter()
+                                .map(|mut b| {
+                                    b.status = normalized_status(&b.status).to_owned();
+                                    b
+                                })
+                                .collect();
+                            self.beads.sort_by(|a, b| {
+                                status_order(&a.status)
+                                    .cmp(&status_order(&b.status))
+                                    .then_with(|| a.status.cmp(&b.status))
+                                    .then_with(|| a.id.cmp(&b.id))
+                            });
+                            self.collapsed
+                                .retain(|s| self.beads.iter().any(|b| &b.status == s));
+                            let preferred = self
                                 .preferred_id
                                 .take()
-                                .and_then(|id| self.beads.iter().position(|b| b.id == id))
-                                .or_else(|| {
-                                    id.and_then(|id| self.beads.iter().position(|b| b.id == id))
-                                        .or_else(|| (!self.beads.is_empty()).then_some(0))
-                                });
-                            self.detail = None;
-                            self.detail_loading = false;
-                            self.detail_error = None;
-                            self.detail_offset = 0;
-                            if let Some(i) = self.selected {
-                                self.detail = Some(self.beads[i].data.clone());
-                                self.detail_loading = true;
-                                self.detail_error = None;
-                                self.detail_seq = self.detail_seq.wrapping_add(1);
-                                let _ = self
-                                    .requests
-                                    .send(Request::Show(self.beads[i].id.clone(), self.detail_seq));
+                                .and_then(|id| self.beads.iter().position(|b| b.id == id));
+                            self.clear_selection();
+                            self.focused_group = None;
+                            if let Some(i) = preferred {
+                                self.collapsed.remove(&self.beads[i].status);
+                                self.select(i);
+                            } else if let Some(status) =
+                                group.filter(|s| self.beads.iter().any(|b| &b.status == s))
+                            {
+                                self.focus_group(status);
+                            } else if let Some(i) =
+                                id.and_then(|id| self.beads.iter().position(|b| b.id == id))
+                            {
+                                self.select(i);
+                            } else {
+                                let targets = list_layout(&self.beads, &self.collapsed).targets;
+                                if let Some(i) = targets.iter().find_map(|t| match t.row {
+                                    DisplayRow::Bead(i) => Some(i),
+                                    DisplayRow::Group(_) => None,
+                                }) {
+                                    self.select(i);
+                                } else if let Some(ListTarget {
+                                    row: DisplayRow::Group(status),
+                                    ..
+                                }) = targets.into_iter().next()
+                                {
+                                    self.focus_group(status);
+                                }
                             }
                             self.list_error = None;
                         }
@@ -289,6 +377,7 @@ impl App {
         }
         match k.code {
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char(' ') => self.toggle_selected_group(),
             KeyCode::Char('n') => {
                 self.modal = Some(Modal::Create(CreateForm::default()));
                 self.modal_ready = false;
@@ -541,23 +630,21 @@ impl App {
         }
         match k {
             MouseEventKind::Down(MouseButton::Left)
-                if Rect::new(
-                    self.list_rect.x.saturating_add(1),
-                    self.list_rect.y.saturating_add(1),
-                    self.list_rect.width.saturating_sub(2),
-                    self.list_rect.height.saturating_sub(2),
-                )
-                .contains((x, y).into()) =>
+                if self.list_rect.contains((x, y).into())
+                    && x > self.list_rect.x
+                    && x < self.list_rect.x + self.list_rect.width.saturating_sub(1) =>
             {
-                let inner_y = y - self.list_rect.y - 1;
-                let inner_height = self.list_rect.height.saturating_sub(2);
-                if inner_y >= inner_height || inner_y / 2 >= inner_height / 2 {
-                    return;
-                }
-                let i = self.list_offset + (inner_y / 2) as usize;
-                if i < self.beads.len() {
-                    self.select(i);
-                    self.focus_detail = false
+                let row = usize::from(y - self.list_rect.y) + self.list_offset;
+                if let Some(target) = list_layout(&self.beads, &self.collapsed)
+                    .targets
+                    .into_iter()
+                    .find(|t| row >= t.y && row < t.y + t.height)
+                {
+                    match target.row {
+                        DisplayRow::Group(status) => self.toggle_group(status),
+                        DisplayRow::Bead(i) => self.select(i),
+                    }
+                    self.focus_detail = false;
                 }
             }
             MouseEventKind::ScrollUp if self.list_rect.contains((x, y).into()) => self.step(-1),
@@ -571,6 +658,98 @@ impl App {
             _ => {}
         }
     }
+}
+fn status_order(status: &str) -> (u8, &str) {
+    match status {
+        "open" => (0, status),
+        "closed" => (2, status),
+        _ => (1, status),
+    }
+}
+fn normalized_status(status: &str) -> &str {
+    match status.trim() {
+        "" => "unknown",
+        status => status,
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DisplayRow {
+    Group(String),
+    Bead(usize),
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListLayout {
+    pub groups: Vec<GroupLayout>,
+    pub targets: Vec<ListTarget>,
+    pub height: usize,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GroupLayout {
+    pub status: String,
+    pub indices: Vec<usize>,
+    pub y: usize,
+    pub height: usize,
+    pub collapsed: bool,
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListTarget {
+    pub row: DisplayRow,
+    pub y: usize,
+    pub height: usize,
+}
+pub fn group_statuses(beads: &[Bead]) -> Vec<String> {
+    let mut groups = beads
+        .iter()
+        .map(|b| normalized_status(&b.status).to_owned())
+        .collect::<Vec<_>>();
+    groups.sort_by(|a, b| status_order(a).cmp(&status_order(b)).then_with(|| a.cmp(b)));
+    groups.dedup();
+    groups
+}
+pub fn list_layout(beads: &[Bead], collapsed: &HashSet<String>) -> ListLayout {
+    let mut layout = ListLayout {
+        groups: Vec::new(),
+        targets: Vec::new(),
+        height: 0,
+    };
+    for status in group_statuses(beads) {
+        let indices = beads
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| normalized_status(&b.status) == status)
+            .map(|(i, _)| i)
+            .collect::<Vec<_>>();
+        let is_collapsed = collapsed.contains(&status);
+        let y = layout.height;
+        let height = if is_collapsed {
+            3
+        } else {
+            4 + 2 * indices.len()
+        };
+        layout.targets.push(ListTarget {
+            row: DisplayRow::Group(status.clone()),
+            y,
+            height: 1,
+        });
+        if !is_collapsed {
+            layout
+                .targets
+                .extend(indices.iter().enumerate().map(|(n, &i)| ListTarget {
+                    row: DisplayRow::Bead(i),
+                    y: y + 3 + 2 * n,
+                    height: 2,
+                }));
+        }
+        layout.groups.push(GroupLayout {
+            status,
+            indices,
+            y,
+            height,
+            collapsed: is_collapsed,
+        });
+        layout.height += height;
+    }
+    layout
 }
 pub fn run(t: &mut Tui) -> std::io::Result<()> {
     let start = Instant::now();
@@ -615,11 +794,13 @@ mod tests {
                     title: format!("issue {i}"),
                     status: "open".into(),
                     priority: 2,
-                    data: json!({}),
+                    data: json!({"id": format!("b{i}"), "description": format!("detail {i}")}),
                 })
                 .collect(),
+            collapsed: HashSet::new(),
+            focused_group: None,
             selected: Some(0),
-            detail: Some(json!({})),
+            detail: Some(json!({"id": "b0", "description": "detail 0"})),
             focus_detail: false,
             list_offset: 0,
             detail_offset: 0,
@@ -639,16 +820,260 @@ mod tests {
             responses,
         }
     }
+    fn assert_header(a: &App, status: &str) {
+        assert_eq!(a.focused_group.as_deref(), Some(status));
+        assert!(a.selected.is_none());
+        assert!(a.detail.is_none());
+        assert!(!a.detail_loading);
+        assert!(a.detail_error.is_none());
+        assert_eq!(a.detail_offset, 0);
+    }
+    fn assert_bead(a: &App, id: &str) {
+        assert!(a.focused_group.is_none());
+        let bead = &a.beads[a.selected.expect("selected bead")];
+        assert_eq!(bead.id, id);
+        assert_eq!(a.detail.as_ref(), Some(&bead.data));
+    }
+    fn respond(a: &mut App, response: Response) {
+        let (tx, rx) = mpsc::channel();
+        a.responses = rx;
+        tx.send(response).unwrap();
+        a.receive();
+    }
+    #[test]
+    fn layout_has_physical_geometry_and_only_interactive_targets() {
+        let mut a = app();
+        a.beads[0].status = " closed ".into();
+        a.beads[1].status = "blocked".into();
+        a.beads[2].status = "open".into();
+        a.beads[3].status = " \t ".into();
+        let layout = list_layout(&a.beads, &HashSet::from(["blocked".into()]));
+        assert_eq!(layout.height, 21);
+        assert_eq!(
+            layout
+                .groups
+                .iter()
+                .map(|g| (&*g.status, g.y, g.height, g.collapsed))
+                .collect::<Vec<_>>(),
+            [
+                ("open", 0, 6, false),
+                ("blocked", 6, 3, true),
+                ("unknown", 9, 6, false),
+                ("closed", 15, 6, false)
+            ]
+        );
+        assert_eq!(
+            layout
+                .groups
+                .iter()
+                .map(|g| g.indices.clone())
+                .collect::<Vec<_>>(),
+            [vec![2], vec![1], vec![3], vec![0]]
+        );
+        assert_eq!(
+            layout.targets,
+            vec![
+                ListTarget {
+                    row: DisplayRow::Group("open".into()),
+                    y: 0,
+                    height: 1
+                },
+                ListTarget {
+                    row: DisplayRow::Bead(2),
+                    y: 3,
+                    height: 2
+                },
+                ListTarget {
+                    row: DisplayRow::Group("blocked".into()),
+                    y: 6,
+                    height: 1
+                },
+                ListTarget {
+                    row: DisplayRow::Group("unknown".into()),
+                    y: 9,
+                    height: 1
+                },
+                ListTarget {
+                    row: DisplayRow::Bead(3),
+                    y: 12,
+                    height: 2
+                },
+                ListTarget {
+                    row: DisplayRow::Group("closed".into()),
+                    y: 15,
+                    height: 1
+                },
+                ListTarget {
+                    row: DisplayRow::Bead(0),
+                    y: 18,
+                    height: 2
+                },
+            ]
+        );
+        assert_eq!(
+            list_layout(&[], &HashSet::new()),
+            ListLayout {
+                groups: vec![],
+                targets: vec![],
+                height: 0
+            }
+        );
+        a.beads[1].status = "unknown".into();
+        assert_eq!(
+            list_layout(&a.beads, &HashSet::new()).groups[1].indices,
+            [1, 3]
+        );
+    }
+    #[test]
+    fn mouse_cross_group_toggle_clears_detail_and_delete_identity() {
+        let mut a = app();
+        a.list_rect = Rect::new(5, 7, 30, 30);
+        a.beads[1].status = "closed".into();
+        a.select(2);
+        a.detail_error = Some("stale".into());
+        a.detail_offset = 8;
+        let layout = list_layout(&a.beads, &a.collapsed);
+        let closed_y = layout
+            .groups
+            .iter()
+            .find(|g| g.status == "closed")
+            .unwrap()
+            .y;
+        a.mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            6,
+            7 + closed_y as u16,
+        );
+        assert_header(&a, "closed");
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.modal.is_none());
+        // Reopening uses the same toggle path as Space, not the old open selection.
+        a.mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            6,
+            7 + closed_y as u16,
+        );
+        assert_bead(&a, "b1");
+        press(&mut a, KeyCode::Char('d'));
+        assert!(matches!(&a.modal, Some(Modal::ConfirmDelete { id, .. }) if id == "b1"));
+        press(&mut a, KeyCode::Esc);
+        // Selecting the same index must still remove conflicting header focus.
+        a.focused_group = Some("open".into());
+        a.select(1);
+        assert_bead(&a, "b1");
+    }
+    #[test]
+    fn mouse_targets_follow_scrolled_natural_lines_without_relocated_headers() {
+        let mut a = app();
+        a.list_rect = Rect::new(5, 7, 30, 20);
+        a.beads[1].status = "closed".into();
+        a.select(2);
+        let layout = list_layout(&a.beads, &a.collapsed);
+        for target in layout
+            .targets
+            .iter()
+            .filter(|t| matches!(t.row, DisplayRow::Bead(_)))
+        {
+            let DisplayRow::Bead(i) = target.row else {
+                unreachable!()
+            };
+            for line in 0..target.height {
+                a.list_offset = target.y + line;
+                a.mouse(MouseEventKind::Down(MouseButton::Left), 6, 7);
+                assert_bead(&a, &a.beads[i].id);
+            }
+        }
+        a.list_offset = 1;
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 6, 7);
+        assert_bead(&a, "b1");
+        assert!(a.collapsed.is_empty());
+        let closed = layout.groups.iter().find(|g| g.status == "closed").unwrap();
+        a.list_offset = closed.y;
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 6, 7);
+        assert_header(&a, "closed");
+    }
+    #[test]
+    fn collapse_and_reselect_reject_stale_detail_success_and_failure() {
+        let mut a = app();
+        a.select(1);
+        let old_seq = a.detail_seq;
+        press(&mut a, KeyCode::Char(' '));
+        respond(
+            &mut a,
+            Response::Show("b1".into(), old_seq, Ok(json!({"stale": true}))),
+        );
+        assert_header(&a, "open");
+        press(&mut a, KeyCode::Char(' '));
+        a.select(1);
+        assert_ne!(a.detail_seq, old_seq);
+        respond(
+            &mut a,
+            Response::Show("b1".into(), old_seq, Err(std::io::Error::other("stale"))),
+        );
+        assert_bead(&a, "b1");
+        assert!(a.detail_loading);
+        assert!(a.detail_error.is_none());
+        respond(
+            &mut a,
+            Response::Show("b1".into(), old_seq, Ok(json!({"stale": true}))),
+        );
+        assert_bead(&a, "b1");
+        let seq = a.detail_seq;
+        respond(
+            &mut a,
+            Response::Show("b1".into(), seq, Ok(json!({"fresh": "b1"}))),
+        );
+        assert_eq!(a.detail, Some(json!({"fresh": "b1"})));
+        assert!(!a.detail_loading);
+    }
     #[test]
     fn navigation_clamps_and_empty_is_safe() {
         let mut a = app();
         a.step(-1);
-        assert_eq!(a.selected, Some(0));
+        assert_eq!(a.focused_group.as_deref(), Some("open"));
         a.step(20);
         assert_eq!(a.selected, Some(3));
         a.beads.clear();
         a.step(1);
         assert_eq!(a.selected, None);
+    }
+    #[test]
+    fn status_groups_sort_open_middle_closed_and_unknown() {
+        let mut a = app();
+        a.beads[0].status = "closed".into();
+        a.beads[1].status = "blocked".into();
+        a.beads[2].status = "open".into();
+        a.beads[3].status = "".into();
+        assert_eq!(
+            group_statuses(&a.beads),
+            ["open", "blocked", "unknown", "closed"]
+        );
+    }
+    #[test]
+    fn every_collapsed_group_can_be_reopened_and_selection_detail_stay_aligned() {
+        let mut a = app();
+        a.beads[0].status = "open".into();
+        a.beads[1].status = "closed".into();
+        a.beads[2].status = "closed".into();
+        a.beads[3].status = "open".into();
+        press(&mut a, KeyCode::Char(' '));
+        assert_header(&a, "open");
+        press(&mut a, KeyCode::Down);
+        assert_header(&a, "closed");
+        press(&mut a, KeyCode::Char(' '));
+        assert_eq!(a.collapsed.len(), 2);
+        press(&mut a, KeyCode::Up);
+        assert_header(&a, "open");
+        press(&mut a, KeyCode::Char(' '));
+        assert!(!a.collapsed.contains("open"));
+        assert_bead(&a, "b0");
+        press(&mut a, KeyCode::Down);
+        assert_bead(&a, "b3");
+        press(&mut a, KeyCode::Down);
+        assert_header(&a, "closed");
+        press(&mut a, KeyCode::Char(' '));
+        assert_bead(&a, "b1");
+        assert!(a.collapsed.is_empty());
     }
     #[test]
     fn detail_focus_and_scroll_work() {
@@ -665,7 +1090,7 @@ mod tests {
         let mut a = app();
         a.list_offset = 1;
         a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 5);
-        assert_eq!(a.selected, Some(3));
+        assert_eq!(a.selected, Some(1));
     }
     #[test]
     fn stale_detail_response_cannot_replace_selection() {
@@ -673,9 +1098,9 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.responses = rx;
         let _ = tx.send(Response::Show("b0".into(), 0, Ok(json!({"old":true}))));
-        a.selected = Some(1);
+        a.select(1);
         a.receive();
-        assert_eq!(a.detail, Some(json!({})));
+        assert_eq!(a.detail, Some(a.beads[1].data.clone()));
     }
     #[test]
     fn stale_response_for_same_id_after_reselection_is_ignored() {
@@ -698,18 +1123,35 @@ mod tests {
     #[test]
     fn click_ignores_border_and_blank_rows() {
         let mut a = app();
-        a.list_rect = Rect::new(0, 0, 30, 7);
-        a.selected = Some(3);
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 0);
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 0, 2);
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 7);
+        a.list_rect = Rect::new(0, 0, 30, 16);
+        a.select(3);
+        for (x, y) in [
+            (0, 0),
+            (0, 3),
+            (29, 3),
+            (4, 1),
+            (4, 2),
+            (4, 11),
+            (4, 12),
+            (4, 15),
+            (4, 16),
+        ] {
+            a.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+            assert_bead(&a, "b3");
+            assert!(a.collapsed.is_empty());
+        }
         a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 5);
-        assert_eq!(a.selected, Some(3));
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 1);
-        assert_eq!(a.selected, Some(0));
-        a.selected = Some(0);
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 7);
-        assert_eq!(a.selected, Some(0));
+        assert_bead(&a, "b1");
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 0);
+        assert!(a.collapsed.contains("open"));
+        assert_header(&a, "open");
+        for y in 1..16 {
+            a.mouse(MouseEventKind::Down(MouseButton::Left), 4, y);
+            assert_header(&a, "open");
+            assert!(a.collapsed.contains("open"));
+        }
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 0);
+        assert_bead(&a, "b0");
     }
 
     #[test]
@@ -725,8 +1167,7 @@ mod tests {
         ])))
         .unwrap();
         a.receive();
-        assert_eq!(a.selected, Some(0));
-        assert_eq!(a.beads[0].id, "b2");
+        assert_eq!(a.beads[a.selected.unwrap()].id, "b2");
         assert_eq!(a.detail_offset, 0);
 
         a.detail_error = Some("old error".into());
@@ -737,6 +1178,133 @@ mod tests {
         assert!(a.detail.is_none());
         assert!(!a.detail_loading);
         assert!(a.detail_error.is_none());
+    }
+    #[test]
+    fn refresh_keeps_existing_group_collapse_and_drops_stale_group_state() {
+        let mut a = app();
+        a.collapsed.extend(["closed".into(), "removed".into()]);
+        let (tx, rx) = mpsc::channel();
+        a.responses = rx;
+        tx.send(Response::List(Ok(vec![Bead {
+            id: "c".into(),
+            title: "closed issue".into(),
+            status: "closed".into(),
+            priority: 2,
+            data: json!({}),
+        }])))
+        .unwrap();
+        a.receive();
+        assert_eq!(a.collapsed, HashSet::from(["closed".to_owned()]));
+        assert_eq!(a.selected, None);
+        assert!(a.detail.is_none());
+        assert_eq!(a.focused_group.as_deref(), Some("closed"));
+    }
+    #[test]
+    fn refresh_preserves_expanded_and_collapsed_headers_without_selecting_beads() {
+        let mut a = app();
+        a.beads[1].status = "closed".into();
+        a.focus_group("closed".into());
+        for collapsed in [false, true] {
+            if collapsed {
+                a.collapsed.insert("closed".into());
+            }
+            let mut items = a.beads.clone();
+            items.reverse();
+            respond(&mut a, Response::List(Ok(items)));
+            assert_header(&a, "closed");
+            assert_eq!(a.collapsed.contains("closed"), collapsed);
+            press(&mut a, KeyCode::Char('d'));
+            assert!(a.modal.is_none());
+        }
+    }
+    #[test]
+    fn refresh_tracks_bead_id_across_reorder_status_moves_and_collapsed_destination() {
+        let mut a = app();
+        a.select(2);
+        let old_seq = a.detail_seq;
+        let mut items = a.beads.clone();
+        items[2].status = "closed".into();
+        items[2].data = json!({"id": "b2", "description": "updated detail"});
+        items.reverse();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_bead(&a, "b2");
+        assert_eq!(a.selected, Some(3));
+        assert_eq!(a.detail_offset, 0);
+        respond(
+            &mut a,
+            Response::Show("b2".into(), old_seq, Ok(json!({"stale": true}))),
+        );
+        assert_bead(&a, "b2");
+        press(&mut a, KeyCode::Char('d'));
+        assert!(matches!(&a.modal, Some(Modal::ConfirmDelete { id, .. }) if id == "b2"));
+        press(&mut a, KeyCode::Esc);
+        a.collapsed.insert("blocked".into());
+        let mut items = a.beads.clone();
+        items.iter_mut().find(|b| b.id == "b2").unwrap().status = "blocked".into();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_header(&a, "blocked");
+        assert!(!a.collapsed.contains("closed"));
+        press(&mut a, KeyCode::Char(' '));
+        assert_bead(&a, "b2");
+    }
+    #[test]
+    fn refresh_missing_bead_or_header_chooses_first_visible_bead_then_first_header() {
+        let mut a = app();
+        a.beads[0].status = "closed".into();
+        a.beads[1].status = "blocked".into();
+        a.collapsed.insert("open".into());
+        a.select(0);
+        let items = a.beads.iter().filter(|b| b.id != "b0").cloned().collect();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_bead(&a, "b1");
+        a.focus_group("blocked".into());
+        let mut items = a.beads.clone();
+        items.iter_mut().find(|b| b.id == "b1").unwrap().status = "closed".into();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_bead(&a, "b1");
+        a.collapsed.insert("closed".into());
+        a.focus_group("closed".into());
+        let items = a
+            .beads
+            .iter()
+            .filter(|b| b.status != "closed")
+            .cloned()
+            .collect();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_header(&a, "open");
+        assert_eq!(a.collapsed, HashSet::from(["open".into()]));
+        respond(&mut a, Response::List(Ok(vec![])));
+        assert!(a.focused_group.is_none());
+        assert!(a.selected.is_none());
+        assert!(a.detail.is_none());
+        assert!(a.collapsed.is_empty());
+    }
+    #[test]
+    fn preferred_id_overrides_header_or_bead_focus_and_expands_destination() {
+        for header in [false, true] {
+            let mut a = app();
+            a.beads[1].status = "closed".into();
+            a.collapsed.insert("closed".into());
+            if header {
+                a.focus_group("open".into());
+            }
+            a.preferred_id = Some("b1".into());
+            let items = a.beads.clone();
+            respond(&mut a, Response::List(Ok(items)));
+            assert_bead(&a, "b1");
+            assert!(!a.collapsed.contains("closed"));
+            assert!(a.preferred_id.is_none());
+        }
+    }
+    #[test]
+    fn missing_preferred_id_does_not_discard_existing_header_focus() {
+        let mut a = app();
+        a.focus_group("open".into());
+        a.preferred_id = Some("missing".into());
+        let items = a.beads.clone();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_header(&a, "open");
+        assert!(a.preferred_id.is_none());
     }
     #[test]
     fn selecting_uses_cache_and_clears_selection_error() {
