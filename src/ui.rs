@@ -12,22 +12,15 @@ const INK: Color = Color::Rgb(220, 228, 229);
 const MUTED: Color = Color::Rgb(123, 144, 148);
 const TEAL: Color = Color::Rgb(73, 211, 182);
 const GOLD: Color = Color::Rgb(239, 183, 99);
-const ASCII_LOGO: [[&str; 7]; 5] = [
-    [
-        " ### ", "#   #", "#####", "#### ", " ### ", " ####", "#   #",
-    ],
-    [
-        "#   #", "##  #", "  #  ", "#   #", "#   #", "#    ", "#  # ",
-    ],
-    [
-        "#   #", "# # #", "  #  ", "#### ", "#####", "#    ", "###  ",
-    ],
-    [
-        "#   #", "#  ##", "  #  ", "#  # ", "#   #", "#    ", "#  # ",
-    ],
-    [
-        " ### ", "#   #", "  #  ", "#   #", "#   #", " ####", "#   #",
-    ],
+const ASCII_LOGO: [&str; 8] = [
+    "    ███████               ███████████                              █████     ",
+    "  ███▒▒▒▒▒███            ▒█▒▒▒███▒▒▒█                             ▒▒███      ",
+    " ███     ▒▒███ ████████  ▒   ▒███  ▒  ████████   ██████    ██████  ▒███ █████",
+    "▒███      ▒███▒▒███▒▒███     ▒███    ▒▒███▒▒███ ▒▒▒▒▒███  ███▒▒███ ▒███▒▒███ ",
+    "▒███      ▒███ ▒███ ▒███     ▒███     ▒███ ▒▒▒   ███████ ▒███ ▒▒▒  ▒██████▒  ",
+    "▒▒███     ███  ▒███ ▒███     ▒███     ▒███      ███▒▒███ ▒███  ███ ▒███▒▒███ ",
+    " ▒▒▒███████▒   ████ █████    █████    █████    ▒▒████████▒▒██████  ████ █████",
+    "   ▒▒▒▒▒▒▒    ▒▒▒▒ ▒▒▒▒▒    ▒▒▒▒▒    ▒▒▒▒▒      ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒  ▒▒▒▒ ▒▒▒▒▒ ",
 ];
 fn status_color(status: &str) -> Color {
     match status {
@@ -112,25 +105,21 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         return;
     }
     if app.modal.is_none() && elapsed < Duration::from_millis(1200) {
-        let large = a.width >= 45 && a.height >= 9;
+        let logo_width = ASCII_LOGO
+            .iter()
+            .map(|line| Span::raw(*line).width())
+            .max()
+            .unwrap_or(0);
+        let large = usize::from(a.width) >= logo_width && a.height >= ASCII_LOGO.len() as u16;
         let lines = if large {
-            let colors = [TEAL, Color::Rgb(99, 205, 207), INK, GOLD, TEAL];
             ASCII_LOGO
                 .iter()
-                .zip(colors)
-                .map(|(letters, color)| {
+                .map(|line| {
                     Line::from(Span::styled(
-                        letters.join(" "),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        *line,
+                        Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
                     ))
                 })
-                .chain([
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        "BEADS WORKSPACE BROWSER",
-                        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
-                    )),
-                ])
                 .collect::<Vec<_>>()
         } else {
             vec![
