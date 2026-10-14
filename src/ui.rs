@@ -1,5 +1,4 @@
 use crate::app::{App, DisplayRow};
-use image::ImageEncoder;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
@@ -7,48 +6,29 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
-use ratatui_splash_screen::{SplashConfig, SplashScreen};
 use std::time::Duration;
 const BG: Color = Color::Rgb(13, 23, 28);
 const INK: Color = Color::Rgb(220, 228, 229);
 const MUTED: Color = Color::Rgb(123, 144, 148);
 const TEAL: Color = Color::Rgb(73, 211, 182);
 const GOLD: Color = Color::Rgb(239, 183, 99);
-pub fn new_splash() -> Option<SplashScreen> {
-    let image = image::load_from_memory(include_bytes!("../assets/splash-ontrack.png"))
-        .ok()?
-        .resize_exact(128, 128, image::imageops::FilterType::Lanczos3)
-        .to_rgba8();
-    // ratatui-splash-screen converts the image to RGB, so pre-composite its
-    // transparent pixels against the app background before handing it over.
-    let image = image::RgbImage::from_fn(image.width(), image.height(), |x, y| {
-        let pixel = image.get_pixel(x, y);
-        let alpha = u16::from(pixel[3]);
-        let channel = |index: usize, background: u8| {
-            ((u16::from(pixel[index]) * alpha
-                + u16::from(background) * (u16::from(u8::MAX) - alpha)
-                + 127)
-                / u16::from(u8::MAX)) as u8
-        };
-        image::Rgb([channel(0, 13), channel(1, 23), channel(2, 28)])
-    });
-    let mut image_data = Vec::new();
-    image::codecs::png::PngEncoder::new(&mut image_data)
-        .write_image(
-            image.as_raw(),
-            image.width(),
-            image.height(),
-            image::ExtendedColorType::Rgb8,
-        )
-        .ok()?;
-    SplashScreen::new(SplashConfig {
-        image_data: &image_data,
-        sha256sum: None,
-        render_steps: 12,
-        use_colors: true,
-    })
-    .ok()
-}
+const ASCII_LOGO: [[&str; 7]; 5] = [
+    [
+        " ### ", "#   #", "#####", "#### ", " ### ", " ####", "#   #",
+    ],
+    [
+        "#   #", "##  #", "  #  ", "#   #", "#   #", "#    ", "#  # ",
+    ],
+    [
+        "#   #", "# # #", "  #  ", "#### ", "#####", "#    ", "###  ",
+    ],
+    [
+        "#   #", "#  ##", "  #  ", "#  # ", "#   #", "#    ", "#  # ",
+    ],
+    [
+        " ### ", "#   #", "  #  ", "#   #", "#   #", " ####", "#   #",
+    ],
+];
 fn status_color(status: &str) -> Color {
     match status {
         "open" => TEAL,
@@ -112,7 +92,7 @@ fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
         .max(2);
     (type_width, priority_width)
 }
-pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen>, app: &mut App) {
+pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     let a = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG)), a);
     app.list_rect = Rect::default();
@@ -131,20 +111,48 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
         );
         return;
     }
-    if app.modal.is_none()
-        && elapsed < Duration::from_millis(700)
-        && let Some(s) = splash.as_mut().filter(|s| !s.is_rendered())
-    {
-        let max_width = 28.min(a.width.saturating_sub(4));
-        let max_height = 14.min(a.height.saturating_sub(2));
-        let height = max_height.min(max_width / 2).max(1);
-        let width = (height * 2).min(max_width).max(1);
+    if app.modal.is_none() && elapsed < Duration::from_millis(1200) {
+        let large = a.width >= 45 && a.height >= 9;
+        let lines = if large {
+            let colors = [TEAL, Color::Rgb(99, 205, 207), INK, GOLD, TEAL];
+            ASCII_LOGO
+                .iter()
+                .zip(colors)
+                .map(|(letters, color)| {
+                    Line::from(Span::styled(
+                        letters.join(" "),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ))
+                })
+                .chain([
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        "BEADS WORKSPACE BROWSER",
+                        Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+                    )),
+                ])
+                .collect::<Vec<_>>()
+        } else {
+            vec![
+                Line::from(Span::styled(
+                    "ONTRACK",
+                    Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(Span::styled(
+                    "BEADS WORKSPACE BROWSER",
+                    Style::default().fg(MUTED),
+                )),
+            ]
+        };
+        let height = lines.len() as u16;
         f.render_widget(
-            s,
+            Paragraph::new(lines)
+                .alignment(Alignment::Center)
+                .style(Style::default().fg(INK)),
             Rect::new(
-                a.x + a.width.saturating_sub(width) / 2,
+                a.x,
                 a.y + a.height.saturating_sub(height) / 2,
-                width,
+                a.width,
                 height,
             ),
         );
@@ -952,9 +960,7 @@ mod tests {
     }
     fn draw(size: (u16, u16), a: &mut App) -> (String, Rect) {
         let mut t = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
-        let mut s = None;
-        t.draw(|f| render(f, Duration::from_secs(1), &mut s, a))
-            .unwrap();
+        t.draw(|f| render(f, Duration::from_secs(1), a)).unwrap();
         (
             t.backend()
                 .buffer()
@@ -973,9 +979,8 @@ mod tests {
         assert!(!s.contains("demo-1  P1"));
         assert!(s.contains("Title is visible"));
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        let mut splash = None;
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .draw(|f| render(f, Duration::from_secs(1), &mut a))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let line = |y: u16| {
@@ -1037,9 +1042,8 @@ mod tests {
         let mut a = app();
         a.selected = None;
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        let mut splash = None;
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .draw(|f| render(f, Duration::from_secs(1), &mut a))
             .unwrap();
         let y = a.list_rect.y + 2;
         assert_eq!(
@@ -1070,9 +1074,8 @@ mod tests {
             .collect();
         a.selected = Some(0);
         let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
-        let mut splash = None;
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .draw(|f| render(f, Duration::from_secs(1), &mut a))
             .unwrap();
         let buf = terminal.backend().buffer();
         let layout = crate::app::list_layout(&a.beads, &a.collapsed);
@@ -1151,9 +1154,8 @@ mod tests {
             layout.groups[0].y + layout.groups[0].height
         );
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        let mut splash = None;
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .draw(|f| render(f, Duration::from_secs(1), &mut a))
             .unwrap();
         let buf = terminal.backend().buffer();
         let closed_y = a.list_rect.y + (layout.groups[1].y - a.list_offset) as u16;
@@ -1188,9 +1190,8 @@ mod tests {
             .unwrap();
         a.list_offset = target.y + 1;
         let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
-        let mut splash = None;
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .draw(|f| render(f, Duration::from_secs(1), &mut a))
             .unwrap();
         let buf = terminal.backend().buffer();
         let first_visible = a.list_rect.y;
@@ -1206,9 +1207,8 @@ mod tests {
         let mut a = app();
         a.detail = Some(json!({"description":"# Overview\n\nA **bold** point and `code`."}));
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        let mut splash = None;
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .draw(|f| render(f, Duration::from_secs(1), &mut a))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let cells = buffer.content();
@@ -1228,15 +1228,14 @@ mod tests {
         );
     }
     #[test]
-    fn tiny_empty_error_splash_and_wrapped_detail_are_safe() {
+    fn tiny_terminal_startup_and_wrapped_detail_are_safe() {
         let mut a = app();
         a.list_rect = Rect::new(1, 1, 10, 10);
         assert!(!draw((18, 5), &mut a).0.is_empty());
         assert_eq!(a.list_rect, Rect::default());
-        let mut splash = new_splash();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
-            .draw(|f| render(f, Duration::ZERO, &mut splash, &mut a))
+            .draw(|f| render(f, Duration::ZERO, &mut a))
             .unwrap();
         assert_eq!(a.list_rect, Rect::default());
         a.list_loading = true;
@@ -1306,7 +1305,6 @@ mod tests {
         assert!(deletion.contains("Cannot be undone"));
         assert!(deletion.contains("orphaned"));
         let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        let mut splash = None;
         a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
             focus: 2,
             dropdown: Some(2),
@@ -1314,7 +1312,7 @@ mod tests {
             ..Default::default()
         }));
         terminal
-            .draw(|f| render(f, Duration::ZERO, &mut splash, &mut a))
+            .draw(|f| render(f, Duration::ZERO, &mut a))
             .unwrap();
         let buf = terminal.backend().buffer();
         let text = buf.content().iter().map(|c| c.symbol()).collect::<String>();

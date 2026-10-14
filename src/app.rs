@@ -864,12 +864,11 @@ pub fn list_layout(beads: &[Bead], collapsed: &HashSet<String>) -> ListLayout {
 }
 pub fn run(t: &mut Tui) -> std::io::Result<()> {
     let start = Instant::now();
-    let mut splash = ui::new_splash();
     let mut app = App::new();
     loop {
         app.receive();
         app.poll_refresh(Instant::now());
-        t.draw(|f| ui::render(f, start.elapsed(), &mut splash, &mut app))?;
+        t.draw(|f| ui::render(f, start.elapsed(), &mut app))?;
         if let Some(e) = event::poll_event(Duration::from_millis(35))? {
             match e {
                 crossterm::event::Event::Key(k)

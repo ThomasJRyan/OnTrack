@@ -18,7 +18,7 @@ cargo build
 
 - Tests are inline; focused checks: `cargo test event::tests` or `cargo test ui::tests`.
 - Preserve terminal cleanup: `src/main.rs` restores after the app returns; `src/terminal.rs` handles raw mode, mouse capture, and alternate-screen cleanup on normal exit, initialization failure, and panic.
-- `src/ui.rs` loads `assets/splash-ontrack.png` at compile time; keep the transparent source asset available when building.
+- `src/ui.rs` renders the startup splash as responsive ASCII text; preserve its centered layout and compact-terminal fallback.
 
 ## Documentation
 
