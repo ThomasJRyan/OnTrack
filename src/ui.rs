@@ -280,7 +280,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
                     .split(inner);
                 let title_area = Rect::new(rows[0].x, rows[0].y, rows[0].width, 3);
                 f.render_widget(
-                    Paragraph::new("Title · required")
+                    Paragraph::new("")
                         .block(
                             Block::default()
                                 .title(" Title ")
@@ -817,6 +817,16 @@ mod tests {
         assert!(normal.contains("NEW BEAD"));
         assert!(normal.contains("Task"));
         assert!(normal.contains("P2"));
+        assert!(!normal.contains("Title · required"));
+        a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
+            title: "Visible title".into(),
+            cursor: 13,
+            ..Default::default()
+        }));
+        let entered = draw((100, 30), &mut a).0;
+        assert!(entered.contains("Visible title"));
+        assert!(!entered.contains("Title · required"));
+        a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm::default()));
         let tiny = draw((12, 5), &mut a).0;
         assert!(tiny.contains("Resize"));
         assert!(!a.modal_ready);

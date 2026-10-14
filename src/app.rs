@@ -395,8 +395,26 @@ impl App {
             return false;
         }
         match key.code {
-            Tab => form.focus = (form.focus + 1) % 6,
-            BackTab => form.focus = (form.focus + 5) % 6,
+            Tab => {
+                form.focus = match form.focus {
+                    0 => 2,
+                    2 => 3,
+                    3 => 1,
+                    1 => 4,
+                    4 => 5,
+                    _ => 0,
+                }
+            }
+            BackTab => {
+                form.focus = match form.focus {
+                    0 => 5,
+                    5 => 4,
+                    4 => 1,
+                    1 => 3,
+                    3 => 2,
+                    _ => 0,
+                }
+            }
             Enter if form.focus == 2 || form.focus == 3 => {
                 form.dropdown = Some(form.focus);
                 form.dropdown_original = Some(if form.focus == 2 {
@@ -753,6 +771,8 @@ mod tests {
         let mut a = app();
         press(&mut a, KeyCode::Char('n'));
         press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Tab);
         for c in ['q', 'r', 'n', 'd'] {
             press(&mut a, KeyCode::Char(c));
         }
@@ -765,10 +785,30 @@ mod tests {
         assert_eq!(form.description, "qrnd\n界");
     }
     #[test]
+    fn form_tab_order_follows_visual_layout_and_wraps_both_directions() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('n'));
+        let mut forward = Vec::new();
+        for _ in 0..6 {
+            press(&mut a, KeyCode::Tab);
+            if let Some(Modal::Create(f)) = &a.modal {
+                forward.push(f.focus)
+            }
+        }
+        assert_eq!(forward, [2, 3, 1, 4, 5, 0]);
+        let mut reverse = Vec::new();
+        for _ in 0..6 {
+            press(&mut a, KeyCode::BackTab);
+            if let Some(Modal::Create(f)) = &a.modal {
+                reverse.push(f.focus)
+            }
+        }
+        assert_eq!(reverse, [5, 4, 1, 3, 2, 0]);
+    }
+    #[test]
     fn dropdown_escape_closes_choice_before_form_and_delete_captures_selection() {
         let mut a = app();
         press(&mut a, KeyCode::Char('n'));
-        press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Enter);
         press(&mut a, KeyCode::Down);
@@ -938,9 +978,7 @@ mod tests {
     fn dropdown_confirm_commits_previewed_option() {
         let mut a = app();
         press(&mut a, KeyCode::Char('n'));
-        for _ in 0..2 {
-            press(&mut a, KeyCode::Tab);
-        }
+        press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Enter);
         press(&mut a, KeyCode::Down);
         press(&mut a, KeyCode::Enter);

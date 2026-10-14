@@ -36,7 +36,7 @@ The left pane lists all returned issues, including closed ones, without the CLI'
 | Mouse wheel over the list | Change issue selection. |
 | Mouse wheel over details | Scroll details. |
 | `r` | Refresh the issue list and reload the selected issue's details. |
-| `n` | Open the new-bead form. Tab / Shift+Tab moves through title, description, type, priority, Create, and Cancel. Enter inserts a newline in the description; Enter opens type/priority choices, arrows preview options, Enter commits, and Esc restores the prior choice or cancels the form. An empty title shows a required message. |
+| `n` | Open the new-bead form. Tab / Shift+Tab moves through Title, Type, Priority, Description, Create, and Cancel. Enter inserts a newline in the description; Enter opens type/priority choices, arrows preview options, Enter commits, and Esc restores the prior choice or cancels the form. An empty title shows a required message. |
 | `d` | Ask to permanently delete the selected bead. `y` confirms; `n` or Enter cancels. Deletion does not cascade; dependency links are removed and dependents may be orphaned. |
 | `q`, `Esc`, or `Ctrl+C` | Quit the browser when no dialog is open. In a form, `Esc` cancels the dialog; while a mutation is running the dialog is locked until completion. |
 
