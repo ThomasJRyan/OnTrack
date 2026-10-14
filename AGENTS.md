@@ -20,6 +20,11 @@ cargo build
 - Preserve terminal cleanup: `src/main.rs` restores after the app returns; `src/terminal.rs` handles raw mode and alternate-screen cleanup on normal exit, initialization failure, and panic.
 - `src/ui.rs` embeds `assets/splash.png` at compile time; keep the asset available when building.
 
+## Documentation
+
+- Document changes and functionality in Markdown files under `docs/`, with guidance for both users and developers. Update relevant documentation alongside changes.
+- Keep `README.md` concise and up to date, showcasing the project's major functionality and linking to detailed documentation in `docs/`.
+
 ## Workflow
 
 - Load `.agents/skills/beads/SKILL.md` and run `bd prime` for workflow context.
