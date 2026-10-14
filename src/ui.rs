@@ -70,6 +70,21 @@ fn row_priority_color(priority: u64) -> Color {
         _ => MUTED,
     }
 }
+fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
+    let type_width = beads
+        .iter()
+        .map(|bead| Span::raw(row_issue_type(bead)).width())
+        .max()
+        .unwrap_or(0)
+        .clamp(8, 18);
+    let priority_width = beads
+        .iter()
+        .map(|bead| Span::raw(format!("P{}", bead.priority)).width())
+        .max()
+        .unwrap_or(2)
+        .max(2);
+    (type_width, priority_width)
+}
 pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen>, app: &mut App) {
     let a = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG)), a);
@@ -133,6 +148,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
     app.list_rect = split[0];
     app.detail_rect = split[1];
     let layout = crate::app::list_layout(&app.beads, &app.collapsed);
+    let (type_width, priority_width) = metadata_column_widths(&app.beads);
     let viewport = split[0].height as usize;
     let focused_target = app
         .focused_group
@@ -243,7 +259,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
                 let screen_y = split[0].y + (natural_y - app.list_offset) as u16;
                 let selected = app.selected == Some(i);
                 let content = if line == 0 {
-                    let kind = row_issue_type(bead);
+                    let kind = truncate_display(&row_issue_type(bead), type_width);
+                    let kind_width = Span::raw(kind.as_str()).width();
+                    let kind = format!(
+                        "{kind}{}",
+                        " ".repeat(type_width.saturating_sub(kind_width))
+                    );
                     let status = if bead.status.trim().is_empty() {
                         "unknown"
                     } else {
@@ -260,13 +281,25 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
                                     Modifier::empty()
                                 }),
                         ),
-                        Span::styled(kind.clone(), Style::default().fg(row_type_color(&kind))),
-                        Span::raw("  "),
                         Span::styled(
-                            format!("P{}", bead.priority),
+                            kind,
+                            Style::default().fg(row_type_color(&row_issue_type(bead))),
+                        ),
+                        Span::raw(" "),
+                        Span::styled(
+                            {
+                                let priority = format!("P{}", bead.priority);
+                                format!(
+                                    "{priority}{}",
+                                    " ".repeat(
+                                        priority_width
+                                            .saturating_sub(Span::raw(priority.as_str()).width())
+                                    )
+                                )
+                            },
                             Style::default().fg(row_priority_color(bead.priority)),
                         ),
-                        Span::styled("  ·  ", Style::default().fg(MUTED)),
+                        Span::raw("  "),
                         Span::styled(status, Style::default().fg(status_color(status))),
                     ])
                 } else {
@@ -902,7 +935,7 @@ mod tests {
     fn renders_exact_two_line_issue_with_status_and_full_nested_data() {
         let mut a = app();
         let (s, _) = draw((120, 40), &mut a);
-        assert!(s.contains("task  P1  ·  closed"));
+        assert!(s.contains("task     P1  closed"));
         assert!(!s.contains("demo-1  P1"));
         assert!(s.contains("Title is visible"));
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
@@ -916,18 +949,28 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
         };
-        assert!(line(5).contains("task  P1  ·  closed"));
-        assert!(line(6).contains("Title is visible"));
+        let bead_row = a.list_rect.y + 1;
+        assert!(line(bead_row).contains("task     P1  closed"));
+        assert!(line(bead_row + 1).contains("Title is visible"));
         assert_eq!(buffer[(a.list_rect.x, a.list_rect.y)].symbol(), "╭");
         assert_eq!(
             buffer[(a.list_rect.x, a.list_rect.y)].fg,
             status_color("closed")
         );
         assert!(line(a.list_rect.y).contains("CLOSED"));
-        assert_eq!(buffer[(a.list_rect.x + 3, 5)].fg, row_type_color("task"));
-        assert_eq!(buffer[(a.list_rect.x + 9, 5)].fg, row_priority_color(1));
-        assert_eq!(buffer[(a.list_rect.x + 16, 5)].fg, status_color("closed"));
-        assert_eq!(buffer[(a.list_rect.x + 3, 6)].fg, Color::White);
+        assert_eq!(
+            buffer[(a.list_rect.x + 3, bead_row)].fg,
+            row_type_color("task")
+        );
+        assert_eq!(
+            buffer[(a.list_rect.x + 12, bead_row)].fg,
+            row_priority_color(1)
+        );
+        assert_eq!(
+            buffer[(a.list_rect.x + 16, bead_row)].fg,
+            status_color("closed")
+        );
+        assert_eq!(buffer[(a.list_rect.x + 3, bead_row + 1)].fg, Color::White);
         let group = crate::app::list_layout(&a.beads, &a.collapsed)
             .groups
             .remove(0);
@@ -964,11 +1007,64 @@ mod tests {
         terminal
             .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
             .unwrap();
-        let y = a.list_rect.y + 4;
+        let y = a.list_rect.y + 2;
         assert_eq!(
             terminal.backend().buffer()[(a.list_rect.x + 3, y)].fg,
             Color::White
         );
+    }
+    #[test]
+    fn metadata_columns_align_across_core_custom_and_unknown_types() {
+        let mut a = app();
+        let kinds = [
+            Some("task"),
+            Some("feature"),
+            Some("custom-extremely-long-type"),
+            None,
+            Some("bug"),
+        ];
+        a.beads = kinds
+            .iter()
+            .enumerate()
+            .map(|(i, kind)| crate::beads::Bead {
+                id: format!("aligned-{i}"),
+                title: format!("title-{i}"),
+                status: "open".into(),
+                priority: [0, 4, 12, 2, 1][i],
+                data: kind.map_or_else(|| json!({}), |kind| json!({"issue_type":kind})),
+            })
+            .collect();
+        a.selected = Some(0);
+        let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
+        let mut splash = None;
+        terminal
+            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+        let mut priority_columns = Vec::new();
+        let mut status_columns = Vec::new();
+        for i in 0..a.beads.len() {
+            let target = layout
+                .targets
+                .iter()
+                .find(|t| t.row == DisplayRow::Bead(i))
+                .unwrap();
+            let y = a.list_rect.y + (target.y - a.list_offset) as u16;
+            let line = (0..a.list_rect.width)
+                .map(|x| buf[(a.list_rect.x + x, y)].symbol())
+                .collect::<String>();
+            let priority_byte = line.find(&format!("P{}", a.beads[i].priority)).unwrap();
+            let status_byte = line.find("open").unwrap();
+            priority_columns.push(Span::raw(&line[..priority_byte]).width());
+            status_columns.push(Span::raw(&line[..status_byte]).width());
+        }
+        assert!(
+            priority_columns.iter().all(|x| *x == priority_columns[0]),
+            "priority columns: {priority_columns:?}"
+        );
+        assert!(status_columns.iter().all(|x| *x == status_columns[0]));
+        assert!(buf.content().iter().any(|cell| cell.symbol() == "…"));
     }
     #[test]
     fn stable_status_colors_and_scrolled_last_group_render_in_small_viewport() {
@@ -1014,7 +1110,7 @@ mod tests {
         );
         assert_eq!(
             layout.groups[0].height,
-            4 + 2 * layout.groups[0].indices.len()
+            2 + 2 * layout.groups[0].indices.len()
         );
         assert_eq!(
             layout.groups[1].y,
@@ -1034,7 +1130,7 @@ mod tests {
         let bottom = closed_y + layout.groups[1].height as u16 - 1;
         assert_eq!(buf[(a.list_rect.x, bottom)].symbol(), "╰");
         assert_eq!(buf[(a.list_rect.x, bottom)].fg, status_color("closed"));
-        assert!(buf[(a.list_rect.x, closed_y + 3)].symbol() == "│");
+        assert!(buf[(a.list_rect.x, closed_y + 1)].symbol() == "│");
     }
     #[test]
     fn partial_scrolled_issue_line_has_no_fabricated_pane_edges() {

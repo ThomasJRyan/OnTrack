@@ -761,9 +761,9 @@ pub fn list_layout(beads: &[Bead], collapsed: &HashSet<String>) -> ListLayout {
         let is_collapsed = collapsed.contains(&status);
         let y = layout.height;
         let height = if is_collapsed {
-            3
+            2
         } else {
-            4 + 2 * indices.len()
+            2 + 2 * indices.len()
         };
         layout.targets.push(ListTarget {
             row: DisplayRow::Group(status.clone()),
@@ -775,7 +775,7 @@ pub fn list_layout(beads: &[Bead], collapsed: &HashSet<String>) -> ListLayout {
                 .targets
                 .extend(indices.iter().enumerate().map(|(n, &i)| ListTarget {
                     row: DisplayRow::Bead(i),
-                    y: y + 3 + 2 * n,
+                    y: y + 1 + 2 * n,
                     height: 2,
                 }));
         }
@@ -887,7 +887,7 @@ mod tests {
         a.beads[2].status = "open".into();
         a.beads[3].status = " \t ".into();
         let layout = list_layout(&a.beads, &HashSet::from(["blocked".into()]));
-        assert_eq!(layout.height, 21);
+        assert_eq!(layout.height, 14);
         assert_eq!(
             layout
                 .groups
@@ -895,10 +895,10 @@ mod tests {
                 .map(|g| (&*g.status, g.y, g.height, g.collapsed))
                 .collect::<Vec<_>>(),
             [
-                ("open", 0, 6, false),
-                ("blocked", 6, 3, true),
-                ("unknown", 9, 6, false),
-                ("closed", 15, 6, false)
+                ("open", 0, 4, false),
+                ("blocked", 4, 2, true),
+                ("unknown", 6, 4, false),
+                ("closed", 10, 4, false)
             ]
         );
         assert_eq!(
@@ -919,32 +919,32 @@ mod tests {
                 },
                 ListTarget {
                     row: DisplayRow::Bead(2),
-                    y: 3,
+                    y: 1,
                     height: 2
                 },
                 ListTarget {
                     row: DisplayRow::Group("blocked".into()),
-                    y: 6,
+                    y: 4,
                     height: 1
                 },
                 ListTarget {
                     row: DisplayRow::Group("unknown".into()),
-                    y: 9,
+                    y: 6,
                     height: 1
                 },
                 ListTarget {
                     row: DisplayRow::Bead(3),
-                    y: 12,
+                    y: 7,
                     height: 2
                 },
                 ListTarget {
                     row: DisplayRow::Group("closed".into()),
-                    y: 15,
+                    y: 10,
                     height: 1
                 },
                 ListTarget {
                     row: DisplayRow::Bead(0),
-                    y: 18,
+                    y: 11,
                     height: 2
                 },
             ]
@@ -1023,7 +1023,13 @@ mod tests {
             }
         }
         a.list_offset = 1;
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 6, 7);
+        let closed_bead = layout
+            .targets
+            .iter()
+            .find(|t| t.row == DisplayRow::Bead(1))
+            .unwrap();
+        let screen_y = a.list_rect.y + (closed_bead.y - a.list_offset) as u16;
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 6, screen_y);
         assert_bead(&a, "b1");
         assert!(a.collapsed.is_empty());
         let closed = layout.groups.iter().find(|g| g.status == "closed").unwrap();
@@ -1193,7 +1199,7 @@ mod tests {
     fn mouse_row_includes_list_offset_and_two_line_items() {
         let mut a = app();
         a.list_offset = 1;
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 5);
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 3);
         assert_eq!(a.selected, Some(1));
     }
     #[test]
@@ -1229,22 +1235,14 @@ mod tests {
         let mut a = app();
         a.list_rect = Rect::new(0, 0, 30, 16);
         a.select(3);
-        for (x, y) in [
-            (0, 0),
-            (0, 3),
-            (29, 3),
-            (4, 1),
-            (4, 2),
-            (4, 11),
-            (4, 12),
-            (4, 15),
-            (4, 16),
-        ] {
+        for (x, y) in [(0, 0), (0, 3), (29, 3), (4, 9), (4, 10), (4, 15), (4, 16)] {
             a.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
             assert_bead(&a, "b3");
             assert!(a.collapsed.is_empty());
         }
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 5);
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 3);
+        assert_bead(&a, "b1");
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 4);
         assert_bead(&a, "b1");
         a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 0);
         assert!(a.collapsed.contains("open"));

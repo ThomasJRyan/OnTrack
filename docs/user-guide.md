@@ -23,7 +23,7 @@ A brief splash precedes the browser. Issue loading starts in the background; qui
 
 ## Status groups
 
-Issues are shown in rounded, colour-coded panes. Open appears first and closed last; other and unrecognized statuses remain grouped alphabetically. An empty status is labelled unknown. Pane titles show the status and count. Use `↑` / `↓` to move through group titles and visible issues. Press `Space` on a group title or issue to collapse/expand that status; clicking the pane title does the same. Collapsing a selected issue clears its detail selection; expanding the focused group selects its first issue. Collapse state is retained across refreshes while groups still exist.
+Issues are shown in rounded, colour-coded panes. Open appears first and closed last; other and unrecognized statuses remain grouped alphabetically. An empty status is labelled unknown. Pane titles show the status and count. Each issue's type, priority, and status columns align across groups; issue details retain the ID. Use `↑` / `↓` to move through group titles and visible issues. Press `Space` on a group title or issue to collapse/expand that status; clicking the pane title does the same. Collapsing a selected issue clears its detail selection; expanding the focused group selects its first issue. Collapse state is retained across refreshes while groups still exist.
 
 ## Browsing and controls
 
