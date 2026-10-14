@@ -866,6 +866,7 @@ name = "ontrack"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "image",
  "ratatui",
  "ratatui-cheese",
  "ratatui-splash-screen",

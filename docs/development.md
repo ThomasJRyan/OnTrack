@@ -14,7 +14,7 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | `src/detail.rs` | Presents complete issue records with Markdown rendering for narrative fields and readable structured fallbacks for metadata. |
 | `src/terminal.rs` | Manages raw mode, alternate screen, mouse capture, and cleanup, including initialization failures and panic handling. |
 
-`src/ui.rs` embeds `assets/splash.png` with `include_bytes!`; keep that asset available at build time.
+`src/ui.rs` loads `assets/splash-ontrack.png`, a transparent square emblem. It downsizes and composites the artwork against the app background because the splash widget drops alpha, then fits it into a centered terminal-sized area. Keep the source asset available at build time and preserve its transparent background.
 
 ## Beads CLI contract
 

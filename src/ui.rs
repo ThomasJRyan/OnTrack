@@ -1,4 +1,5 @@
 use crate::app::{App, DisplayRow};
+use image::ImageEncoder;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
@@ -14,8 +15,34 @@ const MUTED: Color = Color::Rgb(123, 144, 148);
 const TEAL: Color = Color::Rgb(73, 211, 182);
 const GOLD: Color = Color::Rgb(239, 183, 99);
 pub fn new_splash() -> Option<SplashScreen> {
+    let image = image::load_from_memory(include_bytes!("../assets/splash-ontrack.png"))
+        .ok()?
+        .resize_exact(128, 128, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    // ratatui-splash-screen converts the image to RGB, so pre-composite its
+    // transparent pixels against the app background before handing it over.
+    let image = image::RgbImage::from_fn(image.width(), image.height(), |x, y| {
+        let pixel = image.get_pixel(x, y);
+        let alpha = u16::from(pixel[3]);
+        let channel = |index: usize, background: u8| {
+            ((u16::from(pixel[index]) * alpha
+                + u16::from(background) * (u16::from(u8::MAX) - alpha)
+                + 127)
+                / u16::from(u8::MAX)) as u8
+        };
+        image::Rgb([channel(0, 13), channel(1, 23), channel(2, 28)])
+    });
+    let mut image_data = Vec::new();
+    image::codecs::png::PngEncoder::new(&mut image_data)
+        .write_image(
+            image.as_raw(),
+            image.width(),
+            image.height(),
+            image::ExtendedColorType::Rgb8,
+        )
+        .ok()?;
     SplashScreen::new(SplashConfig {
-        image_data: include_bytes!("../assets/splash.png"),
+        image_data: &image_data,
         sha256sum: None,
         render_steps: 12,
         use_colors: true,
@@ -108,13 +135,17 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
         && elapsed < Duration::from_millis(700)
         && let Some(s) = splash.as_mut().filter(|s| !s.is_rendered())
     {
+        let max_width = 28.min(a.width.saturating_sub(4));
+        let max_height = 14.min(a.height.saturating_sub(2));
+        let height = max_height.min(max_width / 2).max(1);
+        let width = (height * 2).min(max_width).max(1);
         f.render_widget(
             s,
             Rect::new(
-                a.x + a.width.saturating_sub(26) / 2,
-                a.y + a.height.saturating_sub(12) / 2,
-                26.min(a.width),
-                12.min(a.height),
+                a.x + a.width.saturating_sub(width) / 2,
+                a.y + a.height.saturating_sub(height) / 2,
+                width,
+                height,
             ),
         );
         return;
