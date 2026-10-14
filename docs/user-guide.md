@@ -32,10 +32,10 @@ The left pane lists all returned issues, including closed ones, without the CLI'
 | Input | Action |
 | --- | --- |
 | `↑` / `↓` with the list focused | Move through group titles and visible issues. |
+| `←` / `→` with the list focused | Collapse / expand the focused status group. Repeating either key leaves the group unchanged. |
 | `Space` on a group or issue | Collapse or expand that status group. |
 | Left-click a pane title / visible issue row | Toggle the group / select the issue. |
 | `Tab` | Toggle pane focus. |
-| `←` / `→` | Focus the list / details pane. |
 | `↑` / `↓` with details focused | Scroll details one line. |
 | `PageUp` / `PageDown` with details focused | Scroll details by a pane-sized page. |
 | Mouse wheel over the list | Change issue selection. |
@@ -45,7 +45,7 @@ The left pane lists all returned issues, including closed ones, without the CLI'
 | `d` | Ask to permanently delete the selected bead. `y` confirms; `n` or Enter cancels. Deletion does not cascade; dependency links are removed and dependents may be orphaned. |
 | `q`, `Esc`, or `Ctrl+C` | Quit the browser when no dialog is open. In a form, `Esc` cancels the dialog; while a mutation is running the dialog is locked until completion. |
 
-Inside the create form, keys are text unless they are form controls; `q`, `r`, `n`, and `d` do not trigger browser shortcuts. Type defaults to Task and priority to P2. A mutation runs once at a time in the background; the modal is locked until it finishes. Failures remain visible and keep the form open for correction or retry. Successful creation refreshes the list and selects the new bead when it appears. Dialogs ask you to enlarge a terminal that is too small to show the full controls and warnings.
+Inside the create form, keys are text unless they are form controls; `q`, `r`, `n`, and `d` do not trigger browser shortcuts, and arrow keys continue to edit text or choose options. Type defaults to Task and priority to P2. A mutation runs once at a time in the background; the modal is locked until it finishes. Failures remain visible and keep the form open for correction or retry. Successful creation refreshes the list and selects the new bead when it appears. Dialogs ask you to enlarge a terminal that is too small to show the full controls and warnings.
 
 ## Details, loading, and refresh
 

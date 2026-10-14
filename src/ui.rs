@@ -291,7 +291,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
     };
     f.render_widget(
         Paragraph::new(format!(
-            " {state}  ·  ↑↓ select  ·  n new  ·  d delete  ·  r refresh  ·  q quit"
+            " {state}  ·  ↑↓ move  ← fold  → unfold  ·  Tab panes  ·  n new  ·  d delete  ·  r refresh  ·  q quit"
         ))
         .style(Style::default().fg(MUTED)),
         v[2],

@@ -229,12 +229,43 @@ impl App {
         }
     }
     fn toggle_selected_group(&mut self) {
-        if let Some(status) = self.focused_group.clone().or_else(|| {
+        if let Some(status) = self.focused_status() {
+            self.toggle_group(status);
+        }
+    }
+    fn focused_status(&self) -> Option<String> {
+        self.focused_group.clone().or_else(|| {
             self.selected
                 .and_then(|i| self.beads.get(i))
                 .map(|b| normalized_status(&b.status).to_owned())
-        }) {
-            self.toggle_group(status);
+        })
+    }
+    fn set_group_collapsed(&mut self, status: String, collapsed: bool) {
+        if !self
+            .beads
+            .iter()
+            .any(|b| normalized_status(&b.status) == status)
+        {
+            return;
+        }
+        let is_collapsed = self.collapsed.contains(&status);
+        if is_collapsed == collapsed {
+            return;
+        }
+        if collapsed {
+            self.collapsed.insert(status.clone());
+            self.focus_group(status);
+        } else {
+            self.collapsed.remove(&status);
+            if let Some(i) = self
+                .beads
+                .iter()
+                .position(|b| normalized_status(&b.status) == status)
+            {
+                self.select(i);
+            } else {
+                self.focus_group(status);
+            }
         }
     }
     fn toggle_group(&mut self, status: String) {
@@ -394,8 +425,16 @@ impl App {
                 }
             }
             KeyCode::Tab => self.focus_detail = !self.focus_detail,
-            KeyCode::Left => self.focus_detail = false,
-            KeyCode::Right => self.focus_detail = true,
+            KeyCode::Left if !self.focus_detail => {
+                if let Some(status) = self.focused_status() {
+                    self.set_group_collapsed(status, true);
+                }
+            }
+            KeyCode::Right if !self.focus_detail => {
+                if let Some(status) = self.focused_status() {
+                    self.set_group_collapsed(status, false);
+                }
+            }
             KeyCode::Up if self.focus_detail => {
                 self.detail_offset = self.detail_offset.saturating_sub(1)
             }
@@ -1084,6 +1123,71 @@ mod tests {
         assert_eq!(a.detail_offset, 1);
         a.key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
         assert_eq!(a.detail_offset, 7);
+    }
+    #[test]
+    fn left_right_collapse_expand_idempotently_without_losing_live_selection() {
+        let mut a = app();
+        a.select(2);
+        press(&mut a, KeyCode::Left);
+        assert!(a.collapsed.contains("open"));
+        assert_header(&a, "open");
+        press(&mut a, KeyCode::Left);
+        assert_header(&a, "open");
+        press(&mut a, KeyCode::Right);
+        assert!(!a.collapsed.contains("open"));
+        assert_bead(&a, "b0");
+        a.select(2);
+        let detail = a.detail.clone();
+        press(&mut a, KeyCode::Right);
+        assert_bead(&a, "b2");
+        assert_eq!(a.detail, detail);
+        assert!(detail.is_some());
+    }
+    #[test]
+    fn details_focus_keeps_arrows_out_of_group_state_and_tab_alone_switches_panes() {
+        let mut a = app();
+        let selected = a.selected;
+        let detail = a.detail.clone();
+        press(&mut a, KeyCode::Tab);
+        assert!(a.focus_detail);
+        press(&mut a, KeyCode::Left);
+        press(&mut a, KeyCode::Right);
+        assert!(a.focus_detail);
+        assert!(a.collapsed.is_empty());
+        assert_eq!(a.selected, selected);
+        assert_eq!(a.detail, detail);
+        press(&mut a, KeyCode::Tab);
+        assert!(!a.focus_detail);
+        press(&mut a, KeyCode::Tab);
+        assert!(a.focus_detail);
+    }
+    #[test]
+    fn list_arrows_are_safe_when_empty_and_modal_arrows_remain_form_controls() {
+        let mut a = app();
+        a.beads.clear();
+        a.clear_selection();
+        press(&mut a, KeyCode::Left);
+        press(&mut a, KeyCode::Right);
+        assert!(a.selected.is_none());
+        assert!(a.collapsed.is_empty());
+        a.beads = app().beads;
+        a.modal = Some(Modal::Create(CreateForm {
+            title: "xy".into(),
+            cursor: 1,
+            ..Default::default()
+        }));
+        press(&mut a, KeyCode::Right);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!("form closed")
+        };
+        assert_eq!(form.cursor, 2);
+        press(&mut a, KeyCode::Left);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!("form closed")
+        };
+        assert_eq!(form.cursor, 1);
+        assert!(!a.focus_detail);
+        assert!(a.collapsed.is_empty());
     }
     #[test]
     fn mouse_row_includes_list_offset_and_two_line_items() {
