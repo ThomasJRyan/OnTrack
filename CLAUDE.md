@@ -2,7 +2,7 @@
 
 ## Project
 
-- Single Rust 2024 binary; requires Rust 1.88+. This is an early terminal-app scaffold, with no project or task tracking features implemented.
+- Single Rust 2024 binary; requires Rust 1.88+. Browses current-workspace Beads in a two-pane terminal view using the read-only `bd` CLI.
 - Run `cargo run` in a terminal with alternate-screen support, not a non-interactive runner.
 - When working with Herdr integrations, reference https://herdr.dev/docs.
 - When working with Beads, reference https://beads.gascity.com.
@@ -17,7 +17,7 @@ cargo build
 ```
 
 - Tests are inline; focused checks: `cargo test event::tests` or `cargo test ui::tests`.
-- Preserve terminal cleanup: `src/main.rs` restores after the app returns; `src/terminal.rs` handles raw mode and alternate-screen cleanup on normal exit, initialization failure, and panic.
+- Preserve terminal cleanup: `src/main.rs` restores after the app returns; `src/terminal.rs` handles raw mode, mouse capture, and alternate-screen cleanup on normal exit, initialization failure, and panic.
 - `src/ui.rs` embeds `assets/splash.png` at compile time; keep the asset available when building.
 
 ## Documentation
