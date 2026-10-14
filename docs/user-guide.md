@@ -41,11 +41,14 @@ The left pane lists all returned issues, including closed ones, without the CLI'
 | Mouse wheel over the list | Change issue selection. |
 | Mouse wheel over details | Scroll details. |
 | `r` | Refresh the issue list and reload the selected issue's details. |
+| `s` | Open Settings. Use `↑` / `↓` or `←` / `→` to preview Dark or Light, Enter to save, and Esc to cancel and restore the current theme. Settings are stored in `settings.json` under your XDG config directory (or `~/.config/ontrack` when XDG_CONFIG_HOME is unset). Save errors stay in the dialog so you can retry or cancel. |
 | `n` | Open the new-bead form. Tab / Shift+Tab moves through Title, Type, Priority, Description, Create, and Cancel. Enter inserts a newline in the description; Enter opens type/priority choices, arrows preview options, Enter commits, and Esc restores the prior choice or cancels the form. An empty title shows a required message. |
 | `d` | Ask to permanently delete the selected bead. `y` confirms; `n` or Enter cancels. Deletion does not cascade; dependency links are removed and dependents may be orphaned. |
 | `q`, `Esc`, or `Ctrl+C` | Quit the browser when no dialog is open. In a form, `Esc` cancels the dialog; while a mutation is running the dialog is locked until completion. |
 
 Inside the create form, keys are text unless they are form controls; `q`, `r`, `n`, and `d` do not trigger browser shortcuts, and arrow keys continue to edit text or choose options. Type defaults to Task and priority to P2. A mutation runs once at a time in the background; the modal is locked until it finishes. Failures remain visible and keep the form open for correction or retry. Successful creation refreshes the list and selects the new bead when it appears. Dialogs ask you to enlarge a terminal that is too small to show the full controls and warnings.
+
+The appearance dialog captures input until it closes, so `q` cannot quit the app while it is open. Arrow keys preview the theme immediately; Enter writes the choice and applies it, while Esc discards the preview. A save error stays visible in the dialog and leaves the previously saved choice intact. Settings load errors are shown in the browser footer at startup; opening Settings repeats the reason there so you can correct the file or continue with the default theme. See the [settings guide](settings.md) for the configuration location and recovery steps.
 
 ## Details, loading, and refresh
 

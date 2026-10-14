@@ -1,12 +1,15 @@
 use crate::{
     Tui,
     beads::{self, Bead, CreateBead},
-    event, ui,
+    event,
+    settings::{self, Settings, Theme},
+    ui,
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::{
     collections::HashSet,
+    path::PathBuf,
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -43,6 +46,10 @@ pub struct App {
     pub list_rect: Rect,
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
+    pub settings: Settings,
+    pub theme: Theme,
+    pub settings_path: Option<PathBuf>,
+    pub settings_load_error: Option<String>,
     pub notice: Option<String>,
     pub mutation_busy: bool,
     pub modal_ready: bool,
@@ -57,6 +64,7 @@ pub struct App {
 pub enum Modal {
     Create(CreateForm),
     ConfirmDelete { id: String, title: String },
+    Settings { draft: Theme, error: Option<String> },
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateForm {
@@ -138,6 +146,22 @@ impl App {
                 }
             }
         });
+        let (settings, settings_path, settings_error) = match settings::config_path() {
+            Ok(path) => match settings::load_from(&path) {
+                Ok(value) => (value, Some(path), None),
+                Err(error) => (
+                    Settings::default(),
+                    Some(path),
+                    Some(format!("Settings could not be loaded: {error}")),
+                ),
+            },
+            Err(error) => (
+                Settings::default(),
+                None,
+                Some(format!("Settings location unavailable: {error}")),
+            ),
+        };
+        let theme = settings.theme;
         let mut a = Self {
             beads: vec![],
             collapsed: HashSet::new(),
@@ -155,7 +179,11 @@ impl App {
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
-            notice: None,
+            settings,
+            theme,
+            settings_path,
+            settings_load_error: settings_error.clone(),
+            notice: settings_error,
             mutation_busy: false,
             modal_ready: true,
             preferred_id: None,
@@ -480,6 +508,17 @@ impl App {
         }
         match k.code {
             KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('s') => {
+                let load_error = self
+                    .settings_load_error
+                    .as_ref()
+                    .map(|error| format!("Settings were not loaded; defaults are active. {error}"));
+                self.modal = Some(Modal::Settings {
+                    draft: self.settings.theme,
+                    error: load_error,
+                });
+                self.modal_ready = false;
+            }
             KeyCode::Char(' ') => self.toggle_selected_group(),
             KeyCode::Char('n') => {
                 self.modal = Some(Modal::Create(CreateForm::default()));
@@ -538,6 +577,11 @@ impl App {
             return false;
         }
         if key.code == Esc {
+            if matches!(&self.modal, Some(Modal::Settings { .. })) {
+                self.theme = self.settings.theme;
+                self.modal = None;
+                return false;
+            }
             if let Some(Modal::Create(form)) = self.modal.as_mut()
                 && let Some(which) = form.dropdown.take()
             {
@@ -550,6 +594,40 @@ impl App {
                 return false;
             }
             self.modal = None;
+            return false;
+        }
+        if let Some(Modal::Settings { draft, error }) = self.modal.as_mut() {
+            match key.code {
+                Up | Left => {
+                    *draft = Theme::Dark;
+                    *error = None;
+                    self.theme = *draft;
+                }
+                Down | Right => {
+                    *draft = Theme::Light;
+                    *error = None;
+                    self.theme = *draft;
+                }
+                Enter => {
+                    let Some(path) = self.settings_path.as_ref() else {
+                        *error = Some("Settings location is unavailable; cannot save.".into());
+                        return false;
+                    };
+                    let proposed = Settings { theme: *draft };
+                    match settings::save_to(path, &proposed) {
+                        Ok(()) => {
+                            let saved_theme = proposed.theme;
+                            self.settings = proposed;
+                            self.theme = saved_theme;
+                            self.settings_load_error = None;
+                            self.modal = None;
+                            self.notice = Some(format!("{} theme saved", saved_theme.label()));
+                        }
+                        Err(e) => *error = Some(format!("Could not save settings: {e}")),
+                    }
+                }
+                _ => {}
+            }
             return false;
         }
         if let Some(Modal::ConfirmDelete { id, .. }) = self.modal.as_ref() {
@@ -876,11 +954,9 @@ pub fn run(t: &mut Tui) -> std::io::Result<()> {
                         k.kind,
                         crossterm::event::KeyEventKind::Press
                             | crossterm::event::KeyEventKind::Repeat
-                    ) =>
+                    ) && app.key(k) =>
                 {
-                    if app.key(k) {
-                        break;
-                    }
+                    break;
                 }
                 crossterm::event::Event::Mouse(m) => app.mouse(m.kind, m.column, m.row),
                 _ => {}
@@ -923,6 +999,10 @@ mod tests {
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,
+            settings: Settings::default(),
+            theme: Theme::Dark,
+            settings_path: None,
+            settings_load_error: None,
             notice: None,
             mutation_busy: false,
             modal_ready: true,
@@ -1398,6 +1478,61 @@ mod tests {
         a.focused_group = Some("open".into());
         a.select(1);
         assert_bead(&a, "b1");
+    }
+    #[test]
+    fn settings_preview_cancel_save_and_modal_isolation() {
+        let mut a = app();
+        let dir = std::env::temp_dir().join(format!("ontrack-app-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        a.settings_path = Some(dir.join("ontrack/settings.json"));
+        press(&mut a, KeyCode::Char('s'));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                draft: Theme::Dark,
+                ..
+            })
+        ));
+        press(&mut a, KeyCode::Char('n'));
+        assert!(
+            matches!(a.modal, Some(Modal::Settings { .. })),
+            "modal keys must not leak to the browser"
+        );
+        assert!(!a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(matches!(a.modal, Some(Modal::Settings { .. })));
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.theme, Theme::Light, "draft choice previews immediately");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.theme, Theme::Dark, "cancel restores the applied theme");
+        assert_eq!(a.settings.theme, Theme::Dark);
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none());
+        assert_eq!(a.settings.theme, Theme::Light);
+        assert_eq!(
+            settings::load_from(a.settings_path.as_deref().unwrap())
+                .unwrap()
+                .theme,
+            Theme::Light
+        );
+        assert!(a.notice.as_deref().unwrap().contains("saved"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn settings_dialog_surfaces_startup_load_failure_without_dismissing_notice() {
+        let mut a = app();
+        let startup_error = "Settings could not be loaded: invalid JSON at /home/test/.config/ontrack/settings.json";
+        a.settings_load_error = Some(startup_error.into());
+        a.notice = Some(startup_error.into());
+        press(&mut a, KeyCode::Char('s'));
+        assert!(
+            matches!(&a.modal, Some(Modal::Settings { error: Some(message), .. }) if message.contains("defaults are active") && message.contains("settings.json"))
+        );
+        assert_eq!(a.notice.as_deref(), Some(startup_error));
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.notice.as_deref(), Some(startup_error));
+        assert_eq!(a.theme, Theme::Dark);
     }
     #[test]
     fn mouse_targets_follow_scrolled_natural_lines_without_relocated_headers() {
@@ -2058,5 +2193,58 @@ mod tests {
         };
         assert_eq!(form.issue_type, 1);
         assert!(form.dropdown.is_none());
+    }
+
+    #[test]
+    fn settings_preview_cancel_save_failure_and_reload_use_isolated_path() {
+        use std::fs;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "ontrack-app-settings-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("settings.json");
+        let mut a = app();
+        a.settings_path = Some(path.clone());
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.theme, Theme::Light);
+        assert!(!path.exists(), "preview must not write settings");
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(a.theme, Theme::Dark);
+        assert!(!path.exists(), "cancel must not write settings");
+
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none());
+        assert_eq!(a.settings.theme, Theme::Light);
+        assert_eq!(settings::load_from(&path).unwrap().theme, Theme::Light);
+
+        // A regular file where the parent directory should be makes saving fail.
+        let blocker = root.join("blocked");
+        fs::write(&blocker, "preserve").unwrap();
+        a.settings_path = Some(blocker.join("settings.json"));
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(
+            a.settings.theme,
+            Theme::Light,
+            "failed save keeps committed value"
+        );
+        assert_eq!(
+            a.theme,
+            Theme::Dark,
+            "live draft remains previewed in dialog"
+        );
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings { error: Some(_), .. })
+        ));
+        assert_eq!(fs::read_to_string(blocker).unwrap(), "preserve");
+        let _ = fs::remove_dir_all(root);
     }
 }

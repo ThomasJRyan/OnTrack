@@ -1,4 +1,5 @@
 use crate::app::{App, DisplayRow};
+use crate::settings::Theme;
 use ratatui::{
     Frame,
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
@@ -70,6 +71,52 @@ fn row_priority_color(priority: u64) -> Color {
         _ => MUTED,
     }
 }
+fn light_semantic(color: Color) -> Color {
+    match color {
+        Color::Reset | Color::White | Color::Black => Color::Rgb(32, 43, 45),
+        Color::DarkGray => Color::Rgb(83, 101, 104),
+        Color::Gray => Color::Rgb(76, 98, 101),
+        Color::Red | Color::LightRed => Color::Rgb(150, 45, 45),
+        Color::Green | Color::LightGreen => Color::Rgb(0, 112, 91),
+        Color::Yellow | Color::LightYellow => Color::Rgb(142, 83, 0),
+        Color::Blue | Color::LightBlue => Color::Rgb(55, 91, 142),
+        Color::Magenta | Color::LightMagenta => Color::Rgb(128, 57, 112),
+        Color::Cyan | Color::LightCyan => Color::Rgb(0, 100, 112),
+        Color::Rgb(73, 211, 182) => Color::Rgb(0, 112, 91),
+        Color::Rgb(239, 183, 99) => Color::Rgb(142, 83, 0),
+        Color::Rgb(123, 144, 148) => Color::Rgb(76, 98, 101),
+        Color::Indexed(index) => light_ansi(index),
+        Color::Rgb(r, g, b) => Color::Rgb(r / 2, g / 2, b / 2),
+    }
+}
+fn light_ansi(index: u8) -> Color {
+    match index {
+        0 | 7 | 15 => Color::Rgb(32, 43, 45),
+        1 | 9 => Color::Rgb(150, 45, 45),
+        2 | 10 => Color::Rgb(0, 112, 91),
+        3 | 11 => Color::Rgb(142, 83, 0),
+        4 | 12 => Color::Rgb(55, 91, 142),
+        5 | 13 => Color::Rgb(128, 57, 112),
+        6 | 14 => Color::Rgb(0, 100, 112),
+        _ => Color::Rgb(83, 101, 104),
+    }
+}
+fn themed_status_color(status: &str, theme: Theme) -> Color {
+    let color = status_color(status);
+    if theme == Theme::Light {
+        light_semantic(color)
+    } else {
+        color
+    }
+}
+fn themed_type_color(kind: &str, theme: Theme) -> Color {
+    let color = row_type_color(kind);
+    if theme == Theme::Light {
+        light_semantic(color)
+    } else {
+        color
+    }
+}
 fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
     let type_width = beads
         .iter()
@@ -87,7 +134,17 @@ fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
 }
 pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     let a = f.area();
-    f.render_widget(Block::default().style(Style::default().bg(BG)), a);
+    let (bg, ink, muted, teal, gold) = match app.theme {
+        Theme::Dark => (BG, INK, MUTED, TEAL, GOLD),
+        Theme::Light => (
+            Color::Rgb(246, 248, 247),
+            Color::Rgb(32, 43, 45),
+            Color::Rgb(83, 101, 104),
+            Color::Rgb(0, 113, 94),
+            Color::Rgb(139, 86, 0),
+        ),
+    };
+    f.render_widget(Block::default().style(Style::default().bg(bg)), a);
     app.list_rect = Rect::default();
     app.detail_rect = Rect::default();
     if a.width < 24 || a.height < 7 {
@@ -98,7 +155,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             } else {
                 "ontrack · expand terminal"
             })
-            .style(Style::default().fg(MUTED))
+            .style(Style::default().fg(muted))
             .alignment(Alignment::Center),
             a,
         );
@@ -117,7 +174,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .map(|line| {
                     Line::from(Span::styled(
                         *line,
-                        Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+                        Style::default().fg(teal).add_modifier(Modifier::BOLD),
                     ))
                 })
                 .collect::<Vec<_>>()
@@ -125,11 +182,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             vec![
                 Line::from(Span::styled(
                     "ONTRACK",
-                    Style::default().fg(TEAL).add_modifier(Modifier::BOLD),
+                    Style::default().fg(teal).add_modifier(Modifier::BOLD),
                 )),
                 Line::from(Span::styled(
                     "BEADS WORKSPACE BROWSER",
-                    Style::default().fg(MUTED),
+                    Style::default().fg(muted),
                 )),
             ]
         };
@@ -137,7 +194,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         f.render_widget(
             Paragraph::new(lines)
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(INK)),
+                .style(Style::default().fg(ink)),
             Rect::new(
                 a.x,
                 a.y + a.height.saturating_sub(height) / 2,
@@ -160,13 +217,13 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             Span::styled(
                 " BEADS ",
                 Style::default()
-                    .fg(BG)
-                    .bg(TEAL)
+                    .fg(bg)
+                    .bg(teal)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  ONTRACK  /  WORKSPACE ISSUES"),
         ]))
-        .style(Style::default().fg(INK)),
+        .style(Style::default().fg(ink)),
         v[0],
     );
     let split = Layout::default()
@@ -208,7 +265,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         if clip_top >= clip_bottom {
             continue;
         }
-        let color = status_color(&group.status);
+        let color = themed_status_color(&group.status, app.theme);
         let border = Style::default().fg(color);
         // Draw the sides only over the true intersection. Top and bottom are
         // drawn at their natural rows, so scrolling never creates fake edges.
@@ -232,7 +289,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             let marker = if group.collapsed { "▸" } else { "▾" };
             let title_style = if focused {
                 Style::default()
-                    .fg(BG)
+                    .fg(bg)
                     .bg(color)
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -302,7 +359,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         Span::styled(
                             if selected { "› " } else { "  " },
                             Style::default()
-                                .fg(if selected { TEAL } else { MUTED })
+                                .fg(if selected { teal } else { muted })
                                 .add_modifier(if selected {
                                     Modifier::BOLD
                                 } else {
@@ -311,7 +368,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         ),
                         Span::styled(
                             kind,
-                            Style::default().fg(row_type_color(&row_issue_type(bead))),
+                            Style::default()
+                                .fg(themed_type_color(&row_issue_type(bead), app.theme)),
                         ),
                         Span::raw(" "),
                         Span::styled(
@@ -325,15 +383,29 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                                     )
                                 )
                             },
-                            Style::default().fg(row_priority_color(bead.priority)),
+                            Style::default().fg(if app.theme == Theme::Light {
+                                light_semantic(row_priority_color(bead.priority))
+                            } else {
+                                row_priority_color(bead.priority)
+                            }),
                         ),
                         Span::raw("  "),
-                        Span::styled(status, Style::default().fg(status_color(status))),
+                        Span::styled(
+                            status,
+                            Style::default().fg(themed_status_color(status, app.theme)),
+                        ),
                     ])
                 } else {
                     Line::from(vec![
                         Span::raw("  "),
-                        Span::styled(bead.title.clone(), Style::default().fg(Color::White)),
+                        Span::styled(
+                            bead.title.clone(),
+                            Style::default().fg(if app.theme == Theme::Dark {
+                                Color::White
+                            } else {
+                                ink
+                            }),
+                        ),
                     ])
                 };
                 f.render_widget(
@@ -359,7 +431,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             b.priority as i64,
         )
     });
-    let detail_text = detail
+    let mut detail_text = detail
         .map(|v| crate::detail::render(v, selected_metadata, inner_width))
         .unwrap_or_else(|| {
             ratatui::text::Text::from(if app.beads.is_empty() {
@@ -368,6 +440,18 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 "Select an issue to inspect its full record."
             })
         });
+    if app.theme == Theme::Light {
+        for line in &mut detail_text.lines {
+            for span in &mut line.spans {
+                let old = span.style;
+                let style = old.fg(old.fg.map(light_semantic).unwrap_or(ink));
+                span.style = old
+                    .bg
+                    .map(|background| style.bg(light_detail_background(background)))
+                    .unwrap_or(style);
+            }
+        }
+    }
     let lines = Paragraph::new(detail_text.clone())
         .wrap(Wrap { trim: false })
         .line_count(inner_width);
@@ -383,11 +467,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if app.focus_detail { TEAL } else { MUTED }));
+        .border_style(Style::default().fg(if app.focus_detail { teal } else { muted }));
     f.render_widget(
         Paragraph::new(detail_text)
             .block(block)
-            .style(Style::default().fg(INK))
+            .style(Style::default().fg(ink))
             .wrap(Wrap { trim: false })
             .scroll((app.detail_offset, 0)),
         split[1],
@@ -407,14 +491,15 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     };
     f.render_widget(
         Paragraph::new(format!(
-            " {state}  ·  ↑↓ move  ← fold  → unfold  ·  Tab panes  ·  n new  ·  d delete  ·  r refresh  ·  q quit"
+            " {state}  ·  ↑↓ move  ← fold  → unfold  ·  Tab panes  ·  s settings  ·  n new  ·  d delete  ·  r refresh  ·  q quit"
         ))
-        .style(Style::default().fg(MUTED)),
+        .style(Style::default().fg(muted)),
         v[2],
     );
     if let Some(modal) = &app.modal {
         let width = match modal {
             crate::app::Modal::Create(_) => 70,
+            crate::app::Modal::Settings { .. } => 64,
             _ => 62,
         }
         .min(a.width.saturating_sub(2));
@@ -429,6 +514,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             _ => None,
         };
         let height = match modal {
+            crate::app::Modal::Settings { error, .. } => {
+                8 + error
+                    .as_deref()
+                    .map(|message| wrap_words(message, width.saturating_sub(4) as usize).len())
+                    .unwrap_or(0) as u16
+            }
             crate::app::Modal::Create(form) => {
                 if form.dropdown.is_some() {
                     19
@@ -442,6 +533,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         };
         let min_width = if matches!(modal, crate::app::Modal::Create(_)) {
             70
+        } else if matches!(modal, crate::app::Modal::Settings { .. }) {
+            54
         } else {
             50
         };
@@ -455,7 +548,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             };
             f.render_widget(
                 Paragraph::new(prompt)
-                    .style(Style::default().fg(GOLD))
+                    .style(Style::default().fg(gold))
                     .alignment(Alignment::Center),
                 a,
             );
@@ -472,11 +565,18 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         let frame = Block::default()
             .title(match modal {
                 crate::app::Modal::Create(_) => " NEW BEAD ",
+                crate::app::Modal::Settings { .. } => " SETTINGS ",
                 _ => " DELETE BEAD? ",
             })
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(TEAL))
-            .style(Style::default().bg(Color::Rgb(20, 33, 38)));
+            .border_style(Style::default().fg(teal))
+            .style(
+                Style::default().bg(if app.theme == crate::settings::Theme::Light {
+                    Color::Rgb(232, 239, 237)
+                } else {
+                    Color::Rgb(20, 33, 38)
+                }),
+            );
         f.render_widget(frame, area);
         let inner = Rect::new(
             area.x + 2,
@@ -485,6 +585,63 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             area.height.saturating_sub(2),
         );
         match modal {
+            crate::app::Modal::Settings { draft, error } => {
+                let choices = Theme::ALL;
+                let mut lines = vec![
+                    Line::from("Choose the workspace appearance"),
+                    Line::from(""),
+                    Line::from(
+                        choices
+                            .into_iter()
+                            .map(|theme| {
+                                let selected = *draft == theme;
+                                Span::styled(
+                                    format!(
+                                        " {} {} ",
+                                        if selected { "›" } else { " " },
+                                        theme.label()
+                                    ),
+                                    if selected {
+                                        Style::default()
+                                            .fg(bg)
+                                            .bg(teal)
+                                            .add_modifier(Modifier::BOLD)
+                                    } else {
+                                        Style::default().fg(ink)
+                                    },
+                                )
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled(
+                            "[ Save ]",
+                            Style::default().fg(teal).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw("   "),
+                        Span::styled("[ Cancel ]", Style::default().fg(gold)),
+                    ]),
+                ];
+                if let Some(error) = error {
+                    lines.extend(
+                        wrap_words(error, inner.width as usize)
+                            .into_iter()
+                            .map(|line| Line::from(Span::styled(line, Style::default().fg(gold)))),
+                    );
+                }
+                lines.push(
+                    Line::from("↑ / ↓ preview · Enter Save · Esc Cancel")
+                        .style(Style::default().fg(muted)),
+                );
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .alignment(Alignment::Center)
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
             crate::app::Modal::Create(form) => {
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
@@ -504,12 +661,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                                 .title(" Title ")
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(if form.focus == 0 {
-                                    TEAL
+                                    teal
                                 } else {
-                                    MUTED
+                                    muted
                                 })),
                         )
-                        .style(Style::default().fg(INK))
+                        .style(Style::default().fg(ink))
                         .scroll((0, 0)),
                     title_area,
                 );
@@ -526,7 +683,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 let (title_slice, title_scroll) =
                     display_window(&form.title, desired_scroll, inner_title.width as usize);
                 f.render_widget(
-                    Paragraph::new(title_slice).style(Style::default().fg(INK)),
+                    Paragraph::new(title_slice).style(Style::default().fg(ink)),
                     inner_title,
                 );
                 if form.focus == 0 {
@@ -566,14 +723,22 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         )
                     };
                     let color = if which == 2 {
-                        type_color(selected)
+                        if app.theme == Theme::Light {
+                            light_semantic(type_color(selected))
+                        } else {
+                            type_color(selected)
+                        }
                     } else {
-                        priority_color(selected)
+                        if app.theme == Theme::Light {
+                            light_semantic(priority_color(selected))
+                        } else {
+                            priority_color(selected)
+                        }
                     };
                     let border = if form.focus == which || dropdown == Some(which) {
-                        TEAL
+                        teal
                     } else {
-                        MUTED
+                        muted
                     };
                     let block = Block::default()
                         .title(title)
@@ -585,11 +750,33 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             crate::beads::BEAD_TYPES
                                 .iter()
                                 .enumerate()
-                                .map(|(i, x)| (i, x.to_string(), type_color(i)))
+                                .map(|(i, x)| {
+                                    let color = type_color(i);
+                                    (
+                                        i,
+                                        x.to_string(),
+                                        if app.theme == Theme::Light {
+                                            light_semantic(color)
+                                        } else {
+                                            color
+                                        },
+                                    )
+                                })
                                 .collect::<Vec<_>>()
                         } else {
                             (0..=4)
-                                .map(|i| (i, format!("P{i}"), priority_color(i)))
+                                .map(|i| {
+                                    let color = priority_color(i);
+                                    (
+                                        i,
+                                        format!("P{i}"),
+                                        if app.theme == Theme::Light {
+                                            light_semantic(color)
+                                        } else {
+                                            color
+                                        },
+                                    )
+                                })
                                 .collect()
                         };
                         let start = if which == 2 {
@@ -607,7 +794,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             let line = Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1);
                             let style = if *idx == selected {
                                 Style::default()
-                                    .fg(BG)
+                                    .fg(bg)
                                     .bg(*col)
                                     .add_modifier(Modifier::BOLD)
                             } else {
@@ -631,7 +818,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             } else {
                                 format!("P{selected}")
                             })
-                            .style(Style::default().fg(BG).bg(color)),
+                            .style(Style::default().fg(bg).bg(color)),
                             line,
                         );
                     }
@@ -650,12 +837,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                                 .title(" Description · Enter for newline ")
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(if form.focus == 1 {
-                                    TEAL
+                                    teal
                                 } else {
-                                    MUTED
+                                    muted
                                 })),
                         )
-                        .style(Style::default().fg(INK))
+                        .style(Style::default().fg(ink))
                         .scroll((desc_scroll as u16, 0)),
                     desc_area,
                 );
@@ -674,28 +861,28 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Span::styled(
                         "[ Create ]",
                         if app.mutation_busy {
-                            Style::default().fg(MUTED)
+                            Style::default().fg(muted)
                         } else if form.focus == 4 {
                             Style::default()
-                                .fg(BG)
-                                .bg(TEAL)
+                                .fg(bg)
+                                .bg(teal)
                                 .add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(TEAL)
+                            Style::default().fg(teal)
                         },
                     ),
                     Span::raw("  "),
                     Span::styled(
                         "[ Cancel ]",
                         if app.mutation_busy {
-                            Style::default().fg(MUTED)
+                            Style::default().fg(muted)
                         } else if form.focus == 5 {
                             Style::default()
-                                .fg(BG)
-                                .bg(GOLD)
+                                .fg(bg)
+                                .bg(gold)
                                 .add_modifier(Modifier::BOLD)
                         } else {
-                            Style::default().fg(GOLD)
+                            Style::default().fg(gold)
                         },
                     ),
                     Span::raw("  ·  Enter choose · Esc cancel"),
@@ -715,9 +902,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 f.render_widget(
                     Paragraph::new(feedback).style(Style::default().fg(
                         if app.notice.is_some() || app.mutation_busy {
-                            GOLD
+                            gold
                         } else {
-                            MUTED
+                            muted
                         },
                     )),
                     rows[4],
@@ -734,11 +921,17 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 f.render_widget(
                     Paragraph::new(text)
                         .block(Block::default())
-                        .style(Style::default().fg(INK)),
+                        .style(Style::default().fg(ink)),
                     inner,
                 );
             }
         }
+    }
+}
+fn light_detail_background(color: Color) -> Color {
+    match color {
+        Color::Reset | Color::Black | Color::DarkGray => Color::Rgb(232, 239, 237),
+        other => light_semantic(other),
     }
 }
 
@@ -824,6 +1017,36 @@ fn wrapped_lines(s: &str, width: usize) -> Vec<String> {
         .split('\n')
         .map(str::to_owned)
         .collect()
+}
+fn wrap_words(s: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    for paragraph in s.lines() {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            if Span::raw(word).width() > width {
+                if !line.is_empty() {
+                    lines.push(std::mem::take(&mut line));
+                }
+                lines.extend(wrapped_lines(word, width));
+            } else if line.is_empty() {
+                line.push_str(word);
+            } else if Span::raw(&line).width() + 1 + Span::raw(word).width() <= width {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                lines.push(std::mem::take(&mut line));
+                line.push_str(word);
+            }
+        }
+        if !line.is_empty() || paragraph.is_empty() {
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 fn truncate_display(s: &str, width: usize) -> String {
     if Span::raw(s).width() <= width {
@@ -936,6 +1159,10 @@ mod tests {
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
+            settings: crate::settings::Settings::default(),
+            theme: crate::settings::Theme::Dark,
+            settings_path: None,
+            settings_load_error: None,
             notice: None,
             mutation_busy: false,
             modal_ready: true,
@@ -949,7 +1176,7 @@ mod tests {
     }
     fn draw(size: (u16, u16), a: &mut App) -> (String, Rect) {
         let mut t = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
-        t.draw(|f| render(f, Duration::from_secs(1), a)).unwrap();
+        t.draw(|f| render(f, Duration::from_secs(2), a)).unwrap();
         (
             t.backend()
                 .buffer()
@@ -969,7 +1196,7 @@ mod tests {
         assert!(s.contains("Title is visible"));
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut a))
+            .draw(|f| render(f, Duration::from_secs(2), &mut a))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let line = |y: u16| {
@@ -1032,7 +1259,7 @@ mod tests {
         a.selected = None;
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut a))
+            .draw(|f| render(f, Duration::from_secs(2), &mut a))
             .unwrap();
         let y = a.list_rect.y + 2;
         assert_eq!(
@@ -1064,7 +1291,7 @@ mod tests {
         a.selected = Some(0);
         let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut a))
+            .draw(|f| render(f, Duration::from_secs(2), &mut a))
             .unwrap();
         let buf = terminal.backend().buffer();
         let layout = crate::app::list_layout(&a.beads, &a.collapsed);
@@ -1144,7 +1371,7 @@ mod tests {
         );
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut a))
+            .draw(|f| render(f, Duration::from_secs(2), &mut a))
             .unwrap();
         let buf = terminal.backend().buffer();
         let closed_y = a.list_rect.y + (layout.groups[1].y - a.list_offset) as u16;
@@ -1180,7 +1407,7 @@ mod tests {
         a.list_offset = target.y + 1;
         let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut a))
+            .draw(|f| render(f, Duration::from_secs(2), &mut a))
             .unwrap();
         let buf = terminal.backend().buffer();
         let first_visible = a.list_rect.y;
@@ -1197,7 +1424,7 @@ mod tests {
         a.detail = Some(json!({"description":"# Overview\n\nA **bold** point and `code`."}));
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|f| render(f, Duration::from_secs(1), &mut a))
+            .draw(|f| render(f, Duration::from_secs(2), &mut a))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let cells = buffer.content();
@@ -1362,6 +1589,108 @@ mod tests {
         let scroll = y.saturating_sub(2);
         assert_eq!(y - scroll, 2);
         assert!(x < 5);
+    }
+    #[test]
+    fn settings_dialog_and_light_theme_render_with_contrast_at_small_sizes() {
+        let mut a = app();
+        a.theme = crate::settings::Theme::Light;
+        let storage_error = "Could not save settings to '/home/alexander/.config/ontrack/settings.json': Permission denied while replacing the destination file. Check the parent directory permissions and try again.";
+        a.modal = Some(crate::app::Modal::Settings {
+            draft: crate::settings::Theme::Light,
+            error: Some(storage_error.into()),
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render(f, Duration::from_secs(2), &mut a))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(text.contains("SETTINGS"));
+        assert!(text.contains("Light"));
+        assert!(text.contains("› Light"));
+        assert!(text.contains("Save"));
+        assert!(text.contains("Cancel"));
+        assert!(text.contains("settings.json"));
+        assert!(text.contains("Permission") && text.contains("denied"));
+        assert!(text.contains("try again"));
+        assert!(text.contains("preview"));
+        assert!(text.contains("Enter Save"));
+        assert!(text.contains("Esc Cancel"));
+        assert!(a.modal_ready);
+        assert_eq!(buffer[(0, 3)].bg, Color::Rgb(246, 248, 247));
+        assert!(a.modal_ready);
+        a.modal = Some(crate::app::Modal::Settings {
+            draft: crate::settings::Theme::Dark,
+            error: None,
+        });
+        assert!(draw((18, 5), &mut a).0.contains("Resize"));
+        assert!(!a.modal_ready);
+    }
+    #[test]
+    fn light_create_type_dropdown_uses_darkened_semantic_colors() {
+        let mut a = app();
+        a.theme = Theme::Light;
+        a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
+            focus: 2,
+            dropdown: Some(2),
+            issue_type: 0,
+            ..Default::default()
+        }));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|f| render(f, Duration::ZERO, &mut a))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.bg == light_semantic(type_color(0)))
+        );
+        assert!(!buffer.content().iter().any(|cell| cell.bg == type_color(0)));
+        assert!(
+            !buffer
+                .content()
+                .iter()
+                .any(|cell| cell.fg == priority_color(2))
+        );
+    }
+    #[test]
+    fn markdown_detail_colors_and_inline_code_backgrounds_follow_theme() {
+        let mut a = app();
+        a.detail = Some(json!({"description":"# Overview\n\nReadable text with `inline code`."}));
+        let draw_detail = |app: &mut App| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|frame| render(frame, Duration::from_secs(2), app))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        a.theme = Theme::Dark;
+        let dark = draw_detail(&mut a);
+        a.theme = Theme::Light;
+        let light = draw_detail(&mut a);
+        let dark_cells = dark.content();
+        let light_cells = light.content();
+        let dark_code = dark_cells
+            .iter()
+            .find(|cell| cell.symbol() == "i" && cell.fg == GOLD)
+            .expect("markdown inline code should retain the dark accent");
+        let light_code = light_cells
+            .iter()
+            .find(|cell| cell.symbol() == "i" && cell.fg == light_semantic(GOLD))
+            .expect("markdown inline code should use a readable light accent");
+        assert_ne!(dark_code.fg, light_code.fg);
+        assert_eq!(light_code.bg, Color::Rgb(246, 248, 247));
+        assert_eq!(light_semantic(Color::Indexed(1)), Color::Rgb(150, 45, 45));
+        assert_eq!(
+            light_detail_background(Color::DarkGray),
+            Color::Rgb(232, 239, 237)
+        );
     }
     #[test]
     fn wide_title_horizontal_scroll_starts_at_character_boundary() {

@@ -266,12 +266,12 @@ pub fn render(
         let mut remaining: Vec<_> = obj
             .iter()
             .filter(|(k, _)| {
-                !narrative.contains(&k.as_str())
-                    && !excluded.contains(&k.as_str())
-                    && !(selected.is_some() && ["id", "status", "priority"].contains(&k.as_str()))
-                    && !(selected.is_some()
-                        && k.as_str() == "title"
-                        && obj.get("title").and_then(Value::as_str).is_some())
+                !(narrative.contains(&k.as_str())
+                    || excluded.contains(&k.as_str())
+                    || selected.is_some()
+                        && (["id", "status", "priority"].contains(&k.as_str())
+                            || k.as_str() == "title"
+                                && obj.get("title").and_then(Value::as_str).is_some()))
             })
             .collect();
         remaining.sort_by_key(|(k, _)| *k);

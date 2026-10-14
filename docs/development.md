@@ -7,6 +7,7 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Defines the terminal type, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
+| `src/settings.rs` | Loads and saves the small JSON appearance configuration under the user's XDG config directory. |
 | `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/app.rs` | Holds selection, focus, scrolling, modal form state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
@@ -15,6 +16,10 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | `src/terminal.rs` | Manages raw mode, alternate screen, mouse capture, and cleanup, including initialization failures and panic handling. |
 
 `src/ui.rs` renders a centered ASCII ONTRACK wordmark during startup, with a short subtitle and a compact text fallback for narrower terminals. Keep the splash readable across terminal sizes and ensure it yields to the normal browser view after startup.
+
+Theme is explicit app state (`App::theme`) threaded into rendering; do not introduce global or thread-local palette state. Keep Dark as the existing default look. New colors need readable Light equivalents for surfaces, text, semantic metadata, startup splash, details, and dialogs. Settings preview a draft but commit `App::settings` only after `settings::save_to` succeeds; cancellation restores the committed theme. Tests should use isolated settings paths rather than changing process-wide environment variables.
+
+The `s` settings dialog previews Dark/Light appearance across the browser and splash. Saving is explicit; Esc discards the draft. Config read/write errors are presented in the UI and must not be reported as successful saves.
 
 ## Beads CLI contract
 
