@@ -3,7 +3,7 @@
 A terminal browser for Beads issues in the current workspace.
 
 - Browse open and closed Beads, with explicit create and permanent-delete actions.
-- Two-pane browsing with scrollable JSON details, comments, relationships, and unknown fields returned by Beads.
+- Two-pane browsing with scrollable, Markdown-rendered descriptions, notes, comments, relationships, and complete Beads details.
 - Background loading and refresh with cached records and visible errors.
 
 ## Requirements

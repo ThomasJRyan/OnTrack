@@ -23,7 +23,7 @@ A brief splash precedes the browser. Issue loading starts in the background; qui
 
 ## Browsing and controls
 
-The left pane lists all returned issues, including closed ones, without the CLI's usual list cap. Each entry shows its ID, priority, status, and title. The right pane shows the selected issue's formatted JSON, wrapped to the pane width.
+The left pane lists all returned issues, including closed ones, without the CLI's usual list cap. Each entry shows its ID, priority, status, and title. The right pane presents the selected issue as a readable record: narrative fields use Markdown formatting, while metadata, comments, relationships, and unfamiliar nested values remain available as you scroll.
 
 | Input | Action |
 | --- | --- |
@@ -44,7 +44,7 @@ Inside the create form, keys are text unless they are form controls; `q`, `r`, `
 
 ## Details, loading, and refresh
 
-Selecting an issue immediately displays its cached list record while a richer `bd show` request runs. The returned detail record replaces that snapshot. ontrack requests long details, comments, and dependents; descriptions, relationships, metadata, nested values, and unknown fields are preserved whenever they are present in the returned JSON. It does not invent missing fields or fetch data outside those CLI responses. Scroll the details pane to see fields below the visible area.
+Selecting an issue immediately displays its cached list record while a richer `bd show` request runs. The returned detail record replaces that snapshot. ontrack requests long details, comments, and dependents; descriptions, notes, design and acceptance text render as Markdown. Metadata, comments, relationships, and unknown nested values are preserved whenever present in the returned JSON. It does not invent missing fields or fetch data outside those CLI responses. Scroll the details pane to see fields below the visible area.
 
 The footer reports refreshing, detail loading, ready, or an error. Refresh retains the existing list while loading and keeps the selected ID if it still exists in the new list; otherwise it selects the first issue. A failed list refresh leaves the existing records available. A failed detail request leaves the available snapshot visible alongside the error. Press `r` to retry after resolving the cause. An empty successful list displays “No issues found in this workspace.”
 

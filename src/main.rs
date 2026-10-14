@@ -1,5 +1,6 @@
 mod app;
 mod beads;
+mod detail;
 mod event;
 mod terminal;
 mod ui;

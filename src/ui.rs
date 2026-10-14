@@ -140,17 +140,25 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
     app.list_offset = state.offset();
     let selected = app.selected.and_then(|i| app.beads.get(i));
     let detail = app.detail.as_ref().or_else(|| selected.map(|b| &b.data));
-    let detail_text = detail
-        .map(|v| serde_json::to_string_pretty(v).unwrap_or_else(|_| v.to_string()))
-        .unwrap_or_else(|| {
-            if app.beads.is_empty() {
-                "No issues found in this workspace.\n\nPress r to refresh.".into()
-            } else {
-                "Select an issue to inspect its full record.".into()
-            }
-        });
     let inner_width = split[1].width.saturating_sub(2).max(1);
-    let lines = Paragraph::new(detail_text.as_str())
+    let selected_metadata = selected.map(|b| {
+        (
+            b.id.as_str(),
+            b.title.as_str(),
+            b.status.as_str(),
+            b.priority as i64,
+        )
+    });
+    let detail_text = detail
+        .map(|v| crate::detail::render(v, selected_metadata, inner_width))
+        .unwrap_or_else(|| {
+            ratatui::text::Text::from(if app.beads.is_empty() {
+                "No issues found in this workspace.\n\nPress r to refresh."
+            } else {
+                "Select an issue to inspect its full record."
+            })
+        });
+    let lines = Paragraph::new(detail_text.clone())
         .wrap(Wrap { trim: false })
         .line_count(inner_width);
     let viewport = split[1].height.saturating_sub(2);
@@ -763,6 +771,32 @@ mod tests {
         }
     }
     #[test]
+    fn markdown_description_is_readable_and_styled_in_detail_pane() {
+        let mut a = app();
+        a.detail = Some(json!({"description":"# Overview\n\nA **bold** point and `code`."}));
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut splash = None;
+        terminal
+            .draw(|f| render(f, Duration::from_secs(1), &mut splash, &mut a))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let cells = buffer.content();
+        assert!(
+            !cells
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+                .contains("**bold**")
+        );
+        let visible = cells.iter().map(|cell| cell.symbol()).collect::<String>();
+        assert!(visible.contains("Overview"));
+        assert!(
+            cells
+                .iter()
+                .any(|cell| cell.symbol() == "b" && cell.modifier.contains(Modifier::BOLD))
+        );
+    }
+    #[test]
     fn tiny_empty_error_splash_and_wrapped_detail_are_safe() {
         let mut a = app();
         a.list_rect = Rect::new(1, 1, 10, 10);
@@ -794,13 +828,16 @@ mod tests {
             data: json!({"text":"界".repeat(700)}),
         });
         a.selected = Some(0);
-        a.beads[0].data = json!({"text": format!("{}FINAL_SENTINEL", "word ".repeat(800))});
+        a.beads[0].data =
+            json!({"unknown_multiline": format!("{}FINAL_SENTINEL", "word\n".repeat(800))});
         a.detail = Some(a.beads[0].data.clone());
         a.detail_offset = u16::MAX;
         let (rendered, rect) = draw((50, 14), &mut a);
         assert!(a.detail_offset > 0);
         assert!(rendered.contains("FINAL_SENTINEL"));
-        assert!(rect.height > 0)
+        assert!(rect.height > 0);
+        let (resized, _) = draw((90, 24), &mut a);
+        assert!(resized.contains("FINAL_SENTINEL"));
     }
     #[test]
     fn create_and_delete_modals_render_at_normal_and_tiny_sizes() {
