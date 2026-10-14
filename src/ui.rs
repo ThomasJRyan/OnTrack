@@ -895,7 +895,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 };
                 let feedback = truncate_display(
                     feedback.unwrap_or(
-                        "Tab / Shift+Tab moves · Enter opens or activates · Esc cancels",
+                        "Tab moves · ←/→ changes Type/Priority · Enter opens · Esc cancels",
                     ),
                     rows[4].width as usize,
                 );

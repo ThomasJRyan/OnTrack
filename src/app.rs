@@ -701,6 +701,21 @@ impl App {
                     form.priority
                 });
             }
+            Left | Right if form.focus == 2 => {
+                let count = beads::BEAD_TYPES.len();
+                form.issue_type = if key.code == Left {
+                    (form.issue_type + count - 1) % count
+                } else {
+                    (form.issue_type + 1) % count
+                };
+            }
+            Left | Right if form.focus == 3 => {
+                form.priority = if key.code == Left {
+                    (form.priority + 4) % 5
+                } else {
+                    (form.priority + 1) % 5
+                };
+            }
             Enter if form.focus == 4 => {
                 if !form.title.trim().is_empty() {
                     let input = CreateBead {
@@ -2193,6 +2208,44 @@ mod tests {
         };
         assert_eq!(form.issue_type, 1);
         assert!(form.dropdown.is_none());
+    }
+
+    #[test]
+    fn create_type_and_priority_cycle_with_left_right_and_enter_picker_remains_available() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Left); // Type wraps from Task to the last option.
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.issue_type, beads::BEAD_TYPES.len() - 1);
+        assert!(form.dropdown.is_none());
+        press(&mut a, KeyCode::Right);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.issue_type, 0);
+        press(&mut a, KeyCode::Enter);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.dropdown, Some(2));
+        press(&mut a, KeyCode::Esc);
+
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Right); // P2 -> P3
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.priority, 3);
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Right);
+        assert!(matches!(a.modal, Some(Modal::Create(ref f)) if f.priority == 0));
+        press(&mut a, KeyCode::Left);
+        assert!(matches!(a.modal, Some(Modal::Create(ref f)) if f.priority == 4));
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.modal, Some(Modal::Create(ref f)) if f.dropdown == Some(3)));
     }
 
     #[test]
