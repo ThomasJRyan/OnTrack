@@ -2,7 +2,7 @@
 
 ## Project
 
-- Single Rust 2024 binary; requires Rust 1.88+. Browses current-workspace Beads in a two-pane terminal view using the read-only `bd` CLI.
+- Single Rust 2024 binary; requires Rust 1.88+. Browses current-workspace Beads in a two-pane terminal view using read-only `bd` operations, plus explicit create/delete operations.
 - Run `cargo run` in a terminal with alternate-screen support, not a non-interactive runner.
 - When working with Herdr integrations, reference https://herdr.dev/docs.
 - When working with Beads, reference https://beads.gascity.com.

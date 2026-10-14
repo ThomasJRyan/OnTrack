@@ -1,14 +1,14 @@
 # Development guide
 
-ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public, read-only Beads CLI; no direct database integration is needed. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
+ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only, while create and delete are explicit user actions. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
 ## Modules
 
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Defines the terminal type, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
-| `src/beads.rs` | Builds read-only CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
-| `src/app.rs` | Holds selection, focus, scrolling, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
+| `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
+| `src/app.rs` | Holds selection, focus, scrolling, modal form state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
 | `src/ui.rs` | Renders splash, issue list, wrapped JSON details, and status; maintains list visibility and scroll bounds. |
 | `src/terminal.rs` | Manages raw mode, alternate screen, mouse capture, and cleanup, including initialization failures and panic handling. |
@@ -22,9 +22,13 @@ The subprocess inherits the application's working directory. Commands are passed
 ```sh
 bd --readonly --no-color list --all --limit 0 --json
 bd --readonly --no-color show --id=ISSUE_ID --json --long --include-comments --include-dependents
+bd --no-color create --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json
+bd --no-color delete --force --json -- ISSUE_ID
 ```
 
-`--all` includes closed issues and `--limit 0` removes the default list cap. `--id=ISSUE_ID` is a single argument. Both responses must be JSON arrays. List parsing requires nonempty string `id`, `title`, and `status`; a missing or null priority defaults to 2, and supplied priority must be an unsigned integer. Each `Bead` retains the entire JSON object as well as its summary fields.
+Create returns a JSON object containing the created ID; delete is successful on a successful command exit. Create/delete are not passed `--readonly`; delete uses `--force` for the selected issue only and never requests cascading deletion. The worker processes queued requests sequentially, preserving mutation order.
+
+`--all` includes closed issues and `--limit 0` removes the default list cap. `--id=ISSUE_ID` is a single argument. The list and show responses must be JSON arrays. List parsing requires nonempty string `id`, `title`, and `status`; a missing or null priority defaults to 2, and supplied priority must be an unsigned integer. Each `Bead` retains the entire JSON object as well as its summary fields.
 
 Detail parsing selects the requested ID, rejects duplicate matching records, and reports a missing ID. It retains the returned JSON intact, including comments, relationships, metadata, and fields unknown to ontrack. Process-start errors, unsuccessful exit statuses with stderr, and invalid JSON/records are surfaced as errors rather than panics.
 
@@ -32,11 +36,11 @@ Detail parsing selects the requested ID, rejects duplicate matching records, and
 
 `App` uses standard-library channels and one background thread for blocking CLI calls. The UI loop receives available responses, draws, and polls input with a short timeout rather than waiting for subprocess completion.
 
-Before each worker batch, queued requests are coalesced: any list request is retained, and only the latest queued show ID is retained. When both are present, the list runs before the show. This reduces redundant pending requests; it does not cancel a command already running. Responses for a show ID other than the current selection are ignored.
+The background worker executes each request in channel order. It does not coalesce or reorder requests, so mutation commands cannot be lost. Responses for a show ID other than the current selection are ignored.
 
 Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Errors retain available cached data and are displayed in the footer. Rendering formats the complete selected JSON instead of maintaining a fixed detail-field whitelist.
 
-Keep CLI calls off the input/render loop and preserve stale-response filtering when changing the worker. The worker is not joined on quit, so terminal cleanup does not wait for a slow CLI call; do not assume in-flight commands are cancelled by request coalescing.
+Keep CLI calls off the input/render loop and preserve stale-response filtering when changing the worker. The worker is not joined on quit, so terminal cleanup does not wait for a slow CLI call; in-flight commands are not cancelled on quit.
 
 ## Terminal cleanup invariants
 
@@ -46,7 +50,7 @@ Run interactive checks in a real terminal or a PTY, not an ordinary non-interact
 
 ## Tests and required checks
 
-Tests are inline in the source modules. They cover CLI arguments and parsing, navigation and focus, mouse selection, cached/stale detail behavior, request coalescing, quit-key recognition, and rendering using ratatui's `TestBackend`.
+Tests are inline in the source modules. They cover CLI arguments and parsing, form input and mutation state, navigation and focus, mouse selection, cached/stale detail behavior, quit-key recognition, and rendering using ratatui's `TestBackend`.
 
 Run all required gates from the repository root:
 
@@ -67,3 +71,6 @@ cargo test ui::tests
 ```
 
 Unit tests do not replace an interactive terminal cleanup check. When changing functionality, update the relevant Markdown guides under `docs/` and keep the README concise, preserving its controls and links to detailed documentation.
+## Mutations
+
+Create and delete are explicit, asynchronous CLI operations. The create form uses the Beads type vocabulary and P0–P4 priorities; deletion requires a second, affirmative confirmation and never cascades. Each worker request is processed in channel order, without batching mutations together, and the UI disables repeat submissions while one is in flight. The CLI adapter is defined in `src/beads.rs`; the UI only calls its create/delete functions and refreshes the normal list/detail views after success.

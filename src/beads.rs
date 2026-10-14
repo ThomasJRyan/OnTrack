@@ -1,9 +1,29 @@
-//! Read-only access to Beads through its public CLI.
+//! Read-only browsing and explicit create/delete operations through the Beads CLI.
 
 use std::io;
 use std::process::{Command, Output};
 
 use serde_json::Value;
+
+pub const BEAD_TYPES: &[&str] = &[
+    "task",
+    "bug",
+    "feature",
+    "epic",
+    "chore",
+    "decision",
+    "spike",
+    "story",
+    "milestone",
+];
+
+#[derive(Debug, Clone)]
+pub struct CreateBead {
+    pub title: String,
+    pub description: String,
+    pub issue_type: String,
+    pub priority: u8,
+}
 
 #[derive(Debug, Clone)]
 pub struct Bead {
@@ -35,6 +55,58 @@ pub fn show_bead(id: &str) -> io::Result<Value> {
     parse_show(&run_bd(&args)?, id)
 }
 
+pub fn create_bead(input: &CreateBead) -> io::Result<String> {
+    let args = create_args(input)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    parse_created_id(&run_bd(&args)?)
+}
+
+/// Permanently delete only this issue, never cascading to dependent issues.
+pub fn delete_bead(id: &str) -> io::Result<()> {
+    run_bd(&delete_args(id)?)?;
+    Ok(())
+}
+
+fn create_args(input: &CreateBead) -> io::Result<Vec<String>> {
+    let title = input.title.trim();
+    if title.is_empty()
+        || input
+            .title
+            .contains(['\n', '\r', '\0', '\u{85}', '\u{2028}', '\u{2029}'])
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Beads title must be nonempty and single-line",
+        ));
+    }
+    if input.priority > 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Beads priority must be between 0 and 4",
+        ));
+    }
+    if !BEAD_TYPES.contains(&input.issue_type.as_str()) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unsupported Beads issue type",
+        ));
+    }
+    Ok(vec![
+        "--no-color".to_owned(),
+        "create".to_owned(),
+        format!("--title={title}"),
+        format!("--description={}", input.description),
+        format!("--type={}", input.issue_type),
+        format!("--priority={}", input.priority),
+        "--json".to_owned(),
+    ])
+}
+
+fn delete_args(id: &str) -> io::Result<[&str; 6]> {
+    validate_id(id)?;
+    Ok(["--no-color", "delete", "--force", "--json", "--", id])
+}
+
 fn show_args(id_arg: &str) -> [&str; 8] {
     [
         "--readonly",
@@ -49,10 +121,13 @@ fn show_args(id_arg: &str) -> [&str; 8] {
 }
 
 fn validate_id(id: &str) -> io::Result<()> {
-    if id.trim().is_empty() {
+    if id.is_empty()
+        || id.starts_with('-')
+        || id.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Beads issue ID must not be empty",
+            "Beads issue ID must be nonempty, not start with '-', and contain no whitespace or control characters",
         ));
     }
     Ok(())
@@ -101,6 +176,17 @@ fn required_string(record: &Value, field: &str) -> io::Result<String> {
         .ok_or_else(|| invalid_data(format!("Beads record has missing or invalid {field}")))
 }
 
+fn parse_created_id(bytes: &[u8]) -> io::Result<String> {
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|error| invalid_data(format!("Invalid bd JSON: {error}")))?;
+    if !value.is_object() {
+        return Err(invalid_data("Expected a JSON object from bd create"));
+    }
+    let id = required_string(&value, "id")?;
+    validate_id(&id).map_err(|error| invalid_data(format!("Invalid created issue ID: {error}")))?;
+    Ok(id)
+}
+
 fn parse_list(bytes: &[u8]) -> io::Result<Vec<Bead>> {
     parse_records(bytes)?
         .into_iter()
@@ -147,6 +233,217 @@ fn parse_show(bytes: &[u8], id: &str) -> io::Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn create_input() -> CreateBead {
+        CreateBead {
+            title: "  A new issue  ".to_owned(),
+            description: "First line\n\nSecond line\r\n  indented  \n".to_owned(),
+            issue_type: "task".to_owned(),
+            priority: 2,
+        }
+    }
+
+    #[test]
+    fn create_args_trim_title_and_preserve_multiline_description() {
+        assert_eq!(
+            create_args(&create_input()).unwrap(),
+            [
+                "--no-color",
+                "create",
+                "--title=A new issue",
+                "--description=First line\n\nSecond line\r\n  indented  \n",
+                "--type=task",
+                "--priority=2",
+                "--json",
+            ]
+        );
+    }
+
+    #[test]
+    fn create_keeps_flag_like_and_shell_text_in_single_arguments() {
+        let mut input = create_input();
+        input.title = "--force $(touch ignored); 'quoted'".to_owned();
+        input.description = "--cascade\n\"; $(touch ignored)".to_owned();
+        let args = create_args(&input).unwrap();
+        assert_eq!(args.len(), 7);
+        assert_eq!(args[2], format!("--title={}", input.title));
+        assert_eq!(args[3], format!("--description={}", input.description));
+        assert!(!args.iter().any(|arg| arg == "--readonly"));
+    }
+
+    #[test]
+    fn create_accepts_all_core_types_and_priorities() {
+        assert_eq!(
+            BEAD_TYPES,
+            [
+                "task",
+                "bug",
+                "feature",
+                "epic",
+                "chore",
+                "decision",
+                "spike",
+                "story",
+                "milestone"
+            ]
+        );
+        for issue_type in BEAD_TYPES {
+            for priority in 0..=4 {
+                let mut input = create_input();
+                input.issue_type = (*issue_type).to_owned();
+                input.priority = priority;
+                input.description.clear();
+                let args = create_args(&input).unwrap();
+                assert_eq!(args[4], format!("--type={issue_type}"));
+                assert_eq!(args[5], format!("--priority={priority}"));
+            }
+        }
+    }
+
+    #[test]
+    fn create_rejects_invalid_inputs_before_running_a_process() {
+        for title in [
+            "",
+            "  \t ",
+            "first\nsecond",
+            "first\rsecond",
+            "title\n",
+            "\n title",
+            "a\0b",
+            "a\u{85}b",
+            "a\u{2028}b",
+            "a\u{2029}b",
+        ] {
+            let mut input = create_input();
+            input.title = title.to_owned();
+            assert_eq!(
+                create_bead(&input).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        for priority in [5, u8::MAX] {
+            let mut input = create_input();
+            input.priority = priority;
+            assert_eq!(
+                create_bead(&input).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+        for issue_type in ["", "custom", "Task", "task ", "--force", "task\n--force"] {
+            let mut input = create_input();
+            input.issue_type = issue_type.to_owned();
+            assert_eq!(
+                create_bead(&input).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn create_parses_object_id_and_rejects_malformed_output() {
+        assert_eq!(
+            parse_created_id(br#"{"id":"ontrack-70t","title":"New issue","future":true}"#).unwrap(),
+            "ontrack-70t"
+        );
+        for input in [
+            "",
+            "not json",
+            "null",
+            "[]",
+            "{}",
+            r#"{"id":null}"#,
+            r#"{"id":3}"#,
+            r#"{"id":""}"#,
+            r#"{"id":"--force"}"#,
+            r#"{"id":"a b"}"#,
+            r#"{"id":"a\nb"}"#,
+        ] {
+            assert_eq!(
+                parse_created_id(input.as_bytes()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData,
+                "input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_args_force_only_selected_issue_without_cascade() {
+        assert_eq!(
+            delete_args("ontrack-70t").unwrap(),
+            [
+                "--no-color",
+                "delete",
+                "--force",
+                "--json",
+                "--",
+                "ontrack-70t"
+            ]
+        );
+        for id in ["ontrack-70t", "ontrack-70t.1", "workspace:a-b", "a", "123"] {
+            validate_id(id).unwrap();
+        }
+    }
+
+    #[test]
+    fn delete_and_show_reject_unsafe_ids_before_running_a_process() {
+        for id in [
+            "", " ", "--force", "-a", "a b", "a\nb", "a\tb", "a\0b", "a\u{7f}b", "a\u{a0}b",
+        ] {
+            assert_eq!(
+                delete_bead(id).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "id: {id:?}"
+            );
+            assert_eq!(
+                show_bead(id).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "id: {id:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutation_command_errors_and_create_success_use_injected_executor() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let owned_args = create_args(&create_input()).unwrap();
+        let create_args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
+        let delete_args = delete_args("ontrack-70t").unwrap();
+        for args in [create_args.as_slice(), delete_args.as_slice()] {
+            let error = run_bd_with(args, |actual| {
+                assert_eq!(actual, args);
+                Ok(Output {
+                    status: std::process::ExitStatus::from_raw(1 << 8),
+                    stdout: b"{}".to_vec(),
+                    stderr: b"mutation rejected\n".to_vec(),
+                })
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert!(error.to_string().contains("exit status: 1"));
+            assert!(error.to_string().contains("mutation rejected"));
+
+            let error = run_bd_with(args, |_| {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "permission denied",
+                ))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("Could not run bd"));
+        }
+        let bytes = run_bd_with(&create_args, |_| {
+            Ok(Output {
+                status: std::process::ExitStatus::from_raw(0),
+                stdout: br#"{"id":"ontrack-new"}"#.to_vec(),
+                stderr: Vec::new(),
+            })
+        })
+        .unwrap();
+        assert_eq!(parse_created_id(&bytes).unwrap(), "ontrack-new");
+    }
 
     #[test]
     fn list_args_are_read_only_uncapped_and_include_closed() {

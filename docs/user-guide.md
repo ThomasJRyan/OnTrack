@@ -1,6 +1,6 @@
 # User guide
 
-ontrack browses Beads issues in a two-pane terminal view. It invokes the public `bd` CLI in read-only mode, using the current working directory to select the workspace. It does not edit issues or access the Beads database directly.
+ontrack browses Beads issues in a two-pane terminal view and can create or permanently delete one issue at a time. It uses the public `bd` CLI and the current working directory to select the workspace. It does not access the Beads database directly.
 
 ## Requirements and startup
 
@@ -36,7 +36,11 @@ The left pane lists all returned issues, including closed ones, without the CLI'
 | Mouse wheel over the list | Change issue selection. |
 | Mouse wheel over details | Scroll details. |
 | `r` | Refresh the issue list and reload the selected issue's details. |
-| `q`, `Esc`, or `Ctrl+C` | Quit. |
+| `n` | Open the new-bead form. Tab / Shift+Tab moves through title, description, type, priority, Create, and Cancel. Enter inserts a newline in the description; Enter opens type/priority choices, arrows preview options, Enter commits, and Esc restores the prior choice or cancels the form. An empty title shows a required message. |
+| `d` | Ask to permanently delete the selected bead. `y` confirms; `n` or Enter cancels. Deletion does not cascade; dependency links are removed and dependents may be orphaned. |
+| `q`, `Esc`, or `Ctrl+C` | Quit the browser when no dialog is open. In a form, `Esc` cancels the dialog; while a mutation is running the dialog is locked until completion. |
+
+Inside the create form, keys are text unless they are form controls; `q`, `r`, `n`, and `d` do not trigger browser shortcuts. Type defaults to Task and priority to P2. A mutation runs once at a time in the background; the modal is locked until it finishes. Failures remain visible and keep the form open for correction or retry. Successful creation refreshes the list and selects the new bead when it appears. Dialogs ask you to enlarge a terminal that is too small to show the full controls and warnings.
 
 ## Details, loading, and refresh
 
@@ -44,15 +48,15 @@ Selecting an issue immediately displays its cached list record while a richer `b
 
 The footer reports refreshing, detail loading, ready, or an error. Refresh retains the existing list while loading and keeps the selected ID if it still exists in the new list; otherwise it selects the first issue. A failed list refresh leaves the existing records available. A failed detail request leaves the available snapshot visible alongside the error. Press `r` to retry after resolving the cause. An empty successful list displays “No issues found in this workspace.”
 
-Backend work does not run on the terminal input loop, so navigation and quitting remain available while a command is slow. Quitting restores raw-mode, mouse-capture, and alternate-screen settings through the application's cleanup path.
+Backend work does not run on the terminal input loop, so browsing remains responsive while a command is slow. During a mutation, its modal stays open and locked until a result arrives. Mutations are queued and executed in order without coalescing. Quitting restores raw-mode, mouse-capture, and alternate-screen settings through the application's cleanup path.
 
 ## Troubleshooting
 
 - **“Could not run bd”**: check that `bd` is installed and on the launch environment's `PATH`, including when starting from an editor or a different shell.
 - **“bd failed” / workspace or database errors**: check the error text and launch directory. Run the read-only list command below from that same directory to diagnose the CLI separately; consult the official Beads documentation for workspace access or setup.
 - **Unknown CLI options**: ensure your `bd` supports `--readonly`, uncapped listing, and the detail flags in the development guide. ontrack reports failures rather than silently dropping those flags.
-- **Invalid JSON or malformed records**: ontrack expects JSON arrays from `bd`; list entries need nonempty string IDs, titles, and statuses. Check the command output and your CLI version.
-- **“expand terminal” / clipped content**: enlarge the terminal. Very small terminals show an expansion prompt instead of the two panes; quit keys still work. Use focus and scrolling for long details.
+- **Invalid JSON or malformed records**: list/show responses must be JSON arrays; creation must return an object with an ID. List entries need nonempty string IDs, titles, and statuses. Check the command output and your CLI version.
+- **“expand terminal” / clipped content**: enlarge the terminal. Very small terminals show an expansion prompt instead of the two panes; browser quit keys still work when no dialog is open. Use focus and scrolling for long details.
 - **Mouse input does not work**: ensure the terminal supports mouse reporting, or use the keyboard controls.
 
 ```sh

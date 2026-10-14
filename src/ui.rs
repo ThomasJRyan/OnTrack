@@ -1,10 +1,10 @@
 use crate::{app::App, beads::Bead};
 use ratatui::{
     Frame,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use ratatui_splash_screen::{SplashConfig, SplashScreen};
 use std::time::Duration;
@@ -49,15 +49,21 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
     app.list_rect = Rect::default();
     app.detail_rect = Rect::default();
     if a.width < 24 || a.height < 7 {
+        app.modal_ready = false;
         f.render_widget(
-            Paragraph::new("ontrack · expand terminal")
-                .style(Style::default().fg(MUTED))
-                .alignment(Alignment::Center),
+            Paragraph::new(if app.modal.is_some() {
+                "Resize terminal"
+            } else {
+                "ontrack · expand terminal"
+            })
+            .style(Style::default().fg(MUTED))
+            .alignment(Alignment::Center),
             a,
         );
         return;
     }
-    if elapsed < Duration::from_millis(700)
+    if app.modal.is_none()
+        && elapsed < Duration::from_millis(700)
         && let Some(s) = splash.as_mut().filter(|s| !s.is_rendered())
     {
         f.render_widget(
@@ -176,16 +182,507 @@ pub fn render(f: &mut Frame, elapsed: Duration, splash: &mut Option<SplashScreen
         "REFRESHING ISSUES…".into()
     } else if app.detail_loading {
         "LOADING DETAILS…".into()
+    } else if let Some(notice) = &app.notice {
+        notice.clone()
     } else {
         "READY".into()
     };
     f.render_widget(
         Paragraph::new(format!(
-            " {state}  ·  ↑↓ select  ·  Tab/←→ focus  ·  PgUp/PgDn scroll  ·  r refresh  ·  q quit"
+            " {state}  ·  ↑↓ select  ·  n new  ·  d delete  ·  r refresh  ·  q quit"
         ))
         .style(Style::default().fg(MUTED)),
         v[2],
     );
+    if let Some(modal) = &app.modal {
+        let width = match modal {
+            crate::app::Modal::Create(_) => 70,
+            _ => 62,
+        }
+        .min(a.width.saturating_sub(2));
+        let delete_lines = match modal {
+            crate::app::Modal::ConfirmDelete { id, title } => Some(delete_dialog_lines(
+                id,
+                title,
+                width.saturating_sub(4) as usize,
+                app.notice.as_deref(),
+                app.mutation_busy,
+            )),
+            _ => None,
+        };
+        let height = match modal {
+            crate::app::Modal::Create(form) => {
+                if form.dropdown.is_some() {
+                    19
+                } else {
+                    15
+                }
+            }
+            crate::app::Modal::ConfirmDelete { .. } => delete_lines
+                .as_ref()
+                .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
+        };
+        let min_width = if matches!(modal, crate::app::Modal::Create(_)) {
+            70
+        } else {
+            50
+        };
+        if a.width < min_width || a.height < height {
+            app.modal_ready = false;
+            f.render_widget(Clear, a);
+            let prompt = if a.width < min_width {
+                format!("Expand terminal width to {min_width} columns · Esc cancels")
+            } else {
+                format!("Expand terminal height to {height} rows · Esc cancels")
+            };
+            f.render_widget(
+                Paragraph::new(prompt)
+                    .style(Style::default().fg(GOLD))
+                    .alignment(Alignment::Center),
+                a,
+            );
+            return;
+        }
+        app.modal_ready = true;
+        let area = Rect::new(
+            a.x + a.width.saturating_sub(width) / 2,
+            a.y + a.height.saturating_sub(height) / 2,
+            width,
+            height,
+        );
+        f.render_widget(Clear, area);
+        let frame = Block::default()
+            .title(match modal {
+                crate::app::Modal::Create(_) => " NEW BEAD ",
+                _ => " DELETE BEAD? ",
+            })
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(TEAL))
+            .style(Style::default().bg(Color::Rgb(20, 33, 38)));
+        f.render_widget(frame, area);
+        let inner = Rect::new(
+            area.x + 2,
+            area.y + 1,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(2),
+        );
+        match modal {
+            crate::app::Modal::Create(form) => {
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(3),
+                        Constraint::Length(if form.dropdown.is_some() { 7 } else { 3 }),
+                        Constraint::Min(3),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
+                    ])
+                    .split(inner);
+                let title_area = Rect::new(rows[0].x, rows[0].y, rows[0].width, 3);
+                f.render_widget(
+                    Paragraph::new("Title · required")
+                        .block(
+                            Block::default()
+                                .title(" Title ")
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(if form.focus == 0 {
+                                    TEAL
+                                } else {
+                                    MUTED
+                                })),
+                        )
+                        .style(Style::default().fg(INK))
+                        .scroll((0, 0)),
+                    title_area,
+                );
+                let inner_title = Rect::new(
+                    title_area.x + 1,
+                    title_area.y + 1,
+                    title_area.width.saturating_sub(2),
+                    1,
+                );
+                let caret_width =
+                    Span::raw(&form.title[..form.cursor.min(form.title.len())]).width();
+                let title_view = inner_title.width.saturating_sub(1) as usize;
+                let desired_scroll = caret_width.saturating_sub(title_view.saturating_sub(1));
+                let (title_slice, title_scroll) =
+                    display_window(&form.title, desired_scroll, inner_title.width as usize);
+                f.render_widget(
+                    Paragraph::new(title_slice).style(Style::default().fg(INK)),
+                    inner_title,
+                );
+                if form.focus == 0 {
+                    f.set_cursor_position(Position::new(
+                        inner_title.x
+                            + caret_width
+                                .saturating_sub(title_scroll)
+                                .min(inner_title.width.saturating_sub(1) as usize)
+                                as u16,
+                        inner_title.y,
+                    ));
+                }
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+                    .split(rows[1]);
+                let type_area = cols[0];
+                let priority_area = cols[1];
+                let dropdown = form.dropdown;
+                let box_height = type_area.height;
+                for (which, area) in [(2usize, type_area), (3usize, priority_area)] {
+                    let selected = if which == 2 {
+                        form.issue_type
+                    } else {
+                        form.priority
+                    };
+                    let title = if which == 2 {
+                        format!(
+                            "Type: {}{}",
+                            capitalize(bead_type_name(selected)),
+                            if dropdown == Some(which) { "" } else { "  ▾" }
+                        )
+                    } else {
+                        format!(
+                            "Priority: P{selected}{}",
+                            if dropdown == Some(which) { "" } else { "  ▾" }
+                        )
+                    };
+                    let color = if which == 2 {
+                        type_color(selected)
+                    } else {
+                        priority_color(selected)
+                    };
+                    let border = if form.focus == which || dropdown == Some(which) {
+                        TEAL
+                    } else {
+                        MUTED
+                    };
+                    let block = Block::default()
+                        .title(title)
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(border));
+                    f.render_widget(block, area);
+                    if dropdown == Some(which) {
+                        let options = if which == 2 {
+                            crate::beads::BEAD_TYPES
+                                .iter()
+                                .enumerate()
+                                .map(|(i, x)| (i, x.to_string(), type_color(i)))
+                                .collect::<Vec<_>>()
+                        } else {
+                            (0..=4)
+                                .map(|i| (i, format!("P{i}"), priority_color(i)))
+                                .collect()
+                        };
+                        let start = if which == 2 {
+                            selected.saturating_sub(box_height.saturating_sub(2) as usize - 1)
+                        } else {
+                            0
+                        };
+                        for (row, (idx, label, col)) in options
+                            .iter()
+                            .skip(start)
+                            .take(box_height.saturating_sub(2) as usize)
+                            .enumerate()
+                        {
+                            let y = area.y + 1 + row as u16;
+                            let line = Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1);
+                            let style = if *idx == selected {
+                                Style::default()
+                                    .fg(BG)
+                                    .bg(*col)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(*col)
+                            };
+                            f.render_widget(
+                                Paragraph::new(format!(
+                                    "{} {label}",
+                                    if *idx == selected { "›" } else { " " }
+                                ))
+                                .style(style),
+                                line,
+                            );
+                        }
+                    } else {
+                        let line =
+                            Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1);
+                        f.render_widget(
+                            Paragraph::new(if which == 2 {
+                                capitalize(bead_type_name(selected))
+                            } else {
+                                format!("P{selected}")
+                            })
+                            .style(Style::default().fg(BG).bg(color)),
+                            line,
+                        );
+                    }
+                }
+                let desc_area = rows[2];
+                let (wrapped_description, cx, cy) = wrapped_description(
+                    &form.description,
+                    form.description_cursor,
+                    desc_area.width.saturating_sub(2).max(1) as usize,
+                );
+                let desc_scroll = cy.saturating_sub(desc_area.height.saturating_sub(3) as usize);
+                f.render_widget(
+                    Paragraph::new(wrapped_description)
+                        .block(
+                            Block::default()
+                                .title(" Description · Enter for newline ")
+                                .borders(Borders::ALL)
+                                .border_style(Style::default().fg(if form.focus == 1 {
+                                    TEAL
+                                } else {
+                                    MUTED
+                                })),
+                        )
+                        .style(Style::default().fg(INK))
+                        .scroll((desc_scroll as u16, 0)),
+                    desc_area,
+                );
+                if form.focus == 1 {
+                    let row = cy.saturating_sub(desc_scroll) as u16;
+                    if row < desc_area.height.saturating_sub(2) {
+                        f.set_cursor_position(Position::new(
+                            desc_area.x
+                                + 1
+                                + cx.min(desc_area.width.saturating_sub(2) as usize) as u16,
+                            desc_area.y + 1 + row,
+                        ));
+                    }
+                }
+                let actions = Paragraph::new(Line::from(vec![
+                    Span::styled(
+                        "[ Create ]",
+                        if app.mutation_busy {
+                            Style::default().fg(MUTED)
+                        } else if form.focus == 4 {
+                            Style::default()
+                                .fg(BG)
+                                .bg(TEAL)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(TEAL)
+                        },
+                    ),
+                    Span::raw("  "),
+                    Span::styled(
+                        "[ Cancel ]",
+                        if app.mutation_busy {
+                            Style::default().fg(MUTED)
+                        } else if form.focus == 5 {
+                            Style::default()
+                                .fg(BG)
+                                .bg(GOLD)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(GOLD)
+                        },
+                    ),
+                    Span::raw("  ·  Enter choose · Esc cancel"),
+                ]));
+                f.render_widget(actions, rows[3]);
+                let feedback = if app.mutation_busy {
+                    Some("Creating… · form locked until the command finishes")
+                } else {
+                    app.notice.as_deref()
+                };
+                let feedback = truncate_display(
+                    feedback.unwrap_or(
+                        "Tab / Shift+Tab moves · Enter opens or activates · Esc cancels",
+                    ),
+                    rows[4].width as usize,
+                );
+                f.render_widget(
+                    Paragraph::new(feedback).style(Style::default().fg(
+                        if app.notice.is_some() || app.mutation_busy {
+                            GOLD
+                        } else {
+                            MUTED
+                        },
+                    )),
+                    rows[4],
+                );
+            }
+            crate::app::Modal::ConfirmDelete { id, title } => {
+                let text = if app.mutation_busy {
+                    format!("Deleting bead\nID: {id}\n\nCommand running · dialog locked")
+                } else {
+                    delete_lines
+                        .unwrap_or_else(|| vec![format!("ID: {id}"), format!("Title: {title}")])
+                        .join("\n")
+                };
+                f.render_widget(
+                    Paragraph::new(text)
+                        .block(Block::default())
+                        .style(Style::default().fg(INK)),
+                    inner,
+                );
+            }
+        }
+    }
+}
+
+fn bead_type_name(index: usize) -> &'static str {
+    crate::beads::BEAD_TYPES
+        .get(index)
+        .copied()
+        .unwrap_or("task")
+}
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    c.next()
+        .map(|first| first.to_uppercase().collect::<String>() + c.as_str())
+        .unwrap_or_default()
+}
+fn display_window(s: &str, desired_start: usize, width: usize) -> (String, usize) {
+    let mut out = String::new();
+    let mut cell = 0;
+    let mut actual_start = 0;
+    let mut visible = 0;
+    for ch in s.chars() {
+        let cw = Span::raw(ch.to_string()).width();
+        if cell < desired_start && cell + cw > desired_start {
+            actual_start = cell + cw;
+        }
+        if cell >= desired_start && visible + cw <= width {
+            out.push(ch);
+            visible += cw;
+        }
+        cell += cw;
+        if cell <= desired_start {
+            actual_start = cell;
+        }
+        if visible >= width {
+            break;
+        }
+    }
+    (out, actual_start)
+}
+fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, usize) {
+    let width = width.max(1);
+    let cursor = cursor.min(s.len());
+    let mut caret = None;
+    let mut out = String::new();
+    let mut row = 0;
+    let mut col = 0;
+    for (byte, ch) in s.char_indices() {
+        if byte == cursor {
+            caret = Some(if col == width {
+                (0, row + 1)
+            } else {
+                (col, row)
+            });
+        }
+        if ch == '\n' {
+            out.push('\n');
+            row += 1;
+            col = 0;
+            continue;
+        }
+        let cw = Span::raw(ch.to_string()).width();
+        if col == width || col + cw > width {
+            out.push('\n');
+            row += 1;
+            col = 0;
+        }
+        out.push(ch);
+        col += cw;
+    }
+    if cursor == s.len() {
+        caret = Some(if col == width {
+            (0, row + 1)
+        } else {
+            (col, row)
+        });
+    }
+    let (x, y) = caret.unwrap_or((col, row));
+    (out, x, y)
+}
+fn wrapped_lines(s: &str, width: usize) -> Vec<String> {
+    wrapped_description(s, 0, width)
+        .0
+        .split('\n')
+        .map(str::to_owned)
+        .collect()
+}
+fn truncate_display(s: &str, width: usize) -> String {
+    if Span::raw(s).width() <= width {
+        return s.to_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let cw = Span::raw(ch.to_string()).width();
+        if used + cw + 1 > width {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+fn delete_dialog_lines(
+    id: &str,
+    title: &str,
+    width: usize,
+    error: Option<&str>,
+    busy: bool,
+) -> Vec<String> {
+    if busy {
+        return vec![
+            "Deleting bead".into(),
+            format!("ID: {id}"),
+            "Command running · dialog locked".into(),
+        ];
+    }
+    let mut lines = vec!["Permanently delete this bead?".into()];
+    lines.extend(wrapped_lines(&format!("ID: {id}"), width));
+    lines.push(format!(
+        "Title: {}",
+        truncate_display(title, width.saturating_sub(7))
+    ));
+    lines.push("Cannot be undone.".into());
+    lines.extend(wrapped_lines(
+        "Dependency links are removed; dependents may be orphaned.",
+        width,
+    ));
+    lines.extend(wrapped_lines(
+        "No cascade: other beads will not be deleted.",
+        width,
+    ));
+    if let Some(error) = error {
+        lines.push(truncate_display(&format!("Delete error: {error}"), width));
+    }
+    lines.push("[y] Delete · [n / Enter] Cancel".into());
+    lines
+}
+fn type_color(index: usize) -> Color {
+    [
+        Color::Rgb(73, 211, 182),
+        Color::Rgb(255, 123, 123),
+        Color::Rgb(103, 177, 255),
+        Color::Rgb(197, 145, 255),
+        Color::Rgb(178, 192, 196),
+        Color::Rgb(255, 192, 115),
+        Color::Rgb(119, 204, 219),
+        Color::Rgb(240, 141, 197),
+        Color::Rgb(168, 207, 125),
+    ][index.min(8)]
+}
+fn priority_color(index: usize) -> Color {
+    [
+        Color::Rgb(255, 105, 105),
+        Color::Rgb(255, 159, 105),
+        Color::Rgb(239, 183, 99),
+        Color::Rgb(138, 197, 169),
+        Color::Rgb(123, 144, 148),
+    ][index.min(4)]
 }
 
 #[cfg(test)]
@@ -218,6 +715,11 @@ mod tests {
             detail_seq: 0,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
+            modal: None,
+            notice: None,
+            mutation_busy: false,
+            modal_ready: true,
+            preferred_id: None,
             requests: tx,
             responses,
         }
@@ -299,5 +801,113 @@ mod tests {
         assert!(a.detail_offset > 0);
         assert!(rendered.contains("FINAL_SENTINEL"));
         assert!(rect.height > 0)
+    }
+    #[test]
+    fn create_and_delete_modals_render_at_normal_and_tiny_sizes() {
+        let mut a = app();
+        a.notice = Some("Created previous".into());
+        a.list_error = Some("current failure".into());
+        let status = draw((120, 40), &mut a).0;
+        assert!(status.contains("LIST ERROR"));
+        assert!(status.contains("n new"));
+        assert!(status.contains("d delete"));
+        a.list_error = None;
+        a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm::default()));
+        let normal = draw((100, 30), &mut a).0;
+        assert!(normal.contains("NEW BEAD"));
+        assert!(normal.contains("Task"));
+        assert!(normal.contains("P2"));
+        let tiny = draw((12, 5), &mut a).0;
+        assert!(tiny.contains("Resize"));
+        assert!(!a.modal_ready);
+        a.modal = Some(crate::app::Modal::ConfirmDelete {
+            id: "demo-1".into(),
+            title: "Title is visible".into(),
+        });
+        let deletion = draw((100, 30), &mut a).0;
+        assert!(deletion.contains("Cannot be undone"));
+        assert!(deletion.contains("orphaned"));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut splash = None;
+        a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
+            focus: 2,
+            dropdown: Some(2),
+            issue_type: 8,
+            ..Default::default()
+        }));
+        terminal
+            .draw(|f| render(f, Duration::ZERO, &mut splash, &mut a))
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let text = buf.content().iter().map(|c| c.symbol()).collect::<String>();
+        assert!(text.contains("Milestone"));
+        assert!(text.contains("NEW BEAD"));
+        assert!(a.modal_ready);
+        assert!(buf.content().iter().any(|cell| cell.bg == type_color(8)));
+        assert_eq!(buf[(17, 9)].fg, TEAL);
+        a.notice = None;
+        a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
+            focus: 5,
+            ..Default::default()
+        }));
+        let normal_80 = draw((80, 24), &mut a).0;
+        assert!(normal_80.contains("Cancel"));
+        assert!(normal_80.contains("Create"));
+        a.modal = Some(crate::app::Modal::ConfirmDelete {
+            id: "demo-1".into(),
+            title: "Title is visible".into(),
+        });
+        let delete_80 = draw((80, 24), &mut a).0;
+        assert!(delete_80.contains("[y] Delete"));
+        assert!(delete_80.contains("orphaned"));
+        a.modal = Some(crate::app::Modal::ConfirmDelete {
+            id: "long-id".into(),
+            title: "A very long title ".repeat(12),
+        });
+        let long_delete = draw((50, 12), &mut a).0;
+        assert!(a.modal_ready);
+        assert!(long_delete.contains("long-id"));
+        assert!(long_delete.contains("Cannot be undone"));
+        assert!(long_delete.contains("Dependency links"));
+        assert!(long_delete.contains("No cascade"));
+        assert!(long_delete.contains("[y] Delete"));
+        assert!(long_delete.contains("…"));
+        a.notice = Some("permission denied".into());
+        let error_delete = draw((80, 24), &mut a).0;
+        assert!(error_delete.contains("Delete error"));
+        assert!(error_delete.contains("permission denied"));
+        assert!(error_delete.contains("[y] Delete"));
+    }
+    #[test]
+    fn wrapping_and_caret_share_unicode_line_map() {
+        let (s, x, y) = wrapped_description("abcdefghij\nxy", 12, 4);
+        assert_eq!(s, "abcd\nefgh\nij\nxy");
+        assert_eq!((x, y), (1, 3));
+        let (s, x, y) = wrapped_description("abc\n", 3, 3);
+        assert_eq!(s, "abc\n");
+        assert_eq!((x, y), (0, 1));
+        let (_, x, y) = wrapped_description("abc\n", 4, 3);
+        assert_eq!((x, y), (0, 1));
+        let (s, x, y) = wrapped_description("ab界x", 5, 3);
+        assert_eq!(s, "ab\n界x");
+        assert_eq!((x, y), (2, 1));
+        let (_, x, y) = wrapped_description("ab界x", 6, 3);
+        assert_eq!((x, y), (0, 2));
+        let (_, x, y) = wrapped_description("one\ntwo\nthree\nfour", 19, 5);
+        let scroll = y.saturating_sub(2);
+        assert_eq!(y - scroll, 2);
+        assert!(x < 5);
+    }
+    #[test]
+    fn wide_title_horizontal_scroll_starts_at_character_boundary() {
+        let title = "界".repeat(40);
+        let caret = Span::raw(title.as_str()).width();
+        let desired = caret.saturating_sub(9);
+        let (window, start) = display_window(&title, desired, 10);
+        assert_eq!(start % 2, 0);
+        assert!(Span::raw(window.as_str()).width() <= 10);
+        assert!(caret - start < 10);
+        let (_, start) = display_window("a界b", 2, 3);
+        assert_eq!(start, 3);
     }
 }
