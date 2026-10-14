@@ -117,6 +117,13 @@ fn themed_type_color(kind: &str, theme: Theme) -> Color {
         color
     }
 }
+fn settings_hint(dropdown_open: bool) -> &'static str {
+    if dropdown_open {
+        "← / → or ↑ / ↓ choose · Enter keep · Esc revert · Tab / Shift+Tab actions"
+    } else {
+        "Tab / Shift+Tab focus · Enter / Space open · ← / → preview · Enter activate · Esc cancel"
+    }
+}
 fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
     let type_width = beads
         .iter()
@@ -514,11 +521,21 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             _ => None,
         };
         let height = match modal {
-            crate::app::Modal::Settings { error, .. } => {
-                8 + error
+            crate::app::Modal::Settings {
+                error,
+                dropdown_open,
+                ..
+            } => {
+                let error_lines = error
                     .as_deref()
                     .map(|message| wrap_words(message, width.saturating_sub(4) as usize).len())
-                    .unwrap_or(0) as u16
+                    .unwrap_or(0);
+                let hint_lines = wrap_words(
+                    settings_hint(*dropdown_open),
+                    width.saturating_sub(4) as usize,
+                )
+                .len();
+                ((if *dropdown_open { 7 } else { 5 } + error_lines + hint_lines) + 2) as u16
             }
             crate::app::Modal::Create(form) => {
                 if form.dropdown.is_some() {
@@ -585,44 +602,70 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             area.height.saturating_sub(2),
         );
         match modal {
-            crate::app::Modal::Settings { draft, error } => {
-                let choices = Theme::ALL;
+            crate::app::Modal::Settings {
+                draft,
+                error,
+                dropdown_open,
+                focus,
+                ..
+            } => {
                 let mut lines = vec![
                     Line::from("Choose the workspace appearance"),
                     Line::from(""),
-                    Line::from(
-                        choices
-                            .into_iter()
-                            .map(|theme| {
-                                let selected = *draft == theme;
-                                Span::styled(
-                                    format!(
-                                        " {} {} ",
-                                        if selected { "›" } else { " " },
-                                        theme.label()
-                                    ),
-                                    if selected {
-                                        Style::default()
-                                            .fg(bg)
-                                            .bg(teal)
-                                            .add_modifier(Modifier::BOLD)
-                                    } else {
-                                        Style::default().fg(ink)
-                                    },
-                                )
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                    Line::from(""),
-                    Line::from(vec![
-                        Span::styled(
-                            "[ Save ]",
-                            Style::default().fg(teal).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw("   "),
-                        Span::styled("[ Cancel ]", Style::default().fg(gold)),
-                    ]),
+                    Line::from(Span::styled(
+                        format!("Theme  [ {}  ▾ ]", draft.label()),
+                        if *focus == 0 {
+                            Style::default()
+                                .fg(bg)
+                                .bg(teal)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(teal).add_modifier(Modifier::BOLD)
+                        },
+                    )),
                 ];
+                if *dropdown_open {
+                    for theme in Theme::ALL {
+                        let selected = *draft == theme;
+                        lines.push(Line::from(Span::styled(
+                            format!("  {} {}", if selected { "›" } else { " " }, theme.label()),
+                            if selected {
+                                Style::default()
+                                    .fg(bg)
+                                    .bg(teal)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(ink)
+                            },
+                        )));
+                    }
+                }
+                lines.push(Line::from(""));
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "[ Save ]",
+                        if *focus == 1 {
+                            Style::default()
+                                .fg(bg)
+                                .bg(teal)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(teal).add_modifier(Modifier::BOLD)
+                        },
+                    ),
+                    Span::raw("   "),
+                    Span::styled(
+                        "[ Cancel ]",
+                        if *focus == 2 {
+                            Style::default()
+                                .fg(bg)
+                                .bg(gold)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(gold)
+                        },
+                    ),
+                ]));
                 if let Some(error) = error {
                     lines.extend(
                         wrap_words(error, inner.width as usize)
@@ -630,9 +673,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             .map(|line| Line::from(Span::styled(line, Style::default().fg(gold)))),
                     );
                 }
-                lines.push(
-                    Line::from("↑ / ↓ preview · Enter Save · Esc Cancel")
-                        .style(Style::default().fg(muted)),
+                lines.extend(
+                    wrap_words(settings_hint(*dropdown_open), inner.width as usize)
+                        .into_iter()
+                        .map(|line| Line::from(line).style(Style::default().fg(muted))),
                 );
                 f.render_widget(
                     Paragraph::new(lines)
@@ -1598,6 +1642,9 @@ mod tests {
         a.modal = Some(crate::app::Modal::Settings {
             draft: crate::settings::Theme::Light,
             error: Some(storage_error.into()),
+            dropdown_open: true,
+            dropdown_original: Some(Theme::Dark),
+            focus: 0,
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
@@ -1617,15 +1664,30 @@ mod tests {
         assert!(text.contains("settings.json"));
         assert!(text.contains("Permission") && text.contains("denied"));
         assert!(text.contains("try again"));
-        assert!(text.contains("preview"));
-        assert!(text.contains("Enter Save"));
-        assert!(text.contains("Esc Cancel"));
+        assert!(text.contains("choose"));
+        assert!(text.contains("Dark"));
+        assert!(text.contains("Enter keep"));
+        assert!(text.contains("Esc revert"));
         assert!(a.modal_ready);
         assert_eq!(buffer[(0, 3)].bg, Color::Rgb(246, 248, 247));
         assert!(a.modal_ready);
+        a.theme = Theme::Dark;
         a.modal = Some(crate::app::Modal::Settings {
             draft: crate::settings::Theme::Dark,
             error: None,
+            dropdown_open: false,
+            dropdown_original: None,
+            focus: 0,
+        });
+        let closed = draw((80, 24), &mut a).0;
+        assert!(closed.contains("Dark"));
+        assert!(closed.contains("Enter / Space open"));
+        a.modal = Some(crate::app::Modal::Settings {
+            draft: Theme::Light,
+            error: None,
+            dropdown_open: true,
+            dropdown_original: Some(Theme::Dark),
+            focus: 0,
         });
         assert!(draw((18, 5), &mut a).0.contains("Resize"));
         assert!(!a.modal_ready);

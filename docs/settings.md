@@ -24,10 +24,14 @@ non-object JSON, unknown themes, and non-string theme values are errors.
 
 ## Changing the theme
 
-Press `s` to open settings. Use the arrow keys to choose and preview a draft
-theme. `Enter` saves and commits the selection only after the write succeeds;
-`Esc` cancels and restores the previously saved theme. A failed save leaves the
-popup open with an error and does not change the saved selection.
+Press `s` to open settings. The Theme dropdown starts focused. `Enter` or `Space`
+opens it; Left / Right changes the choice and previews it immediately. `Enter`
+keeps the current preview and closes the dropdown. `Esc` while the dropdown is
+open restores the choice from when it opened; `Esc` again cancels Settings and
+restores the saved theme. Use `Tab` / `Shift+Tab` to focus Save or Cancel, then
+press `Enter` to activate that button. A save commits only after the write
+succeeds. A failed save leaves the popup open with an error and does not change
+the saved selection.
 
 ## Recovery and failure policy
 

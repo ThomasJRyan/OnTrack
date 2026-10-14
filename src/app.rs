@@ -63,8 +63,17 @@ pub struct App {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     Create(CreateForm),
-    ConfirmDelete { id: String, title: String },
-    Settings { draft: Theme, error: Option<String> },
+    ConfirmDelete {
+        id: String,
+        title: String,
+    },
+    Settings {
+        draft: Theme,
+        error: Option<String>,
+        dropdown_open: bool,
+        dropdown_original: Option<Theme>,
+        focus: usize,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateForm {
@@ -516,6 +525,9 @@ impl App {
                 self.modal = Some(Modal::Settings {
                     draft: self.settings.theme,
                     error: load_error,
+                    dropdown_open: false,
+                    dropdown_original: None,
+                    focus: 0,
                 });
                 self.modal_ready = false;
             }
@@ -577,9 +589,23 @@ impl App {
             return false;
         }
         if key.code == Esc {
-            if matches!(&self.modal, Some(Modal::Settings { .. })) {
-                self.theme = self.settings.theme;
-                self.modal = None;
+            if let Some(Modal::Settings {
+                draft,
+                dropdown_original,
+                dropdown_open,
+                error,
+                ..
+            }) = self.modal.as_mut()
+            {
+                if *dropdown_open {
+                    *draft = dropdown_original.take().unwrap_or(self.settings.theme);
+                    self.theme = *draft;
+                    *dropdown_open = false;
+                    *error = None;
+                } else {
+                    self.theme = self.settings.theme;
+                    self.modal = None;
+                }
                 return false;
             }
             if let Some(Modal::Create(form)) = self.modal.as_mut()
@@ -596,37 +622,55 @@ impl App {
             self.modal = None;
             return false;
         }
-        if let Some(Modal::Settings { draft, error }) = self.modal.as_mut() {
-            match key.code {
-                Up | Left => {
-                    *draft = Theme::Dark;
-                    *error = None;
-                    self.theme = *draft;
-                }
-                Down | Right => {
-                    *draft = Theme::Light;
-                    *error = None;
-                    self.theme = *draft;
-                }
-                Enter => {
-                    let Some(path) = self.settings_path.as_ref() else {
-                        *error = Some("Settings location is unavailable; cannot save.".into());
-                        return false;
-                    };
-                    let proposed = Settings { theme: *draft };
-                    match settings::save_to(path, &proposed) {
-                        Ok(()) => {
-                            let saved_theme = proposed.theme;
-                            self.settings = proposed;
-                            self.theme = saved_theme;
-                            self.settings_load_error = None;
-                            self.modal = None;
-                            self.notice = Some(format!("{} theme saved", saved_theme.label()));
-                        }
-                        Err(e) => *error = Some(format!("Could not save settings: {e}")),
+        if matches!(self.modal, Some(Modal::Settings { .. })) {
+            let mut save_theme = None;
+            if let Some(Modal::Settings {
+                draft,
+                error,
+                dropdown_open,
+                dropdown_original,
+                focus,
+            }) = self.modal.as_mut()
+            {
+                match key.code {
+                    Tab | BackTab => {
+                        *dropdown_open = false;
+                        *dropdown_original = None;
+                        *focus = if key.code == Tab {
+                            (*focus + 1) % 3
+                        } else {
+                            (*focus + 2) % 3
+                        };
                     }
+                    Left | Up if *focus == 0 => {
+                        *draft = Theme::Dark;
+                        *error = None;
+                        self.theme = *draft;
+                    }
+                    Right | Down if *focus == 0 => {
+                        *draft = Theme::Light;
+                        *error = None;
+                        self.theme = *draft;
+                    }
+                    Enter | Char(' ') if *focus == 0 => {
+                        if *dropdown_open {
+                            *dropdown_open = false;
+                            *dropdown_original = None;
+                        } else {
+                            *dropdown_open = true;
+                            *dropdown_original = Some(*draft);
+                        }
+                    }
+                    Enter | Char(' ') if *focus == 1 => save_theme = Some(*draft),
+                    Enter | Char(' ') if *focus == 2 => {
+                        self.theme = self.settings.theme;
+                        self.modal = None;
+                    }
+                    _ => {}
                 }
-                _ => {}
+            }
+            if let Some(theme) = save_theme {
+                self.save_settings(theme);
             }
             return false;
         }
@@ -827,6 +871,28 @@ impl App {
             _ => {}
         }
         false
+    }
+    fn save_settings(&mut self, theme: Theme) {
+        let proposed = Settings { theme };
+        let result = self
+            .settings_path
+            .as_deref()
+            .ok_or_else(|| "Settings location is unavailable; cannot save.".to_owned())
+            .and_then(|path| settings::save_to(path, &proposed).map_err(|error| error.to_string()));
+        match result {
+            Ok(()) => {
+                self.settings = proposed;
+                self.theme = theme;
+                self.settings_load_error = None;
+                self.modal = None;
+                self.notice = Some(format!("{} theme saved", theme.label()));
+            }
+            Err(error) => {
+                if let Some(Modal::Settings { error: message, .. }) = self.modal.as_mut() {
+                    *message = Some(format!("Could not save settings: {error}"));
+                }
+            }
+        }
     }
     fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
         if self.modal.is_some() {
@@ -1515,13 +1581,61 @@ mod tests {
         );
         assert!(!a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
         assert!(matches!(a.modal, Some(Modal::Settings { .. })));
-        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Char(' '));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: true,
+                ..
+            })
+        ));
+        press(&mut a, KeyCode::Right);
         assert_eq!(a.theme, Theme::Light, "draft choice previews immediately");
+        press(&mut a, KeyCode::Left);
+        assert_eq!(a.theme, Theme::Dark, "left returns to the first choice");
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.theme, Theme::Light, "right selects the second choice");
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            a.theme,
+            Theme::Light,
+            "Enter keeps and closes the dropdown choice"
+        );
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Left);
+        press(&mut a, KeyCode::Esc);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            a.theme,
+            Theme::Light,
+            "closing the dropdown reverts its latest preview"
+        );
         press(&mut a, KeyCode::Esc);
         assert_eq!(a.theme, Theme::Dark, "cancel restores the applied theme");
         assert_eq!(a.settings.theme, Theme::Dark);
         press(&mut a, KeyCode::Char('s'));
-        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Tab);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 2, .. })));
+        press(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none(), "focused Cancel closes without saving");
+        assert_eq!(a.theme, Theme::Dark);
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Enter);
         assert!(a.modal.is_none());
         assert_eq!(a.settings.theme, Theme::Light);
@@ -2271,6 +2385,7 @@ mod tests {
 
         press(&mut a, KeyCode::Char('s'));
         press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Enter);
         assert!(a.modal.is_none());
         assert_eq!(a.settings.theme, Theme::Light);
@@ -2282,6 +2397,7 @@ mod tests {
         a.settings_path = Some(blocker.join("settings.json"));
         press(&mut a, KeyCode::Char('s'));
         press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Enter);
         assert_eq!(
             a.settings.theme,
