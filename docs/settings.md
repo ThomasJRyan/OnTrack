@@ -68,14 +68,20 @@ non-object JSON, unknown themes, and non-string theme values are errors.
 ## Changing the theme
 
 Press `s` to open Settings. `Up` / `Down` moves among Theme, automatic merge,
-workspace close, checkout removal, and Close. `Left` / `Right` cycles themes
+workspace close, checkout removal, and Close.
+The dialog places setting titles in a wider, left-aligned column and centers
+theme and cleanup controls in the right column. The theme list opens beneath
+its value; on narrow supported terminals, long titles and values may be
+shortened with an ellipsis.
+
+`Left` / `Right` cycles themes
 with wraparound and immediately saves the new choice, whether the list is open
 or closed. The bounded list scrolls to keep the current choice visible. `Enter`
 or `Space` opens the list; while it is open, either key saves the selected theme
 again and closes the list, which also lets you retry a failed save. `Esc` closes
 an open list without reverting a successful change; `Esc` again closes Settings.
 `Enter` / `Space` toggles a cleanup preference. Every change saves all settings
-together. The removal preference is labeled “Remove checkout after integration”;
+together. The removal preference is labeled “Remove checkout + close Herdr workspace”;
 removing the checkout also closes its Herdr workspace. Cleanup remains
 subject to backend integration checks and cannot force-remove a checkout.
 Use `Tab` / `Shift+Tab` to move focus; Close exits the dialog.

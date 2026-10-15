@@ -3165,6 +3165,48 @@ mod tests {
         }
     }
     #[test]
+    fn escape_navigates_back_without_quitting() {
+        let mut a = app();
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!a.worktrees_view);
+        assert!(a.modal.is_none());
+
+        a.worktrees_view = true;
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!a.worktrees_view);
+
+        a.modal = Some(Modal::Settings {
+            draft: a.settings,
+            error: None,
+            dropdown_open: true,
+            focus: 0,
+        });
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: false,
+                ..
+            })
+        ));
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(a.modal.is_none());
+
+        a.modal = Some(Modal::ConfirmDelete {
+            id: "b0".into(),
+            title: "issue 0".into(),
+        });
+        a.mutation_busy = true;
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(a.modal.is_some());
+        a.mutation_busy = false;
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(a.modal.is_none());
+
+        assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
+    #[test]
     fn create_submits_payload_once_and_locks_until_error_then_preserves_form() {
         let mut a = app();
         let (tx, rx) = mpsc::channel();

@@ -27,6 +27,10 @@ Choice controls use the shared `cycle_choice` helper for Left / Right navigation
 The new-bead Description field uses `wrapped_description` to insert visual line breaks before whole words and map its byte cursor to display cells; words wider than the field still wrap by character. It preserves explicit newlines and the stored text. While Description has focus, Shift+Enter inserts a newline and plain Enter focuses Create without submitting. Terminal setup enables Crossterm's keyboard enhancement protocol so supported terminals can distinguish modified Enter; restoration pops that mode on normal exit, initialization failure, and panic. Terminals without modified-key reporting cannot distinguish Shift+Enter from Enter.
 
 The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
+Settings rows in `src/ui.rs` share a two-thirds title column and one-third
+value column. `settings_row` aligns titles to the left and centers controls
+by terminal cell width; keep dropdown entries on the same value boundary and
+retain the existing compact-terminal fallback when changing this layout.
 
 ## Beads CLI contract
 
@@ -103,6 +107,8 @@ Run interactive checks in a real terminal or a PTY, not an ordinary non-interact
 ## Tests and required checks
 
 Tests are inline in the source modules. They cover CLI arguments and parsing, form input and mutation state, navigation and focus, mouse selection, cached/stale detail behavior, quit-key recognition, and rendering using ratatui's `TestBackend`.
+
+Escape is navigation, not a quit key. The app handles dialogs first, then explicit quit keys (`q` and `Ctrl+C`), then the outstanding-worktrees view, and finally the main browser. An open choice list consumes Escape before its dialog does; the main browser consumes Escape without leaving the app. The mutation-busy guard blocks all keys until the operation completes.
 
 For automatic refresh, check external list/detail changes without manual input, completion-based scheduling without a request backlog, cached-data retention and recovery after transient errors, and preservation of selection, collapsed groups, focus, scrolling, and form input. Keep immediate refresh after mutations and stale-detail response filtering covered too.
 
