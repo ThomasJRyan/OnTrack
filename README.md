@@ -2,7 +2,15 @@
 
 A terminal browser for Beads issues in the current workspace.
 
-Versioned Linux and macOS binaries are published from Git tags; see [releases](docs/releases.md) for supported platforms, checksums, and installation.
+## Quick install
+
+Install [Beads (`bd`)](https://beads.gascity.com/) and [Herdr](https://herdr.dev/docs/install/) first, and make sure both commands are on `PATH`. On macOS or Ubuntu 24.04-compatible Linux, with Bash, `curl`, and Python 3 installed, run this when a compatible stable release is available:
+
+```sh
+curl -fsSLo install-ontrack.sh https://raw.githubusercontent.com/ThomasJRyan/OnTrack/main/scripts/install.sh && bash install-ontrack.sh
+```
+
+The installer puts `ontrack` in `~/.local/bin` by default. Add that directory to `PATH` if needed, then run `ontrack` from the Git workspace you want to browse. See the [installation guide](docs/installation.md) for supported architectures, updates, and troubleshooting.
 
 - Browse open and closed Beads, with explicit create, edit, and permanent-delete actions.
 - Mark open Tasks Ready, or mark an Epic and all its open descendant Tasks Ready together. Press `r` again to unready an unsent Task; sent Tasks stay Ready until their Beads status becomes In Progress. The scheduler prepares a Ready Epic's checkout and hands eligible child Tasks to Herdr agents. Set a concurrent agent limit in Settings (five by default).
