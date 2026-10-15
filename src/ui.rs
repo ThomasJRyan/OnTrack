@@ -1370,7 +1370,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 let harness_name = if form.harness == 0 {
                     "Unassigned"
                 } else {
-                    crate::beads::HARNESSES[form.harness - 1]
+                    &form.harnesses[form.harness - 1]
                 };
                 let harness_border = if form.focus == 6 || form.dropdown == Some(6) {
                     teal
@@ -1386,7 +1386,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 );
                 if form.dropdown == Some(6) {
                     let options = std::iter::once("Unassigned")
-                        .chain(crate::beads::HARNESSES.iter().copied())
+                        .chain(form.harnesses.iter().map(String::as_str))
                         .collect::<Vec<_>>();
                     let count = harness_area.height.saturating_sub(2) as usize;
                     let start = form.harness.saturating_sub(count.saturating_sub(1));
@@ -1414,7 +1414,16 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     }
                 } else {
                     f.render_widget(
-                        Paragraph::new(harness_name).style(Style::default().fg(ink)),
+                        Paragraph::new(if form.harness_loading {
+                            "Checking Herdr integrations…"
+                        } else if form.harness_error.is_some() {
+                            "Unassigned · Herdr unavailable"
+                        } else if form.harnesses.is_empty() && !editing {
+                            "Unassigned · no current integrations"
+                        } else {
+                            harness_name
+                        })
+                        .style(Style::default().fg(ink)),
                         Rect::new(
                             harness_area.x + 1,
                             harness_area.y + 1,
@@ -1519,7 +1528,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "Creating… · form locked until the command finishes"
                     })
                 } else {
-                    app.notice.as_deref()
+                    app.notice.as_deref().or(form.harness_error.as_deref())
                 };
                 let feedback = truncate_display(
                     feedback.unwrap_or(
@@ -1529,7 +1538,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 );
                 f.render_widget(
                     Paragraph::new(feedback).style(Style::default().fg(
-                        if app.notice.is_some() || app.mutation_busy {
+                        if app.notice.is_some() || form.harness_error.is_some() || app.mutation_busy
+                        {
                             gold
                         } else {
                             muted
@@ -2081,6 +2091,7 @@ mod tests {
             detail_error: None,
             detail_seq: 0,
             edit_seq: 0,
+            harness_seq: 0,
             launch_seq: 0,
             handoff: None,
             toast: None,
@@ -2735,6 +2746,37 @@ mod tests {
             form,
         });
         assert!(!draw((100, 30), &mut app).0.contains("Generate child tasks"));
+    }
+    #[test]
+    fn create_harness_picker_shows_only_discovered_kinds_and_discovery_states() {
+        let mut app = app();
+        app.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
+            harnesses: vec!["opencode".into()],
+            harness: 1,
+            focus: 6,
+            dropdown: Some(6),
+            ..Default::default()
+        }));
+        let choices = draw((100, 30), &mut app).0;
+        assert!(choices.contains("opencode"));
+        assert!(choices.contains("Unassigned"));
+        assert!(!choices.contains("claude"));
+        app.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
+            harness_loading: true,
+            ..Default::default()
+        }));
+        assert!(
+            draw((100, 30), &mut app)
+                .0
+                .contains("Checking Herdr integrations")
+        );
+        app.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
+            harness_error: Some("Herdr integration discovery failed: offline".into()),
+            ..Default::default()
+        }));
+        let failed = draw((100, 30), &mut app).0;
+        assert!(failed.contains("Herdr unavailable"));
+        assert!(failed.contains("offline"));
     }
 
     #[test]

@@ -203,6 +203,34 @@ pub fn discover() -> io::Result<LaunchContext> {
         .into())
 }
 
+/// Current Herdr integrations that OnTrack can store as task harness labels.
+/// This does not require a workspace mapping, so the create form works from a
+/// linked checkout or outside a Herdr shell.
+pub fn installed_harnesses() -> io::Result<Vec<String>> {
+    installed_harnesses_with(&mut SystemExecutor)
+}
+
+fn installed_harnesses_with(executor: &mut impl Executor) -> io::Result<Vec<String>> {
+    let help = executor
+        .run(&["agent", "start", "--help"])
+        .map_err(|error| stage("supported agent discovery", error))?;
+    let supported =
+        supported_agents(&help).map_err(|error| stage("supported agent discovery", error))?;
+    let status = executor
+        .run(&["integration", "status"])
+        .map_err(|error| stage("integration discovery", error))?;
+    let available = match available_agents(&status, &supported) {
+        Ok(agents) => agents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(stage("integration discovery", error)),
+    };
+    Ok(crate::beads::HARNESSES
+        .iter()
+        .filter(|kind| available.iter().any(|agent| agent == **kind))
+        .map(|kind| (*kind).to_owned())
+        .collect())
+}
+
 pub fn launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result<LaunchOutcome> {
     launch_mode(context, agent, bead, false)
 }
@@ -1522,6 +1550,26 @@ mod tests {
         assert_eq!(executor.calls[2], ["integration", "status"]);
         assert!(executor.mutations().is_empty());
         assert!(executor.outputs.is_empty());
+    }
+
+    #[test]
+    fn create_form_discovery_uses_current_supported_integrations_without_workspace() {
+        let mut executor = FakeExecutor::default();
+        executor.outputs.push_back(Ok(HELP.as_bytes().to_vec()));
+        executor.outputs.push_back(Ok(STATUS.as_bytes().to_vec()));
+        assert_eq!(
+            installed_harnesses_with(&mut executor).unwrap(),
+            ["codex", "opencode", "hermes"]
+        );
+        assert_eq!(executor.calls[0], ["agent", "start", "--help"]);
+        assert_eq!(executor.calls[1], ["integration", "status"]);
+
+        let mut empty = FakeExecutor::default();
+        empty.outputs.push_back(Ok(HELP.as_bytes().to_vec()));
+        empty
+            .outputs
+            .push_back(Ok(b"codex: not installed (/hook)".to_vec()));
+        assert!(installed_harnesses_with(&mut empty).unwrap().is_empty());
     }
 
     #[test]

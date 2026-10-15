@@ -43,7 +43,7 @@ retain the existing compact-terminal fallback when changing this layout.
 
 ### Ready and agent harness labels
 
-OnTrack uses `ontrack:ready` and `ontrack:agent:KIND` labels instead of adding Beads statuses. `beads::is_ready` requires a task whose actual Beads status is `open`; the UI groups it under Ready through `app::display_status`. Creation writes a supported harness label with `--labels`, editing changes only that label when the choice changes, and `Shift+R` adds or removes Ready using a guarded `bd update`. All values are passed as separate `Command` arguments. The current harness choices mirror Herdr's supported `agent start --kind` kinds; live discovery still decides whether a chosen kind is available.
+OnTrack uses `ontrack:ready` and `ontrack:agent:KIND` labels instead of adding Beads statuses. `beads::is_ready` requires a task whose actual Beads status is `open`; the UI groups it under Ready through `app::display_status`. Creation writes a supported harness label with `--labels`, editing changes only that label when the choice changes, and `Shift+R` adds or removes Ready using a guarded `bd update`. All values are passed as separate `Command` arguments. When a create form opens, the background worker calls `herdr agent start --help` and `herdr integration status`, then intersects supported kinds, current integrations, and OnTrack's known harness labels. This check does not require Herdr workspace mapping. The form starts with Unassigned while discovery runs and blocks task submission until it finishes. Empty or failed discovery leaves Unassigned as the only choice, with an error shown for failures. Responses carry a form sequence so late results cannot change a reopened form. Existing edit forms keep their stored choice and the full known-kind list; launch discovery still validates availability before handoff.
 
 `App::poll_scheduler` runs after responses and worktree polling in the terminal loop. It waits for a successful managed-worktree scan before dispatch, selects by priority and ID, and handles one handoff at a time. It remembers attempted IDs in the running process and skips all journaled handoffs, including uncertain ones. A prepared parent can resume only after its open descendants and pending child worktrees clear. A successful agent launch removes Ready through the same background worker; a merely prepared parent retains it. On failure, the Ready marker remains for explicit retry. If the worktree scan fails, dispatch pauses. Herdr's launch journal remains the durable duplicate guard across app restarts and concurrent processes.
 
@@ -241,11 +241,20 @@ status renders as `READY TO MERGE` in both worktree panes. New handoff prompts
 ask agents to close the Bead only after checked and committed work; unfinished
 work must keep its Bead open or in progress.
 The display check makes read-only Beads and Herdr calls during worktree refresh;
-it does not change merge, finalization, or cleanup gates. In particular, a
-legacy launch without a recorded session cannot trigger automatic merge, even
-when the display says `READY TO MERGE`. Explicit manual merge
-confirmation remains available for `InProgress` rows and is still subject to
-the existing Git and agent checks.
+it does not change merge, finalization, or cleanup gates. A legacy launch without
+a recorded session can show `READY TO MERGE` from weaker display evidence.
+Automatic reconciliation separately requires a later native session on the same
+recorded terminal and persists it before acting. Without that evidence, automatic
+merge remains deferred. Explicit manual merge confirmation remains available
+for `InProgress` rows and is still subject to the existing Git and agent checks.
+The launch journal records `state_change_seq` and `terminal_id` from the
+pre-prompt `agent get` response even when `agent_session` has not appeared yet.
+Reconciliation can recover those observations from the retained `ready`
+response in older entries. A later native session is bound and persisted only
+after the same pane, workspace, agent kind, terminal, checkout, and post-prompt
+activity pass the settled-agent check. Subsequent merge and cleanup passes
+require that exact session. Missing or changed evidence leaves the worktree
+visible; no automatic action is dispatched.
 `inspect_for_display` only changes a `NeedsResolution` merge-request row to
 `MergeRequested` when a read-only Herdr `agent get` response reports `working`
 for the recorded pane, workspace, and agent kind, with the recorded session

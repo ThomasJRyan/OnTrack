@@ -30,6 +30,7 @@ pub(super) enum Request {
     Update(UpdateBead),
     SetReady(String, bool),
     Delete(String),
+    DiscoverHarnesses(u64),
     Discover(u64),
     Launch(u64, LaunchContext, Agent, Bead),
     LaunchReady(u64, LaunchContext, Agent, Bead),
@@ -49,6 +50,7 @@ pub(super) enum Response {
     Updated(String, std::io::Result<()>),
     ReadySet(String, bool, std::io::Result<()>),
     Deleted(std::io::Result<()>),
+    HarnessesDiscovered(u64, std::io::Result<Vec<String>>),
     Discovered(u64, std::io::Result<LaunchContext>),
     Launched(u64, std::io::Result<LaunchOutcome>),
     Worktrees(std::io::Result<Vec<ManagedWorktree>>),
@@ -76,6 +78,7 @@ pub struct App {
     pub detail_error: Option<String>,
     pub(super) detail_seq: u64,
     pub(super) edit_seq: u64,
+    pub(super) harness_seq: u64,
     pub(super) launch_seq: u64,
     pub(super) handoff: Option<PendingHandoff>,
     pub toast: Option<Toast>,
@@ -182,6 +185,10 @@ pub struct CreateForm {
     pub issue_type: usize,
     pub priority: usize,
     pub harness: usize,
+    pub harnesses: Vec<String>,
+    pub harness_loading: bool,
+    pub harness_error: Option<String>,
+    pub harness_seq: u64,
     pub previous_harness: Option<String>,
     pub generate_children: bool,
     pub focus: usize,
@@ -199,7 +206,11 @@ impl Default for CreateForm {
             description: String::new(),
             issue_type: 0,
             priority: 2,
-            harness: 3,
+            harness: 0,
+            harnesses: Vec::new(),
+            harness_loading: false,
+            harness_error: None,
+            harness_seq: 0,
             previous_harness: None,
             generate_children: false,
             focus: 0,
@@ -209,6 +220,24 @@ impl Default for CreateForm {
             dropdown: None,
             dropdown_original: None,
         }
+    }
+}
+
+impl CreateForm {
+    fn set_harnesses(&mut self, harnesses: Vec<String>) {
+        self.harnesses = harnesses;
+        self.harness = self
+            .harnesses
+            .iter()
+            .position(|kind| kind == "codex")
+            .map_or_else(
+                || usize::from(!self.harnesses.is_empty()),
+                |index| index + 1,
+            );
+        self.harness_loading = false;
+        self.harness_error = None;
+        self.dropdown = None;
+        self.dropdown_original = None;
     }
 }
 
@@ -243,6 +272,10 @@ fn edit_form(record: &serde_json::Value) -> Result<CreateForm, String> {
         harness: beads::harness(record)
             .and_then(|kind| beads::HARNESSES.iter().position(|known| *known == kind))
             .map_or(0, |index| index + 1),
+        harnesses: beads::HARNESSES
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect(),
         previous_harness: beads::harness(record).map(str::to_owned),
         ..Default::default()
     })
@@ -335,6 +368,9 @@ impl App {
                         Response::ReadySet(id.clone(), ready, beads::set_ready(&id, ready))
                     }
                     Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
+                    Request::DiscoverHarnesses(seq) => {
+                        Response::HarnessesDiscovered(seq, crate::herdr::installed_harnesses())
+                    }
                     Request::Discover(seq) => Response::Discovered(seq, crate::herdr::discover()),
                     Request::Launch(seq, context, agent, bead) => {
                         Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
@@ -393,6 +429,7 @@ impl App {
             detail_error: None,
             detail_seq: 0,
             edit_seq: 0,
+            harness_seq: 0,
             launch_seq: 0,
             handoff: None,
             toast: None,
@@ -945,6 +982,25 @@ impl App {
                         Err(e) => self.notice = Some(format!("Delete failed: {e}")),
                     }
                 }
+                Response::HarnessesDiscovered(seq, result) => {
+                    if let Some(Modal::Create(form)) = self.modal.as_mut()
+                        && form.harness_seq == seq
+                    {
+                        match result {
+                            Ok(harnesses) => form.set_harnesses(harnesses),
+                            Err(error) => {
+                                form.set_harnesses(Vec::new());
+                                form.harness_error =
+                                    Some(format!("Herdr integration discovery failed: {error}"));
+                            }
+                        }
+                        if self.notice.as_deref().is_some_and(|message| {
+                            message.starts_with("Checking Herdr integrations;")
+                        }) {
+                            self.notice = None;
+                        }
+                    }
+                }
                 Response::Discovered(seq, result) => {
                     if let Some(pending) = self
                         .handoff
@@ -1298,12 +1354,23 @@ impl App {
                 } else {
                     None
                 };
+                self.harness_seq = self.harness_seq.wrapping_add(1);
+                let seq = self.harness_seq;
                 self.modal = Some(Modal::Create(CreateForm {
                     parent_id,
+                    harness_loading: true,
+                    harness_seq: seq,
                     ..CreateForm::default()
                 }));
                 self.modal_ready = false;
                 self.notice = None;
+                if self.requests.send(Request::DiscoverHarnesses(seq)).is_err()
+                    && let Some(Modal::Create(form)) = self.modal.as_mut()
+                {
+                    form.harness_loading = false;
+                    form.harness_error =
+                        Some("Herdr integration discovery could not be queued".into());
+                }
             }
             KeyCode::Char('e') => {
                 if let Some(b) = self.selected.and_then(|i| self.beads.get(i)) {
@@ -1600,7 +1667,7 @@ impl App {
                     } else if which == 3 {
                         form.priority = (form.priority + 1).min(4)
                     } else {
-                        form.harness = (form.harness + 1).min(beads::HARNESSES.len())
+                        form.harness = (form.harness + 1).min(form.harnesses.len())
                     }
                 }
                 Left | Right => {
@@ -1613,11 +1680,8 @@ impl App {
                     } else if which == 3 {
                         form.priority = cycle_choice(form.priority, 5, key.code == Right);
                     } else {
-                        form.harness = cycle_choice(
-                            form.harness,
-                            beads::HARNESSES.len() + 1,
-                            key.code == Right,
-                        );
+                        form.harness =
+                            cycle_choice(form.harness, form.harnesses.len() + 1, key.code == Right);
                     }
                 }
                 Enter | Char(' ') => {
@@ -1677,10 +1741,18 @@ impl App {
             }
             Left | Right if form.focus == 6 => {
                 form.harness =
-                    cycle_choice(form.harness, beads::HARNESSES.len() + 1, key.code == Right);
+                    cycle_choice(form.harness, form.harnesses.len() + 1, key.code == Right);
             }
             Enter if form.focus == 4 => {
                 if !form.title.trim().is_empty() {
+                    if edit_id.is_none()
+                        && form.harness_loading
+                        && beads::BEAD_TYPES[form.issue_type] == "task"
+                    {
+                        self.notice =
+                            Some("Checking Herdr integrations; wait before creating a task".into());
+                        return false;
+                    }
                     if edit_id.is_none()
                         && form.generate_children
                         && beads::BEAD_TYPES[form.issue_type] == "epic"
@@ -1698,7 +1770,7 @@ impl App {
                         harness: if beads::BEAD_TYPES[form.issue_type] == "task" {
                             form.harness
                                 .checked_sub(1)
-                                .map(|index| beads::HARNESSES[index].to_owned())
+                                .map(|index| form.harnesses[index].clone())
                         } else {
                             None
                         },
@@ -2171,6 +2243,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         app.requests = tx;
         app.key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+        let seq = take_harness_discovery(&rx);
+        supply_harnesses(&mut app, seq, &["codex"]);
         assert!(
             matches!(&app.modal, Some(Modal::Create(form)) if form.parent_id.as_deref() == Some("b0"))
         );
@@ -2246,6 +2320,7 @@ mod tests {
             detail_error: None,
             detail_seq: 0,
             edit_seq: 0,
+            harness_seq: 0,
             launch_seq: 0,
             handoff: None,
             toast: None,
@@ -2693,6 +2768,108 @@ mod tests {
             }
             _ => panic!("missing show for {expected_id}"),
         }
+    }
+    fn take_harness_discovery(rx: &mpsc::Receiver<Request>) -> u64 {
+        match rx.try_recv() {
+            Ok(Request::DiscoverHarnesses(seq)) => seq,
+            _ => panic!("missing harness discovery"),
+        }
+    }
+    fn supply_harnesses(app: &mut App, seq: u64, kinds: &[&str]) {
+        let (tx, responses) = mpsc::channel();
+        app.responses = responses;
+        tx.send(Response::HarnessesDiscovered(
+            seq,
+            Ok(kinds.iter().map(|kind| (*kind).to_owned()).collect()),
+        ))
+        .unwrap();
+        app.receive();
+    }
+    #[test]
+    fn new_form_uses_only_discovered_harnesses_and_saves_selected_label() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&rx);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert!(form.harnesses.is_empty());
+        assert!(form.harness_loading);
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "New task".into();
+        form.focus = 4;
+        press(&mut a, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        assert!(a.notice.as_deref().unwrap().contains("Checking Herdr"));
+        tx.send(Response::HarnessesDiscovered(
+            seq,
+            Ok(vec!["opencode".into(), "hermes".into()]),
+        ))
+        .unwrap();
+        a.receive();
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.harnesses, ["opencode", "hermes"]);
+        assert_eq!(form.harness, 1);
+        // Right wraps through the installed kinds and Unassigned.
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        form.focus = 0;
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Tab);
+        }
+        press(&mut a, KeyCode::Right);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.harnesses[form.harness - 1], "hermes");
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Right);
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        assert_eq!(form.harness, 1);
+        form.title = "New task".into();
+        form.focus = 4;
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Create(input)) if input.harness.as_deref() == Some("opencode"))
+        );
+    }
+
+    #[test]
+    fn new_form_defaults_to_codex_when_current_and_unassigned_on_failure() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('n'));
+        let first = take_harness_discovery(&rx);
+        tx.send(Response::HarnessesDiscovered(
+            first,
+            Ok(vec!["pi".into(), "codex".into()]),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(&a.modal, Some(Modal::Create(form)) if form.harness == 2));
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('n'));
+        let second = take_harness_discovery(&rx);
+        tx.send(Response::HarnessesDiscovered(
+            first,
+            Ok(vec!["claude".into()]),
+        ))
+        .unwrap();
+        tx.send(Response::HarnessesDiscovered(
+            second,
+            Err(std::io::Error::other("offline")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(
+            matches!(&a.modal, Some(Modal::Create(form)) if form.harness == 0 && form.harnesses.is_empty() && form.harness_error.as_deref().unwrap().contains("offline"))
+        );
     }
     #[test]
     fn startup_and_interval_polling_wait_for_completion_without_queue_growth() {
@@ -3941,6 +4118,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.requests = tx;
         press(&mut a, KeyCode::Char('n'));
+        take_harness_discovery(&rx);
         let Some(Modal::Create(form)) = a.modal.as_mut() else {
             panic!()
         };
@@ -3966,6 +4144,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         b.requests = tx;
         press(&mut b, KeyCode::Char('n'));
+        take_harness_discovery(&rx);
         let Some(Modal::Create(form)) = b.modal.as_mut() else {
             panic!()
         };
@@ -3991,6 +4170,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         empty.requests = tx;
         press(&mut empty, KeyCode::Char('n'));
+        take_harness_discovery(&rx);
         let Some(Modal::Create(form)) = empty.modal.as_mut() else {
             panic!()
         };
@@ -4071,6 +4251,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.requests = tx;
         press(&mut a, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&rx);
+        supply_harnesses(&mut a, seq, &["codex"]);
         for c in "Title".chars() {
             press(&mut a, KeyCode::Char(c));
         }
@@ -4239,6 +4421,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.requests = tx;
         press(&mut a, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&rx);
+        supply_harnesses(&mut a, seq, &["codex"]);
         for c in "q/rn界".chars() {
             press(&mut a, KeyCode::Char(c));
         }
@@ -4274,6 +4458,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.requests = tx;
         press(&mut a, KeyCode::Char('n'));
+        take_harness_discovery(&rx);
         for _ in 0..5 {
             press(&mut a, KeyCode::Tab);
         }
