@@ -20,6 +20,8 @@ pub struct ManagedWorktree {
     pub bead_id: String,
     /// Herdr accepted the initial prompt and the active phase was persisted.
     pub handoff_accepted: bool,
+    pub bead_title: Option<String>,
+    pub bead_description: Option<String>,
     pub branch: String,
     pub target_branch: String,
     pub workspace_id: String,
@@ -353,12 +355,13 @@ pub(crate) struct LaunchJournal {
 impl LaunchJournal {
     pub(crate) fn begin(
         checkout: &Path,
-        bead: &str,
+        bead: &Value,
         branch: &str,
         agent: &str,
         name: &str,
         workspace: &str,
     ) -> io::Result<Self> {
+        let bead_id = field(bead, "id")?;
         let mut registry = Registry::open(checkout)?;
         let target = default_branch(&registry.repo)?;
         clean(&registry.repo.main_root)?;
@@ -384,7 +387,10 @@ impl LaunchJournal {
         let base = tip(&registry.repo.main_root, "HEAD")?;
         let index = registry.entries.len();
         registry.entries.push(json!({
-            "id":name, "bead_id":bead, "branch":branch, "target_branch":target,
+            "id":name, "bead_id":bead_id,
+            "bead_title":bead["title"].as_str(),
+            "bead_description":bead["description"].as_str(),
+            "branch":branch, "target_branch":target,
             "common_dir":registry.repo.common_dir, "main_root":registry.repo.main_root,
             "source_workspace":workspace, "agent":agent, "base":base,
             "phase":"create_possibly_sent", "responses":{},
@@ -515,6 +521,8 @@ fn view(entry: &Value, status: WorktreeStatus, detail: Option<String>) -> Manage
         id: string("id"),
         bead_id: string("bead_id"),
         handoff_accepted: entry["phase"] == "active",
+        bead_title: entry["bead_title"].as_str().map(str::to_owned),
+        bead_description: entry["bead_description"].as_str().map(str::to_owned),
         branch: string("branch"),
         target_branch: string("target_branch"),
         workspace_id: string("workspace_id"),
@@ -1202,10 +1210,19 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     const ID: &str = "ot-test";
     const BRANCH: &str = "ontrack/ot-test";
+
+    fn test_bead() -> Value {
+        json!({
+            "id": "Bead-1",
+            "title": "Fix the selected handoff",
+            "description": "First line\nSecond line"
+        })
+    }
 
     struct Fixture {
         directory: PathBuf,
@@ -1222,13 +1239,24 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let directory = PathBuf::from("/tmp/opencode").join(format!(
-                "ontrack-worktrees-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let directory = loop {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let path = std::env::temp_dir().join(format!(
+                    "ontrack-worktrees-{}-{nanos}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => break path,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("Cannot create worktree test fixture: {error}"),
+                }
+            };
             let main = directory.join("main");
-            fs::create_dir_all(&main).unwrap();
+            fs::create_dir(&main).unwrap();
             git(&main, &["init", "--initial-branch=trunk"]).unwrap();
             for (key, value) in [
                 ("user.name", "OnTrack Test"),
@@ -1257,7 +1285,7 @@ mod tests {
         fn managed() -> Self {
             let fixture = Self::new();
             let mut journal =
-                LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain")
+                LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
                     .unwrap();
             git(
                 &fixture.main,
@@ -1376,13 +1404,22 @@ mod tests {
     fn intent_is_durable_before_creation_and_exclusively_locked() {
         let fixture = Fixture::new();
         let journal =
-            LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain").unwrap();
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
         let persisted: Value = serde_json::from_slice(
             &fs::read(journal.registry.directory.join("registry.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(persisted["version"], 1);
         assert_eq!(persisted["entries"][0]["phase"], "create_possibly_sent");
+        assert_eq!(
+            persisted["entries"][0]["bead_title"],
+            "Fix the selected handoff"
+        );
+        assert_eq!(
+            persisted["entries"][0]["bead_description"],
+            "First line\nSecond line"
+        );
         assert!(!fixture.source.exists());
         assert!(
             Registry::open(&fixture.main)
@@ -1404,9 +1441,38 @@ mod tests {
         drop(journal);
         assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
         assert!(!fixture.status().handoff_accepted);
-        assert!(
-            LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain").is_err()
+        assert_eq!(
+            fixture.status().bead_title.as_deref(),
+            Some("Fix the selected handoff")
         );
+        assert_eq!(
+            fixture.status().bead_description.as_deref(),
+            Some("First line\nSecond line")
+        );
+        assert!(
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn older_registry_entries_without_bead_context_remain_viewable() {
+        let fixture = Fixture::managed();
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("bead_title");
+        registry.entries[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("bead_description");
+        registry.save().unwrap();
+        drop(registry);
+        let item = fixture.status();
+        assert_eq!(item.bead_id, "Bead-1");
+        assert!(item.bead_title.is_none());
+        assert!(item.bead_description.is_none());
     }
 
     #[test]
@@ -1434,7 +1500,8 @@ mod tests {
     fn partial_launch_response_and_failure_survive_restart() {
         let fixture = Fixture::new();
         let mut journal =
-            LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain").unwrap();
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
         journal
             .capture(
                 "create",

@@ -24,6 +24,8 @@ Theme is explicit app state (`App::theme`) threaded into rendering; do not intro
 
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
+The new-bead Description field uses `wrapped_description` to insert visual line breaks before whole words and map its byte cursor to display cells; words wider than the field still wrap by character. It preserves explicit newlines and the stored text. While Description has focus, Shift+Enter inserts a newline and plain Enter focuses Create without submitting. Terminal setup enables Crossterm's keyboard enhancement protocol so supported terminals can distinguish modified Enter; restoration pops that mode on normal exit, initialization failure, and panic. Terminals without modified-key reporting cannot distinguish Shift+Enter from Enter.
+
 The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
 Settings rows in `src/ui.rs` share a two-thirds title column and one-third
 value column. `settings_row` aligns titles to the left and centers controls
@@ -84,7 +86,9 @@ Agent start waits up to 30 seconds for readiness. Prompt submission deliberately
 
 The main issue list adds `· sent` to Open Beads whose OnTrack journal has the persisted `active` phase. `ManagedWorktree.handoff_accepted` is derived from that phase even if later Git or Herdr inspection reports a worktree needing attention. Earlier phases, including a prompt that may have been sent but was not confirmed, do not assert a successful handoff. The app reloads tracked worktrees after a successful launch, including when a worktree snapshot was already in flight; startup discovery and subsequent polling preserve the marker across refresh and restart. The marker is presentation only and never rewrites the Beads status.
 
-Focused tests (`cargo test herdr::tests`) inject command execution, Bead retrieval and Git identity lookup. They use deterministic fake text/JSON responses and captured argv, with no process-wide environment mutation or live Herdr creation/start/prompt. Coverage includes dynamic supported kinds/current integrations, malformed output, unavailable CLI, missing workspace without focus fallback, rejection of outside/nested linked launch directories using the observed main-source response and filesystem-only `.git` markers, full Bead capture before mutation, arbitrary single-argument prompting, ordering, no prompt wait, selection/collision checks, 32-character agent-name bounds and pre-creation overlong-name rejection, new target validation, stop-on-failure, and partial-success recovery. Codex regressions cover both overrides after `--`, separate pane-targeted prompting, unchanged OpenCode startup, TOML key escaping, normal/linked **created-worktree metadata** main-root resolution (not linked-source discovery support), nonstandard metadata rejection, and source/new identity failure without starting an agent. Installed read-only help/worktree-list/schema established the 0.9.1 contracts; no real worktree creation or agent lifecycle is exercised. Fixtures cover the required response subset, not every server version or external race.
+Focused tests (`cargo test herdr::tests`) inject command execution, Bead retrieval, Git identity lookup and launch journaling. Each test thread initializes a disposable main Git checkout with `.git`, `src`, and `target` directories, so tests work when Cargo runs from either a main checkout or a linked worktree, including with `CARGO_TARGET_DIR` set elsewhere. They use deterministic fake text/JSON responses and captured argv, with no process-wide environment mutation, real Git worktree creation, or live Herdr creation/start/prompt. The tracked-launch regression persists a fake journal and checks that each phase is recorded before the next action; real Git journal behavior is tested separately in `src/worktrees.rs`. Coverage includes dynamic supported kinds/current integrations, malformed output, unavailable CLI, missing workspace without focus fallback, rejection of outside/nested linked launch directories using the observed main-source response and filesystem-only `.git` markers, full Bead capture before mutation, arbitrary single-argument prompting, ordering, no prompt wait, selection/collision checks, 32-character agent-name bounds and pre-creation overlong-name rejection, new target validation, stop-on-failure, and partial-success recovery. Codex regressions cover both overrides after `--`, separate pane-targeted prompting, unchanged OpenCode startup, TOML key escaping, normal/linked **created-worktree metadata** main-root resolution (not linked-source discovery support), nonstandard metadata rejection, and source/new identity failure without starting an agent. Installed read-only help/worktree-list/schema established the 0.9.1 contracts; no live Herdr creation or agent lifecycle is exercised. Fixtures cover the required response subset, not every server version or external race.
+
+Worktree registry tests create exclusive temporary fixture directories and keep each registry lock inside its fixture. These test paths do not change the production rule that Herdr launch discovery starts from the main checkout.
 
 ## Background work and cached state
 
@@ -121,6 +125,8 @@ cargo clippy --all-targets -- -D warnings
 cargo build
 ```
 
+The same commands can run from a linked Git worktree. Keep the default test concurrency for `cargo test` to exercise fixture and registry lock isolation.
+
 For focused iterations:
 
 ```sh
@@ -147,6 +153,13 @@ The list row's first line derives issue type from the retained `Bead.data` (`iss
 OnTrack records only worktrees created by its own confirmed Herdr handoffs; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
 from Beads: a closed or missing Bead does not remove the managed-worktree record.
+The launch journal stores the authoritative Bead title and description before
+Herdr creates a worktree. The right pane prefers current text from the already
+refreshed Beads list and falls back to this registry snapshot after Bead removal
+or a list failure; it makes no extra `bd` request. Registry entries from older
+versions may omit these optional fields; the view then shows a fallback. The
+pane wraps multiline descriptions and keeps its own bounded scroll position,
+reset when the selected worktree changes.
 The verified repository target branch is shown to the user. A merge request is
 pending work, not a completed merge; Git ancestry/cleanliness checks decide
 integration. Conflicts and uncertain outcomes remain inspectable for manual

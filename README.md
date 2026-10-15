@@ -7,7 +7,7 @@ A terminal browser for Beads issues in the current workspace.
 - Automatic background refresh picks up external changes, with cached records and visible errors; no watcher setup required.
 - Persistent theme selection in a structured settings dialog with a live preview.
 - Press `h` to hand a selected Bead to an installed Herdr agent in a new worktree, after explicit confirmation. Open issues show `· sent` once the agent prompt is confirmed. See the [user guide](docs/user-guide.md) for setup and recovery limits.
-- Press `w` to inspect OnTrack-tracked outstanding worktrees independently of Bead status, request a merge, or confirm safe cleanup.
+- Press `w` to inspect OnTrack-tracked outstanding worktrees independently of Bead status, including each handoff's Bead title and description, request a merge, or confirm safe cleanup.
 
 ## Requirements
 
