@@ -7,7 +7,7 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Defines the terminal type, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
-| `src/settings.rs` | Loads and atomically saves theme and worktree-cleanup preferences under the user's XDG config directory. |
+| `src/settings.rs` | Loads and atomically saves theme, default-agent, and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
 | `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/herdr.rs` | Discovers usable agent integrations, maps the current checkout to a Herdr workspace, focuses a selected managed workspace, and explicitly creates a worktree and starts/prompts an agent. |
@@ -33,7 +33,7 @@ The create/edit Description field uses `description_layout` to insert visual lin
 
 The hotkey reference is a separate `App::help` overlay, not a modal replacement. `App::key` handles its toggle and scroll keys before dispatching to the underlying pane or dialog; the mutation lock still takes precedence. `hotkeys::Context` captures the current pane or dialog when opened and owns its key/action list. Add new keyboard commands to the matching context when changing input handling. `ui::render_help` wraps the right column, clamps scrolling to the rendered lines, and renders over either browser view. Enhanced keyboard reports distinguish `Ctrl+?` or `Ctrl+Shift+/`; legacy terminals may report it as plain Backspace, which must remain text deletion/navigation rather than opening help.
 
-The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
+The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme or default agent, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. The default-agent setting uses stable supported kind IDs; `automatic` preserves the old Codex/first-available form behavior, `unassigned` selects no harness, and an unavailable preferred kind falls back only for the current form. See the [settings guide](settings.md) for details.
 Settings rows in `src/ui.rs` share a two-thirds title column and one-third
 value column. `settings_row` aligns titles to the left and centers controls
 by terminal cell width; keep dropdown entries on the same value boundary and
