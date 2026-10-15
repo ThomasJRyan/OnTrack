@@ -82,6 +82,30 @@ fn themed_type_color(kind: &str, theme: Theme) -> Color {
 fn themed_priority_color(priority: u64, theme: Theme) -> Color {
     crate::theme::priority_color(theme, priority)
 }
+fn worktree_status_style(theme: Theme, status: crate::worktrees::WorktreeStatus) -> Style {
+    let color = crate::theme::worktree_status_color(theme, status);
+    let Color::Rgb(red, green, blue) = color else {
+        return Style::default().fg(color).add_modifier(Modifier::BOLD);
+    };
+    let channel = |value: u8| {
+        let value = f64::from(value) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue);
+    let foreground = if luminance > 0.179 {
+        Color::Black
+    } else {
+        Color::White
+    };
+    Style::default()
+        .fg(foreground)
+        .bg(color)
+        .add_modifier(Modifier::BOLD)
+}
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
         "↑ / ↓ move · ← / → theme · Enter / Space toggle · Tab moves · Esc close"
@@ -290,18 +314,17 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             } else {
                 Style::default().fg(ink)
             };
-            rows.push(Line::from(Span::styled(
-                truncate_display(
-                    &format!(
-                        "{} {} · {}",
-                        if selected { "›" } else { " " },
-                        item.bead_id,
-                        crate::app::worktree_status_label(item.status)
-                    ),
-                    panes[0].width.saturating_sub(2) as usize,
-                ),
-                style,
-            )));
+            let width = panes[0].width.saturating_sub(2) as usize;
+            let prefix = truncate_display(
+                &format!("{} {} · ", if selected { "›" } else { " " }, item.bead_id),
+                width,
+            );
+            let remaining = width.saturating_sub(Span::raw(prefix.as_str()).width());
+            let label = truncate_display(crate::app::worktree_status_label(item.status), remaining);
+            rows.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(label, worktree_status_style(app.theme, item.status)),
+            ]));
             rows.push(Line::from(Span::styled(
                 truncate_display(
                     &format!("  {} → {}", item.branch, item.target_branch),
@@ -335,14 +358,16 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .and_then(serde_json::Value::as_str)
                 .or(item.bead_description.as_deref());
             let mut lines = vec![
-                Line::from(Span::styled(
-                    format!(
-                        "{} · {}",
-                        item.bead_id,
-                        crate::app::worktree_status_label(item.status)
+                Line::from(vec![
+                    Span::styled(
+                        format!("{} · ", item.bead_id),
+                        Style::default().fg(teal).add_modifier(Modifier::BOLD),
                     ),
-                    Style::default().fg(teal).add_modifier(Modifier::BOLD),
-                )),
+                    Span::styled(
+                        crate::app::worktree_status_label(item.status),
+                        worktree_status_style(app.theme, item.status),
+                    ),
+                ]),
                 Line::from(format!("Branch: {}", item.branch)),
                 Line::from(format!("Target: {}", item.target_branch)),
                 Line::from(format!("Herdr workspace: {}", item.workspace_id)),
@@ -2319,6 +2344,95 @@ mod tests {
         assert!(screen.contains("main"));
         assert!(screen.contains("waiting for verified ancestry"));
         assert!(screen.contains("Git integration"));
+    }
+    #[test]
+    fn worktree_status_badges_use_theme_colours_in_list_and_detail() {
+        use crate::worktrees::{ManagedWorktree, WorktreeStatus};
+        let statuses = [
+            WorktreeStatus::Unmerged,
+            WorktreeStatus::MergeRequested,
+            WorktreeStatus::NeedsResolution,
+            WorktreeStatus::Integrated,
+            WorktreeStatus::WorkspaceClosed,
+            WorktreeStatus::CheckoutRemoved,
+            WorktreeStatus::NeedsAttention,
+        ];
+        let locate = |buffer: &ratatui::buffer::Buffer, rect: Rect, label: &str| {
+            let chars = label.chars().collect::<Vec<_>>();
+            for y in rect.y..rect.bottom() {
+                for x in rect.x..rect.right().saturating_sub(chars.len() as u16) {
+                    if chars.iter().enumerate().all(|(offset, ch)| {
+                        buffer[(x + offset as u16, y)].symbol() == ch.to_string()
+                    }) {
+                        return (x, y);
+                    }
+                }
+            }
+            panic!("{label} missing from {rect:?}")
+        };
+        for theme in Theme::ALL {
+            let mut app = app();
+            app.theme = theme;
+            app.worktrees_view = true;
+            app.worktrees = statuses
+                .iter()
+                .enumerate()
+                .map(|(index, &status)| ManagedWorktree {
+                    id: format!("handoff-{index}"),
+                    bead_id: format!("bead-{index}"),
+                    handoff_accepted: true,
+                    bead_title: None,
+                    bead_description: None,
+                    branch: format!("ontrack/bead-{index}"),
+                    target_branch: "main".into(),
+                    workspace_id: format!("ws-{index}"),
+                    status,
+                    detail: None,
+                })
+                .collect();
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for status in statuses {
+                let label = crate::app::worktree_status_label(status);
+                let (x, y) = locate(buffer, app.list_rect, label);
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.bg, crate::theme::worktree_status_color(theme, status));
+                assert!(matches!(cell.fg, Color::Black | Color::White));
+                assert!(cell.modifier.contains(Modifier::BOLD));
+            }
+            let selected = statuses[0];
+            let (x, y) = locate(
+                buffer,
+                app.detail_rect,
+                crate::app::worktree_status_label(selected),
+            );
+            assert_eq!(
+                buffer[(x, y)].bg,
+                crate::theme::worktree_status_color(theme, selected)
+            );
+            assert_eq!(
+                buffer[(app.list_rect.x + 1, app.list_rect.y + 1)].bg,
+                crate::theme::definition(theme).palette.selected_background
+            );
+            app.selected_worktree = 3;
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let integrated = WorktreeStatus::Integrated;
+            let (x, y) = locate(
+                buffer,
+                app.detail_rect,
+                crate::app::worktree_status_label(integrated),
+            );
+            assert_eq!(
+                buffer[(x, y)].bg,
+                crate::theme::worktree_status_color(theme, integrated)
+            );
+        }
     }
     #[test]
     fn selected_worktree_shows_its_captured_title_and_multiline_description() {

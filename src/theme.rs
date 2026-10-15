@@ -1,4 +1,5 @@
 use crate::settings::Theme;
+use crate::worktrees::WorktreeStatus;
 use ratatui::style::Color;
 
 #[derive(Clone, Copy, Debug)]
@@ -338,6 +339,18 @@ pub fn status_color(theme: Theme, status: &str) -> Color {
     }
 }
 
+pub fn worktree_status_color(theme: Theme, status: WorktreeStatus) -> Color {
+    let p = definition(theme).palette;
+    match status {
+        WorktreeStatus::Unmerged => p.info,
+        WorktreeStatus::MergeRequested => p.warning,
+        WorktreeStatus::NeedsResolution | WorktreeStatus::NeedsAttention => p.danger,
+        WorktreeStatus::Integrated => p.success,
+        WorktreeStatus::WorkspaceClosed => p.accent_alt,
+        WorktreeStatus::CheckoutRemoved => p.muted,
+    }
+}
+
 pub fn issue_type_color(theme: Theme, kind: &str) -> Color {
     let p = definition(theme).palette;
     match kind.to_ascii_lowercase().as_str() {
@@ -489,6 +502,36 @@ mod tests {
                     "{} {role} contrast too low",
                     entry.id
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn worktree_statuses_keep_pending_and_attention_distinct_from_integration() {
+        for theme in Theme::ALL {
+            let color = |status| worktree_status_color(theme, status);
+            assert_ne!(
+                color(WorktreeStatus::MergeRequested),
+                color(WorktreeStatus::Integrated)
+            );
+            assert_ne!(
+                color(WorktreeStatus::NeedsResolution),
+                color(WorktreeStatus::Integrated)
+            );
+            assert_ne!(
+                color(WorktreeStatus::NeedsAttention),
+                color(WorktreeStatus::Integrated)
+            );
+            for status in [
+                WorktreeStatus::Unmerged,
+                WorktreeStatus::MergeRequested,
+                WorktreeStatus::NeedsResolution,
+                WorktreeStatus::Integrated,
+                WorktreeStatus::WorkspaceClosed,
+                WorktreeStatus::CheckoutRemoved,
+                WorktreeStatus::NeedsAttention,
+            ] {
+                assert!(matches!(color(status), Color::Rgb(_, _, _)));
             }
         }
     }
