@@ -31,6 +31,8 @@ See the [user guide](docs/user-guide.md) for setup and controls, the [settings g
 
 ## Checks
 
+GitHub Actions runs these checks on pull requests and pushes to `main`. See the [CI guide](docs/ci.md) for results and required-check setup.
+
 ```sh
 cargo fmt --check
 cargo test
