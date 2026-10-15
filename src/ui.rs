@@ -195,7 +195,7 @@ fn worktree_status_style(theme: Theme, status: crate::worktrees::WorktreeStatus)
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
         "↑ / ↓ move · ← / → change choice · Enter / Space save · Tab moves · Esc close"
-    } else if (2..=4).contains(&focus) {
+    } else if (2..=5).contains(&focus) {
         "↑ / ↓ move · Enter / Space toggle · Tab moves · Esc close"
     } else {
         "↑ / ↓ move · ← / → change choice · Enter / Space open · Tab moves"
@@ -235,7 +235,7 @@ const MAX_VISIBLE_THEMES: usize = 6;
 fn visible_theme_window(theme: Theme, available_height: u16) -> (usize, usize) {
     let total = crate::theme::CATALOG.len();
     let visible = usize::from(available_height)
-        .saturating_sub(20)
+        .saturating_sub(21)
         .clamp(1, MAX_VISIBLE_THEMES.min(total));
     let selected = Theme::ALL
         .iter()
@@ -248,7 +248,7 @@ fn visible_theme_window(theme: Theme, available_height: u16) -> (usize, usize) {
 }
 fn visible_limit_window(limit: crate::settings::AgentLimit, available_height: u16) -> (u64, usize) {
     let visible = usize::from(available_height)
-        .saturating_sub(21)
+        .saturating_sub(22)
         .clamp(1, MAX_VISIBLE_THEMES);
     let selected = match limit {
         crate::settings::AgentLimit::Unlimited => 0,
@@ -989,7 +989,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 } else {
                     0
                 };
-                (10 + option_lines + error_lines + hint_lines + 2) as u16
+                (11 + option_lines + error_lines + hint_lines + 2) as u16
             }
             crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
                 let epic_toggle = matches!(modal, crate::app::Modal::Create(_))
@@ -1205,7 +1205,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     }
                 }
                 for (index, (label, enabled)) in [
-                    ("Auto-request merge", draft.auto_merge),
+                    ("Auto-merge top-level tasks", draft.auto_merge),
+                    (
+                        "Auto-merge child tasks into parent",
+                        draft.auto_merge_children,
+                    ),
                     (
                         "Close Herdr workspace after integration",
                         draft.auto_close_workspace,
@@ -1246,7 +1250,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 lines.push(
                     Line::from(Span::styled(
                         "[ Close ]",
-                        if *focus == 5 {
+                        if *focus == 6 {
                             selected_style
                         } else {
                             value_style
@@ -3366,7 +3370,8 @@ mod tests {
         let title_x = locate(buffer, "Theme").0;
         for label in [
             "Agent limit",
-            "Auto-request merge",
+            "Auto-merge top-level tasks",
+            "Auto-merge child tasks into parent",
             "Close Herdr workspace after integration",
             "Remove checkout + close Herdr workspace",
         ] {
@@ -3376,7 +3381,8 @@ mod tests {
         assert_eq!(locate(buffer, "OnTrack Dark ▾").0, 53);
         assert_eq!(locate(buffer, "› OnTrack Dark").0, 53);
         for label in [
-            "Auto-request merge",
+            "Auto-merge top-level tasks",
+            "Auto-merge child tasks into parent",
             "Remove checkout + close Herdr workspace",
         ] {
             let y = locate(buffer, label).1;

@@ -588,6 +588,7 @@ impl App {
             self.worktrees_loading = true;
             let policy = CleanupPolicy {
                 auto_merge: self.settings.auto_merge,
+                auto_merge_children: self.settings.auto_merge_children,
                 auto_close_workspace: self.settings.auto_close_workspace,
                 auto_remove_checkout: self.settings.auto_remove_checkout,
             };
@@ -1596,10 +1597,10 @@ impl App {
                 match key.code {
                     Tab | BackTab => {
                         *dropdown_open = false;
-                        *focus = (*focus + if key.code == Tab { 1 } else { 5 }) % 6;
+                        *focus = (*focus + if key.code == Tab { 1 } else { 6 }) % 7;
                     }
                     Up | Down => {
-                        *focus = (*focus + if key.code == Down { 1 } else { 5 }) % 6;
+                        *focus = (*focus + if key.code == Down { 1 } else { 6 }) % 7;
                         *dropdown_open = false;
                     }
                     Left | Right if *focus == 0 => {
@@ -1617,15 +1618,16 @@ impl App {
                     Enter | Char(' ') if *focus <= 1 => {
                         *dropdown_open = true;
                     }
-                    Enter | Char(' ') if (2..=4).contains(focus) => {
+                    Enter | Char(' ') if (2..=5).contains(focus) => {
                         match *focus {
                             2 => draft.auto_merge = !draft.auto_merge,
-                            3 => draft.auto_close_workspace = !draft.auto_close_workspace,
+                            3 => draft.auto_merge_children = !draft.auto_merge_children,
+                            4 => draft.auto_close_workspace = !draft.auto_close_workspace,
                             _ => draft.auto_remove_checkout = !draft.auto_remove_checkout,
                         }
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus == 5 => {
+                    Enter | Char(' ') if *focus == 6 => {
                         self.modal = None;
                     }
                     _ => {}
@@ -3723,7 +3725,7 @@ mod tests {
             "reopening does not change the saved theme"
         );
         assert!(matches!(a.modal, Some(Modal::Settings { .. })));
-        for _ in 0..5 {
+        for _ in 0..6 {
             press(&mut a, KeyCode::Tab);
         }
         press(&mut a, KeyCode::Enter);
@@ -3775,7 +3777,7 @@ mod tests {
         a.settings_path = Some(path.clone());
         press(&mut a, KeyCode::Char('s'));
         press(&mut a, KeyCode::Up);
-        assert!(matches!(a.modal, Some(Modal::Settings { focus: 5, .. })));
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 6, .. })));
         press(&mut a, KeyCode::Down);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 0, .. })));
         press(&mut a, KeyCode::Down);
@@ -3786,6 +3788,11 @@ mod tests {
         assert_eq!(a.theme, Theme::Dark);
         assert!(a.settings.auto_merge);
         assert!(settings::load_from(&path).unwrap().auto_merge);
+        press(&mut a, KeyCode::Down);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 3, .. })));
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.settings.auto_merge_children);
+        assert!(!settings::load_from(&path).unwrap().auto_merge_children);
         press(&mut a, KeyCode::Esc);
         assert!(a.modal.is_none());
         assert!(a.settings.auto_merge);
@@ -5491,6 +5498,7 @@ mod tests {
             rx.try_recv(),
             Ok(Request::ReconcileWorktrees(CleanupPolicy {
                 auto_merge: false,
+                auto_merge_children: true,
                 auto_close_workspace: false,
                 auto_remove_checkout: false,
             }))

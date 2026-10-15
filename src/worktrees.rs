@@ -51,11 +51,23 @@ pub enum Action {
     RemoveCheckout,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct CleanupPolicy {
     pub auto_merge: bool,
+    pub auto_merge_children: bool,
     pub auto_close_workspace: bool,
     pub auto_remove_checkout: bool,
+}
+
+impl Default for CleanupPolicy {
+    fn default() -> Self {
+        Self {
+            auto_merge: false,
+            auto_merge_children: true,
+            auto_close_workspace: false,
+            auto_remove_checkout: false,
+        }
+    }
 }
 
 fn error(message: impl Into<String>) -> io::Error {
@@ -1719,7 +1731,12 @@ fn reconcile_with(
                 finalize(&mut registry, index, executor)?;
             }
             let status = inspect(&registry.repo, &registry.entries[index]).status;
-            if !(policy.auto_merge || policy.auto_close_workspace || policy.auto_remove_checkout) {
+            let auto_merge = if registry.entries[index]["parent_bead_id"].as_str().is_some() {
+                policy.auto_merge_children
+            } else {
+                policy.auto_merge
+            };
+            if !(auto_merge || policy.auto_close_workspace || policy.auto_remove_checkout) {
                 return Ok(());
             }
             if !matches!(
@@ -1730,7 +1747,7 @@ fn reconcile_with(
             ) {
                 return Ok(());
             }
-            if (status == WorktreeStatus::Unmerged && !policy.auto_merge)
+            if (status == WorktreeStatus::Unmerged && !auto_merge)
                 || (status == WorktreeStatus::Integrated
                     && !(policy.auto_close_workspace || policy.auto_remove_checkout))
                 || (status == WorktreeStatus::WorkspaceClosed && !policy.auto_remove_checkout)
@@ -1752,7 +1769,7 @@ fn reconcile_with(
             let agent = settled(executor, entry, true)?;
             bind_late_session(&mut registry, index, &agent)?;
             if status == WorktreeStatus::Unmerged {
-                if policy.auto_merge && registry.entries[index]["merge_request"].is_null() {
+                if auto_merge && registry.entries[index]["merge_request"].is_null() {
                     request_merge(&mut registry, index, executor, true)?;
                 }
             } else if policy.auto_remove_checkout {
@@ -2829,6 +2846,7 @@ mod tests {
         executor.json(fixture.inventory(false, false));
         let policy = CleanupPolicy {
             auto_merge: true,
+            auto_merge_children: true,
             auto_close_workspace: true,
             auto_remove_checkout: true,
         };
@@ -2967,6 +2985,7 @@ mod tests {
                 &fixture.main,
                 CleanupPolicy {
                     auto_merge: true,
+                    auto_merge_children: true,
                     auto_close_workspace: true,
                     auto_remove_checkout: true,
                 },
@@ -3028,6 +3047,7 @@ mod tests {
         fixture.simulate_legacy_late_session();
         let policy = CleanupPolicy {
             auto_merge: true,
+            auto_merge_children: true,
             auto_close_workspace: true,
             auto_remove_checkout: true,
         };
@@ -3094,6 +3114,7 @@ mod tests {
             &fixture.main,
             CleanupPolicy {
                 auto_merge: true,
+                auto_merge_children: true,
                 auto_close_workspace: true,
                 auto_remove_checkout: true,
             },
@@ -3186,6 +3207,131 @@ mod tests {
                 .calls
                 .iter()
                 .any(|args| args.get(1).is_some_and(|s| s == "prompt"))
+        );
+    }
+
+    #[test]
+    fn child_auto_merge_uses_its_own_preference_and_parent_target() {
+        for (auto_merge, auto_merge_children, should_request) in
+            [(false, true, true), (true, false, false)]
+        {
+            let fixture = Fixture::managed();
+            let child_path = fixture.directory.join("child");
+            let child_branch = "ontrack/child";
+            let child = json!({"id":"Bead-1.1", "title":"Child", "parent":"Bead-1"});
+            let mut journal = LaunchJournal::begin(
+                &fixture.main,
+                &child,
+                child_branch,
+                "opencode",
+                "child",
+                "wMain",
+            )
+            .unwrap();
+            git(
+                &fixture.main,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    child_branch,
+                    child_path.to_str().unwrap(),
+                    BRANCH,
+                ],
+            )
+            .unwrap();
+            let created = json!({"workspace":{"workspace_id":"wChild"},
+                "root_pane":{"pane_id":"wChild:p1"},
+                "worktree":{"path":child_path,"branch":child_branch}});
+            journal.created(&created).unwrap();
+            let child_agent = |seq| {
+                json!({"result":{"type":"agent_info", "agent":{
+                    "pane_id":"wChild:p1", "workspace_id":"wChild", "agent":"opencode",
+                    "agent_status":"done", "cwd":child_path, "foreground_cwd":child_path,
+                    "agent_session":{"agent":"opencode", "kind":"id", "source":"herdr:opencode", "value":"child-session"},
+                    "state_change_seq":seq
+                }}})
+            };
+            journal
+                .capture("ready", child_agent(10).to_string().as_bytes())
+                .unwrap();
+            journal.phase("active").unwrap();
+            drop(journal);
+            Fixture::commit_at(&child_path, "child-task", "completed work\n");
+
+            let mut executor = Fake::default();
+            executor.json(child_agent(12));
+            if should_request {
+                executor.json(child_agent(12));
+                executor.json(json!({"result":{"type":"agent_prompted", "agent":{
+                    "pane_id":"wChild:p1", "workspace_id":"wChild"}}}));
+            }
+            let rows = reconcile_with(
+                &fixture.main,
+                CleanupPolicy {
+                    auto_merge,
+                    auto_merge_children,
+                    ..CleanupPolicy::default()
+                },
+                &mut executor,
+            )
+            .unwrap();
+            assert_eq!(
+                rows[1].status,
+                if should_request {
+                    WorktreeStatus::MergeRequested
+                } else {
+                    WorktreeStatus::Unmerged
+                }
+            );
+            assert_eq!(
+                executor
+                    .calls
+                    .iter()
+                    .filter(|args| args.get(1).is_some_and(|s| s == "prompt"))
+                    .count(),
+                usize::from(should_request)
+            );
+            let registry = Registry::open(&fixture.main).unwrap();
+            assert_eq!(registry.entries[1]["target_branch"], BRANCH);
+            assert_eq!(registry.entries[1]["target_path"], json!(fixture.source));
+            drop(registry);
+            if should_request {
+                let main_tip = tip(&fixture.main, "HEAD").unwrap();
+                let child_tip = tip(&child_path, "HEAD").unwrap();
+                let mut finish = Fake::default();
+                finish.json(child_agent(14));
+                finish.json(fixture.agent(12, "done"));
+                let rows = reconcile_with(
+                    &fixture.main,
+                    CleanupPolicy {
+                        auto_merge,
+                        auto_merge_children,
+                        ..CleanupPolicy::default()
+                    },
+                    &mut finish,
+                )
+                .unwrap();
+                assert_eq!(rows[1].status, WorktreeStatus::Integrated);
+                assert_eq!(tip(&fixture.source, "HEAD").unwrap(), child_tip);
+                assert_eq!(tip(&fixture.main, "HEAD").unwrap(), main_tip);
+            }
+        }
+    }
+
+    #[test]
+    fn child_default_does_not_auto_merge_top_level_handoff() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "completed work\n");
+        let mut executor = Fake::default();
+        executor.json(fixture.agent(12, "done"));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::Unmerged);
+        assert!(
+            !executor
+                .calls
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "prompt"))
         );
     }
 
@@ -3422,6 +3568,7 @@ mod tests {
             &fixture.main,
             CleanupPolicy {
                 auto_merge: true,
+                auto_merge_children: true,
                 auto_close_workspace: true,
                 auto_remove_checkout: true,
             },
@@ -3469,6 +3616,7 @@ mod tests {
             &fixture.main,
             CleanupPolicy {
                 auto_merge: true,
+                auto_merge_children: true,
                 auto_close_workspace: true,
                 auto_remove_checkout: true,
             },
@@ -3546,6 +3694,7 @@ mod tests {
                 &fixture.main,
                 CleanupPolicy {
                     auto_merge: true,
+                    auto_merge_children: true,
                     auto_close_workspace: true,
                     auto_remove_checkout: true,
                 },
@@ -3700,6 +3849,7 @@ mod tests {
                     &fixture.main,
                     CleanupPolicy {
                         auto_merge: true,
+                        auto_merge_children: true,
                         auto_close_workspace: true,
                         auto_remove_checkout: true,
                     },

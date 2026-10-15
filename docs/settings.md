@@ -56,22 +56,24 @@ The OnTrack-specific role mapping and contrast choices are maintained in
 The file is a JSON object:
 
 ```json
-{"theme":"dark","agent_limit":5,"auto_merge":false,"auto_close_workspace":false,"auto_remove_checkout":false}
+{"theme":"dark","agent_limit":5,"auto_merge":false,"auto_merge_children":true,"auto_close_workspace":false,"auto_remove_checkout":false}
 ```
 
 `theme` accepts one of the stable IDs above; existing `"dark"` and `"light"`
-files remain valid. Missing worktree preference fields default to false; old theme-only
-files therefore remain backward compatible. A missing `agent_limit` defaults to 5.
+files remain valid. Missing `auto_merge_children` defaults to true, including in
+older theme-only files. Other missing worktree preferences default to false.
+A missing `agent_limit` defaults to 5.
 It accepts a positive integer or `"unlimited"`; zero, negative, fractional, and
-other values are invalid. All automatic cleanup switches are
-off by default. Unknown additional keys
+other values are invalid. Child merge requests are on by default; top-level
+merge requests, workspace closing, and checkout removal are off by default.
+Unknown additional keys
 are accepted for future expansion. Invalid JSON,
 non-object JSON, unknown themes, and non-string theme values are errors.
 
 ## Changing settings
 
 Press `s` to open Settings. `Up` / `Down` moves among Theme, Agent limit,
-automatic merge, workspace close, checkout removal, and Close.
+top-level merge, child merge, workspace close, checkout removal, and Close.
 The dialog places setting titles in a wider, left-aligned column and centers
 theme, agent limit, and cleanup controls in the right column. The choice lists open beneath
 its value; on narrow supported terminals, long titles and values may be
@@ -88,6 +90,16 @@ together. The removal preference is labeled “Remove checkout + close Herdr wor
 removing the checkout also closes its Herdr workspace. Cleanup remains
 subject to backend integration checks and cannot force-remove a checkout.
 Use `Tab` / `Shift+Tab` to move focus; Close exits the dialog.
+
+“Auto-merge child tasks into parent” controls managed child handoffs, including
+Epic subtasks and nested child tasks. It is enabled by default. Once a child
+Bead is closed and its agent has finished, OnTrack requests integration into
+the recorded parent worktree without a confirmation dialog. The existing Git,
+agent, and Beads checks still apply; conflicts and uncertain outcomes stay
+visible for manual recovery. Turning this off leaves children available for
+the confirmed manual `m` action. “Auto-merge top-level tasks” controls
+handoffs without a managed parent independently and remains off by default.
+Neither merge setting closes workspaces or removes checkouts by itself.
 
 Agent limit starts at 5. `Left` / `Right` moves through Unlimited, 1, 2, 3,
 and increasing positive counts, saving each change immediately. `Enter` or
@@ -140,7 +152,8 @@ the containing directory is not explicitly synchronized.
 ## Developer interface
 
 `src/settings.rs` exposes `Theme`, `AgentLimit`, `Settings` (theme, a five-agent
-default limit, and three false-by-default worktree cleanup preferences), `config_path()`, `load_from(path)`,
+default limit, a true-by-default child merge preference, and three false-by-default
+worktree preferences), `config_path()`, `load_from(path)`,
 and `save_to(path, settings)`. The filesystem functions return `io::Result`;
 invalid settings contents use `io::ErrorKind::InvalidData` with the file path and
 reason. Loading never writes. Saving serializes the current supported fields

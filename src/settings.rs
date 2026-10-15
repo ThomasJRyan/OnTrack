@@ -53,13 +53,27 @@ impl Theme {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
     pub theme: Theme,
     pub agent_limit: AgentLimit,
     pub auto_merge: bool,
+    pub auto_merge_children: bool,
     pub auto_close_workspace: bool,
     pub auto_remove_checkout: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            theme: Theme::default(),
+            agent_limit: AgentLimit::default(),
+            auto_merge: false,
+            auto_merge_children: true,
+            auto_close_workspace: false,
+            auto_remove_checkout: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,9 +161,9 @@ pub fn load_from(path: &Path) -> io::Result<Settings> {
             .ok_or_else(|| invalid(&format!("unknown theme id '{theme}'")))?,
         Some(_) => return Err(invalid("theme must be a supported string ID")),
     };
-    let boolean = |key: &str| -> io::Result<bool> {
+    let boolean = |key: &str, default: bool| -> io::Result<bool> {
         match object.get(key) {
-            None => Ok(false),
+            None => Ok(default),
             Some(serde_json::Value::Bool(value)) => Ok(*value),
             Some(_) => Err(invalid(&format!("{key} must be a boolean"))),
         }
@@ -172,9 +186,10 @@ pub fn load_from(path: &Path) -> io::Result<Settings> {
     Ok(Settings {
         theme,
         agent_limit,
-        auto_merge: boolean("auto_merge")?,
-        auto_close_workspace: boolean("auto_close_workspace")?,
-        auto_remove_checkout: boolean("auto_remove_checkout")?,
+        auto_merge: boolean("auto_merge", false)?,
+        auto_merge_children: boolean("auto_merge_children", true)?,
+        auto_close_workspace: boolean("auto_close_workspace", false)?,
+        auto_remove_checkout: boolean("auto_remove_checkout", false)?,
     })
 }
 
@@ -199,7 +214,7 @@ pub fn save_to(path: &Path, settings: &Settings) -> io::Result<()> {
         AgentLimit::Limited(count) => count.to_string(),
     };
     let result = (|| {
-        writeln!(file, "{{\"theme\":\"{theme}\",\"agent_limit\":{agent_limit},\"auto_merge\":{},\"auto_close_workspace\":{},\"auto_remove_checkout\":{}}}", settings.auto_merge, settings.auto_close_workspace, settings.auto_remove_checkout)
+        writeln!(file, "{{\"theme\":\"{theme}\",\"agent_limit\":{agent_limit},\"auto_merge\":{},\"auto_merge_children\":{},\"auto_close_workspace\":{},\"auto_remove_checkout\":{}}}", settings.auto_merge, settings.auto_merge_children, settings.auto_close_workspace, settings.auto_remove_checkout)
             .and_then(|()| file.sync_all())
             .map_err(|error| io_error("write", &temporary_path, error))?;
         drop(file);
@@ -349,10 +364,12 @@ mod tests {
                 ..Settings::default()
             }
         );
+        assert!(load_from(&directory.path()).unwrap().auto_merge_children);
         let settings = Settings {
             theme: Theme::Nord,
             agent_limit: AgentLimit::Unlimited,
             auto_merge: true,
+            auto_merge_children: false,
             auto_close_workspace: true,
             auto_remove_checkout: true,
         };
@@ -397,6 +414,20 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidData);
             assert!(error.to_string().contains("agent_limit"));
         }
+    }
+
+    #[test]
+    fn child_auto_merge_defaults_on_and_rejects_non_boolean_values() {
+        let directory = TestDirectory::new();
+        assert!(load_from(&directory.path()).unwrap().auto_merge_children);
+        for value in ["null", "0", "\"false\""] {
+            directory.write(&format!("{{\"auto_merge_children\":{value}}}"));
+            let error = load_from(&directory.path()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("auto_merge_children"));
+        }
+        directory.write(r#"{"auto_merge_children":false}"#);
+        assert!(!load_from(&directory.path()).unwrap().auto_merge_children);
     }
 
     #[test]
