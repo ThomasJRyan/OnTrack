@@ -10,6 +10,7 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
 | `src/beads.rs` | Initializes missing workspaces, builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
+| `src/screenshots.rs` | Reads clipboard images, writes local screenshots into the shared Beads workspace, and parses description references for agent prompts. |
 | `src/herdr.rs` | Discovers usable agent integrations, maps the current checkout to a Herdr workspace, focuses a selected managed workspace, and explicitly creates a worktree and starts/prompts an agent. |
 | `src/worktrees.rs` | Journals OnTrack-created handoffs separately from Beads and verifies Git/Herdr evidence before merge finalization or cleanup. |
 | `src/app.rs` | Holds selection, focus, scrolling, modal form and handoff toast state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
@@ -286,3 +287,6 @@ Cleanup revalidates the current Herdr workspace/path/branch mapping before any
 mutation. Untouched launch-base branches remain unmerged. Close-first/remove-later
 is explicitly unsupported; recovery guidance avoids guessing a closed workspace
 ID or invoking force removal.
+## Screenshot descriptions
+
+`src/screenshots.rs` reads PNG and JPEG clipboard data using `wl-paste` or `xclip`, limits images to 10 MiB, and stores them in the shared workspace reported by `bd where --json`. The create/edit form inserts an absolute Markdown image path only after the bytes are saved. The Herdr launch prompt extracts these references from the live description and lists paths for the agent to inspect. Image storage is local and separate from Beads records and Git worktrees; do not assume remote sync or embed binary data in Herdr text prompts.

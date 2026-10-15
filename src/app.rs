@@ -5,10 +5,11 @@ use crate::{
     beads::{self, Bead, CreateBead, UpdateBead},
     event,
     hotkeys::{self, Help},
+    screenshots,
     settings::{self, DefaultAgent, Settings, Theme},
     ui,
 };
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet},
@@ -40,6 +41,7 @@ pub(super) enum Request {
     WorktreeAction(String, WorktreeAction),
     RestartWorktree(String),
     ReconcileWorktrees(CleanupPolicy),
+    ReadScreenshot(u64),
 }
 pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
@@ -58,6 +60,7 @@ pub(super) enum Response {
     WorkspaceFocused(String, std::io::Result<()>),
     WorktreeChanged(std::io::Result<ManagedWorktree>),
     WorktreeRestarted(std::io::Result<String>),
+    ScreenshotRead(u64, std::io::Result<Vec<u8>>),
 }
 pub(super) enum WorktreeFocusFeedback {
     Success(String),
@@ -112,6 +115,9 @@ pub struct App {
     pub notice: Option<String>,
     pub mutation_busy: bool,
     pub modal_ready: bool,
+    pub(crate) paste_seq: u64,
+    pub(crate) paste_pending: bool,
+    pub(crate) created_screenshots: Vec<PathBuf>,
     pub preferred_id: Option<String>,
     pub(super) refresh_inflight: bool,
     pub(super) refresh_pending: bool,
@@ -225,6 +231,14 @@ impl Default for CreateForm {
 }
 
 impl CreateForm {
+    fn insert_screenshot(&mut self, path: &std::path::Path) {
+        let reference = screenshots::markdown_reference(path);
+        let cursor = self.description_cursor.min(self.description.len());
+        self.description.insert_str(cursor, &reference);
+        self.description_cursor = cursor + reference.len();
+        self.description_preferred_col = None;
+    }
+
     fn set_harnesses(&mut self, harnesses: Vec<String>, preferred: DefaultAgent) {
         self.harnesses = harnesses;
         self.harness = match preferred {
@@ -377,6 +391,9 @@ impl App {
                     Request::Update(input) => {
                         Response::Updated(input.id.clone(), beads::update_bead(&input))
                     }
+                    Request::ReadScreenshot(seq) => {
+                        Response::ScreenshotRead(seq, screenshots::read_clipboard())
+                    }
                     Request::SetReady(id, ready) => Response::ReadySet(
                         id.clone(),
                         ready,
@@ -481,6 +498,9 @@ impl App {
             notice: settings_error,
             mutation_busy: false,
             modal_ready: true,
+            paste_seq: 0,
+            paste_pending: false,
+            created_screenshots: Vec::new(),
             preferred_id: None,
             refresh_inflight: false,
             refresh_pending: false,
@@ -915,6 +935,7 @@ impl App {
                                 )));
                             }
                             self.notice = Some(format!("Created {id}"));
+                            self.created_screenshots.clear();
                             self.modal = None;
                             self.preferred_id = Some(id);
                             self.refresh_at(now);
@@ -961,11 +982,32 @@ impl App {
                     match result {
                         Ok(()) => {
                             self.notice = Some(format!("Updated {id}"));
+                            self.created_screenshots.clear();
                             self.modal = None;
                             self.preferred_id = Some(id);
                             self.refresh_at(now);
                         }
                         Err(e) => self.notice = Some(format!("Update failed: {e}")),
+                    }
+                }
+                Response::ScreenshotRead(seq, result) => {
+                    if seq != self.paste_seq {
+                        continue;
+                    }
+                    self.paste_pending = false;
+                    if let Some(Modal::Create(form) | Modal::Edit { form, .. }) =
+                        self.modal.as_mut()
+                    {
+                        match result.and_then(|bytes| screenshots::save(&bytes)) {
+                            Ok(path) => {
+                                form.insert_screenshot(&path);
+                                self.notice = Some(format!("Screenshot saved: {}", path.display()));
+                                self.created_screenshots.push(path);
+                            }
+                            Err(error) => {
+                                self.notice = Some(format!("Screenshot paste failed: {error}"))
+                            }
+                        }
                     }
                 }
                 Response::ReadySet(id, ready, result) => {
@@ -1576,7 +1618,16 @@ impl App {
                 }
                 return false;
             }
+            for path in self.created_screenshots.drain(..) {
+                let _ = std::fs::remove_file(path);
+            }
             self.modal = None;
+            self.paste_seq = self.paste_seq.wrapping_add(1);
+            self.paste_pending = false;
+            return false;
+        }
+        if self.paste_pending {
+            self.notice = Some("Wait for screenshot paste or press Esc to cancel".into());
             return false;
         }
         if let Some(Modal::ConfirmWorktree { id, action }) = self.modal.as_ref() {
@@ -1739,6 +1790,20 @@ impl App {
         }
         if form.focus == 1 && !matches!(key.code, Up | Down) {
             form.description_preferred_col = None;
+        }
+        if key.code == Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) && form.focus == 1
+        {
+            self.paste_seq = self.paste_seq.wrapping_add(1);
+            self.paste_pending = true;
+            if self
+                .requests
+                .send(Request::ReadScreenshot(self.paste_seq))
+                .is_err()
+            {
+                self.paste_pending = false;
+                self.notice = Some("Screenshot paste could not be queued".into());
+            }
+            return false;
         }
         match key.code {
             Tab => {
@@ -2496,6 +2561,9 @@ mod tests {
             notice: None,
             mutation_busy: false,
             modal_ready: true,
+            paste_seq: 0,
+            paste_pending: false,
+            created_screenshots: Vec::new(),
             preferred_id: None,
             refresh_inflight: false,
             refresh_pending: false,
@@ -4698,6 +4766,93 @@ mod tests {
             panic!()
         };
         assert_eq!(form.description, "qrnd\n界");
+    }
+
+    #[test]
+    fn screenshot_paste_inserts_reference_at_description_caret() {
+        let mut form = CreateForm {
+            description: "before after".into(),
+            description_cursor: 7,
+            focus: 1,
+            ..Default::default()
+        };
+        form.insert_screenshot(std::path::Path::new("/shared/.beads/screenshots/test.png"));
+        assert_eq!(
+            form.description,
+            "before ![Screenshot](</shared/.beads/screenshots/test.png>)after"
+        );
+        assert_eq!(form.description_cursor, form.description.len() - 5);
+    }
+
+    #[test]
+    fn failed_screenshot_paste_keeps_description() {
+        let mut a = app();
+        a.modal = Some(Modal::Create(CreateForm {
+            description: "keep this".into(),
+            description_cursor: 4,
+            focus: 1,
+            ..Default::default()
+        }));
+        a.paste_seq = 1;
+        a.paste_pending = true;
+        let (tx, rx) = mpsc::channel();
+        a.responses = rx;
+        tx.send(Response::ScreenshotRead(
+            1,
+            Err(std::io::Error::other("no image")),
+        ))
+        .unwrap();
+        a.receive();
+        let Some(Modal::Create(form)) = a.modal else {
+            panic!("create form was closed")
+        };
+        assert_eq!(form.description, "keep this");
+        assert!(!a.paste_pending);
+        assert!(a.notice.as_deref().unwrap().contains("no image"));
+    }
+
+    #[test]
+    fn control_v_requests_image_only_in_description_for_create_and_edit() {
+        for editing in [false, true] {
+            let mut a = app();
+            let mut form = CreateForm {
+                focus: 1,
+                ..Default::default()
+            };
+            form.description = "draft".into();
+            a.modal = Some(if editing {
+                Modal::Edit {
+                    id: "b0".into(),
+                    form,
+                }
+            } else {
+                Modal::Create(form)
+            });
+            let (tx, rx) = mpsc::channel();
+            a.requests = tx;
+            a.modal_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+            assert!(matches!(rx.try_recv(), Ok(Request::ReadScreenshot(1))));
+            assert!(a.paste_pending);
+            a.modal_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            let form = match a.modal.as_ref().unwrap() {
+                Modal::Create(form) | Modal::Edit { form, .. } => form,
+                _ => unreachable!(),
+            };
+            assert_eq!(form.description, "draft");
+        }
+    }
+
+    #[test]
+    fn cancel_form_removes_unsaved_screenshot() {
+        let path =
+            std::env::temp_dir().join(format!("ontrack-unsaved-screenshot-{}", std::process::id()));
+        std::fs::write(&path, b"image").unwrap();
+        let mut a = app();
+        a.modal = Some(Modal::Create(CreateForm::default()));
+        a.created_screenshots.push(path.clone());
+        a.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.modal.is_none());
+        assert!(!path.exists());
     }
     #[test]
     fn enter_from_description_focuses_create_without_submitting() {
