@@ -2,7 +2,7 @@ use crate::herdr::{Agent, LaunchContext, LaunchOutcome};
 use crate::worktrees::{self, Action as WorktreeAction, CleanupPolicy, ManagedWorktree};
 use crate::{
     Tui,
-    beads::{self, Bead, CreateBead},
+    beads::{self, Bead, CreateBead, UpdateBead},
     event,
     settings::{self, Settings, Theme},
     ui,
@@ -22,7 +22,9 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 pub(super) enum Request {
     List,
     Show(String, u64),
+    LoadEdit(String, u64),
     Create(CreateBead),
+    Update(UpdateBead),
     Delete(String),
     Discover(u64),
     Launch(u64, LaunchContext, Agent, Bead),
@@ -34,7 +36,9 @@ pub(super) enum Request {
 pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
     Show(String, u64, std::io::Result<serde_json::Value>),
+    EditLoaded(String, u64, std::io::Result<serde_json::Value>),
     Created(std::io::Result<String>),
+    Updated(String, std::io::Result<()>),
     Deleted(std::io::Result<()>),
     Discovered(u64, std::io::Result<LaunchContext>),
     Launched(u64, std::io::Result<LaunchOutcome>),
@@ -61,6 +65,7 @@ pub struct App {
     pub list_error: Option<String>,
     pub detail_error: Option<String>,
     pub(super) detail_seq: u64,
+    pub(super) edit_seq: u64,
     pub(super) launch_seq: u64,
     pub(super) handoff: Option<PendingHandoff>,
     pub toast: Option<Toast>,
@@ -72,6 +77,8 @@ pub struct App {
     pub settings_path: Option<PathBuf>,
     pub settings_load_error: Option<String>,
     pub worktrees: Vec<ManagedWorktree>,
+    /// Accepted handoffs include removed checkouts, which are hidden from `worktrees`.
+    pub accepted_handoffs: HashSet<String>,
     pub selected_worktree: usize,
     pub worktree_offset: usize,
     pub worktree_detail_offset: u16,
@@ -98,6 +105,15 @@ pub struct App {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
     Create(CreateForm),
+    EditLoading {
+        id: String,
+        seq: u64,
+        error: Option<String>,
+    },
+    Edit {
+        id: String,
+        form: CreateForm,
+    },
     ConfirmDelete {
         id: String,
         title: String,
@@ -171,6 +187,38 @@ impl Default for CreateForm {
         }
     }
 }
+
+fn edit_form(record: &serde_json::Value) -> Result<CreateForm, String> {
+    let title = record
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .ok_or("Bead has no editable title")?;
+    let issue_type = record
+        .get("issue_type")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|kind| beads::BEAD_TYPES.iter().position(|known| *known == kind))
+        .ok_or("Bead type is missing or unsupported by the edit form")?;
+    let priority = record
+        .get("priority")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|priority| *priority <= 4)
+        .ok_or("Bead priority is missing or outside P0–P4")? as usize;
+    let description = match record.get("description") {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(value)) => value.clone(),
+        _ => return Err("Bead description is not text".into()),
+    };
+    Ok(CreateForm {
+        title: title.into(),
+        cursor: title.len(),
+        description_cursor: description.len(),
+        description,
+        issue_type,
+        priority,
+        ..Default::default()
+    })
+}
 fn previous_boundary(s: &str, cursor: usize) -> usize {
     s[..cursor.min(s.len())]
         .char_indices()
@@ -237,7 +285,13 @@ impl App {
                     Request::Show(id, seq) => {
                         Response::Show(id.clone(), seq, beads::show_bead(&id))
                     }
+                    Request::LoadEdit(id, seq) => {
+                        Response::EditLoaded(id.clone(), seq, beads::show_bead(&id))
+                    }
                     Request::Create(input) => Response::Created(beads::create_bead(&input)),
+                    Request::Update(input) => {
+                        Response::Updated(input.id.clone(), beads::update_bead(&input))
+                    }
                     Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
                     Request::Discover(seq) => Response::Discovered(seq, crate::herdr::discover()),
                     Request::Launch(seq, context, agent, bead) => {
@@ -290,6 +344,7 @@ impl App {
             list_error: None,
             detail_error: None,
             detail_seq: 0,
+            edit_seq: 0,
             launch_seq: 0,
             handoff: None,
             toast: None,
@@ -301,6 +356,7 @@ impl App {
             settings_path,
             settings_load_error: settings_error.clone(),
             worktrees: Vec::new(),
+            accepted_handoffs: HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,
@@ -657,6 +713,24 @@ impl App {
                         }
                     }
                 }
+                Response::EditLoaded(id, seq, result) => {
+                    if let Some(Modal::EditLoading {
+                        id: pending,
+                        seq: active,
+                        error,
+                    }) = self.modal.as_mut()
+                        && *pending == id
+                        && *active == seq
+                    {
+                        match result
+                            .map_err(|e| e.to_string())
+                            .and_then(|v| edit_form(&v))
+                        {
+                            Ok(form) => self.modal = Some(Modal::Edit { id, form }),
+                            Err(message) => *error = Some(message),
+                        }
+                    }
+                }
                 Response::Created(result) => {
                     self.mutation_busy = false;
                     match result {
@@ -669,6 +743,18 @@ impl App {
                         Err(e) => {
                             self.notice = Some(format!("Create failed: {e}"));
                         }
+                    }
+                }
+                Response::Updated(id, result) => {
+                    self.mutation_busy = false;
+                    match result {
+                        Ok(()) => {
+                            self.notice = Some(format!("Updated {id}"));
+                            self.modal = None;
+                            self.preferred_id = Some(id);
+                            self.refresh_at(now);
+                        }
+                        Err(e) => self.notice = Some(format!("Update failed: {e}")),
                     }
                 }
                 Response::Deleted(result) => {
@@ -771,13 +857,32 @@ impl App {
                                     .worktrees
                                     .get(self.selected_worktree)
                                     .map(|item| item.id.clone());
-                                self.worktrees = items;
+                                self.accepted_handoffs = items
+                                    .iter()
+                                    .filter(|item| item.handoff_accepted)
+                                    .map(|item| item.bead_id.clone())
+                                    .collect();
+                                self.worktrees = items
+                                    .into_iter()
+                                    .filter(|item| {
+                                        item.status != worktrees::WorktreeStatus::CheckoutRemoved
+                                    })
+                                    .collect();
                                 self.selected_worktree = selected_id
+                                    .as_deref()
                                     .and_then(|id| {
                                         self.worktrees.iter().position(|item| item.id == id)
                                     })
                                     .unwrap_or(self.selected_worktree)
                                     .min(self.worktrees.len().saturating_sub(1));
+                                if selected_id.as_deref()
+                                    != self
+                                        .worktrees
+                                        .get(self.selected_worktree)
+                                        .map(|item| item.id.as_str())
+                                {
+                                    self.worktree_detail_offset = 0;
+                                }
                                 self.worktrees_error = None;
                             }
                             Err(error) => self.worktrees_error = Some(error.to_string()),
@@ -805,12 +910,25 @@ impl App {
                     self.worktree_action_pending = false;
                     match result {
                         Ok(item) => {
+                            if item.handoff_accepted {
+                                self.accepted_handoffs.insert(item.bead_id.clone());
+                            }
                             if let Some(index) = self
                                 .worktrees
                                 .iter()
                                 .position(|existing| existing.id == item.id)
                             {
-                                self.worktrees[index] = item.clone();
+                                if item.status == worktrees::WorktreeStatus::CheckoutRemoved {
+                                    self.worktrees.remove(index);
+                                    self.selected_worktree = self
+                                        .selected_worktree
+                                        .min(self.worktrees.len().saturating_sub(1));
+                                    if self.selected_worktree >= index {
+                                        self.worktree_detail_offset = 0;
+                                    }
+                                } else {
+                                    self.worktrees[index] = item.clone();
+                                }
                             }
                             self.notice = Some(format!(
                                 "{} · {}",
@@ -900,6 +1018,25 @@ impl App {
                 self.modal = Some(Modal::Create(CreateForm::default()));
                 self.modal_ready = false;
                 self.notice = None;
+            }
+            KeyCode::Char('e') => {
+                if let Some(b) = self.selected.and_then(|i| self.beads.get(i)) {
+                    let id = b.id.clone();
+                    self.edit_seq = self.edit_seq.wrapping_add(1);
+                    let seq = self.edit_seq;
+                    self.modal = Some(Modal::EditLoading {
+                        id: id.clone(),
+                        seq,
+                        error: None,
+                    });
+                    self.modal_ready = false;
+                    self.notice = None;
+                    if self.requests.send(Request::LoadEdit(id, seq)).is_err()
+                        && let Some(Modal::EditLoading { error, .. }) = self.modal.as_mut()
+                    {
+                        *error = Some("Edit could not be queued; try again".into());
+                    }
+                }
             }
             KeyCode::Char('d') => {
                 if let Some(b) = self.selected.and_then(|i| self.beads.get(i)) {
@@ -1028,7 +1165,7 @@ impl App {
                 }
                 return false;
             }
-            if let Some(Modal::Create(form)) = self.modal.as_mut()
+            if let Some(Modal::Create(form) | Modal::Edit { form, .. }) = self.modal.as_mut()
                 && let Some(which) = form.dropdown.take()
             {
                 if let Some(old) = form.dropdown_original.take() {
@@ -1128,7 +1265,25 @@ impl App {
             }
             return false;
         }
-        let Some(Modal::Create(form)) = self.modal.as_mut() else {
+        if let Some(Modal::EditLoading { id, seq, error }) = self.modal.as_mut() {
+            if key.code == Char('e') && error.is_some() {
+                let id = id.clone();
+                self.edit_seq = self.edit_seq.wrapping_add(1);
+                *seq = self.edit_seq;
+                *error = None;
+                if self.requests.send(Request::LoadEdit(id, *seq)).is_err()
+                    && let Some(Modal::EditLoading { error, .. }) = self.modal.as_mut()
+                {
+                    *error = Some("Edit could not be queued; try again".into());
+                }
+            }
+            return false;
+        }
+        let edit_id = match self.modal.as_ref() {
+            Some(Modal::Edit { id, .. }) => Some(id.clone()),
+            _ => None,
+        };
+        let Some(Modal::Create(form) | Modal::Edit { form, .. }) = self.modal.as_mut() else {
             return false;
         };
         if let Some(which) = form.dropdown {
@@ -1211,9 +1366,14 @@ impl App {
                         priority: form.priority as u8,
                     };
                     self.mutation_busy = true;
-                    if self.requests.send(Request::Create(input)).is_err() {
+                    let request = if let Some(id) = edit_id {
+                        Request::Update(UpdateBead { id, fields: input })
+                    } else {
+                        Request::Create(input)
+                    };
+                    if self.requests.send(request).is_err() {
                         self.mutation_busy = false;
-                        self.notice = Some("Create could not be queued; try again".into());
+                        self.notice = Some("Save could not be queued; try again".into());
                     }
                 } else {
                     self.notice = Some("Title is required".into());
@@ -1589,6 +1749,7 @@ mod tests {
             list_error: None,
             detail_error: None,
             detail_seq: 0,
+            edit_seq: 0,
             launch_seq: 0,
             handoff: None,
             toast: None,
@@ -1600,6 +1761,7 @@ mod tests {
             settings_path: None,
             settings_load_error: None,
             worktrees: Vec::new(),
+            accepted_handoffs: HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,
@@ -3419,6 +3581,128 @@ mod tests {
         }
     }
     #[test]
+    fn edit_loads_live_record_and_update_failure_keeps_draft_for_retry() {
+        let mut a = app();
+        let (requests, rx) = mpsc::channel();
+        let (out, responses) = mpsc::channel();
+        a.requests = requests;
+        a.responses = responses;
+        press(&mut a, KeyCode::Char('e'));
+        let seq = match rx.try_recv() {
+            Ok(Request::LoadEdit(id, seq)) if id == "b0" => seq,
+            _ => panic!("missing edit load"),
+        };
+        assert!(matches!(a.modal, Some(Modal::EditLoading { .. })));
+        out.send(Response::EditLoaded(
+            "b0".into(),
+            seq,
+            Ok(json!({
+                "id": "b0", "title": "Live title", "description": "Live\ntext",
+                "issue_type": "bug", "priority": 3, "notes": "untouched"
+            })),
+        ))
+        .unwrap();
+        a.receive();
+        let Some(Modal::Edit { id, form }) = a.modal.as_mut() else {
+            panic!("edit form not opened")
+        };
+        assert_eq!(id, "b0");
+        assert_eq!(
+            (
+                &*form.title,
+                &*form.description,
+                form.issue_type,
+                form.priority
+            ),
+            ("Live title", "Live\ntext", 1, 3)
+        );
+        form.title = "Changed".into();
+        form.focus = 4;
+        press(&mut a, KeyCode::Enter);
+        let Ok(Request::Update(input)) = rx.try_recv() else {
+            panic!("missing update request")
+        };
+        assert_eq!(input.id, "b0");
+        assert_eq!(input.fields.title, "Changed");
+        assert_eq!(input.fields.description, "Live\ntext");
+        assert_eq!(input.fields.issue_type, "bug");
+        assert_eq!(input.fields.priority, 3);
+        press(&mut a, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        out.send(Response::Updated(
+            "b0".into(),
+            Err(std::io::Error::other("offline")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(!a.mutation_busy);
+        assert!(matches!(&a.modal, Some(Modal::Edit { form, .. }) if form.title == "Changed"));
+        assert!(a.notice.as_deref().unwrap().contains("offline"));
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(Request::Update(_))));
+        out.send(Response::Updated("b0".into(), Ok(()))).unwrap();
+        a.receive();
+        assert!(a.modal.is_none());
+        assert_eq!(a.preferred_id.as_deref(), Some("b0"));
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+    }
+
+    #[test]
+    fn edit_cancellation_and_bad_live_record_do_not_write() {
+        let mut a = app();
+        let (requests, rx) = mpsc::channel();
+        let (out, responses) = mpsc::channel();
+        a.requests = requests;
+        a.responses = responses;
+        press(&mut a, KeyCode::Char('e'));
+        let seq = match rx.try_recv() {
+            Ok(Request::LoadEdit(_, seq)) => seq,
+            _ => panic!(),
+        };
+        out.send(Response::EditLoaded(
+            "b0".into(),
+            seq.wrapping_sub(1),
+            Ok(json!({"id": "b0", "title": "stale", "issue_type": "task", "priority": 2})),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(a.modal, Some(Modal::EditLoading { .. })));
+        out.send(Response::EditLoaded(
+            "b0".into(),
+            seq,
+            Ok(json!({
+                "id": "b0", "title": "Existing", "issue_type": "custom", "priority": 2
+            })),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(
+            &a.modal,
+            Some(Modal::EditLoading { error: Some(_), .. })
+        ));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Char('e'));
+        let seq = match rx.try_recv() {
+            Ok(Request::LoadEdit(_, seq)) => seq,
+            _ => panic!(),
+        };
+        out.send(Response::EditLoaded(
+            "b0".into(),
+            seq,
+            Ok(json!({
+                "id": "b0", "title": "Existing", "issue_type": "task", "priority": 2
+            })),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(a.modal, Some(Modal::Edit { .. })));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
     fn dropdown_confirm_commits_previewed_option() {
         let mut a = app();
         press(&mut a, KeyCode::Char('n'));
@@ -3766,6 +4050,93 @@ mod tests {
         assert_eq!(a.worktrees.len(), 1);
         assert_eq!(a.worktrees[0].id, item.id);
         assert_eq!(a.beads[0].status, "closed");
+    }
+    #[test]
+    fn removed_checkout_is_hidden_on_refresh_without_hiding_attention_or_closed_workspace() {
+        let (mut app, _, tx) = connected_app();
+        let item = |id: &str, status| ManagedWorktree {
+            id: id.into(),
+            bead_id: format!("bead-{id}"),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: format!("ontrack/{id}"),
+            target_branch: "main".into(),
+            workspace_id: format!("ws-{id}"),
+            status,
+            detail: None,
+        };
+        let removed = item("removed", worktrees::WorktreeStatus::CheckoutRemoved);
+        let closed = item("closed", worktrees::WorktreeStatus::WorkspaceClosed);
+        let attention = item("attention", worktrees::WorktreeStatus::NeedsAttention);
+        app.worktrees = vec![removed.clone(), closed.clone()];
+        app.selected_worktree = 1;
+        app.worktree_detail_offset = 7;
+        tx.send(Response::Worktrees(Ok(vec![
+            removed.clone(),
+            closed.clone(),
+            attention.clone(),
+        ])))
+        .unwrap();
+        app.receive();
+        assert_eq!(
+            app.worktrees
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["closed", "attention"]
+        );
+        assert_eq!(app.selected_worktree, 0);
+        assert_eq!(app.worktree_detail_offset, 7);
+        assert!(app.accepted_handoffs.contains(&removed.bead_id));
+
+        tx.send(Response::Worktrees(Ok(vec![
+            removed.clone(),
+            attention.clone(),
+        ])))
+        .unwrap();
+        app.receive();
+        assert_eq!(app.worktrees[0].id, attention.id);
+        assert_eq!(app.selected_worktree, 0);
+        assert_eq!(app.worktree_detail_offset, 0);
+
+        tx.send(Response::Worktrees(Ok(vec![removed]))).unwrap();
+        app.receive();
+        assert!(app.worktrees.is_empty());
+        assert_eq!(app.selected_worktree, 0);
+    }
+    #[test]
+    fn successful_checkout_removal_hides_selected_row_immediately() {
+        let (mut app, _, tx) = connected_app();
+        let item = |id: &str| ManagedWorktree {
+            id: id.into(),
+            bead_id: format!("bead-{id}"),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: format!("ontrack/{id}"),
+            target_branch: "main".into(),
+            workspace_id: format!("ws-{id}"),
+            status: worktrees::WorktreeStatus::Integrated,
+            detail: None,
+        };
+        let first = item("first");
+        let selected = item("selected");
+        let last = item("last");
+        app.worktrees = vec![first, selected.clone(), last.clone()];
+        app.selected_worktree = 1;
+        app.worktree_detail_offset = 9;
+        tx.send(Response::WorktreeChanged(Ok(ManagedWorktree {
+            status: worktrees::WorktreeStatus::CheckoutRemoved,
+            ..selected
+        })))
+        .unwrap();
+        app.receive();
+        assert_eq!(app.worktrees.len(), 2);
+        assert_eq!(app.worktrees[app.selected_worktree].id, last.id);
+        assert_eq!(app.worktree_detail_offset, 0);
+        assert!(app.accepted_handoffs.contains("bead-selected"));
+        assert!(app.notice.as_deref().unwrap().contains("CHECKOUT REMOVED"));
     }
     #[test]
     fn older_worktree_snapshot_cannot_overwrite_action_result() {

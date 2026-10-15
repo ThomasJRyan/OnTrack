@@ -189,7 +189,8 @@ fn relationships(v: &Value, width: u16) -> Vec<Line<'static>> {
     output
 }
 
-/// Human-readable presentation of the complete Beads response, retaining unrecognized fields.
+/// Human-readable presentation of the Beads response, retaining unrecognized fields.
+/// The top-level revision is hidden because it is not useful in the details pane.
 pub fn render(
     value: &Value,
     selected: Option<(&str, &str, &str, i64)>,
@@ -204,6 +205,7 @@ pub fn render(
         "dependents",
         "blocks",
         "blocked_by",
+        "revision",
     ];
     if let Some((id, title, status, priority)) = selected {
         let field = |name: &str| object.and_then(|o| o.get(name));
@@ -363,6 +365,25 @@ mod tests {
             }
             assert!(rendered.lines.len() > 8);
         }
+    }
+
+    #[test]
+    fn hides_top_level_revision_but_keeps_other_details() {
+        let value = json!({
+            "id": "demo-1",
+            "title": "Title",
+            "revision": "stale-revision",
+            "created_at": "today",
+            "unknown": {"revision": "nested-revision"}
+        });
+
+        for selected in [Some(("demo-1", "Title", "open", 2)), None] {
+            let plain = render(&value, selected, 50).to_string();
+            assert!(!plain.contains("stale-revision"), "{plain}");
+            assert!(plain.contains("created_at: today"), "{plain}");
+            assert!(plain.contains("nested-revision"), "{plain}");
+        }
+        assert_eq!(value["revision"], "stale-revision");
     }
 
     #[test]

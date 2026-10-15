@@ -82,6 +82,30 @@ fn themed_type_color(kind: &str, theme: Theme) -> Color {
 fn themed_priority_color(priority: u64, theme: Theme) -> Color {
     crate::theme::priority_color(theme, priority)
 }
+fn worktree_status_style(theme: Theme, status: crate::worktrees::WorktreeStatus) -> Style {
+    let color = crate::theme::worktree_status_color(theme, status);
+    let Color::Rgb(red, green, blue) = color else {
+        return Style::default().fg(color).add_modifier(Modifier::BOLD);
+    };
+    let channel = |value: u8| {
+        let value = f64::from(value) / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue);
+    let foreground = if luminance > 0.179 {
+        Color::Black
+    } else {
+        Color::White
+    };
+    Style::default()
+        .fg(foreground)
+        .bg(color)
+        .add_modifier(Modifier::BOLD)
+}
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
         "↑ / ↓ move · ← / → theme · Enter / Space toggle · Tab moves · Esc close"
@@ -272,7 +296,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             rows.push(Line::from(if app.worktrees_loading {
                 "Checking tracked handoffs…"
             } else {
-                "No OnTrack-tracked handoffs."
+                "No outstanding OnTrack-tracked handoffs."
             }));
             rows.push(Line::from("Existing worktrees are not adopted."));
         }
@@ -292,18 +316,17 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             } else {
                 Style::default().fg(ink)
             };
-            rows.push(Line::from(Span::styled(
-                truncate_display(
-                    &format!(
-                        "{} {} · {}",
-                        if selected { "›" } else { " " },
-                        item.bead_id,
-                        crate::app::worktree_status_label(item.status)
-                    ),
-                    panes[0].width.saturating_sub(2) as usize,
-                ),
-                style,
-            )));
+            let width = panes[0].width.saturating_sub(2) as usize;
+            let prefix = truncate_display(
+                &format!("{} {} · ", if selected { "›" } else { " " }, item.bead_id),
+                width,
+            );
+            let remaining = width.saturating_sub(Span::raw(prefix.as_str()).width());
+            let label = truncate_display(crate::app::worktree_status_label(item.status), remaining);
+            rows.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::styled(label, worktree_status_style(app.theme, item.status)),
+            ]));
             rows.push(Line::from(Span::styled(
                 truncate_display(
                     &format!("  {} → {}", item.branch, item.target_branch),
@@ -337,14 +360,16 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .and_then(serde_json::Value::as_str)
                 .or(item.bead_description.as_deref());
             let mut lines = vec![
-                Line::from(Span::styled(
-                    format!(
-                        "{} · {}",
-                        item.bead_id,
-                        crate::app::worktree_status_label(item.status)
+                Line::from(vec![
+                    Span::styled(
+                        format!("{} · ", item.bead_id),
+                        Style::default().fg(teal).add_modifier(Modifier::BOLD),
                     ),
-                    Style::default().fg(teal).add_modifier(Modifier::BOLD),
-                )),
+                    Span::styled(
+                        crate::app::worktree_status_label(item.status),
+                        worktree_status_style(app.theme, item.status),
+                    ),
+                ]),
                 Line::from(format!("Branch: {}", item.branch)),
                 Line::from(format!("Target: {}", item.target_branch)),
                 Line::from(format!("Herdr workspace: {}", item.workspace_id)),
@@ -609,9 +634,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         bead.status.as_str()
                     };
                     let handed_off = status == "open"
-                        && app.worktrees.iter().any(|worktree| {
-                            worktree.bead_id == bead.id && worktree.handoff_accepted
-                        });
+                        && (app.accepted_handoffs.contains(&bead.id)
+                            || app.worktrees.iter().any(|worktree| {
+                                worktree.bead_id == bead.id && worktree.handoff_accepted
+                            }));
                     let mut spans = vec![
                         Span::styled(
                             if selected { "› " } else { "  " },
@@ -769,7 +795,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     );
     if let Some(modal) = &app.modal {
         let width = match modal {
-            crate::app::Modal::Create(_) => 70,
+            crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. } => 70,
             crate::app::Modal::Settings { .. } => 64,
             _ => 62,
         }
@@ -810,21 +836,24 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 };
                 (9 + option_lines + error_lines + hint_lines + 2) as u16
             }
-            crate::app::Modal::Create(form) => {
-                if form.dropdown.is_some() {
-                    19
-                } else {
-                    15
-                }
+            crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
+                if form.dropdown.is_some() { 19 } else { 15 }
             }
+            crate::app::Modal::EditLoading { .. } => 8,
             crate::app::Modal::ConfirmDelete { .. } => delete_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
             crate::app::Modal::ConfirmWorktree { .. } => 8,
         };
-        let min_width = if matches!(modal, crate::app::Modal::Create(_)) {
+        let min_width = if matches!(
+            modal,
+            crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. }
+        ) {
             70
-        } else if matches!(modal, crate::app::Modal::Settings { .. }) {
+        } else if matches!(
+            modal,
+            crate::app::Modal::Settings { .. } | crate::app::Modal::EditLoading { .. }
+        ) {
             38
         } else {
             50
@@ -862,6 +891,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         let frame = Block::default()
             .title(match modal {
                 crate::app::Modal::Create(_) => " NEW BEAD ",
+                crate::app::Modal::EditLoading { .. } | crate::app::Modal::Edit { .. } => {
+                    " EDIT BEAD "
+                }
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 _ => " DELETE BEAD? ",
             })
@@ -876,6 +908,18 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             area.height.saturating_sub(2),
         );
         match modal {
+            crate::app::Modal::EditLoading { id, error, .. } => {
+                let message = error.as_ref().map_or_else(
+                    || format!("Loading {id}…"),
+                    |error| format!("Could not load {id}: {error}\nPress e to retry · Esc cancels"),
+                );
+                f.render_widget(
+                    Paragraph::new(message)
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().fg(if error.is_some() { gold } else { ink })),
+                    inner,
+                );
+            }
             crate::app::Modal::Settings {
                 draft,
                 error,
@@ -1019,7 +1063,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     inner,
                 );
             }
-            crate::app::Modal::Create(form) => {
+            crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
+                let editing = matches!(modal, crate::app::Modal::Edit { .. });
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -1196,7 +1241,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Paragraph::new(wrapped_description)
                         .block(
                             Block::default()
-                                .title(" Description · Shift+Enter newline · Enter Create ")
+                                .title(if editing {
+                                    " Description · Shift+Enter newline · Enter Save "
+                                } else {
+                                    " Description · Shift+Enter newline · Enter Create "
+                                })
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(if form.focus == 1 {
                                     teal
@@ -1221,7 +1270,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 }
                 let actions = Paragraph::new(Line::from(vec![
                     Span::styled(
-                        "[ Create ]",
+                        if editing { "[ Save ]" } else { "[ Create ]" },
                         if app.mutation_busy {
                             Style::default().fg(muted)
                         } else if form.focus == 4 {
@@ -1251,7 +1300,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 ]));
                 f.render_widget(actions, rows[3]);
                 let feedback = if app.mutation_busy {
-                    Some("Creating… · form locked until the command finishes")
+                    Some(if editing {
+                        "Saving… · form locked until the command finishes"
+                    } else {
+                        "Creating… · form locked until the command finishes"
+                    })
                 } else {
                     app.notice.as_deref()
                 };
@@ -1355,7 +1408,7 @@ fn footer_text(state: &str, width: usize) -> String {
     // long status/error cannot push create, delete, or handoff offscreen. At
     // narrow widths, spend the remaining cells on the start of the status and
     // mark its truncation rather than letting Ratatui clip the actions.
-    let actions = " · n new · d delete · h hand off · r refresh · q quit";
+    let actions = " · n new · e edit · d delete · h hand off · r refresh · q quit";
     let state_width = width.saturating_sub(1 + Span::raw(actions).width());
     let state = truncate_display(state, state_width);
     let core = if state.is_empty() {
@@ -1363,7 +1416,7 @@ fn footer_text(state: &str, width: usize) -> String {
     } else {
         format!(" {state}{actions}")
     };
-    let navigation = " · ↑↓ · ←/→ groups · Tab panes · s settings · w worktrees";
+    let navigation = " · ↑↓ · ←/→ · Tab panes · s settings · w worktrees";
     if Span::raw(core.as_str()).width() + Span::raw(navigation).width() <= width {
         format!("{core}{navigation}")
     } else {
@@ -1628,6 +1681,7 @@ mod tests {
             list_error: None,
             detail_error: None,
             detail_seq: 0,
+            edit_seq: 0,
             launch_seq: 0,
             handoff: None,
             toast: None,
@@ -1639,6 +1693,7 @@ mod tests {
             settings_path: None,
             settings_load_error: None,
             worktrees: Vec::new(),
+            accepted_handoffs: std::collections::HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,
@@ -1766,6 +1821,9 @@ mod tests {
         });
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));
         a.worktrees[0].handoff_accepted = true;
+        assert!(draw((80, 24), &mut a).0.contains("open · sent"));
+        a.worktrees.clear();
+        a.accepted_handoffs.insert("demo-1".into());
         assert!(draw((80, 24), &mut a).0.contains("open · sent"));
         a.beads[0].status = "in_progress".into();
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));
@@ -2068,6 +2126,7 @@ mod tests {
         let status = draw((120, 40), &mut a).0;
         assert!(status.contains("LIST ERROR"));
         assert!(status.contains("n new"));
+        assert!(status.contains("e edit"));
         assert!(status.contains("d delete"));
         assert!(status.contains("h hand off"));
         a.list_error = None;
@@ -2085,6 +2144,28 @@ mod tests {
         let entered = draw((100, 30), &mut a).0;
         assert!(entered.contains("Visible title"));
         assert!(!entered.contains("Title · required"));
+        a.modal = Some(crate::app::Modal::Edit {
+            id: "demo-1".into(),
+            form: crate::app::CreateForm {
+                title: "Edited title".into(),
+                cursor: 12,
+                description: "Existing description".into(),
+                ..Default::default()
+            },
+        });
+        let edit = draw((100, 30), &mut a).0;
+        assert!(edit.contains("EDIT BEAD"));
+        assert!(edit.contains("Edited title"));
+        assert!(edit.contains("Existing description"));
+        assert!(edit.contains("[ Save ]"));
+        a.modal = Some(crate::app::Modal::EditLoading {
+            id: "demo-1".into(),
+            seq: 1,
+            error: Some("offline".into()),
+        });
+        let loading_error = draw((100, 30), &mut a).0;
+        assert!(loading_error.contains("offline"));
+        assert!(loading_error.contains("retry"));
         a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm::default()));
         let tiny = draw((12, 5), &mut a).0;
         assert!(tiny.contains("Resize"));
@@ -2188,6 +2269,95 @@ mod tests {
         assert!(screen.contains("main"));
         assert!(screen.contains("waiting for verified ancestry"));
         assert!(screen.contains("Git integration"));
+    }
+    #[test]
+    fn worktree_status_badges_use_theme_colours_in_list_and_detail() {
+        use crate::worktrees::{ManagedWorktree, WorktreeStatus};
+        let statuses = [
+            WorktreeStatus::Unmerged,
+            WorktreeStatus::MergeRequested,
+            WorktreeStatus::NeedsResolution,
+            WorktreeStatus::Integrated,
+            WorktreeStatus::WorkspaceClosed,
+            WorktreeStatus::CheckoutRemoved,
+            WorktreeStatus::NeedsAttention,
+        ];
+        let locate = |buffer: &ratatui::buffer::Buffer, rect: Rect, label: &str| {
+            let chars = label.chars().collect::<Vec<_>>();
+            for y in rect.y..rect.bottom() {
+                for x in rect.x..rect.right().saturating_sub(chars.len() as u16) {
+                    if chars.iter().enumerate().all(|(offset, ch)| {
+                        buffer[(x + offset as u16, y)].symbol() == ch.to_string()
+                    }) {
+                        return (x, y);
+                    }
+                }
+            }
+            panic!("{label} missing from {rect:?}")
+        };
+        for theme in Theme::ALL {
+            let mut app = app();
+            app.theme = theme;
+            app.worktrees_view = true;
+            app.worktrees = statuses
+                .iter()
+                .enumerate()
+                .map(|(index, &status)| ManagedWorktree {
+                    id: format!("handoff-{index}"),
+                    bead_id: format!("bead-{index}"),
+                    handoff_accepted: true,
+                    bead_title: None,
+                    bead_description: None,
+                    branch: format!("ontrack/bead-{index}"),
+                    target_branch: "main".into(),
+                    workspace_id: format!("ws-{index}"),
+                    status,
+                    detail: None,
+                })
+                .collect();
+            let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for status in statuses {
+                let label = crate::app::worktree_status_label(status);
+                let (x, y) = locate(buffer, app.list_rect, label);
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.bg, crate::theme::worktree_status_color(theme, status));
+                assert!(matches!(cell.fg, Color::Black | Color::White));
+                assert!(cell.modifier.contains(Modifier::BOLD));
+            }
+            let selected = statuses[0];
+            let (x, y) = locate(
+                buffer,
+                app.detail_rect,
+                crate::app::worktree_status_label(selected),
+            );
+            assert_eq!(
+                buffer[(x, y)].bg,
+                crate::theme::worktree_status_color(theme, selected)
+            );
+            assert_eq!(
+                buffer[(app.list_rect.x + 1, app.list_rect.y + 1)].bg,
+                crate::theme::definition(theme).palette.selected_background
+            );
+            app.selected_worktree = 3;
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let integrated = WorktreeStatus::Integrated;
+            let (x, y) = locate(
+                buffer,
+                app.detail_rect,
+                crate::app::worktree_status_label(integrated),
+            );
+            assert_eq!(
+                buffer[(x, y)].bg,
+                crate::theme::worktree_status_color(theme, integrated)
+            );
+        }
     }
     #[test]
     fn selected_worktree_shows_its_captured_title_and_multiline_description() {
