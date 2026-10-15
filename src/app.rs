@@ -43,6 +43,7 @@ pub(super) enum Response {
 pub struct App {
     pub beads: Vec<Bead>,
     pub collapsed: HashSet<String>,
+    pub(crate) closed_default_pending: bool,
     pub collapse_context: Option<String>,
     pub selected: Option<usize>,
     pub detail: Option<serde_json::Value>,
@@ -254,6 +255,7 @@ impl App {
         let mut a = Self {
             beads: vec![],
             collapsed: HashSet::new(),
+            closed_default_pending: true,
             collapse_context: None,
             selected: None,
             detail: None,
@@ -532,6 +534,12 @@ impl App {
                                     .then_with(|| a.status.cmp(&b.status))
                                     .then_with(|| a.id.cmp(&b.id))
                             });
+                            if self.closed_default_pending
+                                && self.beads.iter().any(|bead| bead.status == "closed")
+                            {
+                                self.collapsed.insert("closed".into());
+                                self.closed_default_pending = false;
+                            }
                             self.collapsed
                                 .retain(|s| self.beads.iter().any(|b| &b.status == s));
                             // An in-flight pre-mutation snapshot must not consume
@@ -1472,6 +1480,7 @@ mod tests {
                 })
                 .collect(),
             collapsed: HashSet::new(),
+            closed_default_pending: false,
             collapse_context: None,
             selected: Some(0),
             detail: Some(json!({"id": "b0", "description": "detail 0"})),
@@ -1522,6 +1531,13 @@ mod tests {
         let bead = &a.beads[a.selected.expect("selected bead")];
         assert_eq!(bead.id, id);
         assert_eq!(a.detail.as_ref(), Some(&bead.data));
+    }
+    fn unloaded_app() -> App {
+        let mut a = app();
+        a.beads.clear();
+        a.clear_selection();
+        a.closed_default_pending = true;
+        a
     }
     fn launch_context() -> LaunchContext {
         LaunchContext {
@@ -2846,6 +2862,70 @@ mod tests {
         assert_eq!(a.selected, None);
         assert!(a.detail.is_none());
         assert!(a.collapse_context.is_none());
+    }
+    #[test]
+    fn closed_group_starts_collapsed_and_user_expansion_survives_refresh() {
+        let mut a = unloaded_app();
+        let mut items = app().beads;
+        items.truncate(2);
+        items[1].status = " closed ".into();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_bead(&a, "b0");
+        let layout = list_layout(&a.beads, &a.collapsed);
+        assert_eq!(layout.groups.len(), 2);
+        assert!(!layout.groups[0].collapsed);
+        assert!(layout.groups[1].collapsed);
+        assert_eq!(layout.groups[1].indices, vec![1]);
+        assert!(
+            !layout
+                .targets
+                .iter()
+                .any(|target| target.row == DisplayRow::Bead(1))
+        );
+
+        press(&mut a, KeyCode::Down);
+        assert_collapsed_header_selected(&a, "closed");
+        press(&mut a, KeyCode::Right);
+        assert_bead(&a, "b1");
+        let refreshed = a.beads.clone();
+        respond(&mut a, Response::List(Ok(refreshed)));
+        assert_bead(&a, "b1");
+        assert!(!a.collapsed.contains("closed"));
+        press(&mut a, KeyCode::Left);
+        assert_collapsed_header_selected(&a, "closed");
+    }
+    #[test]
+    fn closed_group_defaults_when_it_first_appears_after_an_empty_list() {
+        let mut a = unloaded_app();
+        respond(&mut a, Response::List(Ok(vec![])));
+        assert!(a.closed_default_pending);
+        assert!(a.collapsed.is_empty());
+
+        let mut items = app().beads;
+        items.truncate(2);
+        respond(&mut a, Response::List(Ok(items.clone())));
+        assert!(a.closed_default_pending);
+        assert_bead(&a, "b0");
+
+        items[1].status = "closed".into();
+        respond(&mut a, Response::List(Ok(items)));
+        assert!(!a.closed_default_pending);
+        assert!(a.collapsed.contains("closed"));
+        assert_bead(&a, "b0");
+    }
+    #[test]
+    fn closed_only_workspace_keeps_header_keyboard_accessible() {
+        let mut a = unloaded_app();
+        let mut items = app().beads;
+        items.truncate(1);
+        items[0].status = "closed".into();
+        respond(&mut a, Response::List(Ok(items)));
+        assert!(a.collapsed.contains("closed"));
+        assert!(a.selected.is_none());
+        press(&mut a, KeyCode::Down);
+        assert_collapsed_header_selected(&a, "closed");
+        press(&mut a, KeyCode::Right);
+        assert_bead(&a, "b0");
     }
     #[test]
     fn refresh_never_selects_group_headers_or_makes_them_delete_targets() {

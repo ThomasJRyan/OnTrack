@@ -19,7 +19,7 @@ Rust 1.88 or newer, the `bd` command-line tool, and a Beads workspace. A termina
 cargo run
 ```
 
-Issues are grouped into coloured, collapsible status panes (open first, closed last). Press `w` for outstanding tracked handoffs, `s` for appearance and cleanup preferences, `n` to create a bead, and `d` to permanently delete one (confirmation required). See the [user guide](docs/user-guide.md) for controls and the [development guide](docs/development.md) for the tracked-worktree model.
+Issues are grouped into coloured, collapsible status panes (open first, closed last), with Closed collapsed on launch. Press `w` for outstanding tracked handoffs, `s` for appearance and cleanup preferences, `n` to create a bead, and `d` to permanently delete one (confirmation required). See the [user guide](docs/user-guide.md) for controls and the [development guide](docs/development.md) for the tracked-worktree model.
 
 See the [user guide](docs/user-guide.md) for setup and controls, the [settings guide](docs/settings.md) for theme and worktree preferences, the [development guide](docs/development.md) for architecture and checks, and the [official Beads documentation](https://beads.gascity.com) for workspace setup.
 

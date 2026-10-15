@@ -1596,6 +1596,7 @@ mod tests {
                 data: json!({"issue_type":"task","unknown":{"n":5},"comments":[{"body":"hello comment"}],"unicode":"界界界界界界界界界界"}),
             }],
             collapsed: std::collections::HashSet::new(),
+            closed_default_pending: false,
             collapse_context: None,
             selected: Some(0),
             detail: None,
