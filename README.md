@@ -8,6 +8,7 @@ A terminal browser for Beads issues in the current workspace.
 - When creating an Epic, optionally generate child tasks with assessed P0–P4 priorities from its Description using a Herdr agent in a separate workspace at the same checkout.
 - Two-pane browsing with scrollable, Markdown-rendered descriptions, notes, comments, relationships, and Beads details.
 - Automatic background refresh picks up external changes, with cached records and visible errors; no watcher setup required.
+- Press `u` to check the latest published GitHub release against the running version; the result shows the version and release link without interrupting Beads browsing.
 - Persistent theme and default new-task agent selection in a structured settings dialog.
 - A brief animated terminal splash with the ONTRACK wordmark and a waving anime girl, with compact layouts for smaller terminals.
 - Press `h` to hand a selected Bead to a Herdr agent in a new worktree. A top-right toast shows progress and the result; Open and Ready issues show `· sent` once the prompt is confirmed. See the [user guide](docs/user-guide.md) for setup and recovery limits.
@@ -15,7 +16,7 @@ A terminal browser for Beads issues in the current workspace.
 
 ## Requirements
 
-Rust 1.88 or newer and the `bd` command-line tool. OnTrack initializes Beads in the launch directory when no workspace is available. A terminal with alternate-screen and mouse support is recommended.
+Rust 1.88 or newer and the `bd` command-line tool. The release check also needs `curl`. OnTrack initializes Beads in the launch directory when no workspace is available. A terminal with alternate-screen and mouse support is recommended.
 
 ## Run
 
@@ -23,7 +24,7 @@ Rust 1.88 or newer and the `bd` command-line tool. OnTrack initializes Beads in 
 cargo run
 ```
 
-Issues are grouped into coloured, collapsible panes (Open, Ready, other statuses, Closed), with Closed collapsed on launch. Press `Ctrl+?` for hotkeys, `r` (or `Shift+R`) to toggle Ready for an open Task or Epic, `w` for tracked handoffs, `s` for settings, `n` to create a bead, `Shift+N` to create a child task, `e` to edit, and `d` to delete (confirmation required). `Esc` goes back or closes a dialog; `q` and `Ctrl+C` quit. See the [user guide](docs/user-guide.md) for controls and the [development guide](docs/development.md) for scheduling and tracked worktrees.
+Issues are grouped into coloured, collapsible panes (Open, Ready, other statuses, Closed), with Closed collapsed on launch. Press `Ctrl+?` for hotkeys, `r` (or `Shift+R`) to toggle Ready for an open Task or Epic, `u` to check for a release, `w` for tracked handoffs, `s` for settings, `n` to create a bead, `Shift+N` to create a child task, `e` to edit, and `d` to delete (confirmation required). `Esc` goes back or closes a dialog; `q` and `Ctrl+C` quit. See the [user guide](docs/user-guide.md) for controls and the [development guide](docs/development.md) for scheduling and tracked worktrees.
 
 See the [user guide](docs/user-guide.md) for setup and controls, the [settings guide](docs/settings.md) for theme, default agent, agent limit, and worktree preferences, the [development guide](docs/development.md) for architecture and checks, and the [official Beads documentation](https://beads.gascity.com) for workspace setup.
 

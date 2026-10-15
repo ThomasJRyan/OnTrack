@@ -133,6 +133,12 @@ The top-right toast stays visible during discovery and launch, then shows succes
 
 Backend work does not run on the terminal input loop, so browsing remains responsive while a command is slow. Handoff keeps the browser usable; create, edit, and delete mutations still lock their dialogs until a result arrives. Worker requests are queued and executed in order without coalescing. Quitting restores raw-mode, mouse-capture, and alternate-screen settings through the application's cleanup path.
 
+## Check for updates
+
+Press `u` in the issue browser to check the latest published stable OnTrack release on GitHub. The dialog shows your running version and, when an update exists, the newer version and its release link. Press `r` in the dialog to check again or `Esc` to resume browsing. The request continues in the background if you close the dialog; press `u` again to see its result. An offline connection or GitHub error is shown in the dialog and does not stop issue browsing. This check does not install an update.
+
+The check uses the `curl` command with an eight-second request limit. Ensure `curl` is installed and available on `PATH`.
+
 ## Troubleshooting
 
 - **“Could not run bd”**: check that `bd` is installed and on the launch environment's `PATH`, including when starting from an editor or a different shell.

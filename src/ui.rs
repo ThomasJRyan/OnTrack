@@ -961,6 +961,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 FORM_DESCRIPTION_WIDTH as u16 + 6
             }
             crate::app::Modal::Settings { .. } => 64,
+            crate::app::Modal::Release => 76,
             _ => 62,
         }
         .min(a.width.saturating_sub(2));
@@ -1025,6 +1026,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
             crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
+            crate::app::Modal::Release => 12,
         };
         let min_width = if matches!(
             modal,
@@ -1033,7 +1035,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             70
         } else if matches!(
             modal,
-            crate::app::Modal::Settings { .. } | crate::app::Modal::EditLoading { .. }
+            crate::app::Modal::Settings { .. }
+                | crate::app::Modal::EditLoading { .. }
+                | crate::app::Modal::Release
         ) {
             38
         } else {
@@ -1078,6 +1082,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     " EDIT BEAD "
                 }
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
+                crate::app::Modal::Release => " ONTRACK RELEASE ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
                 crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
                 _ => " DELETE BEAD? ",
@@ -1093,6 +1098,34 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             area.height.saturating_sub(2),
         );
         match modal {
+            crate::app::Modal::Release => {
+                let version = env!("CARGO_PKG_VERSION");
+                let result = if app.release_inflight {
+                    "Checking GitHub for the latest release…".to_owned()
+                } else {
+                    match app.release_result.as_ref() {
+                        Some(Ok(crate::release::CheckResult::Available { version, url })) => {
+                            format!("Update available: v{version}\n\nRelease link:\n{url}")
+                        }
+                        Some(Ok(crate::release::CheckResult::Current { .. })) => {
+                            "You are running the latest published release.".into()
+                        }
+                        Some(Ok(crate::release::CheckResult::NoPublishedRelease)) => {
+                            "No public OnTrack release is available.".into()
+                        }
+                        Some(Err(error)) => format!("Update check failed: {error}"),
+                        None => "Check not started.".into(),
+                    }
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "Running version: v{version}\n\n{result}\n\nr check again · Esc return to browser"
+                    ))
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
             crate::app::Modal::EditLoading { id, error, .. } => {
                 let message = error.as_ref().map_or_else(
                     || format!("Loading {id}…"),
@@ -2306,6 +2339,8 @@ mod tests {
             launch_seq: 0,
             handoff: None,
             toast: None,
+            release_result: None,
+            release_inflight: false,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -2341,6 +2376,24 @@ mod tests {
             requests: tx,
             responses,
         }
+    }
+    #[test]
+    fn release_dialog_shows_version_link_and_error() {
+        let mut state = app();
+        state.modal = Some(crate::app::Modal::Release);
+        state.release_result = Some(Ok(crate::release::CheckResult::Available {
+            version: semver::Version::parse("1.2.0").unwrap(),
+            url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+        }));
+        let screen = draw((100, 24), &mut state).0;
+        assert!(screen.contains("Update available: v1.2.0"));
+        assert!(screen.contains("https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0"));
+        state.release_result = Some(Err("offline".into()));
+        assert!(
+            draw((100, 24), &mut state)
+                .0
+                .contains("Update check failed: offline")
+        );
     }
     fn draw(size: (u16, u16), a: &mut App) -> (String, Rect) {
         let mut t = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
