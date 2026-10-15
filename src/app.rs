@@ -4,6 +4,7 @@ use crate::{
     Tui,
     beads::{self, Bead, CreateBead, UpdateBead},
     event,
+    hotkeys::{self, Help},
     settings::{self, Settings, Theme},
     ui,
 };
@@ -75,6 +76,7 @@ pub struct App {
     pub list_rect: Rect,
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
+    pub help: Option<Help>,
     pub settings: Settings,
     pub theme: Theme,
     pub settings_path: Option<PathBuf>,
@@ -362,6 +364,7 @@ impl App {
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
+            help: None,
             settings,
             theme,
             settings_path,
@@ -977,6 +980,31 @@ impl App {
         if self.mutation_busy {
             return false;
         }
+        if let Some(help) = self.help.as_mut() {
+            if hotkeys::is_help_key(k) || k.code == KeyCode::Esc {
+                self.help = None;
+            } else {
+                match k.code {
+                    KeyCode::Up | KeyCode::Char('k') => help.offset = help.offset.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        help.offset = help.offset.saturating_add(1)
+                    }
+                    KeyCode::PageUp => help.offset = help.offset.saturating_sub(10),
+                    KeyCode::PageDown => help.offset = help.offset.saturating_add(10),
+                    KeyCode::Home => help.offset = 0,
+                    KeyCode::End => help.offset = usize::MAX,
+                    _ => {}
+                }
+            }
+            return false;
+        }
+        if hotkeys::is_help_key(k) {
+            self.help = Some(Help {
+                context: hotkeys::Context::current(self),
+                offset: 0,
+            });
+            return false;
+        }
         if self.modal.is_some() {
             return self.modal_key(k);
         }
@@ -1590,7 +1618,7 @@ impl App {
         }
     }
     fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
-        if self.modal.is_some() {
+        if self.modal.is_some() || self.help.is_some() {
             return;
         }
         if self.worktrees_view {
@@ -1896,6 +1924,7 @@ mod tests {
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,
+            help: None,
             settings: Settings::default(),
             theme: Theme::Dark,
             settings_path: None,
@@ -3540,6 +3569,43 @@ mod tests {
         if a.modal.is_some() {
             a.modal_ready = true;
         }
+    }
+    #[test]
+    fn help_tracks_active_view_and_preserves_underlying_form() {
+        let mut a = app();
+        let help_key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
+        a.key(help_key);
+        assert_eq!(a.help.unwrap().context, hotkeys::Context::Issues);
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.selected, Some(0));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.help.is_none());
+
+        press(&mut a, KeyCode::Tab);
+        a.key(help_key);
+        assert_eq!(a.help.unwrap().context, hotkeys::Context::Details);
+        a.key(help_key);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Char('?'));
+        a.key(help_key);
+        assert_eq!(a.help.unwrap().context, hotkeys::Context::Form);
+        press(&mut a, KeyCode::Esc);
+        assert!(matches!(a.modal, Some(Modal::Create(ref form)) if form.title == "?"));
+        a.mutation_busy = true;
+        a.key(help_key);
+        assert!(a.help.is_none());
+    }
+
+    #[test]
+    fn help_lists_view_specific_commands() {
+        let mut a = app();
+        a.worktrees_view = true;
+        a.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        let context = a.help.unwrap().context;
+        assert_eq!(context, hotkeys::Context::Worktrees);
+        assert!(context.entries().iter().any(|(key, _)| *key == "Shift+R"));
+        assert!(!context.entries().iter().any(|(key, _)| *key == "n"));
     }
     #[test]
     fn escape_navigates_back_without_quitting() {

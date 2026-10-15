@@ -33,6 +33,7 @@ An Open issue shows `· sent` beside its status after Herdr confirms the initial
 
 | Input | Action |
 | --- | --- |
+| `Ctrl+?` | Open the hotkey reference for the active issue pane, worktree view, or dialog. Keys appear in the left column and their actions on the right. Use `↑` / `↓` or `PageUp` / `PageDown` to scroll, `Home` / `End` to jump, and `Esc` or `Ctrl+?` to close it. The underlying selection and form text stay as they were. |
 | `↑` / `↓` with the list focused | Move through visible issues and collapsed group headers; expanded headers are skipped. Clamp at either end. |
 | `←` / `→` with the list focused | Collapse / expand the selected issue's group or the focused collapsed header. Repeating an unchanged direction has no effect. |
 | `Space` on a selected issue or collapsed header | Collapse or expand that status group. |
@@ -54,6 +55,8 @@ An Open issue shows `· sent` beside its status after Herdr confirms the initial
 | `q` or `Ctrl+C` | Quit when no dialog is open. |
 
 Inside the create and edit forms, keys are text unless they are form controls; app shortcuts do not trigger, and arrow keys continue to edit text or choose options. Dropdowns share one rule: Left / Right cycles choices with wraparound, whether the dropdown is closed or open. In text fields, Left / Right retain their cursor-editing behavior. Description wraps at word boundaries, splitting only words wider than the field. Shift+Enter requires a terminal that reports modified Enter keys; in terminals without that support, it may arrive as plain Enter. New beads default to Task and P2. The edit form loads the latest `bd show` record before opening and preserves fields outside its four controls. Beads with unsupported types or priorities cannot be opened in the edit form. A mutation runs once at a time in the background; the modal is locked until it finishes. Failures remain visible and keep the form open for correction or retry. Successful creation refreshes the list and selects the new bead; successful edit refreshes the list and detail while retaining the edited bead. Dialogs ask you to enlarge a terminal that is too small to show the full controls and warnings.
+
+The hotkey reference accepts terminal reports of `Ctrl+?`, `Ctrl+Shift+/`, and `Ctrl+/`. Some terminals send the same unmodified Backspace code for `Ctrl+?`; on those terminals the app cannot distinguish the keys, so use a terminal with modified-key reporting. The reference is unavailable while a mutation locks its dialog.
 
 The settings dialog captures input until it closes, so `q` cannot quit while it is open. Theme changes and each cleanup toggle save immediately. All automatic cleanup options default off. Automatic merge may defer when there is no trustworthy evidence that the agent is idle; a closed Bead alone never proves it is safe to merge. Removing a checkout also closes its Herdr workspace. Settings load/save errors remain visible; failed saves preserve the last successfully saved settings. See the [settings guide](settings.md) for recovery.
 

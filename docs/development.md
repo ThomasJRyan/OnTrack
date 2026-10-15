@@ -14,6 +14,7 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | `src/worktrees.rs` | Journals OnTrack-created handoffs separately from Beads and verifies Git/Herdr evidence before merge finalization or cleanup. |
 | `src/app.rs` | Holds selection, focus, scrolling, modal form and handoff toast state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
+| `src/hotkeys.rs` | Maps the active pane or dialog to its keyboard command list and recognizes modified help-key reports. |
 | `src/ui.rs` | Renders splash, issue list, wrapped Markdown details, status, and top-right handoff toasts; maintains list visibility and scroll bounds. |
 | `src/detail.rs` | Presents complete issue records with Markdown rendering for narrative fields and readable structured fallbacks for metadata. |
 | `src/terminal.rs` | Manages raw mode, alternate screen, mouse capture, and cleanup, including initialization failures and panic handling. |
@@ -29,6 +30,8 @@ Theme is explicit app state (`App::theme`) threaded into rendering; do not intro
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
 The create/edit Description field uses `wrapped_description` to insert visual line breaks before whole words and map its byte cursor to display cells; words wider than the field still wrap by character. It preserves explicit newlines and the stored text. While Description has focus, Shift+Enter inserts a newline and plain Enter focuses the form's action without submitting. Terminal setup enables Crossterm's keyboard enhancement protocol so supported terminals can distinguish modified Enter; restoration pops that mode on normal exit, initialization failure, and panic. Terminals without modified-key reporting cannot distinguish Shift+Enter from Enter.
+
+The hotkey reference is a separate `App::help` overlay, not a modal replacement. `App::key` handles its toggle and scroll keys before dispatching to the underlying pane or dialog; the mutation lock still takes precedence. `hotkeys::Context` captures the current pane or dialog when opened and owns its key/action list. Add new keyboard commands to the matching context when changing input handling. `ui::render_help` wraps the right column, clamps scrolling to the rendered lines, and renders over either browser view. Enhanced keyboard reports distinguish `Ctrl+?` or `Ctrl+Shift+/`; legacy terminals may report it as plain Backspace, which must remain text deletion/navigation rather than opening help.
 
 The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
 Settings rows in `src/ui.rs` share a two-thirds title column and one-third
