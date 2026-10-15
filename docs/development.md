@@ -2,6 +2,8 @@
 
 ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only. Create, edit, delete, and Ready toggles are user actions; the scheduler automatically hands off Ready tasks through the existing tracked Herdr path. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
+Tagged builds and release asset naming are documented in the [release guide](releases.md); installer behavior and offline checks are in the [installation guide](installation.md#release-asset-contract-for-maintainers). The workflow uses `scripts/release_asset.py` for tag validation, archive creation, and checksum verification; keep its target list aligned with the native runner matrix in `.github/workflows/release.yml`.
+
 ## Modules
 
 | File | Responsibility |
@@ -140,7 +142,7 @@ Merge requests use the repository-wide registry lock and persist `merge_queue` o
 
 ## Background work and cached state
 
-The explicit `u` flow sends release checks and installs from `App` to detached background tasks so downloads do not block input or Beads refresh. The update module calls `curl` with fixed HTTPS endpoints and separate arguments, parses semantic versions, accepts `ontrack-vVERSION-TARGET.tar.gz` with a matching `.sha256` sidecar, and extracts only the `ontrack` entry from the archive. The selected target is one of glibc Linux or macOS on x86_64 or aarch64. Release URL and asset URL checks restrict downloads to the official tagged repository. Downloads and candidate executables are staged with unique names in the executable directory, and temporary files are removed on every error. SHA-256 is verified before extraction or replacement, including GitHub's API digest when present; the final rename is on the same filesystem. Failure before that rename leaves the original path untouched. The running process continues using its old image, so the UI instructs the user to restart. Cancellation is checked during the download and immediately before replacement; a request arriving after replacement has begun cannot undo a successful update. `curl` and `tar` are runtime prerequisites for this flow, while normal browsing does not need them.
+The explicit `u` then `i` flow sends release checks, asset preparation, and installs from `App` to detached background tasks so downloads do not block input or Beads refresh. The initial release check is informational; asset preparation checks the latest release again and the confirmation shows the selected compatible version. The update module calls `curl` with fixed HTTPS endpoints and separate arguments, parses semantic versions, accepts `ontrack-vVERSION-TARGET.tar.gz` with a matching `.sha256` sidecar, and extracts only the `ontrack` entry from the archive. The selected target is one of glibc Linux or macOS on x86_64 or aarch64. Release URL and asset URL checks restrict downloads to the official tagged repository. Downloads and candidate executables are staged with unique names in the executable directory, and temporary files are removed on every error. SHA-256 is verified before extraction or replacement, including GitHub's API digest when present; the final rename is on the same filesystem. Failure before that rename leaves the original path untouched. The running process continues using its old image, so the UI instructs the user to restart. Cancellation is checked during the download and immediately before replacement; a request arriving after replacement has begun cannot undo a successful update. `curl` and `tar` are runtime prerequisites for this flow, while normal browsing does not need them.
 
 `App` uses standard-library channels and one background thread for blocking CLI calls. The UI loop receives available responses, draws, and polls input with a short timeout rather than waiting for subprocess completion.
 
@@ -151,6 +153,12 @@ The background worker executes each request in channel order. It does not coales
 Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Automatic updates also retain group collapse state, focus, scroll positions within current bounds, and active form input. Failed list/detail refreshes retain the last loaded data or available snapshot, display errors in the footer, and retry automatically. The presentation layer renders narrative Markdown via `tui-markdown`. The selected issue's ID, status, and priority appear in the details pane border title and are omitted from its body; other fields except the top-level revision, including unknown nested values, remain represented. Rendered text drives both wrapping and scroll bounds.
 
 Keep CLI calls off the input/render loop and preserve stale-response filtering when changing the worker. The worker is not joined on quit, so terminal cleanup does not wait for a slow CLI call; in-flight commands are not cancelled on quit.
+
+## Release check
+
+`src/release.rs` queries the official `ThomasJRyan/OnTrack` GitHub Releases [`latest` endpoint](https://docs.github.com/en/rest/releases/releases#get-the-latest-release) with `curl`. GitHub's latest endpoint selects a published stable release; an HTTP 404 is reported as no public release available (which can also mean the repository is inaccessible). The response must have a semantic-version tag (an optional leading `v` is accepted) and an OnTrack GitHub release URL. The running version comes from `CARGO_PKG_VERSION`, and `semver` compares versions, including prerelease precedence. The HTTP request has connection and overall time limits and a response-size cap.
+
+Pressing `u` queues a check. The worker starts a separate request thread so a slow network call cannot hold the Beads request queue or terminal input loop. The result is kept in the app state and shown by the release dialog; closing the dialog does not cancel the check. `r` retries inside the dialog, and `i` prepares a compatible asset only when a newer release is shown. `check_with` accepts a controlled fetch function, allowing focused success, no-release, malformed-response, and network-error tests without GitHub access.
 
 ## Terminal cleanup invariants
 
@@ -174,6 +182,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build
 ```
+
+GitHub Actions runs these gates on pull requests and pushes to `main`. See the [CI guide](ci.md) for workflow details, logs, and branch protection setup.
 
 The same commands can run from a linked Git worktree. Keep the default test concurrency for `cargo test` to exercise fixture and registry lock isolation.
 

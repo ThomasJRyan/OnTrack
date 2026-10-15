@@ -1,13 +1,14 @@
 use crate::herdr::{Agent, LaunchContext, LaunchOutcome};
-use crate::update::{self, Available, Check};
 use crate::worktrees::{self, Action as WorktreeAction, CleanupPolicy, ManagedWorktree};
 use crate::{
     Tui,
     beads::{self, Bead, CreateBead, UpdateBead},
     event,
     hotkeys::{self, Help},
+    release,
     settings::{self, DefaultAgent, Settings, Theme},
     ui,
+    update::{self, Available, Check},
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
@@ -46,6 +47,7 @@ pub(super) enum Request {
     RestartWorktree(String),
     ReconcileWorktrees(CleanupPolicy),
     CheckRelease,
+    PrepareUpdate,
     InstallRelease(Available, Arc<AtomicBool>),
 }
 pub(super) enum Response {
@@ -65,7 +67,8 @@ pub(super) enum Response {
     WorkspaceFocused(String, std::io::Result<()>),
     WorktreeChanged(std::io::Result<ManagedWorktree>),
     WorktreeRestarted(std::io::Result<String>),
-    ReleaseChecked(std::io::Result<Check>),
+    ReleaseChecked(Result<release::CheckResult, String>),
+    UpdatePrepared(std::io::Result<Check>),
     ReleaseInstalled(std::io::Result<()>),
 }
 pub(super) enum WorktreeFocusFeedback {
@@ -92,7 +95,9 @@ pub struct App {
     pub(super) launch_seq: u64,
     pub(super) handoff: Option<PendingHandoff>,
     pub toast: Option<Toast>,
-    pub release_checking: bool,
+    pub release_result: Option<Result<release::CheckResult, String>>,
+    pub release_inflight: bool,
+    pub update_preparing: bool,
     pub release_cancel: Option<Arc<AtomicBool>>,
     pub list_rect: Rect,
     pub detail_rect: Rect,
@@ -156,6 +161,7 @@ pub enum Modal {
         id: String,
         action: u8,
     },
+    Release,
     ConfirmUpdate(Available),
     InstallingUpdate(String),
 }
@@ -427,7 +433,14 @@ impl App {
                     Request::CheckRelease => {
                         let replies = out.clone();
                         thread::spawn(move || {
-                            let _ = replies.send(Response::ReleaseChecked(update::check()));
+                            let _ = replies.send(Response::ReleaseChecked(release::check()));
+                        });
+                        continue;
+                    }
+                    Request::PrepareUpdate => {
+                        let replies = out.clone();
+                        thread::spawn(move || {
+                            let _ = replies.send(Response::UpdatePrepared(update::check()));
                         });
                         continue;
                     }
@@ -482,7 +495,9 @@ impl App {
             launch_seq: 0,
             handoff: None,
             toast: None,
-            release_checking: false,
+            release_result: None,
+            release_inflight: false,
+            update_preparing: false,
             release_cancel: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
@@ -1362,38 +1377,46 @@ impl App {
                     }
                 }
                 Response::ReleaseChecked(result) => {
-                    self.release_checking = false;
+                    self.release_inflight = false;
+                    self.notice = Some(match &result {
+                        Ok(release::CheckResult::Available { version, .. }) => {
+                            format!("Update v{version} available · press u to review")
+                        }
+                        Ok(release::CheckResult::Current { .. }) => "OnTrack is up to date".into(),
+                        Ok(release::CheckResult::NoPublishedRelease) => {
+                            "No public OnTrack release is available".into()
+                        }
+                        Err(error) => format!("Update check failed: {error}"),
+                    });
+                    self.release_result = Some(result);
+                }
+                Response::UpdatePrepared(result) => {
+                    self.update_preparing = false;
                     match result {
                         Ok(Check::Available(release)) => {
-                            if self.modal.is_none() && !self.worktrees_view {
-                                self.notice =
-                                    Some(format!("OnTrack {} is available", release.version));
+                            if matches!(self.modal, Some(Modal::Release)) {
                                 self.modal = Some(Modal::ConfirmUpdate(release));
                                 self.modal_ready = false;
                             } else {
-                                self.toast = Some(Toast::result(
-                                    format!(
-                                        "OnTrack {} is available. Press u in the issue browser to review the update.",
-                                        release.version
-                                    ),
-                                    false,
-                                ));
+                                self.notice = Some(
+                                    "Update is ready to review; press u, then i to continue".into(),
+                                );
                             }
                         }
                         Ok(Check::Current) => {
                             self.notice = Some("OnTrack is up to date".into());
-                            self.toast = Some(Toast::result("OnTrack is up to date".into(), false))
+                            self.release_result = Some(Ok(release::CheckResult::Current {
+                                version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                            }));
                         }
                         Ok(Check::NoPublishedRelease) => {
-                            self.notice = Some("No published OnTrack release yet".into());
-                            self.toast = Some(Toast::result(
-                                "No published OnTrack release yet".into(),
-                                false,
-                            ))
+                            self.notice = Some("No public OnTrack release is available".into());
+                            self.release_result =
+                                Some(Ok(release::CheckResult::NoPublishedRelease));
                         }
                         Err(error) => {
                             let message =
-                                format!("Update check failed: {error}. Press u to retry.");
+                                format!("Update preparation failed: {error}. Press i to retry.");
                             self.notice = Some(message.clone());
                             self.toast = Some(Toast::result(message, true));
                         }
@@ -1506,20 +1529,7 @@ impl App {
                 self.poll_worktrees(Instant::now());
             }
             KeyCode::Char('r' | 'R') => self.toggle_ready(),
-            KeyCode::Char('u') if !self.release_checking => {
-                self.release_checking = true;
-                self.notice = None;
-                self.toast = Some(Toast::progress(
-                    "Checking the latest OnTrack release…".into(),
-                ));
-                if self.requests.send(Request::CheckRelease).is_err() {
-                    self.release_checking = false;
-                    self.toast = Some(Toast::result(
-                        "Update check could not be queued; retry with u".into(),
-                        true,
-                    ));
-                }
-            }
+            KeyCode::Char('u') => self.open_release(),
             KeyCode::Char('s') => {
                 let load_error = self
                     .settings_load_error
@@ -1713,6 +1723,24 @@ impl App {
         });
         self.modal_ready = false;
     }
+    fn open_release(&mut self) {
+        self.modal = Some(Modal::Release);
+        self.modal_ready = false;
+        if !self.release_inflight && self.release_result.is_none() {
+            self.start_release_check();
+        }
+    }
+    fn start_release_check(&mut self) {
+        if self.release_inflight {
+            return;
+        }
+        self.release_inflight = true;
+        self.release_result = None;
+        if self.requests.send(Request::CheckRelease).is_err() {
+            self.release_inflight = false;
+            self.release_result = Some(Err("Update check could not be queued".into()));
+        }
+    }
     fn modal_key(&mut self, key: KeyEvent) -> bool {
         use crossterm::event::KeyCode::*;
         if self.mutation_busy {
@@ -1754,6 +1782,24 @@ impl App {
             self.modal = None;
             return false;
         }
+        if matches!(self.modal, Some(Modal::Release)) {
+            if key.code == KeyCode::Char('r') && !self.update_preparing {
+                self.start_release_check();
+            } else if key.code == KeyCode::Char('i')
+                && !self.update_preparing
+                && matches!(
+                    self.release_result,
+                    Some(Ok(release::CheckResult::Available { .. }))
+                )
+            {
+                self.update_preparing = true;
+                if self.requests.send(Request::PrepareUpdate).is_err() {
+                    self.update_preparing = false;
+                    self.notice = Some("Update preparation could not be queued".into());
+                }
+            }
+            return false;
+        }
         if let Some(Modal::ConfirmUpdate(release)) = self.modal.as_ref() {
             if matches!(key.code, Char('y') | Char('Y')) {
                 let release = release.clone();
@@ -1778,10 +1824,6 @@ impl App {
                 }
             } else if matches!(key.code, Char('n') | Char('N') | Enter) {
                 self.modal = None;
-                self.toast = Some(Toast::result(
-                    "Update cancelled; existing executable is unchanged.".into(),
-                    false,
-                ));
             }
             return false;
         }
@@ -2524,10 +2566,74 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn update_needs_confirmation_and_cancellation_preserves_control() {
+    fn release_check_is_dismissible_and_late_result_remains_available() {
         let (mut app, requests, replies) = connected_app();
-        press(&mut app, KeyCode::Char('u'));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
         assert!(matches!(requests.try_recv(), Ok(Request::CheckRelease)));
+        assert!(app.release_inflight);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        replies
+            .send(Response::ReleaseChecked(Ok(
+                release::CheckResult::Available {
+                    version: semver::Version::parse("1.2.0").unwrap(),
+                    url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+                },
+            )))
+            .unwrap();
+        app.receive();
+        assert!(!app.release_inflight);
+        assert!(app.notice.as_deref().unwrap().contains("v1.2.0"));
+        assert!(matches!(
+            app.release_result,
+            Some(Ok(release::CheckResult::Available { .. }))
+        ));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::Release)));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn release_install_requires_available_asset_and_explicit_confirmation() {
+        let (mut app, requests, replies) = connected_app();
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::CheckRelease)));
+        app.modal_ready = true;
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(requests.try_recv().is_err());
+
+        replies
+            .send(Response::ReleaseChecked(Ok(
+                release::CheckResult::Available {
+                    version: semver::Version::parse("1.2.0").unwrap(),
+                    url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+                },
+            )))
+            .unwrap();
+        app.receive();
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::PrepareUpdate)));
+        assert!(app.update_preparing);
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(requests.try_recv().is_err());
+
+        replies
+            .send(Response::UpdatePrepared(Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no compatible asset",
+            ))))
+            .unwrap();
+        app.receive();
+        assert!(matches!(app.modal, Some(Modal::Release)));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("no compatible asset")
+        );
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::PrepareUpdate)));
+
         let release = Available {
             version: "1.2.0".into(),
             page: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
@@ -2537,31 +2643,25 @@ mod tests {
             digest: None,
         };
         replies
-            .send(Response::ReleaseChecked(Ok(Check::Available(
+            .send(Response::UpdatePrepared(Ok(Check::Available(
                 release.clone(),
             ))))
             .unwrap();
         app.receive();
         assert!(matches!(app.modal, Some(Modal::ConfirmUpdate(_))));
         app.modal_ready = true;
-        press(&mut app, KeyCode::Char('n'));
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
         assert!(app.modal.is_none());
         assert!(requests.try_recv().is_err());
 
-        replies
-            .send(Response::ReleaseChecked(Ok(Check::Available(
-                release.clone(),
-            ))))
-            .unwrap();
-        app.receive();
-        app.modal_ready = true;
-        press(&mut app, KeyCode::Char('y'));
+        app.modal = Some(Modal::ConfirmUpdate(release.clone()));
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         let Ok(Request::InstallRelease(chosen, cancel)) = requests.try_recv() else {
             panic!("install was not queued")
         };
-        assert_eq!(chosen.version, release.version);
+        assert_eq!(chosen, release);
         assert!(!cancel.load(Ordering::Relaxed));
-        press(&mut app, KeyCode::Esc);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(cancel.load(Ordering::Relaxed));
         replies
             .send(Response::ReleaseInstalled(Err(std::io::Error::new(
@@ -2571,7 +2671,7 @@ mod tests {
             .unwrap();
         app.receive();
         assert!(app.modal.is_none());
-        assert!(app.toast.as_ref().unwrap().message.contains("cancelled"));
+        assert!(app.notice.as_deref().unwrap().contains("cancelled"));
     }
 
     #[test]
@@ -2725,7 +2825,9 @@ mod tests {
             launch_seq: 0,
             handoff: None,
             toast: None,
-            release_checking: false,
+            release_result: None,
+            release_inflight: false,
+            update_preparing: false,
             release_cancel: None,
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),

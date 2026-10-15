@@ -13,6 +13,7 @@ pub enum Context {
     EditLoading,
     Delete,
     WorktreeConfirm,
+    Release,
     UpdateConfirm,
     UpdateInstalling,
 }
@@ -38,6 +39,7 @@ impl Context {
             Some(Modal::EditLoading { .. }) => Self::EditLoading,
             Some(Modal::ConfirmDelete { .. }) => Self::Delete,
             Some(Modal::ConfirmWorktree { .. }) => Self::WorktreeConfirm,
+            Some(Modal::Release) => Self::Release,
             Some(Modal::ConfirmUpdate(_)) => Self::UpdateConfirm,
             Some(Modal::InstallingUpdate(_)) => Self::UpdateInstalling,
             None if app.worktrees_view => Self::Worktrees,
@@ -58,6 +60,7 @@ impl Context {
             Self::EditLoading => "Loading edit",
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
+            Self::Release => "Release check",
             Self::UpdateConfirm => "Update confirmation",
             Self::UpdateInstalling => "Installing update",
         }
@@ -72,7 +75,6 @@ impl Context {
                 ("Tab", "Focus issue details"),
                 ("r", "Toggle Ready for an open Task or Epic and its tasks"),
                 ("s", "Open settings"),
-                ("u", "Check for and install a new OnTrack release"),
                 ("n", "Create a bead"),
                 ("Shift+N", "Create child of selected open task"),
                 ("e", "Edit selected bead"),
@@ -83,6 +85,7 @@ impl Context {
                     "Toggle Ready for an open Task or Epic and its tasks",
                 ),
                 ("w", "Open outstanding worktrees"),
+                ("u", "Check for a newer OnTrack release"),
                 ("Esc", "Stay in the issue browser"),
             ],
             Self::Details => vec![
@@ -90,7 +93,6 @@ impl Context {
                 ("PgUp / PgDn", "Scroll issue details one page"),
                 ("Tab", "Focus issue list"),
                 ("r", "Toggle Ready for an open Task or Epic and its tasks"),
-                ("u", "Check for and install a new OnTrack release"),
                 (
                     "Shift+R",
                     "Toggle Ready for an open Task or Epic and its tasks",
@@ -102,6 +104,7 @@ impl Context {
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
                 ("w", "Open outstanding worktrees"),
+                ("u", "Check for a newer OnTrack release"),
                 ("Esc", "Stay in the issue browser"),
             ],
             Self::Worktrees => vec![
@@ -158,12 +161,21 @@ impl Context {
                 ("e", "Retry a failed edit load"),
                 ("Esc", "Cancel edit loading"),
             ],
-            Self::Delete | Self::WorktreeConfirm | Self::UpdateConfirm => vec![
+            Self::Delete | Self::WorktreeConfirm => vec![
                 ("y / Y", "Confirm action"),
                 ("n / N / Enter", "Cancel action"),
                 ("Esc", "Cancel action"),
             ],
-            Self::UpdateInstalling => vec![("Esc / c", "Cancel download before replacement")],
+            Self::Release => vec![
+                ("r", "Check GitHub again"),
+                ("i", "Prepare a compatible release for installation"),
+                ("Esc", "Return to issue browser"),
+            ],
+            Self::UpdateConfirm => vec![
+                ("y / Y", "Install the verified release"),
+                ("n / N / Enter / Esc", "Cancel installation"),
+            ],
+            Self::UpdateInstalling => vec![("Esc / c", "Request cancellation before replacement")],
         };
         rows.extend([
             ("Ctrl+?", "Open or close this hotkey reference"),
