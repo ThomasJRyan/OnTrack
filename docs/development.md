@@ -2,6 +2,8 @@
 
 ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only. Create, edit, delete, and Ready toggles are user actions; the scheduler automatically hands off Ready tasks through the existing tracked Herdr path. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
+Tagged builds and the release asset naming contract are documented in the [release guide](releases.md). The workflow uses `scripts/release_asset.py` for tag validation, archive creation, and checksum verification; keep its target list aligned with the native runner matrix in `.github/workflows/release.yml`.
+
 ## Modules
 
 | File | Responsibility |
@@ -177,6 +179,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build
 ```
+
+GitHub Actions runs these gates on pull requests and pushes to `main`. See the [CI guide](ci.md) for workflow details, logs, and branch protection setup.
 
 The same commands can run from a linked Git worktree. Keep the default test concurrency for `cargo test` to exercise fixture and registry lock isolation.
 
