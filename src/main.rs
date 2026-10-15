@@ -2,6 +2,7 @@ mod app;
 mod beads;
 mod detail;
 mod event;
+mod herdr;
 mod settings;
 mod terminal;
 mod theme;

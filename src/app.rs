@@ -1,3 +1,4 @@
+use crate::herdr::{Agent, LaunchContext, LaunchOutcome};
 use crate::{
     Tui,
     beads::{self, Bead, CreateBead},
@@ -22,17 +23,21 @@ pub(super) enum Request {
     Show(String, u64),
     Create(CreateBead),
     Delete(String),
+    Discover(u64),
+    Launch(u64, LaunchContext, Agent, Bead),
 }
 pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
     Show(String, u64, std::io::Result<serde_json::Value>),
     Created(std::io::Result<String>),
     Deleted(std::io::Result<()>),
+    Discovered(u64, std::io::Result<LaunchContext>),
+    Launched(u64, std::io::Result<LaunchOutcome>),
 }
 pub struct App {
     pub beads: Vec<Bead>,
     pub collapsed: HashSet<String>,
-    pub focused_group: Option<String>,
+    pub collapse_context: Option<String>,
     pub selected: Option<usize>,
     pub detail: Option<serde_json::Value>,
     pub focus_detail: bool,
@@ -43,6 +48,7 @@ pub struct App {
     pub list_error: Option<String>,
     pub detail_error: Option<String>,
     pub(super) detail_seq: u64,
+    pub(super) launch_seq: u64,
     pub list_rect: Rect,
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
@@ -73,7 +79,30 @@ pub enum Modal {
         dropdown_open: bool,
         focus: usize,
     },
+    Launch(LaunchModal),
 }
+#[derive(Debug, Clone)]
+pub struct LaunchModal {
+    pub bead: Bead,
+    pub seq: u64,
+    pub context: Option<LaunchContext>,
+    pub selected_agent: usize,
+    pub error: Option<String>,
+    pub scroll: u16,
+    pub finished: bool,
+}
+impl PartialEq for LaunchModal {
+    fn eq(&self, other: &Self) -> bool {
+        self.bead.id == other.bead.id
+            && self.seq == other.seq
+            && self.context == other.context
+            && self.selected_agent == other.selected_agent
+            && self.error == other.error
+            && self.scroll == other.scroll
+            && self.finished == other.finished
+    }
+}
+impl Eq for LaunchModal {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateForm {
     pub title: String,
@@ -169,6 +198,10 @@ impl App {
                     }
                     Request::Create(input) => Response::Created(beads::create_bead(&input)),
                     Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
+                    Request::Discover(seq) => Response::Discovered(seq, crate::herdr::discover()),
+                    Request::Launch(seq, context, agent, bead) => {
+                        Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
+                    }
                 };
                 if out.send(response).is_err() {
                     break;
@@ -194,7 +227,7 @@ impl App {
         let mut a = Self {
             beads: vec![],
             collapsed: HashSet::new(),
-            focused_group: None,
+            collapse_context: None,
             selected: None,
             detail: None,
             focus_detail: false,
@@ -205,6 +238,7 @@ impl App {
             list_error: None,
             detail_error: None,
             detail_seq: 0,
+            launch_seq: 0,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -267,7 +301,7 @@ impl App {
         }
     }
     fn select(&mut self, index: usize) {
-        self.focused_group = None;
+        self.collapse_context = None;
         if self.beads.is_empty() {
             self.clear_selection();
             return;
@@ -275,7 +309,7 @@ impl App {
         let index = index.min(self.beads.len() - 1);
         let status = normalized_status(&self.beads[index].status).to_owned();
         if self.collapsed.contains(&status) {
-            self.focus_group(status);
+            self.clear_selection();
             return;
         }
         if self.selected == Some(index) {
@@ -298,34 +332,43 @@ impl App {
         self.detail_error = None;
         self.detail_offset = 0;
     }
-    fn focus_group(&mut self, status: String) {
-        self.clear_selection();
-        self.focused_group = Some(status);
-    }
     fn step(&mut self, d: isize) {
-        let targets = list_layout(&self.beads, &self.collapsed).targets;
+        let targets = list_layout(&self.beads, &self.collapsed)
+            .targets
+            .into_iter()
+            .filter_map(|target| match target.row {
+                DisplayRow::Bead(index) => Some(DisplayRow::Bead(index)),
+                DisplayRow::Group(status) if self.collapsed.contains(&status) => {
+                    Some(DisplayRow::Group(status))
+                }
+                DisplayRow::Group(_) => None,
+            })
+            .collect::<Vec<_>>();
         if targets.is_empty() {
             self.clear_selection();
-            self.focused_group = None;
+            self.collapse_context = None;
             return;
         }
         let current = self
-            .focused_group
-            .as_ref()
-            .and_then(|s| {
+            .selected
+            .and_then(|index| {
                 targets
                     .iter()
-                    .position(|t| matches!(&t.row, DisplayRow::Group(g) if g == s))
+                    .position(|target| *target == DisplayRow::Bead(index))
             })
             .or_else(|| {
-                self.selected
-                    .and_then(|i| targets.iter().position(|t| t.row == DisplayRow::Bead(i)))
-            })
-            .unwrap_or(0);
-        let next = current.saturating_add_signed(d).min(targets.len() - 1);
-        match &targets[next].row {
-            DisplayRow::Group(status) => self.focus_group(status.clone()),
-            DisplayRow::Bead(i) => self.select(*i),
+                self.collapse_context.as_ref().and_then(|status| {
+                    targets
+                        .iter()
+                        .position(|target| target == &DisplayRow::Group(status.clone()))
+                })
+            });
+        let next = current
+            .map(|i| i.saturating_add_signed(d).min(targets.len() - 1))
+            .unwrap_or(if d < 0 { targets.len() - 1 } else { 0 });
+        match &targets[next] {
+            DisplayRow::Bead(index) => self.select(*index),
+            DisplayRow::Group(status) => self.focus_collapsed_group(status.clone()),
         }
     }
     fn toggle_selected_group(&mut self) {
@@ -334,11 +377,14 @@ impl App {
         }
     }
     fn focused_status(&self) -> Option<String> {
-        self.focused_group.clone().or_else(|| {
-            self.selected
-                .and_then(|i| self.beads.get(i))
-                .map(|b| normalized_status(&b.status).to_owned())
-        })
+        self.selected
+            .and_then(|i| self.beads.get(i))
+            .map(|b| normalized_status(&b.status).to_owned())
+            .or_else(|| self.collapse_context.clone())
+    }
+    fn focus_collapsed_group(&mut self, status: String) {
+        self.clear_selection();
+        self.collapse_context = Some(status);
     }
     fn set_group_collapsed(&mut self, status: String, collapsed: bool) {
         if !self
@@ -352,9 +398,14 @@ impl App {
         if is_collapsed == collapsed {
             return;
         }
+        let selected_in_group = self
+            .selected
+            .is_some_and(|i| normalized_status(&self.beads[i].status) == status);
         if collapsed {
             self.collapsed.insert(status.clone());
-            self.focus_group(status);
+            if selected_in_group {
+                self.focus_collapsed_group(status.clone());
+            }
         } else {
             self.collapsed.remove(&status);
             if let Some(i) = self
@@ -363,8 +414,6 @@ impl App {
                 .position(|b| normalized_status(&b.status) == status)
             {
                 self.select(i);
-            } else {
-                self.focus_group(status);
             }
         }
     }
@@ -376,12 +425,9 @@ impl App {
                 .position(|b| normalized_status(&b.status) == status)
             {
                 self.select(i);
-            } else {
-                self.focus_group(status);
             }
         } else {
-            self.collapsed.insert(status.clone());
-            self.focus_group(status);
+            self.set_group_collapsed(status, true);
         }
     }
     fn receive(&mut self) {
@@ -400,7 +446,7 @@ impl App {
                                 .selected
                                 .and_then(|i| self.beads.get(i))
                                 .map(|b| b.id.clone());
-                            let group = self.focused_group.clone();
+                            let collapse_context = self.collapse_context.clone();
                             self.beads = items
                                 .into_iter()
                                 .map(|mut b| {
@@ -432,7 +478,7 @@ impl App {
                             // surviving ID can reuse the existing detail and scroll.
                             self.selected = None;
                             if let Some(i) = preferred {
-                                self.focused_group = None;
+                                self.collapse_context = None;
                                 self.collapsed.remove(&self.beads[i].status);
                                 if Some(i) == same_id {
                                     self.selected = Some(i);
@@ -440,33 +486,38 @@ impl App {
                                 } else {
                                     self.select(i);
                                 }
-                            } else if let Some(status) =
-                                group.filter(|s| self.beads.iter().any(|b| &b.status == s))
-                            {
-                                self.focus_group(status);
+                            } else if let Some(status) = collapse_context.filter(|status| {
+                                self.collapsed.contains(status)
+                                    && self.beads.iter().any(|bead| bead.status == *status)
+                            }) {
+                                self.focus_collapsed_group(status);
                             } else if let Some(i) = same_id {
-                                self.focused_group = None;
+                                self.collapse_context = None;
                                 if self.collapsed.contains(&self.beads[i].status) {
-                                    self.focus_group(self.beads[i].status.clone());
+                                    self.clear_selection();
+                                    if let Some(visible) = list_layout(&self.beads, &self.collapsed)
+                                        .targets
+                                        .into_iter()
+                                        .find_map(|target| match target.row {
+                                            DisplayRow::Bead(index) => Some(index),
+                                            DisplayRow::Group(_) => None,
+                                        })
+                                    {
+                                        self.select(visible);
+                                    }
                                 } else {
                                     self.selected = Some(i);
                                     self.refresh_detail();
                                 }
                             } else {
                                 self.clear_selection();
-                                self.focused_group = None;
+                                self.collapse_context = None;
                                 let targets = list_layout(&self.beads, &self.collapsed).targets;
                                 if let Some(i) = targets.iter().find_map(|t| match t.row {
                                     DisplayRow::Bead(i) => Some(i),
                                     DisplayRow::Group(_) => None,
                                 }) {
                                     self.select(i);
-                                } else if let Some(ListTarget {
-                                    row: DisplayRow::Group(status),
-                                    ..
-                                }) = targets.into_iter().next()
-                                {
-                                    self.focus_group(status);
                                 }
                             }
                             self.list_error = None;
@@ -522,6 +573,41 @@ impl App {
                         Err(e) => self.notice = Some(format!("Delete failed: {e}")),
                     }
                 }
+                Response::Discovered(seq, result) => {
+                    if let Some(Modal::Launch(modal)) = self.modal.as_mut()
+                        && modal.seq == seq
+                    {
+                        match result {
+                            Ok(context) => {
+                                modal.selected_agent = 0;
+                                modal.error = None;
+                                modal.context = Some(context);
+                            }
+                            Err(error) => modal.error = Some(error.to_string()),
+                        }
+                    }
+                }
+                Response::Launched(seq, result) => {
+                    self.mutation_busy = false;
+                    if seq == self.launch_seq {
+                        match result {
+                            Ok(outcome) => {
+                                self.notice = Some(outcome.message);
+                                if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
+                                    modal.finished = true;
+                                    modal.scroll = 0;
+                                }
+                            }
+                            Err(error) => {
+                                self.notice = Some(format!("Launch failed: {error}"));
+                                if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
+                                    modal.finished = true;
+                                    modal.scroll = 0;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -566,6 +652,7 @@ impl App {
                     self.notice = None;
                 }
             }
+            KeyCode::Char('h') => self.open_launch(),
             KeyCode::Tab => self.focus_detail = !self.focus_detail,
             KeyCode::Left if !self.focus_detail => {
                 if let Some(status) = self.focused_status() {
@@ -608,6 +695,11 @@ impl App {
             return false;
         }
         if key.code == Esc {
+            if matches!(self.modal, Some(Modal::Launch(_))) {
+                self.launch_seq = self.launch_seq.wrapping_add(1);
+                self.modal = None;
+                return false;
+            }
             if let Some(Modal::Settings { dropdown_open, .. }) = self.modal.as_mut() {
                 if *dropdown_open {
                     *dropdown_open = false;
@@ -667,6 +759,64 @@ impl App {
             }
             if let Some(theme) = save_theme {
                 self.save_settings(theme);
+            }
+            return false;
+        }
+        if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
+            match key.code {
+                PageUp => modal.scroll = modal.scroll.saturating_sub(6),
+                PageDown => modal.scroll = modal.scroll.saturating_add(6),
+                Enter if modal.finished => {}
+                Up | Char('k') if modal.context.as_ref().is_some_and(|c| !c.agents.is_empty()) => {
+                    modal.selected_agent = modal.selected_agent.saturating_sub(1);
+                }
+                Down | Char('j')
+                    if modal.context.as_ref().is_some_and(|c| !c.agents.is_empty()) =>
+                {
+                    let len = modal.context.as_ref().unwrap().agents.len();
+                    modal.selected_agent = (modal.selected_agent + 1).min(len - 1);
+                }
+                Enter => {
+                    let Some(context) = modal.context.clone() else {
+                        return false;
+                    };
+                    let Some(agent) = context.agents.get(modal.selected_agent).cloned() else {
+                        self.notice = Some("No agents are available in this workspace".into());
+                        return false;
+                    };
+                    let seq = modal.seq;
+                    let bead = modal.bead.clone();
+                    self.mutation_busy = true;
+                    if self
+                        .requests
+                        .send(Request::Launch(seq, context, agent, bead))
+                        .is_err()
+                    {
+                        self.mutation_busy = false;
+                        self.notice = Some("Launch could not be queued; try again".into());
+                    }
+                }
+                Char('h') if modal.error.is_some() => {
+                    let bead = modal.bead.clone();
+                    self.launch_seq = self.launch_seq.wrapping_add(1);
+                    let seq = self.launch_seq;
+                    self.modal = Some(Modal::Launch(LaunchModal {
+                        bead,
+                        seq,
+                        context: None,
+                        selected_agent: 0,
+                        error: None,
+                        scroll: 0,
+                        finished: false,
+                    }));
+                    if self.requests.send(Request::Discover(seq)).is_err()
+                        && let Some(Modal::Launch(modal)) = self.modal.as_mut()
+                    {
+                        modal.error =
+                            Some("Workspace discovery could not be queued; try again".into());
+                    }
+                }
+                _ => {}
             }
             return false;
         }
@@ -894,6 +1044,33 @@ impl App {
             }
         }
     }
+    fn open_launch(&mut self) {
+        let Some(bead) = self
+            .selected
+            .and_then(|index| self.beads.get(index))
+            .cloned()
+        else {
+            self.notice = Some("Select a bead before handing it to an agent".into());
+            return;
+        };
+        self.launch_seq = self.launch_seq.wrapping_add(1);
+        let seq = self.launch_seq;
+        self.modal = Some(Modal::Launch(LaunchModal {
+            bead,
+            seq,
+            context: None,
+            selected_agent: 0,
+            error: None,
+            scroll: 0,
+            finished: false,
+        }));
+        self.notice = None;
+        if self.requests.send(Request::Discover(seq)).is_err()
+            && let Some(Modal::Launch(modal)) = self.modal.as_mut()
+        {
+            modal.error = Some("Workspace discovery could not be queued; try again".into());
+        }
+    }
     fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
         if self.modal.is_some() {
             return;
@@ -1066,7 +1243,7 @@ mod tests {
                 })
                 .collect(),
             collapsed: HashSet::new(),
-            focused_group: None,
+            collapse_context: None,
             selected: Some(0),
             detail: Some(json!({"id": "b0", "description": "detail 0"})),
             focus_detail: false,
@@ -1077,6 +1254,7 @@ mod tests {
             list_error: None,
             detail_error: None,
             detail_seq: 0,
+            launch_seq: 0,
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,
@@ -1095,19 +1273,270 @@ mod tests {
             responses,
         }
     }
-    fn assert_header(a: &App, status: &str) {
-        assert_eq!(a.focused_group.as_deref(), Some(status));
+    fn assert_collapsed_header_selected(a: &App, status: &str) {
+        assert_eq!(a.collapse_context.as_deref(), Some(status));
+        assert!(a.collapsed.contains(status));
         assert!(a.selected.is_none());
         assert!(a.detail.is_none());
-        assert!(!a.detail_loading);
-        assert!(a.detail_error.is_none());
-        assert_eq!(a.detail_offset, 0);
     }
     fn assert_bead(a: &App, id: &str) {
-        assert!(a.focused_group.is_none());
         let bead = &a.beads[a.selected.expect("selected bead")];
         assert_eq!(bead.id, id);
         assert_eq!(a.detail.as_ref(), Some(&bead.data));
+    }
+    fn launch_context() -> LaunchContext {
+        LaunchContext {
+            workspace: crate::herdr::Workspace {
+                id: "ws".into(),
+                label: "ws".into(),
+            },
+            agents: vec![
+                Agent {
+                    id: "codex".into(),
+                    label: "Codex".into(),
+                },
+                Agent {
+                    id: "opencode".into(),
+                    label: "OpenCode".into(),
+                },
+            ],
+        }
+    }
+    #[test]
+    fn launch_discovery_is_queued_without_launch_until_explicit_confirmation() {
+        let (mut a, rx, tx) = connected_app();
+        a.beads[0].data["description"] = json!("Preserve full bead context for the worker");
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => panic!("expected discovery"),
+        };
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        press(&mut a, KeyCode::Down);
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Launch(_, context, agent, bead)) if context.workspace.id == "ws" && agent.id == "opencode" && bead.id == "b0" && bead.title == "issue 0" && bead.data["description"] == "Preserve full bead context for the worker")
+        );
+    }
+    #[test]
+    fn handoff_gates_selection_and_captures_selected_bead_across_discovery() {
+        let (mut a, rx, tx) = connected_app();
+        a.clear_selection();
+        press(&mut a, KeyCode::Char('h'));
+        assert!(rx.try_recv().is_err());
+        a.collapsed.insert("open".into());
+        a.focus_collapsed_group("open".into());
+        press(&mut a, KeyCode::Char('h'));
+        assert!(rx.try_recv().is_err());
+        assert!(a.modal.is_none());
+
+        a.collapsed.clear();
+        a.select(0);
+        let _ = rx.try_recv(); // selection detail request
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        a.select(1);
+        let _ = rx.try_recv(); // changed selection detail request
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Launch(_, _, _, bead)) if bead.id == "b0" && bead.title == "issue 0")
+        );
+    }
+    #[test]
+    fn empty_agents_prevent_launch_and_duplicate_confirmation_is_ignored() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        tx.send(Response::Discovered(
+            seq,
+            Ok(LaunchContext {
+                workspace: crate::herdr::Workspace {
+                    id: "ws".into(),
+                    label: "ws".into(),
+                },
+                agents: vec![],
+            }),
+        ))
+        .unwrap();
+        a.receive();
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.mutation_busy);
+        assert!(rx.try_recv().is_err());
+
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
+        press(&mut a, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn disconnected_discovery_and_launch_queues_do_not_lock_the_ui() {
+        let mut a = app();
+        let (requests, rx) = mpsc::channel();
+        drop(rx);
+        a.requests = requests;
+        press(&mut a, KeyCode::Char('h'));
+        assert!(!a.mutation_busy);
+        assert!(
+            matches!(&a.modal, Some(Modal::Launch(m)) if m.error.as_deref().is_some_and(|e| e.contains("could not be queued")))
+        );
+
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        let (requests, receiver) = mpsc::channel();
+        drop(receiver);
+        a.requests = requests;
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.mutation_busy);
+        assert!(
+            a.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Launch could not be queued"))
+        );
+    }
+    #[test]
+    fn launch_cancel_ignores_stale_discovery_and_busy_guard_blocks_input() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        press(&mut a, KeyCode::Esc);
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(a.modal.is_none());
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        a.mutation_busy = true;
+        press(&mut a, KeyCode::Down);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Launch(LaunchModal {
+                selected_agent: 0,
+                ..
+            }))
+        ));
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn discovery_failure_is_reported_and_retryable() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        tx.send(Response::Discovered(
+            seq,
+            Err(std::io::Error::other("workspace unavailable")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(
+            matches!(&a.modal, Some(Modal::Launch(m)) if m.error.as_deref() == Some("workspace unavailable"))
+        );
+        press(&mut a, KeyCode::Char('h'));
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+    }
+    #[test]
+    fn completed_launch_result_scrolls_without_relaunch_and_can_be_dismissed() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
+        tx.send(Response::Launched(
+            seq,
+            Ok(LaunchOutcome {
+                message: "Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0".into(),
+            }),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(!a.mutation_busy);
+        assert_eq!(
+            a.notice.as_deref(),
+            Some("Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0")
+        );
+        assert!(matches!(&a.modal, Some(Modal::Launch(m)) if m.finished));
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            rx.try_recv().is_err(),
+            "Enter cannot repeat a completed launch"
+        );
+        press(&mut a, KeyCode::PageDown);
+        assert!(matches!(&a.modal, Some(Modal::Launch(m)) if m.scroll == 6));
+        press(&mut a, KeyCode::PageUp);
+        assert!(matches!(&a.modal, Some(Modal::Launch(m)) if m.scroll == 0));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+    }
+    #[test]
+    fn failed_launch_clears_busy_and_keeps_actionable_result_open() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
+        press(&mut a, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::Launched(
+            seq,
+            Err(std::io::Error::other(
+                "worktree may exist; inspect before retrying",
+            )),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(!a.mutation_busy);
+        assert!(matches!(&a.modal, Some(Modal::Launch(modal)) if modal.finished));
+        assert!(
+            a.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("inspect before retrying"))
+        );
     }
     fn respond(a: &mut App, response: Response) {
         let (tx, rx) = mpsc::channel();
@@ -1275,10 +1704,10 @@ mod tests {
         }
     }
     #[test]
-    fn unchanged_poll_preserves_focused_group_and_does_not_request_details() {
+    fn refresh_preserves_surviving_collapsed_header_selection() {
         let (mut a, rx, tx) = connected_app();
-        a.focus_group("open".into());
         a.collapsed.insert("open".into());
+        a.focus_collapsed_group("open".into());
         a.focus_detail = true;
         a.list_offset = 4;
         let now = Instant::now();
@@ -1286,7 +1715,9 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Request::List)));
         tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
         a.receive_at(now);
-        assert_header(&a, "open");
+        assert!(a.selected.is_none());
+        assert_eq!(a.collapse_context.as_deref(), Some("open"));
+        assert!(a.detail.is_none());
         assert!(a.collapsed.contains("open"));
         assert!(a.focus_detail);
         assert_eq!(a.list_offset, 4);
@@ -1542,9 +1973,11 @@ mod tests {
             6,
             7 + closed_y as u16,
         );
-        assert_header(&a, "closed");
+        assert!(a.collapse_context.is_none());
+        assert_eq!(a.beads[a.selected.unwrap()].id, "b2");
         press(&mut a, KeyCode::Char('d'));
-        assert!(a.modal.is_none());
+        assert!(matches!(&a.modal, Some(Modal::ConfirmDelete { id, .. }) if id == "b2"));
+        press(&mut a, KeyCode::Esc);
         // Reopening uses the same toggle path as Space, not the old open selection.
         a.mouse(
             MouseEventKind::Down(MouseButton::Left),
@@ -1556,7 +1989,6 @@ mod tests {
         assert!(matches!(&a.modal, Some(Modal::ConfirmDelete { id, .. }) if id == "b1"));
         press(&mut a, KeyCode::Esc);
         // Selecting the same index must still remove conflicting header focus.
-        a.focused_group = Some("open".into());
         a.select(1);
         assert_bead(&a, "b1");
     }
@@ -1846,7 +2278,7 @@ mod tests {
         let closed = layout.groups.iter().find(|g| g.status == "closed").unwrap();
         a.list_offset = closed.y;
         a.mouse(MouseEventKind::Down(MouseButton::Left), 6, 7);
-        assert_header(&a, "closed");
+        assert_collapsed_header_selected(&a, "closed");
     }
     #[test]
     fn collapse_and_reselect_reject_stale_detail_success_and_failure() {
@@ -1858,7 +2290,7 @@ mod tests {
             &mut a,
             Response::Show("b1".into(), old_seq, Ok(json!({"stale": true}))),
         );
-        assert_header(&a, "open");
+        assert_collapsed_header_selected(&a, "open");
         press(&mut a, KeyCode::Char(' '));
         a.select(1);
         assert_ne!(a.detail_seq, old_seq);
@@ -1886,7 +2318,7 @@ mod tests {
     fn navigation_clamps_and_empty_is_safe() {
         let mut a = app();
         a.step(-1);
-        assert_eq!(a.focused_group.as_deref(), Some("open"));
+        assert_eq!(a.selected, Some(0));
         a.step(20);
         assert_eq!(a.selected, Some(3));
         a.beads.clear();
@@ -1906,28 +2338,28 @@ mod tests {
         );
     }
     #[test]
-    fn every_collapsed_group_can_be_reopened_and_selection_detail_stay_aligned() {
+    fn keyboard_steps_between_expanded_rows_and_collapsed_headers() {
         let mut a = app();
         a.beads[0].status = "open".into();
         a.beads[1].status = "closed".into();
         a.beads[2].status = "closed".into();
         a.beads[3].status = "open".into();
         press(&mut a, KeyCode::Char(' '));
-        assert_header(&a, "open");
+        assert_collapsed_header_selected(&a, "open");
         press(&mut a, KeyCode::Down);
-        assert_header(&a, "closed");
+        assert_bead(&a, "b1");
         press(&mut a, KeyCode::Char(' '));
         assert_eq!(a.collapsed.len(), 2);
+        assert_collapsed_header_selected(&a, "closed");
         press(&mut a, KeyCode::Up);
-        assert_header(&a, "open");
+        assert_collapsed_header_selected(&a, "open");
         press(&mut a, KeyCode::Char(' '));
-        assert!(!a.collapsed.contains("open"));
         assert_bead(&a, "b0");
         press(&mut a, KeyCode::Down);
         assert_bead(&a, "b3");
         press(&mut a, KeyCode::Down);
-        assert_header(&a, "closed");
-        press(&mut a, KeyCode::Char(' '));
+        assert_collapsed_header_selected(&a, "closed");
+        press(&mut a, KeyCode::Right);
         assert_bead(&a, "b1");
         assert!(a.collapsed.is_empty());
     }
@@ -1947,9 +2379,10 @@ mod tests {
         a.select(2);
         press(&mut a, KeyCode::Left);
         assert!(a.collapsed.contains("open"));
-        assert_header(&a, "open");
+        assert_collapsed_header_selected(&a, "open");
+        assert!(a.selected.is_none());
         press(&mut a, KeyCode::Left);
-        assert_header(&a, "open");
+        assert_collapsed_header_selected(&a, "open");
         press(&mut a, KeyCode::Right);
         assert!(!a.collapsed.contains("open"));
         assert_bead(&a, "b0");
@@ -2014,6 +2447,75 @@ mod tests {
         assert_eq!(a.selected, Some(1));
     }
     #[test]
+    fn vertical_navigation_crosses_visible_groups_without_selecting_headers() {
+        let mut a = app();
+        a.beads[2].status = "blocked".into();
+        a.beads[3].status = "closed".into();
+        a.select(1);
+        press(&mut a, KeyCode::Down);
+        assert_bead(&a, "b2");
+        press(&mut a, KeyCode::Up);
+        assert_bead(&a, "b1");
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Down);
+        assert_bead(&a, "b3");
+        press(&mut a, KeyCode::Down);
+        assert_bead(&a, "b3");
+        press(&mut a, KeyCode::Up);
+        assert_bead(&a, "b2");
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Up);
+        assert_bead(&a, "b0");
+        press(&mut a, KeyCode::Up);
+        assert_bead(&a, "b0");
+        assert!(a.collapse_context.is_none());
+    }
+    #[test]
+    fn collapsed_headers_are_keyboard_targets_and_mouse_can_also_reopen() {
+        let mut a = app();
+        a.beads[2].status = "blocked".into();
+        a.beads[3].status = "closed".into();
+        a.collapsed.insert("blocked".into());
+        a.select(1);
+        press(&mut a, KeyCode::Down);
+        assert_collapsed_header_selected(&a, "blocked");
+        press(&mut a, KeyCode::Right);
+        assert_bead(&a, "b2");
+
+        a.collapsed
+            .extend(["open".into(), "blocked".into(), "closed".into()]);
+        a.focus_collapsed_group("open".into());
+        press(&mut a, KeyCode::Up);
+        assert_collapsed_header_selected(&a, "open");
+        press(&mut a, KeyCode::Down);
+        assert_collapsed_header_selected(&a, "blocked");
+        press(&mut a, KeyCode::Down);
+        assert_collapsed_header_selected(&a, "closed");
+        press(&mut a, KeyCode::Down);
+        assert_collapsed_header_selected(&a, "closed");
+        press(&mut a, KeyCode::Up);
+        assert_collapsed_header_selected(&a, "blocked");
+        press(&mut a, KeyCode::Right);
+        assert_bead(&a, "b2");
+        assert!(!a.collapsed.contains("blocked"));
+        // Mouse title clicks and keyboard controls share the same expansion transition.
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 0);
+        assert_bead(&a, "b0");
+        assert!(!a.collapsed.contains("open"));
+    }
+    #[test]
+    fn details_focused_arrows_scroll_without_changing_issue_selection() {
+        let mut a = app();
+        a.focus_detail = true;
+        a.detail_offset = 2;
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.detail_offset, 1);
+        assert_bead(&a, "b0");
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.detail_offset, 2);
+        assert_bead(&a, "b0");
+    }
+    #[test]
     fn stale_detail_response_cannot_replace_selection() {
         let mut a = app();
         let (tx, rx) = mpsc::channel();
@@ -2057,12 +2559,8 @@ mod tests {
         assert_bead(&a, "b1");
         a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 0);
         assert!(a.collapsed.contains("open"));
-        assert_header(&a, "open");
-        for y in 1..16 {
-            a.mouse(MouseEventKind::Down(MouseButton::Left), 4, y);
-            assert_header(&a, "open");
-            assert!(a.collapsed.contains("open"));
-        }
+        assert_eq!(a.collapse_context.as_deref(), Some("open"));
+        assert!(a.selected.is_none());
         a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 0);
         assert_bead(&a, "b0");
     }
@@ -2111,25 +2609,19 @@ mod tests {
         assert_eq!(a.collapsed, HashSet::from(["closed".to_owned()]));
         assert_eq!(a.selected, None);
         assert!(a.detail.is_none());
-        assert_eq!(a.focused_group.as_deref(), Some("closed"));
+        assert!(a.collapse_context.is_none());
     }
     #[test]
-    fn refresh_preserves_expanded_and_collapsed_headers_without_selecting_beads() {
+    fn refresh_never_selects_group_headers_or_makes_them_delete_targets() {
         let mut a = app();
         a.beads[1].status = "closed".into();
-        a.focus_group("closed".into());
-        for collapsed in [false, true] {
-            if collapsed {
-                a.collapsed.insert("closed".into());
-            }
-            let mut items = a.beads.clone();
-            items.reverse();
-            respond(&mut a, Response::List(Ok(items)));
-            assert_header(&a, "closed");
-            assert_eq!(a.collapsed.contains("closed"), collapsed);
-            press(&mut a, KeyCode::Char('d'));
-            assert!(a.modal.is_none());
-        }
+        let mut items = a.beads.clone();
+        items.reverse();
+        respond(&mut a, Response::List(Ok(items)));
+        assert!(a.collapse_context.is_none());
+        assert!(a.selected.is_some());
+        press(&mut a, KeyCode::Char('d'));
+        assert!(matches!(a.modal, Some(Modal::ConfirmDelete { .. })));
     }
     #[test]
     fn refresh_tracks_bead_id_across_reorder_status_moves_and_collapsed_destination() {
@@ -2158,13 +2650,18 @@ mod tests {
         let mut items = a.beads.clone();
         items.iter_mut().find(|b| b.id == "b2").unwrap().status = "blocked".into();
         respond(&mut a, Response::List(Ok(items)));
-        assert_header(&a, "blocked");
+        assert!(a.collapse_context.is_none());
+        let selected = a.selected.expect("refresh keeps a visible issue selected");
+        assert_ne!(a.beads[selected].id, "b2");
+        assert_eq!(a.detail.as_ref(), Some(&a.beads[selected].data));
         assert!(!a.collapsed.contains("closed"));
-        press(&mut a, KeyCode::Char(' '));
-        assert_bead(&a, "b2");
+        press(&mut a, KeyCode::Char('d'));
+        assert!(
+            matches!(&a.modal, Some(Modal::ConfirmDelete { id, .. }) if id == &a.beads[selected].id)
+        );
     }
     #[test]
-    fn refresh_missing_bead_or_header_chooses_first_visible_bead_then_first_header() {
+    fn refresh_missing_bead_selects_visible_issue_or_leaves_no_selection() {
         let mut a = app();
         a.beads[0].status = "closed".into();
         a.beads[1].status = "blocked".into();
@@ -2173,13 +2670,11 @@ mod tests {
         let items = a.beads.iter().filter(|b| b.id != "b0").cloned().collect();
         respond(&mut a, Response::List(Ok(items)));
         assert_bead(&a, "b1");
-        a.focus_group("blocked".into());
         let mut items = a.beads.clone();
         items.iter_mut().find(|b| b.id == "b1").unwrap().status = "closed".into();
         respond(&mut a, Response::List(Ok(items)));
         assert_bead(&a, "b1");
         a.collapsed.insert("closed".into());
-        a.focus_group("closed".into());
         let items = a
             .beads
             .iter()
@@ -2187,23 +2682,20 @@ mod tests {
             .cloned()
             .collect();
         respond(&mut a, Response::List(Ok(items)));
-        assert_header(&a, "open");
-        assert_eq!(a.collapsed, HashSet::from(["open".into()]));
+        assert!(a.collapse_context.is_none());
+        assert!(a.selected.is_none());
         respond(&mut a, Response::List(Ok(vec![])));
-        assert!(a.focused_group.is_none());
+        assert!(a.collapse_context.is_none());
         assert!(a.selected.is_none());
         assert!(a.detail.is_none());
         assert!(a.collapsed.is_empty());
     }
     #[test]
-    fn preferred_id_overrides_header_or_bead_focus_and_expands_destination() {
-        for header in [false, true] {
+    fn preferred_id_expands_destination_and_selects_created_bead() {
+        {
             let mut a = app();
             a.beads[1].status = "closed".into();
             a.collapsed.insert("closed".into());
-            if header {
-                a.focus_group("open".into());
-            }
             a.preferred_id = Some("b1".into());
             let items = a.beads.clone();
             respond(&mut a, Response::List(Ok(items)));
@@ -2213,13 +2705,12 @@ mod tests {
         }
     }
     #[test]
-    fn missing_preferred_id_does_not_discard_existing_header_focus() {
+    fn missing_preferred_id_falls_back_to_visible_issue_not_header() {
         let mut a = app();
-        a.focus_group("open".into());
         a.preferred_id = Some("missing".into());
         let items = a.beads.clone();
         respond(&mut a, Response::List(Ok(items)));
-        assert_header(&a, "open");
+        assert_bead(&a, "b0");
         assert!(a.preferred_id.is_none());
     }
     #[test]
