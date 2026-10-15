@@ -25,6 +25,10 @@ Theme is explicit app state (`App::theme`) threaded into rendering; do not intro
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
 The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
+Settings rows in `src/ui.rs` share a two-thirds title column and one-third
+value column. `settings_row` aligns titles to the left and centers controls
+by terminal cell width; keep dropdown entries on the same value boundary and
+retain the existing compact-terminal fallback when changing this layout.
 
 ## Beads CLI contract
 
