@@ -1,6 +1,6 @@
 # Install and update OnTrack
 
-The installer supports macOS and glibc Linux on x86_64 or aarch64. It needs Bash,
+The installer supports macOS and Ubuntu 24.04-compatible glibc Linux on x86_64 or aarch64. It needs Bash,
 `curl`, Python 3, and a writable user-owned install directory. It installs one
 `ontrack` executable into `~/.local/bin` by default. Rust is needed only when
 building from source. A terminal with alternate-screen support is needed to run
@@ -29,8 +29,7 @@ workspace, install an embedded-capable `bd` build as described in the
 Once a stable OnTrack GitHub Release with an asset for your platform exists:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/ThomasJRyan/OnTrack/main/scripts/install.sh -o install-ontrack.sh
-bash install-ontrack.sh
+curl -fsSLo install-ontrack.sh https://raw.githubusercontent.com/ThomasJRyan/OnTrack/main/scripts/install.sh && bash install-ontrack.sh
 ```
 
 Review the downloaded script before running it if desired. It is also usable
@@ -99,8 +98,8 @@ The installer uses the GitHub API's latest **stable** release for
 
 | System | Target |
 | --- | --- |
-| Linux x86_64 with glibc | `x86_64-unknown-linux-gnu` |
-| Linux aarch64 with glibc | `aarch64-unknown-linux-gnu` |
+| Linux x86_64 with Ubuntu 24.04-compatible glibc | `x86_64-unknown-linux-gnu` |
+| Linux aarch64 with Ubuntu 24.04-compatible glibc | `aarch64-unknown-linux-gnu` |
 | macOS Intel | `x86_64-apple-darwin` |
 | macOS Apple silicon | `aarch64-apple-darwin` |
 
