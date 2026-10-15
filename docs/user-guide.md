@@ -19,7 +19,7 @@ cargo run
 
 To browse another workspace, build with `cargo build`, change to that workspace, and launch the built binary using its absolute path. The launch directory, not the binary's location, determines which workspace `bd` uses. Do not launch the interactive application in a runner without a terminal.
 
-A brief splash precedes the browser. Issue loading starts in the background; quit keys work during startup too.
+A brief splash precedes the browser. A terminal-drawn anime girl blinks and waves beneath the ONTRACK wordmark; narrower terminals use a compact title, and very small terminals show text only. The animation lasts about 1.2 seconds and uses the selected theme. Issue loading starts in the background; quit keys work during startup too.
 
 ## Status groups
 

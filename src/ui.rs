@@ -60,6 +60,109 @@ const ASCII_LOGO: [&str; 8] = [
     " ▒▒▒███████▒   ████ █████    █████    █████    ▒▒████████▒▒██████  ████ █████",
     "   ▒▒▒▒▒▒▒    ▒▒▒▒ ▒▒▒▒▒    ▒▒▒▒▒    ▒▒▒▒▒      ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒  ▒▒▒▒ ▒▒▒▒▒ ",
 ];
+const SPLASH_DURATION: Duration = Duration::from_millis(1200);
+const GIRL_FRAMES: [[&str; 10]; 3] = [
+    [
+        "          .-\"\"\"-.          ",
+        "        .'  .-.  '.        ",
+        "       /  //   \\  \\       ",
+        "      |  | o   o |  |      ",
+        "      |  |   ^   |  |      ",
+        "      |  |  \\_/  |  |      ",
+        "       \\  \\_____/  /  \\o   ",
+        "        '-._|_|_.-'   /    ",
+        "           /|\\      /     ",
+        "          /_|_\\           ",
+    ],
+    [
+        "          .-\"\"\"-.       *  ",
+        "        .'  .-.  '.     o/ ",
+        "       /  //   \\  \\    /  ",
+        "      |  | o   o |  |  /   ",
+        "      |  |   ^   |  | /    ",
+        "      |  |  \\_/  |  |/     ",
+        "       \\  \\_____/  /      ",
+        "        '-._|_|_.-'       ",
+        "           /|\\            ",
+        "          /_|_\\           ",
+    ],
+    [
+        "          .-\"\"\"-.          ",
+        "        .'  .-.  '.    *   ",
+        "       /  //   \\  \\   o/  ",
+        "      |  | -   - |  | /    ",
+        "      |  |   ^   |  |/     ",
+        "      |  |  \\_/  |  |      ",
+        "       \\  \\_____/  /      ",
+        "        '-._|_|_.-'       ",
+        "           /|\\            ",
+        "          /_|_\\           ",
+    ],
+];
+
+fn girl_frame(elapsed: Duration) -> &'static [&'static str; 10] {
+    // The existing redraw loop runs every 35 ms, so elapsed time is enough state.
+    &GIRL_FRAMES[(elapsed.as_millis() / 300 % GIRL_FRAMES.len() as u128) as usize]
+}
+
+fn splash_lines(
+    elapsed: Duration,
+    area: Rect,
+    teal: Color,
+    gold: Color,
+    muted: Color,
+) -> Vec<Line<'static>> {
+    let girl = girl_frame(elapsed);
+    // One width for every frame keeps the character fixed in place as she moves.
+    let girl_width = GIRL_FRAMES
+        .iter()
+        .flatten()
+        .map(|line| Span::raw(*line).width())
+        .max()
+        .unwrap_or(0);
+    let logo_width = ASCII_LOGO
+        .iter()
+        .map(|line| Span::raw(*line).width())
+        .max()
+        .unwrap_or(0);
+    let large = usize::from(area.width) >= logo_width
+        && usize::from(area.height) >= ASCII_LOGO.len() + 1 + girl.len();
+    let show_girl = usize::from(area.width) >= girl_width
+        && usize::from(area.height) >= (if large { ASCII_LOGO.len() } else { 2 }) + 1 + girl.len();
+
+    let mut lines = if large {
+        ASCII_LOGO
+            .iter()
+            .map(|line| {
+                Line::from(Span::styled(
+                    *line,
+                    Style::default().fg(teal).add_modifier(Modifier::BOLD),
+                ))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "ONTRACK",
+                Style::default().fg(teal).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "BEADS WORKSPACE BROWSER",
+                Style::default().fg(muted),
+            )),
+        ]
+    };
+    if show_girl {
+        lines.push(Line::raw(""));
+        lines.extend(girl.iter().enumerate().map(|(index, line)| {
+            Line::from(Span::styled(
+                format!("{line:<girl_width$}"),
+                Style::default().fg(if index <= 2 { gold } else { teal }),
+            ))
+        }));
+    }
+    lines
+}
 fn row_issue_type(bead: &crate::beads::Bead) -> String {
     ["issue_type", "type"]
         .into_iter()
@@ -187,35 +290,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         render_help(f, app);
         return;
     }
-    if app.modal.is_none() && app.help.is_none() && elapsed < Duration::from_millis(1200) {
-        let logo_width = ASCII_LOGO
-            .iter()
-            .map(|line| Span::raw(*line).width())
-            .max()
-            .unwrap_or(0);
-        let large = usize::from(a.width) >= logo_width && a.height >= ASCII_LOGO.len() as u16;
-        let lines = if large {
-            ASCII_LOGO
-                .iter()
-                .map(|line| {
-                    Line::from(Span::styled(
-                        *line,
-                        Style::default().fg(teal).add_modifier(Modifier::BOLD),
-                    ))
-                })
-                .collect::<Vec<_>>()
-        } else {
-            vec![
-                Line::from(Span::styled(
-                    "ONTRACK",
-                    Style::default().fg(teal).add_modifier(Modifier::BOLD),
-                )),
-                Line::from(Span::styled(
-                    "BEADS WORKSPACE BROWSER",
-                    Style::default().fg(muted),
-                )),
-            ]
-        };
+    if app.modal.is_none() && app.help.is_none() && elapsed < SPLASH_DURATION {
+        let lines = splash_lines(elapsed, a, teal, gold, muted);
         let height = lines.len() as u16;
         f.render_widget(
             Paragraph::new(lines)
@@ -1982,6 +2058,55 @@ mod tests {
                 .collect(),
             a.list_rect,
         )
+    }
+    fn draw_at(size: (u16, u16), elapsed: Duration, app: &mut App) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+        terminal.draw(|frame| render(frame, elapsed, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+    #[test]
+    fn splash_animates_girl_without_moving_her_or_delaying_browser() {
+        let mut app = app();
+        let idle = draw_at((100, 30), Duration::ZERO, &mut app);
+        let wave = draw_at((100, 30), Duration::from_millis(300), &mut app);
+        let blink = draw_at((100, 30), Duration::from_millis(600), &mut app);
+        assert!(idle.contains("███████"));
+        assert!(idle.contains("o   o"));
+        assert!(wave.contains("o/"));
+        assert!(blink.contains("-   -"));
+        assert_eq!(
+            idle.find(".-\"\"\"-."),
+            wave.find(".-\"\"\"-."),
+            "the character should stay centered between poses"
+        );
+        assert_eq!(idle.find(".-\"\"\"-."), blink.find(".-\"\"\"-."));
+        let browser = draw_at((100, 30), SPLASH_DURATION, &mut app);
+        assert!(browser.contains("Title is visible"));
+        assert!(!browser.contains(".-\"\"\"-."));
+    }
+    #[test]
+    fn splash_uses_character_and_title_when_compact_and_text_when_tiny() {
+        let mut app = app();
+        let compact = draw_at((60, 18), Duration::from_millis(300), &mut app);
+        assert!(compact.contains("ONTRACK"));
+        assert!(compact.contains(".-\"\"\"-."));
+        assert!(!compact.contains("███████"));
+        let tiny = draw_at((24, 7), Duration::from_millis(300), &mut app);
+        assert!(tiny.contains("ONTRACK"));
+        assert!(!tiny.contains(".-\"\"\"-."));
+        app.help = Some(crate::hotkeys::Help {
+            context: crate::hotkeys::Context::Issues,
+            offset: 0,
+        });
+        let help = draw_at((60, 18), Duration::ZERO, &mut app);
+        assert!(help.contains("HOTKEYS"));
+        assert!(!help.contains(".-\"\"\"-."));
     }
     #[test]
     fn hotkey_reference_has_columns_and_scrolls_in_compact_terminals() {

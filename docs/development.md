@@ -19,7 +19,7 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | `src/detail.rs` | Presents complete issue records with Markdown rendering for narrative fields and readable structured fallbacks for metadata. |
 | `src/terminal.rs` | Manages raw mode, alternate screen, mouse capture, and cleanup, including initialization failures and panic handling. |
 
-`src/ui.rs` renders a centered ASCII ONTRACK wordmark during startup, with a short subtitle and a compact text fallback for narrower terminals. Keep the splash readable across terminal sizes and ensure it yields to the normal browser view after startup.
+`src/ui.rs` renders the supplied centered ONTRACK wordmark and a terminal-drawn anime girl during the 1.2-second startup splash. `girl_frame` chooses the blink and wave pose from elapsed time supplied by `app::run`'s existing redraw loop, so the animation needs no separate timer or state. If the full wordmark and character do not fit, the renderer uses the compact ONTRACK title with the character when possible, then a text-only fallback. Width checks use terminal cell widths; preserve the wordmark verbatim, keep the splash centered and theme-aware, and ensure it yields to the normal browser view after startup.
 
 In the managed-worktree view, Enter queues `herdr workspace focus WORKSPACE_ID` on the existing background worker. The ID comes from the selected OnTrack handoff, never global focus. The adapter passes arguments separately, rejects unsafe IDs, and requires Herdr's `workspace_focused` result to repeat the selected ID. Closed workspaces and removed checkouts are rejected before dispatch. Focus success and errors are shown in the view without changing Git, Beads, or the handoff registry.
 
