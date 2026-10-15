@@ -818,7 +818,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     );
     if let Some(modal) = &app.modal {
         let width = match modal {
-            crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. } => 70,
+            crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. } => {
+                FORM_DESCRIPTION_WIDTH as u16 + 6
+            }
             crate::app::Modal::Settings { .. } => 64,
             _ => 62,
         }
@@ -1257,6 +1259,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     }
                 }
                 let desc_area = rows[2];
+                debug_assert_eq!(
+                    desc_area.width.saturating_sub(2) as usize,
+                    FORM_DESCRIPTION_WIDTH
+                );
                 let (wrapped_description, cx, cy) = wrapped_description(
                     &form.description,
                     form.description_cursor,
@@ -1488,21 +1494,30 @@ fn display_window(s: &str, desired_start: usize, width: usize) -> (String, usize
     }
     (out, actual_start)
 }
-fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, usize) {
+pub(crate) const FORM_DESCRIPTION_WIDTH: usize = 64;
+
+fn description_layout(
+    s: &str,
+    cursor: usize,
+    width: usize,
+) -> (String, usize, usize, Vec<(usize, usize, usize)>) {
     let width = width.max(1);
     let cursor = cursor.min(s.len());
     let mut caret = None;
+    let mut positions = Vec::with_capacity(s.chars().count() + 1);
     let mut out = String::new();
     let mut row = 0;
     let mut col = 0;
     for (byte, ch) in s.char_indices() {
         if ch == '\n' {
+            let position = if col == width {
+                (0, row + 1)
+            } else {
+                (col, row)
+            };
+            positions.push((byte, position.0, position.1));
             if byte == cursor {
-                caret = Some(if col == width {
-                    (0, row + 1)
-                } else {
-                    (col, row)
-                });
+                caret = Some(position);
             }
             out.push('\n');
             row += 1;
@@ -1535,6 +1550,7 @@ fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, 
             out.push('\n');
             row += 1;
             col = 0;
+            positions.push((byte, col, row));
             if byte == cursor {
                 caret = Some((col, row));
             }
@@ -1546,21 +1562,48 @@ fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, 
             row += 1;
             col = 0;
         }
+        positions.push((byte, col, row));
         if byte == cursor {
             caret = Some((col, row));
         }
         out.push(ch);
         col += cw;
     }
+    let end = if col == width {
+        (0, row + 1)
+    } else {
+        (col, row)
+    };
+    positions.push((s.len(), end.0, end.1));
     if cursor == s.len() {
-        caret = Some(if col == width {
-            (0, row + 1)
-        } else {
-            (col, row)
-        });
+        caret = Some(end);
     }
     let (x, y) = caret.unwrap_or((col, row));
-    (out, x, y)
+    (out, x, y, positions)
+}
+
+fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, usize) {
+    let (text, x, y, _) = description_layout(s, cursor, width);
+    (text, x, y)
+}
+
+pub(crate) fn move_description_vertical(
+    s: &str,
+    cursor: usize,
+    down: bool,
+    preferred_column: &mut Option<usize>,
+) -> usize {
+    let (_, x, y, positions) = description_layout(s, cursor, FORM_DESCRIPTION_WIDTH);
+    let column = *preferred_column.get_or_insert(x);
+    let target_row = if down { y + 1 } else { y.saturating_sub(1) };
+    if target_row == y {
+        return cursor;
+    }
+    positions
+        .into_iter()
+        .filter(|(_, _, row)| *row == target_row)
+        .min_by_key(|(byte, x, _)| (x.abs_diff(column), std::cmp::Reverse(*byte)))
+        .map_or(cursor, |(byte, _, _)| byte)
 }
 fn wrapped_lines(s: &str, width: usize) -> Vec<String> {
     wrapped_description(s, 0, width)
