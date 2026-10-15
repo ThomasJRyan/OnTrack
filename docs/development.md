@@ -49,7 +49,7 @@ Create returns a JSON object containing the created ID; delete is successful on 
 
 `--all` includes closed issues and `--limit 0` removes the default list cap. `--id=ISSUE_ID` is a single argument. The list and show responses must be JSON arrays. List parsing requires nonempty string `id`, `title`, and `status`; a missing or null priority defaults to 2, and supplied priority must be an unsigned integer. Each `Bead` retains the entire JSON object as well as its summary fields.
 
-Detail parsing selects the requested ID, rejects duplicate matching records, and reports a missing ID. It retains the returned JSON intact, including comments, relationships, metadata, and fields unknown to ontrack. Process-start errors, unsuccessful exit statuses with stderr, and invalid JSON/records are surfaced as errors rather than panics.
+Detail parsing selects the requested ID, rejects duplicate matching records, and reports a missing ID. It retains the returned JSON intact, including comments, relationships, metadata, and fields unknown to ontrack. The detail renderer omits only the top-level `revision` field from display, for both cached list records and full show records; nested revision fields and other metadata remain visible. Process-start errors, unsuccessful exit statuses with stderr, and invalid JSON/records are surfaced as errors rather than panics.
 
 ## Herdr launch adapter
 
@@ -100,7 +100,7 @@ Automatic refresh uses the same public read-only list/show commands above. Sched
 
 The background worker executes each request in channel order. It does not coalesce or reorder requests, so mutation commands cannot be lost. Responses for a show ID other than the current selection are ignored.
 
-Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Automatic updates also retain group collapse state, focus, scroll positions within current bounds, and active form input. Failed list/detail refreshes retain the last loaded data or available snapshot, display errors in the footer, and retry automatically. The presentation layer renders narrative Markdown via `tui-markdown`; all remaining fields, including unknown nested values, remain represented. Rendered text drives both wrapping and scroll bounds.
+Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Automatic updates also retain group collapse state, focus, scroll positions within current bounds, and active form input. Failed list/detail refreshes retain the last loaded data or available snapshot, display errors in the footer, and retry automatically. The presentation layer renders narrative Markdown via `tui-markdown`; all remaining fields except the top-level revision, including unknown nested values, remain represented. Rendered text drives both wrapping and scroll bounds.
 
 Keep CLI calls off the input/render loop and preserve stale-response filtering when changing the worker. The worker is not joined on quit, so terminal cleanup does not wait for a slow CLI call; in-flight commands are not cancelled on quit.
 

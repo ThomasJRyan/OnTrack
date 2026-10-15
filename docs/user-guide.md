@@ -57,7 +57,7 @@ The settings dialog captures input until it closes, so `q` cannot quit while it 
 
 ## Details, loading, and refresh
 
-Selecting an issue immediately displays its cached list record while a richer `bd show` request runs. The returned detail record replaces that snapshot. ontrack requests long details, comments, and dependents; descriptions, notes, design and acceptance text render as Markdown. Metadata, comments, relationships, and unknown nested values are preserved whenever present in the returned JSON. It does not invent missing fields or fetch data outside those CLI responses. Scroll the details pane to see fields below the visible area.
+Selecting an issue immediately displays its cached list record while a richer `bd show` request runs. The returned detail record replaces that snapshot. ontrack requests long details, comments, and dependents; descriptions, notes, design and acceptance text render as Markdown. Metadata, comments, relationships, and unknown nested values are shown whenever present in the returned JSON, except for the top-level revision field. It does not invent missing fields or fetch data outside those CLI responses. Scroll the details pane to see fields below the visible area.
 
 ontrack automatically polls the issue list and selected issue's details in the background, starting another refresh roughly one second after the previous refresh completes. Changes made by another terminal or agent appear without pressing `r` or configuring events, a watcher, or extra dependencies. Slow `bd` commands increase the delay; updates are not instantaneous or event-driven. Successful create/delete actions in ontrack still trigger an immediate refresh, and `r` remains available for a manual refresh.
 
