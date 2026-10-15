@@ -315,6 +315,20 @@ fn render_header(f: &mut Frame, area: Rect, left: Line<'static>, app: &App) {
         left_area,
     );
 }
+fn render_header_feedback(f: &mut Frame, area: Rect, message: Option<&str>, theme: Theme) {
+    let Some(message) = message else {
+        return;
+    };
+    let palette = crate::theme::definition(theme).palette;
+    f.render_widget(
+        Paragraph::new(truncate_display(
+            message,
+            area.width.saturating_sub(1) as usize,
+        ))
+        .style(Style::default().fg(palette.warning).bg(palette.background)),
+        Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(1), 1),
+    );
+}
 pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     let a = f.area();
     let palette = crate::theme::definition(app.theme).palette;
@@ -371,7 +385,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .constraints([
                 Constraint::Length(2),
                 Constraint::Min(3),
-                Constraint::Length(3),
+                Constraint::Length(1),
             ])
             .split(a);
         render_header(
@@ -389,6 +403,22 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             ]),
             app,
         );
+        let feedback = app
+            .worktrees_error
+            .as_deref()
+            .map(|error| format!("ERROR · {error}"))
+            .or_else(|| {
+                app.worktrees_focus_feedback
+                    .as_ref()
+                    .map(|feedback| match feedback {
+                        crate::app::WorktreeFocusFeedback::Success(message) => message.clone(),
+                        crate::app::WorktreeFocusFeedback::Error(message) => {
+                            format!("ERROR · {message}")
+                        }
+                    })
+            })
+            .or_else(|| app.notice.clone());
+        render_header_feedback(f, areas[0], feedback.as_deref(), app.theme);
         let panes = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
@@ -573,50 +603,14 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .style(Style::default().fg(ink).bg(bg)),
             panes[1],
         );
-        let footer = if let Some(crate::app::Modal::ConfirmWorktree { id, action }) = &app.modal {
-            let operation = match action {
-                0 => "MERGE REQUEST · dispatch only; not integrated",
-                1 => "CLOSE WORKSPACE · integrated only",
-                2 => "REMOVE CHECKOUT AND CLOSE HERDR WORKSPACE · integrated only; branch kept",
-                _ => "RESTART TASK · discard checkout changes; old branch kept",
-            };
-            format!("y confirm / Esc cancel · {operation} · {id}")
-        } else if let Some(feedback) = &app.worktrees_focus_feedback {
-            match feedback {
-                crate::app::WorktreeFocusFeedback::Success(message) => message.clone(),
-                crate::app::WorktreeFocusFeedback::Error(message) => format!("ERROR · {message}"),
-            }
-        } else if let Some(error) = &app.worktrees_error {
-            format!("ERROR · {error}")
-        } else {
-            "Enter switch workspace · Ctrl+? keys".to_owned()
-        };
-        let footer_lines = wrap_words(&footer, areas[2].width as usize)
-            .into_iter()
-            .take(usize::from(areas[2].height))
-            .collect::<Vec<_>>();
         f.render_widget(
-            Paragraph::new(footer_lines.join("\n")).style(
-                Style::default()
-                    .fg(
-                        if app.worktrees_error.is_some()
-                            || matches!(
-                                app.worktrees_focus_feedback,
-                                Some(crate::app::WorktreeFocusFeedback::Error(_))
-                            )
-                            || app.modal.is_some()
-                        {
-                            gold
-                        } else {
-                            muted
-                        },
-                    )
-                    .bg(palette.panel_alt),
-            ),
+            Paragraph::new(worktree_footer_text(areas[2].width as usize))
+                .style(Style::default().fg(muted).bg(palette.panel_alt)),
             areas[2],
         );
-        if let Some(crate::app::Modal::ConfirmWorktree { id, action: 3 }) = &app.modal {
-            let height = 12;
+        if let Some(crate::app::Modal::ConfirmWorktree { id, action }) = &app.modal {
+            let restart = *action == 3;
+            let height = if restart { 12 } else { 8 };
             if a.width < 50 || a.height < height {
                 app.modal_ready = false;
                 f.render_widget(Clear, a);
@@ -638,13 +632,28 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 f.render_widget(Clear, area);
                 f.render_widget(
                     Block::default()
-                        .title(" RESTART TASK? ")
+                        .title(if restart {
+                            " RESTART TASK? "
+                        } else {
+                            " CONFIRM WORKTREE ACTION "
+                        })
                         .borders(Borders::ALL)
                         .border_style(Style::default().fg(palette.border))
                         .style(Style::default().bg(palette.panel)),
                     area,
                 );
-                let prompt = "Restart this task from scratch?\n\nDiscard all uncommitted checkout changes.\nThe current Herdr workspace will close.\nThe old branch is kept. A fresh worktree\nand agent will start for this Bead.";
+                let prompt = match action {
+                    0 => {
+                        "Request merge resolution from the recorded agent? This is pending, not merged."
+                    }
+                    1 => "Close the integrated Herdr workspace?",
+                    2 => {
+                        "Remove integrated checkout and close its Herdr workspace? Branch is preserved."
+                    }
+                    _ => {
+                        "Restart this task from scratch?\n\nDiscard all uncommitted checkout changes.\nThe current Herdr workspace will close.\nThe old branch is kept. A fresh worktree\nand agent will start for this Bead."
+                    }
+                };
                 let inner = Rect::new(area.x + 2, area.y + 1, area.width - 4, area.height - 2);
                 f.render_widget(
                     Paragraph::new(format!(
@@ -683,6 +692,14 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         ]),
         app,
     );
+    let feedback = if let Some(error) = &app.list_error {
+        Some(format!("LIST ERROR · {error}"))
+    } else if let Some(error) = &app.detail_error {
+        Some(format!("DETAIL ERROR · {error}"))
+    } else {
+        app.notice.clone()
+    };
+    render_header_feedback(f, v[0], feedback.as_deref(), app.theme);
     let split = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -963,15 +980,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .scroll((app.detail_offset, 0)),
         split[1],
     );
-    let message = if let Some(e) = &app.list_error {
-        Some(format!("LIST ERROR · {e}"))
-    } else if let Some(e) = &app.detail_error {
-        Some(format!("DETAIL ERROR · {e}"))
-    } else {
-        app.notice.clone()
-    };
     f.render_widget(
-        Paragraph::new(footer_text(message.as_deref(), v[2].width as usize))
+        Paragraph::new(footer_text(v[2].width as usize))
             .style(Style::default().fg(muted).bg(palette.panel_alt)),
         v[2],
     );
@@ -1768,6 +1778,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Paragraph::new(format!(
                         "{action}\n\nWorktree: {id}\n\ny confirm · n / Esc cancel"
                     ))
+                    .wrap(Wrap { trim: false })
                     .style(Style::default().fg(ink)),
                     inner,
                 );
@@ -1889,7 +1900,7 @@ fn render_toast(f: &mut Frame, app: &App) {
     let visible_lines = usize::from(height.saturating_sub(2));
     if lines.len() > visible_lines && visible_lines > 0 {
         lines.truncate(visible_lines);
-        lines[visible_lines - 1] = truncate_display("… see footer / w for handoffs", text_width);
+        lines[visible_lines - 1] = truncate_display("… press w for handoffs", text_width);
     }
     let colors = crate::theme::definition(app.theme).palette;
     let border = if toast.error {
@@ -1911,10 +1922,7 @@ fn render_toast(f: &mut Frame, app: &App) {
         box_area,
     );
 }
-fn footer_text(message: Option<&str>, width: usize) -> String {
-    if let Some(message) = message {
-        return truncate_display(&format!(" {message}"), width);
-    }
+fn footer_text(width: usize) -> String {
     let mut footer = truncate_display(
         " n new · e edit · d delete · h hand off · r ready · q quit",
         width,
@@ -1924,6 +1932,30 @@ fn footer_text(message: Option<&str>, width: usize) -> String {
         " · s settings",
         " · w worktrees",
         " · Ctrl+? keys",
+    ] {
+        if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
+            footer.push_str(hint);
+        }
+    }
+    footer
+}
+fn worktree_footer_text(width: usize) -> String {
+    let mut footer = String::new();
+    for hint in [
+        " Enter switch",
+        " · m merge",
+        " · c close",
+        " · x remove",
+        " · R restart",
+        " · r refresh",
+        " · w back",
+        " · ↑/↓ select",
+        " · PgUp/PgDn scroll",
+        " · q quit",
+        " · Ctrl+? keys",
+        " · k/j select",
+        " · Esc/Backspace back",
+        " · Ctrl+C quit",
     ] {
         if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
             footer.push_str(hint);
@@ -3053,7 +3085,7 @@ mod tests {
     #[test]
     fn browser_footer_keeps_action_hints_without_routine_state_or_arrow_tips() {
         for width in [64, 90, 120] {
-            let footer = footer_text(None, width);
+            let footer = footer_text(width);
             for action in ["n new", "d delete", "h hand off", "r ready", "q quit"] {
                 assert!(
                     footer.contains(action),
@@ -3065,11 +3097,33 @@ mod tests {
             assert!(!footer.contains("←"));
             assert!(!footer.contains("READY"));
         }
-        assert!(footer_text(None, 120).contains("N child"));
-        assert!(footer_text(None, 120).contains("Ctrl+? keys"));
-        let error = footer_text(Some("LIST ERROR · current failure"), 24);
-        assert!(error.starts_with(" LIST ERROR"));
-        assert!(Span::raw(error.as_str()).width() <= 24);
+        assert!(footer_text(120).contains("N child"));
+        assert!(footer_text(120).contains("Ctrl+? keys"));
+        let mut app = app();
+        let original = draw((120, 24), &mut app).0;
+        app.list_error = Some("current failure".into());
+        app.notice = Some("Updated bead".into());
+        let with_feedback = draw((120, 24), &mut app).0;
+        assert_eq!(
+            original.chars().skip(120 * 23).collect::<String>(),
+            with_feedback.chars().skip(120 * 23).collect::<String>()
+        );
+        assert!(with_feedback.contains("LIST ERROR · current failure"));
+        app.list_error = None;
+        app.detail_error = Some("detail unavailable".into());
+        let with_detail_error = draw((120, 24), &mut app).0;
+        assert_eq!(
+            original.chars().skip(120 * 23).collect::<String>(),
+            with_detail_error.chars().skip(120 * 23).collect::<String>()
+        );
+        assert!(with_detail_error.contains("DETAIL ERROR · detail unavailable"));
+        app.detail_error = None;
+        let with_notice = draw((120, 24), &mut app).0;
+        assert_eq!(
+            original.chars().skip(120 * 23).collect::<String>(),
+            with_notice.chars().skip(120 * 23).collect::<String>()
+        );
+        assert!(with_notice.contains("Updated bead"));
     }
     #[test]
     fn outstanding_worktrees_render_target_state_and_pending_dispatch_on_compact_terminal() {
@@ -3095,18 +3149,53 @@ mod tests {
         assert!(screen.contains("main"));
         assert!(screen.contains("waiting for verified ancestry"));
         assert!(screen.contains("Git integration"));
-        let footer = screen.chars().skip(80 * 13).collect::<String>();
-        assert!(footer.contains("Enter switch workspace · Ctrl+? keys"));
+        let footer = screen.chars().skip(80 * 15).collect::<String>();
+        assert!(footer.contains("Enter switch"));
+        assert!(footer.contains("m merge"));
+        assert!(footer.contains("c close"));
+        assert!(footer.contains("x remove"));
         assert!(!footer.contains("MERGE PENDING"));
         assert!(!footer.contains("waiting for verified ancestry"));
-        assert!(!footer.contains("PgUp"));
         app.worktrees_error = Some("scan failed".into());
-        let error_footer = draw((80, 16), &mut app)
-            .0
-            .chars()
-            .skip(80 * 13)
-            .collect::<String>();
-        assert!(error_footer.contains("ERROR · scan failed"));
+        let with_error = draw((80, 16), &mut app).0;
+        let error_footer = with_error.chars().skip(80 * 15).collect::<String>();
+        assert_eq!(footer, error_footer);
+        assert!(with_error.contains("ERROR · scan failed"));
+        app.worktrees_focus_feedback = Some(crate::app::WorktreeFocusFeedback::Success(
+            "Switched workspace".into(),
+        ));
+        app.worktrees_error = None;
+        let with_focus = draw((80, 16), &mut app).0;
+        assert_eq!(footer, with_focus.chars().skip(80 * 15).collect::<String>());
+        assert!(with_focus.contains("Switched workspace"));
+        assert_eq!(app.detail_rect.height, 13);
+    }
+    #[test]
+    fn worktree_footer_lists_all_view_actions_on_wide_terminal_and_fits_one_row() {
+        let hints = worktree_footer_text(200);
+        for key in [
+            "Enter switch",
+            "m merge",
+            "c close",
+            "x remove",
+            "R restart",
+            "r refresh",
+            "w back",
+            "↑/↓ select",
+            "PgUp/PgDn scroll",
+            "k/j select",
+            "Esc/Backspace back",
+            "q quit",
+            "Ctrl+C quit",
+            "Ctrl+? keys",
+        ] {
+            assert!(hints.contains(key), "missing {key}: {hints}");
+        }
+        for width in [24, 64, 80, 120, 200] {
+            let footer = worktree_footer_text(width);
+            assert!(Span::raw(footer.as_str()).width() <= width);
+            assert!(!footer.contains('\n'));
+        }
     }
     #[test]
     fn worktree_status_text_uses_theme_colours_in_list_and_detail() {
@@ -3324,9 +3413,17 @@ mod tests {
             action: 0,
         });
         let screen = draw((80, 9), &mut app).0;
-        assert!(screen.contains("bead-11"));
-        assert!(screen.contains("MERGE REQUEST"));
+        assert!(screen.contains("Worktree: wt-11"));
+        assert!(screen.contains("Request merge"));
+        assert!(screen.contains("recorded agent"));
         assert!(screen.contains("confirm"));
+        assert!(
+            screen
+                .chars()
+                .skip(80 * 8)
+                .collect::<String>()
+                .contains("m merge")
+        );
         assert!(app.worktree_offset > 0);
     }
     #[test]
@@ -3352,8 +3449,9 @@ mod tests {
             action: 2,
         });
         let screen = draw((80, 9), &mut state).0;
-        assert!(screen.contains("REMOVE CHECKOUT AND CLOSE HERDR WORKSPACE"));
-        assert!(screen.contains("y confirm / Esc cancel"));
+        assert!(screen.contains("Remove integrated checkout"));
+        assert!(screen.contains("Herdr workspace?"));
+        assert!(screen.contains("y confirm · n / Esc cancel"));
         let mut settings = app();
         settings.modal = Some(crate::app::Modal::Settings {
             draft: crate::settings::Settings {
