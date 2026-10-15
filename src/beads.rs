@@ -166,7 +166,13 @@ pub fn update_bead(input: &UpdateBead) -> io::Result<()> {
 }
 
 pub fn set_ready(id: &str, ready: bool) -> io::Result<()> {
-    validate_id(id)?;
+    set_ready_many(&[id.to_owned()], ready)
+}
+
+fn set_ready_many(ids: &[String], ready: bool) -> io::Result<()> {
+    for id in ids {
+        validate_id(id)?;
+    }
     let flag = if ready {
         "--add-label"
     } else {
@@ -176,14 +182,65 @@ pub fn set_ready(id: &str, ready: bool) -> io::Result<()> {
     if ready {
         args.extend(["--if-status", "open", "--status", "open"]);
     }
-    args.extend(["--", id]);
+    args.push("--");
+    args.extend(ids.iter().map(String::as_str));
     run_bd(&args)?;
     Ok(())
 }
 
+/// Change an Epic and its open descendant Tasks in one CLI invocation.
+/// Beads applies updates per ID, so callers must refresh after any error.
+pub fn set_epic_ready(
+    epic_id: &str,
+    ready: bool,
+    known_handoffs: &std::collections::HashSet<String>,
+) -> io::Result<Vec<String>> {
+    validate_id(epic_id)?;
+    let beads = list_beads()?;
+    let ids = epic_ready_targets_in(&beads, epic_id, ready, known_handoffs)?;
+    set_ready_many(&ids, ready)?;
+    Ok(ids)
+}
+
+fn epic_ready_targets_in(
+    beads: &[Bead],
+    epic_id: &str,
+    ready: bool,
+    known_handoffs: &std::collections::HashSet<String>,
+) -> io::Result<Vec<String>> {
+    let epic = beads
+        .iter()
+        .find(|bead| bead.id == epic_id)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Selected Epic is no longer listed")
+        })?;
+    if epic.status != "open" || epic.data["issue_type"] != "epic" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Only open Epics can change descendant Ready markers",
+        ));
+    }
+    let descendants: std::collections::HashSet<_> =
+        open_descendants_in(beads, epic_id).into_iter().collect();
+    let mut ids = vec![epic_id.to_owned()];
+    ids.extend(
+        beads
+            .iter()
+            .filter(|bead| {
+                descendants.contains(&bead.id)
+                    && bead.status == "open"
+                    && bead.data["issue_type"] == "task"
+                    && (!ready || !known_handoffs.contains(&bead.id))
+                    && (ready != is_ready(bead))
+            })
+            .map(|bead| bead.id.clone()),
+    );
+    Ok(ids)
+}
+
 pub fn is_ready(bead: &Bead) -> bool {
     bead.status == "open"
-        && bead.data["issue_type"] == "task"
+        && (bead.data["issue_type"] == "task" || bead.data["issue_type"] == "epic")
         && labels(&bead.data).any(|label| label == READY_LABEL)
 }
 
@@ -492,6 +549,38 @@ mod tests {
             data: json!({"issue_type":"feature", "labels":[READY_LABEL]}),
             ..bead
         }));
+        assert!(is_ready(&Bead {
+            id: "epic".into(),
+            title: "Epic".into(),
+            status: "open".into(),
+            priority: 2,
+            data: json!({"issue_type":"epic", "labels":[READY_LABEL]}),
+        }));
+    }
+
+    #[test]
+    fn epic_ready_targets_include_nested_open_tasks_and_skip_existing_handoffs() {
+        let rows = json!([
+            {"id":"epic","title":"Epic","status":"open","issue_type":"epic"},
+            {"id":"direct","title":"Direct","status":"open","issue_type":"task","parent":"epic"},
+            {"id":"ready","title":"Ready","status":"open","issue_type":"task","parent":"epic","labels":[READY_LABEL]},
+            {"id":"closed","title":"Closed","status":"closed","issue_type":"task","parent":"epic"},
+            {"id":"group","title":"Group","status":"closed","issue_type":"feature","parent":"epic"},
+            {"id":"nested","title":"Nested","status":"open","issue_type":"task","parent":"group"},
+            {"id":"sent","title":"Sent","status":"open","issue_type":"task","parent":"epic"},
+            {"id":"other","title":"Other","status":"open","issue_type":"task"}
+        ]);
+        let beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        let handoffs = std::collections::HashSet::from(["sent".to_owned()]);
+        assert_eq!(
+            epic_ready_targets_in(&beads, "epic", true, &handoffs).unwrap(),
+            ["epic", "direct", "nested"]
+        );
+        assert_eq!(
+            epic_ready_targets_in(&beads, "epic", false, &handoffs).unwrap(),
+            ["epic", "ready"]
+        );
+        assert!(epic_ready_targets_in(&beads, "other", true, &handoffs).is_err());
     }
 
     #[test]
