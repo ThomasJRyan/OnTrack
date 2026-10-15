@@ -642,13 +642,62 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
     view(entry, Unmerged, entry["detail"].as_str().map(str::to_owned))
 }
 
+/// A conflict can be a transient part of the requested merge. Only a live,
+/// matching native agent observation changes its display state; Git safety
+/// decisions continue to use `inspect` and `verify`.
+fn inspect_for_display(
+    repo: &RepositoryIdentity,
+    entry: &Value,
+    executor: &mut impl Executor,
+) -> ManagedWorktree {
+    let mut item = inspect(repo, entry);
+    if item.status != WorktreeStatus::NeedsResolution || !entry["merge_request"].is_object() {
+        return item;
+    }
+    let working = (|| -> io::Result<bool> {
+        let result = envelope(&executor.run(&["agent", "get", field(entry, "pane_id")?])?)?;
+        let agent = &result["agent"];
+        if result["type"] != "agent_info"
+            || agent["pane_id"] != entry["pane_id"]
+            || agent["workspace_id"] != entry["workspace_id"]
+            || agent["agent"] != entry["agent"]
+        {
+            return Ok(false);
+        }
+        let session = if entry["merge_request"]["agent_session"].is_object() {
+            &entry["merge_request"]["agent_session"]
+        } else {
+            &entry["agent_session"]
+        };
+        if session.is_object() && agent["agent_session"] != *session {
+            return Ok(false);
+        }
+        Ok(agent["agent_status"] == "working")
+    })()
+    .unwrap_or(false);
+    if working {
+        item.status = WorktreeStatus::MergeRequested;
+        item.detail = Some(format!(
+            "{} The recorded agent is still working; recheck Git when it settles.",
+            item.detail
+                .as_deref()
+                .unwrap_or("Merge request is pending.")
+        ));
+    }
+    item
+}
+
 /// Read-only with respect to Git/Herdr; only this repository's durable handoffs.
 pub fn list() -> io::Result<Vec<ManagedWorktree>> {
-    let registry = Registry::open(&std::env::current_dir()?)?;
+    list_with(&std::env::current_dir()?, &mut SystemExecutor)
+}
+
+fn list_with(cwd: &Path, executor: &mut impl Executor) -> io::Result<Vec<ManagedWorktree>> {
+    let registry = Registry::open(cwd)?;
     Ok(registry
         .entries
         .iter()
-        .map(|entry| inspect(&registry.repo, entry))
+        .map(|entry| inspect_for_display(&registry.repo, entry, executor))
         .collect())
 }
 
@@ -1200,7 +1249,7 @@ fn reconcile_with(
     Ok(registry
         .entries
         .iter()
-        .map(|entry| inspect(&registry.repo, entry))
+        .map(|entry| inspect_for_display(&registry.repo, entry, executor))
         .collect())
 }
 
@@ -1691,11 +1740,83 @@ mod tests {
         Fixture::commit_at(&fixture.main, "target", "advanced after prompt\n");
         let before = tip(&fixture.main, "HEAD").unwrap();
         let mut executor = Fake::default();
+        executor.json(fixture.agent(13, "idle"));
         let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
         assert_eq!(rows[0].status, WorktreeStatus::NeedsResolution);
-        assert!(executor.calls.is_empty());
+        assert_eq!(executor.calls, vec![vec!["agent", "get", "wTask:p1"]]);
         assert_eq!(tip(&fixture.main, "HEAD").unwrap(), before);
         fixture.request();
+    }
+
+    #[test]
+    fn working_agent_keeps_unresolved_merge_pending_in_worktree_list() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "file", "source change\n");
+        Fixture::commit_at(&fixture.main, "file", "target change\n");
+        fixture.request();
+        assert!(git(&fixture.source, &["merge", "--no-edit", "trunk"]).is_err());
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsResolution);
+
+        let mut working = Fake::default();
+        working.json(fixture.agent(13, "working"));
+        let rows = list_with(&fixture.main, &mut working).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
+        assert!(rows[0].detail.as_deref().unwrap().contains("still working"));
+        assert_eq!(working.calls, vec![vec!["agent", "get", "wTask:p1"]]);
+
+        for state in ["idle", "done", "blocked"] {
+            let mut executor = Fake::default();
+            executor.json(fixture.agent(14, state));
+            assert_eq!(
+                list_with(&fixture.main, &mut executor).unwrap()[0].status,
+                WorktreeStatus::NeedsResolution,
+                "{state}"
+            );
+        }
+        let mut mismatched = fixture.agent(14, "working");
+        mismatched["result"]["agent"]["agent_session"]["value"] = json!("replacement");
+        let mut executor = Fake::default();
+        executor.json(mismatched);
+        assert_eq!(
+            list_with(&fixture.main, &mut executor).unwrap()[0].status,
+            WorktreeStatus::NeedsResolution
+        );
+        let mut unavailable = Fake::default();
+        unavailable
+            .outputs
+            .push_back(Err(error("Herdr unavailable")));
+        assert_eq!(
+            list_with(&fixture.main, &mut unavailable).unwrap()[0].status,
+            WorktreeStatus::NeedsResolution
+        );
+    }
+
+    #[test]
+    fn working_agent_keeps_advanced_target_pending() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implemented\n");
+        fixture.request();
+        Fixture::commit_at(&fixture.main, "target", "advanced after prompt\n");
+        let mut executor = Fake::default();
+        executor.json(fixture.agent(13, "working"));
+        let rows = list_with(&fixture.main, &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
+        assert!(
+            rows[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("Target advanced")
+        );
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsResolution);
+
+        let before = tip(&fixture.main, "HEAD").unwrap();
+        let mut reconcile = Fake::default();
+        reconcile.json(fixture.agent(13, "working"));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut reconcile).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
+        assert_eq!(tip(&fixture.main, "HEAD").unwrap(), before);
+        assert_eq!(reconcile.calls, vec![vec!["agent", "get", "wTask:p1"]]);
     }
 
     #[test]
@@ -1780,12 +1901,17 @@ mod tests {
         Fixture::commit_at(&fixture.source, "task", "implemented\n");
         fixture.request();
         let main = fixture.main.clone();
+        let mut advanced = false;
         let mut executor = Fake {
             hook: Some(Box::new(move |_| {
-                Fixture::commit_at(&main, "race", "advanced concurrently\n")
+                if !advanced {
+                    Fixture::commit_at(&main, "race", "advanced concurrently\n");
+                    advanced = true;
+                }
             })),
             ..Fake::default()
         };
+        executor.json(fixture.agent(14, "done"));
         executor.json(fixture.agent(14, "done"));
         let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
         assert_eq!(rows[0].status, WorktreeStatus::NeedsResolution);
