@@ -11,7 +11,6 @@ pub fn poll_event(timeout: Duration) -> std::io::Result<Option<Event>> {
 
 pub fn is_quit(key: KeyEvent) -> bool {
     key.code == KeyCode::Char('q')
-        || key.code == KeyCode::Esc
         || (key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
@@ -25,7 +24,7 @@ mod tests {
             KeyCode::Char('q'),
             KeyModifiers::NONE
         )));
-        assert!(is_quit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!is_quit(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert!(is_quit(KeyEvent::new(
             KeyCode::Char('c'),
             KeyModifiers::CONTROL

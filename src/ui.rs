@@ -413,7 +413,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             };
             format!("y confirm / Esc cancel · {operation} · {id}")
         } else if let Some(error) = &app.worktrees_error {
-            format!("ERROR · {error} · w back")
+            format!("ERROR · {error} · Esc / w back")
         } else if let Some(item) = selected.filter(|item| item.detail.is_some()) {
             format!(
                 "{} · {} · PgUp/PgDn details · r refresh",
@@ -421,7 +421,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 item.detail.as_deref().unwrap_or_default()
             )
         } else {
-            "↑/↓ select · PgUp/PgDn details · m request merge · c close · x remove · r refresh · w back".to_owned()
+            "↑/↓ select · PgUp/PgDn details · m request merge · c close · x remove · r refresh · Esc / w back".to_owned()
         };
         let footer_lines = wrap_words(&footer, areas[2].width as usize)
             .into_iter()
@@ -1188,7 +1188,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Paragraph::new(wrapped_description)
                         .block(
                             Block::default()
-                                .title(" Description · Enter for newline ")
+                                .title(" Description · Shift+Enter newline · Enter Create ")
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(if form.focus == 1 {
                                     teal
@@ -1523,17 +1523,48 @@ fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, 
     let mut row = 0;
     let mut col = 0;
     for (byte, ch) in s.char_indices() {
-        if byte == cursor {
-            caret = Some(if col == width {
-                (0, row + 1)
-            } else {
-                (col, row)
-            });
-        }
         if ch == '\n' {
+            if byte == cursor {
+                caret = Some(if col == width {
+                    (0, row + 1)
+                } else {
+                    (col, row)
+                });
+            }
             out.push('\n');
             row += 1;
             col = 0;
+            continue;
+        }
+        if !ch.is_whitespace()
+            && (byte == 0
+                || s[..byte]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace))
+        {
+            let word = s[byte..].split(char::is_whitespace).next().unwrap_or("");
+            if col > 0 && col + Span::raw(word).width() > width {
+                out.push('\n');
+                row += 1;
+                col = 0;
+            }
+        }
+        // A separator at the right edge belongs to the next visual line, but
+        // need not occupy a cell there before the next word.
+        if ch == ' '
+            && col == width
+            && s[byte + ch.len_utf8()..]
+                .chars()
+                .next()
+                .is_some_and(|next| !next.is_whitespace())
+        {
+            out.push('\n');
+            row += 1;
+            col = 0;
+            if byte == cursor {
+                caret = Some((col, row));
+            }
             continue;
         }
         let cw = Span::raw(ch.to_string()).width();
@@ -1541,6 +1572,9 @@ fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, 
             out.push('\n');
             row += 1;
             col = 0;
+        }
+        if byte == cursor {
+            caret = Some((col, row));
         }
         out.push(ch);
         col += cw;
@@ -2412,6 +2446,21 @@ mod tests {
         let scroll = y.saturating_sub(2);
         assert_eq!(y - scroll, 2);
         assert!(x < 5);
+    }
+    #[test]
+    fn description_wraps_words_and_keeps_cursor_on_the_rendered_line() {
+        let (s, x, y) = wrapped_description("hello world", 6, 8);
+        assert_eq!(s, "hello \nworld");
+        assert_eq!((x, y), (0, 1));
+        let (s, x, y) = wrapped_description("hello world", 11, 5);
+        assert_eq!(s, "hello\nworld");
+        assert_eq!((x, y), (0, 2));
+        let (s, x, y) = wrapped_description("ab longword\n界", 7, 4);
+        assert_eq!(s, "ab \nlong\nword\n界");
+        assert_eq!((x, y), (0, 2));
+        let (s, x, y) = wrapped_description("a 界界", 2, 4);
+        assert_eq!(s, "a \n界界");
+        assert_eq!((x, y), (0, 1));
     }
     #[test]
     fn settings_dialog_and_light_theme_render_with_contrast_at_small_sizes() {
