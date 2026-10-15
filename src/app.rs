@@ -25,11 +25,14 @@ pub(super) enum Request {
     Show(String, u64),
     LoadEdit(String, u64),
     Create(CreateBead),
+    CreateEpic(CreateBead, Option<String>),
     CreateChild(CreateBead, String),
     Update(UpdateBead),
+    SetReady(String, bool),
     Delete(String),
     Discover(u64),
     Launch(u64, LaunchContext, Agent, Bead),
+    LaunchReady(u64, LaunchContext, Agent, Bead),
     ListWorktrees,
     FocusWorkspace(String),
     WorktreeAction(String, WorktreeAction),
@@ -41,7 +44,10 @@ pub(super) enum Response {
     Show(String, u64, std::io::Result<serde_json::Value>),
     EditLoaded(String, u64, std::io::Result<serde_json::Value>),
     Created(std::io::Result<String>),
+    EpicLaunched(String, std::io::Result<crate::epic::Session>),
+    EpicFinished(String, std::io::Result<Vec<String>>),
     Updated(String, std::io::Result<()>),
+    ReadySet(String, bool, std::io::Result<()>),
     Deleted(std::io::Result<()>),
     Discovered(u64, std::io::Result<LaunchContext>),
     Launched(u64, std::io::Result<LaunchOutcome>),
@@ -84,6 +90,8 @@ pub struct App {
     pub worktrees: Vec<ManagedWorktree>,
     /// Accepted handoffs include removed checkouts, which are hidden from `worktrees`.
     pub accepted_handoffs: HashSet<String>,
+    pub(crate) known_handoffs: HashSet<String>,
+    pub(crate) scheduler_attempted: HashSet<String>,
     pub selected_worktree: usize,
     pub worktree_offset: usize,
     pub worktree_detail_offset: u16,
@@ -164,6 +172,7 @@ pub(super) struct PendingHandoff {
     seq: u64,
     bead: Bead,
     launch_queued: bool,
+    scheduled: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateForm {
@@ -172,6 +181,9 @@ pub struct CreateForm {
     pub description: String,
     pub issue_type: usize,
     pub priority: usize,
+    pub harness: usize,
+    pub previous_harness: Option<String>,
+    pub generate_children: bool,
     pub focus: usize,
     pub cursor: usize,
     pub description_cursor: usize,
@@ -187,6 +199,9 @@ impl Default for CreateForm {
             description: String::new(),
             issue_type: 0,
             priority: 2,
+            harness: 3,
+            previous_harness: None,
+            generate_children: false,
             focus: 0,
             cursor: 0,
             description_cursor: 0,
@@ -225,6 +240,10 @@ fn edit_form(record: &serde_json::Value) -> Result<CreateForm, String> {
         description,
         issue_type,
         priority,
+        harness: beads::harness(record)
+            .and_then(|kind| beads::HARNESSES.iter().position(|known| *known == kind))
+            .map_or(0, |index| index + 1),
+        previous_harness: beads::harness(record).map(str::to_owned),
         ..Default::default()
     })
 }
@@ -276,16 +295,52 @@ impl App {
                         Response::EditLoaded(id.clone(), seq, beads::show_bead(&id))
                     }
                     Request::Create(input) => Response::Created(beads::create_bead(&input)),
+                    Request::CreateEpic(input, parent) => match parent.as_deref().map_or_else(
+                        || beads::create_bead(&input),
+                        |id| beads::create_child(&input, id),
+                    ) {
+                        Ok(id) => {
+                            if out.send(Response::Created(Ok(id.clone()))).is_err() {
+                                break;
+                            }
+                            let replies = out.clone();
+                            thread::spawn(move || {
+                                let session = match crate::epic::launch(&id) {
+                                    Ok(session) => session,
+                                    Err(error) => {
+                                        let _ =
+                                            replies.send(Response::EpicLaunched(id, Err(error)));
+                                        return;
+                                    }
+                                };
+                                if replies
+                                    .send(Response::EpicLaunched(id.clone(), Ok(session.clone())))
+                                    .is_ok()
+                                {
+                                    let result = crate::epic::finish(&session, &id);
+                                    let _ = replies.send(Response::EpicFinished(id, result));
+                                }
+                            });
+                            continue;
+                        }
+                        Err(error) => Response::Created(Err(error)),
+                    },
                     Request::CreateChild(input, parent) => {
                         Response::Created(beads::create_child(&input, &parent))
                     }
                     Request::Update(input) => {
                         Response::Updated(input.id.clone(), beads::update_bead(&input))
                     }
+                    Request::SetReady(id, ready) => {
+                        Response::ReadySet(id.clone(), ready, beads::set_ready(&id, ready))
+                    }
                     Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
                     Request::Discover(seq) => Response::Discovered(seq, crate::herdr::discover()),
                     Request::Launch(seq, context, agent, bead) => {
                         Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
+                    }
+                    Request::LaunchReady(seq, context, agent, bead) => {
+                        Response::Launched(seq, crate::herdr::launch_ready(&context, &agent, &bead))
                     }
                     Request::ListWorktrees => Response::Worktrees(worktrees::list()),
                     Request::FocusWorkspace(id) => {
@@ -351,6 +406,8 @@ impl App {
             settings_load_error: settings_error.clone(),
             worktrees: Vec::new(),
             accepted_handoffs: HashSet::new(),
+            known_handoffs: HashSet::new(),
+            scheduler_attempted: HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,
@@ -392,6 +449,66 @@ impl App {
         if !self.refresh_inflight && now >= self.next_refresh {
             self.start_refresh(now);
         }
+    }
+    fn poll_scheduler(&mut self) {
+        if !self.worktrees_discovered || self.handoff.is_some() || self.mutation_busy {
+            return;
+        }
+        let next = self
+            .beads
+            .iter()
+            .filter(|bead| {
+                beads::is_ready(bead)
+                    && self.scheduler_eligible(bead)
+                    && !self.scheduler_attempted.contains(&bead.id)
+            })
+            .min_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)))
+            .cloned();
+        if let Some(bead) = next {
+            self.scheduler_attempted.insert(bead.id.clone());
+            if beads::harness(&bead.data).is_none() {
+                let message = format!(
+                    "{} is Ready but has no supported agent harness; edit it to select one",
+                    bead.id
+                );
+                self.notice = Some(message.clone());
+                self.toast = Some(Toast::result(message, true));
+            } else {
+                self.start_launch(bead, true);
+            }
+        }
+    }
+    fn scheduler_eligible(&self, bead: &Bead) -> bool {
+        if let Some(parent) = bead.data["parent"].as_str()
+            && !self.worktrees.iter().any(|item| {
+                item.bead_id == parent
+                    && matches!(
+                        item.status,
+                        worktrees::WorktreeStatus::Reserved | worktrees::WorktreeStatus::InProgress
+                    )
+            })
+        {
+            return false;
+        }
+        if !self.known_handoffs.contains(&bead.id) {
+            return true;
+        }
+        let Some(reserved) = self.worktrees.iter().find(|item| {
+            item.bead_id == bead.id && item.status == worktrees::WorktreeStatus::Reserved
+        }) else {
+            return false;
+        };
+        beads::open_descendants_in(&self.beads, &bead.id).is_empty()
+            && !self.worktrees.iter().any(|item| {
+                item.parent_bead_id.as_deref() == Some(bead.id.as_str())
+                    && !matches!(
+                        item.status,
+                        worktrees::WorktreeStatus::Integrated
+                            | worktrees::WorktreeStatus::WorkspaceClosed
+                            | worktrees::WorktreeStatus::CheckoutRemoved
+                    )
+            })
+            && !reserved.workspace_id.is_empty()
     }
     fn poll_worktrees(&mut self, now: Instant) {
         let automatic = self.settings.auto_merge
@@ -460,7 +577,7 @@ impl App {
             return;
         }
         let index = index.min(self.beads.len() - 1);
-        let status = normalized_status(&self.beads[index].status).to_owned();
+        let status = display_status(&self.beads[index]).to_owned();
         if self.collapsed.contains(&status) {
             self.clear_selection();
             return;
@@ -532,7 +649,7 @@ impl App {
     fn focused_status(&self) -> Option<String> {
         self.selected
             .and_then(|i| self.beads.get(i))
-            .map(|b| normalized_status(&b.status).to_owned())
+            .map(|b| display_status(b).to_owned())
             .or_else(|| self.collapse_context.clone())
     }
     fn focus_collapsed_group(&mut self, status: String) {
@@ -540,11 +657,7 @@ impl App {
         self.collapse_context = Some(status);
     }
     fn set_group_collapsed(&mut self, status: String, collapsed: bool) {
-        if !self
-            .beads
-            .iter()
-            .any(|b| normalized_status(&b.status) == status)
-        {
+        if !self.beads.iter().any(|b| display_status(b) == status) {
             return;
         }
         let is_collapsed = self.collapsed.contains(&status);
@@ -553,7 +666,7 @@ impl App {
         }
         let selected_in_group = self
             .selected
-            .is_some_and(|i| normalized_status(&self.beads[i].status) == status);
+            .is_some_and(|i| display_status(&self.beads[i]) == status);
         if collapsed {
             self.collapsed.insert(status.clone());
             if selected_in_group {
@@ -561,22 +674,14 @@ impl App {
             }
         } else {
             self.collapsed.remove(&status);
-            if let Some(i) = self
-                .beads
-                .iter()
-                .position(|b| normalized_status(&b.status) == status)
-            {
+            if let Some(i) = self.beads.iter().position(|b| display_status(b) == status) {
                 self.select(i);
             }
         }
     }
     fn toggle_group(&mut self, status: String) {
         if self.collapsed.remove(&status) {
-            if let Some(i) = self
-                .beads
-                .iter()
-                .position(|b| normalized_status(&b.status) == status)
-            {
+            if let Some(i) = self.beads.iter().position(|b| display_status(b) == status) {
                 self.select(i);
             }
         } else {
@@ -608,8 +713,8 @@ impl App {
                                 })
                                 .collect();
                             self.beads.sort_by(|a, b| {
-                                status_order(&a.status)
-                                    .cmp(&status_order(&b.status))
+                                status_order(display_status(a))
+                                    .cmp(&status_order(display_status(b)))
                                     .then_with(|| a.status.cmp(&b.status))
                                     .then_with(|| a.id.cmp(&b.id))
                             });
@@ -638,7 +743,7 @@ impl App {
                             self.selected = None;
                             if let Some(i) = preferred {
                                 self.collapse_context = None;
-                                self.collapsed.remove(&self.beads[i].status);
+                                self.collapsed.remove(display_status(&self.beads[i]));
                                 if Some(i) == same_id {
                                     self.selected = Some(i);
                                     self.refresh_detail();
@@ -652,7 +757,7 @@ impl App {
                                 self.focus_collapsed_group(status);
                             } else if let Some(i) = same_id {
                                 self.collapse_context = None;
-                                if self.collapsed.contains(&self.beads[i].status) {
+                                if self.collapsed.contains(display_status(&self.beads[i])) {
                                     self.clear_selection();
                                     if let Some(visible) = list_layout(&self.beads, &self.collapsed)
                                         .targets
@@ -729,6 +834,12 @@ impl App {
                     self.mutation_busy = false;
                     match result {
                         Ok(id) => {
+                            if matches!(&self.modal, Some(Modal::Create(form)) if form.generate_children && beads::BEAD_TYPES[form.issue_type] == "epic")
+                            {
+                                self.toast = Some(Toast::progress(format!(
+                                    "Created Epic {id}; starting sub-task agent…"
+                                )));
+                            }
                             self.notice = Some(format!("Created {id}"));
                             self.modal = None;
                             self.preferred_id = Some(id);
@@ -738,6 +849,38 @@ impl App {
                             self.notice = Some(format!("Create failed: {e}"));
                         }
                     }
+                }
+                Response::EpicLaunched(id, result) => match result {
+                    Ok(session) => {
+                        let message =
+                            format!("Planning {id} in Herdr workspace {}…", session.workspace_id);
+                        self.notice = Some(message.clone());
+                        self.toast = Some(Toast::progress(message));
+                    }
+                    Err(error) => {
+                        let message =
+                            format!("Epic {id} created; automatic planning failed: {error}");
+                        self.notice = Some(message.clone());
+                        self.toast = Some(Toast::result(message, true));
+                    }
+                },
+                Response::EpicFinished(id, result) => {
+                    let (message, error) = match result {
+                        Ok(children) => (
+                            format!(
+                                "Epic {id}: {} child Beads created; planning workspace closed",
+                                children.len()
+                            ),
+                            false,
+                        ),
+                        Err(error) => (
+                            format!("Epic {id}: planning needs attention: {error}"),
+                            true,
+                        ),
+                    };
+                    self.notice = Some(message.clone());
+                    self.toast = Some(Toast::result(message, error));
+                    self.refresh_at(now);
                 }
                 Response::Updated(id, result) => {
                     self.mutation_busy = false;
@@ -749,6 +892,46 @@ impl App {
                             self.refresh_at(now);
                         }
                         Err(e) => self.notice = Some(format!("Update failed: {e}")),
+                    }
+                }
+                Response::ReadySet(id, ready, result) => {
+                    self.mutation_busy = false;
+                    match result {
+                        Ok(()) => {
+                            if let Some(bead) = self.beads.iter_mut().find(|bead| bead.id == id) {
+                                let labels = bead.data["labels"].as_array_mut();
+                                if ready {
+                                    if let Some(labels) = labels {
+                                        if !labels.iter().any(|label| label == beads::READY_LABEL) {
+                                            labels.push(serde_json::Value::String(
+                                                beads::READY_LABEL.into(),
+                                            ));
+                                        }
+                                    } else {
+                                        bead.data["labels"] =
+                                            serde_json::json!([beads::READY_LABEL]);
+                                    }
+                                } else if let Some(labels) = labels {
+                                    labels.retain(|label| label != beads::READY_LABEL);
+                                }
+                            }
+                            self.notice = Some(format!(
+                                "{id} {} Ready",
+                                if ready { "marked" } else { "removed from" }
+                            ));
+                            if self
+                                .selected
+                                .and_then(|i| self.beads.get(i))
+                                .is_some_and(|bead| bead.id == id)
+                            {
+                                self.preferred_id = Some(id.clone());
+                                self.collapsed.remove(if ready { "ready" } else { "open" });
+                            }
+                            self.refresh_at(now);
+                        }
+                        Err(error) => {
+                            self.notice = Some(format!("Could not update Ready for {id}: {error}"))
+                        }
                     }
                 }
                 Response::Deleted(result) => {
@@ -767,15 +950,21 @@ impl App {
                         .handoff
                         .as_ref()
                         .filter(|item| item.seq == seq && !item.launch_queued)
+                        .cloned()
                     {
                         match result {
                             Ok(context) => {
-                                let agent = context
-                                    .agents
-                                    .iter()
-                                    .find(|agent| agent.id == "codex")
-                                    .or_else(|| context.agents.first())
-                                    .cloned();
+                                let chosen = beads::harness(&pending.bead.data);
+                                let agent = if let Some(kind) = chosen {
+                                    context.agents.iter().find(|agent| agent.id == kind)
+                                } else {
+                                    context
+                                        .agents
+                                        .iter()
+                                        .find(|agent| agent.id == "codex")
+                                        .or_else(|| context.agents.first())
+                                }
+                                .cloned();
                                 if let Some(agent) = agent {
                                     let bead = pending.bead.clone();
                                     self.handoff.as_mut().unwrap().launch_queued = true;
@@ -783,11 +972,12 @@ impl App {
                                         "Handing {} to {} in Herdr…",
                                         bead.id, agent.label
                                     )));
-                                    if self
-                                        .requests
-                                        .send(Request::Launch(seq, context, agent, bead))
-                                        .is_err()
-                                    {
+                                    let request = if pending.scheduled {
+                                        Request::LaunchReady(seq, context, agent, bead)
+                                    } else {
+                                        Request::Launch(seq, context, agent, bead)
+                                    };
+                                    if self.requests.send(request).is_err() {
                                         self.handoff = None;
                                         let message =
                                             "Handoff could not be queued; try again".to_owned();
@@ -796,8 +986,19 @@ impl App {
                                     }
                                 } else {
                                     self.handoff = None;
-                                    let message = "No Herdr agents are available in this workspace"
-                                        .to_owned();
+                                    let message = if let Some(kind) = chosen {
+                                        format!(
+                                            "Harness {kind} for {} is unavailable; change it or toggle Ready to retry",
+                                            pending.bead.id
+                                        )
+                                    } else if pending.scheduled {
+                                        format!(
+                                            "Selected harness for {} is unavailable; change it or toggle Ready to retry",
+                                            pending.bead.id
+                                        )
+                                    } else {
+                                        "No Herdr agents are available in this workspace".to_owned()
+                                    };
                                     self.notice = Some(message.clone());
                                     self.toast = Some(Toast::result(message, true));
                                 }
@@ -817,11 +1018,34 @@ impl App {
                         .as_ref()
                         .is_some_and(|item| item.seq == seq && item.launch_queued)
                     {
+                        let ready_id = self
+                            .handoff
+                            .as_ref()
+                            .filter(|item| beads::is_ready(&item.bead))
+                            .map(|item| item.bead.id.clone());
                         self.handoff = None;
                         match result {
                             Ok(outcome) => {
+                                let mut clear_error = false;
+                                if let Some(id) = ready_id {
+                                    self.known_handoffs.insert(id.clone());
+                                    if outcome.reserved {
+                                        self.scheduler_attempted.remove(&id);
+                                    } else {
+                                        self.mutation_busy = true;
+                                        if self.requests.send(Request::SetReady(id, false)).is_err()
+                                        {
+                                            self.mutation_busy = false;
+                                            clear_error = true;
+                                        }
+                                    }
+                                }
                                 self.toast = Some(Toast::result(outcome.message.clone(), false));
-                                self.notice = Some(outcome.message);
+                                self.notice = Some(if clear_error {
+                                    "Handoff started, but Ready could not be cleared; refresh and clear it manually".into()
+                                } else {
+                                    outcome.message
+                                });
                                 // The launch journal is now active. Reload it even if the
                                 // initial worktree scan found no managed handoffs.
                                 if self.worktrees_inflight {
@@ -843,7 +1067,7 @@ impl App {
                     self.worktrees_inflight = false;
                     self.worktrees_loading = false;
                     self.worktrees_next_refresh = now + REFRESH_INTERVAL;
-                    self.worktrees_discovered = true;
+                    self.worktrees_discovered = result.is_ok();
                     if !self.worktree_action_pending {
                         match result {
                             Ok(mut items) => {
@@ -856,6 +1080,8 @@ impl App {
                                     .filter(|item| item.handoff_accepted)
                                     .map(|item| item.bead_id.clone())
                                     .collect();
+                                self.known_handoffs
+                                    .extend(items.iter().map(|item| item.bead_id.clone()));
                                 items.retain(|item| {
                                     item.status != worktrees::WorktreeStatus::CheckoutRemoved
                                 });
@@ -1035,6 +1261,9 @@ impl App {
                 self.worktrees_next_refresh = Instant::now();
                 self.poll_worktrees(Instant::now());
             }
+            KeyCode::Char('r') if k.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
+                self.toggle_ready()
+            }
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('s') => {
                 let load_error = self
@@ -1106,6 +1335,7 @@ impl App {
                 }
             }
             KeyCode::Char('h') => self.open_launch(),
+            KeyCode::Char('R') => self.toggle_ready(),
             KeyCode::Tab => self.focus_detail = !self.focus_detail,
             KeyCode::Left if !self.focus_detail => {
                 if let Some(status) = self.focused_status() {
@@ -1240,7 +1470,8 @@ impl App {
                 if let Some(old) = form.dropdown_original.take() {
                     match which {
                         2 => form.issue_type = old,
-                        _ => form.priority = old,
+                        3 => form.priority = old,
+                        _ => form.harness = old,
                     }
                 }
                 return false;
@@ -1357,15 +1588,19 @@ impl App {
                 Up => {
                     if which == 2 {
                         form.issue_type = form.issue_type.saturating_sub(1)
-                    } else {
+                    } else if which == 3 {
                         form.priority = form.priority.saturating_sub(1)
+                    } else {
+                        form.harness = form.harness.saturating_sub(1)
                     }
                 }
                 Down => {
                     if which == 2 {
                         form.issue_type = (form.issue_type + 1).min(beads::BEAD_TYPES.len() - 1)
-                    } else {
+                    } else if which == 3 {
                         form.priority = (form.priority + 1).min(4)
+                    } else {
+                        form.harness = (form.harness + 1).min(beads::HARNESSES.len())
                     }
                 }
                 Left | Right => {
@@ -1375,8 +1610,14 @@ impl App {
                             beads::BEAD_TYPES.len(),
                             key.code == Right,
                         );
-                    } else {
+                    } else if which == 3 {
                         form.priority = cycle_choice(form.priority, 5, key.code == Right);
+                    } else {
+                        form.harness = cycle_choice(
+                            form.harness,
+                            beads::HARNESSES.len() + 1,
+                            key.code == Right,
+                        );
                     }
                 }
                 Enter | Char(' ') => {
@@ -1392,31 +1633,39 @@ impl App {
         }
         match key.code {
             Tab => {
+                let epic = edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic";
                 form.focus = match form.focus {
                     0 => 2,
                     2 => 3,
-                    3 => 1,
+                    3 => 6,
+                    6 => 1,
+                    1 if epic => 7,
                     1 => 4,
+                    7 => 4,
                     4 => 5,
                     _ => 0,
                 }
             }
             BackTab => {
+                let epic = edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic";
                 form.focus = match form.focus {
                     0 => 5,
                     5 => 4,
+                    4 if epic => 7,
                     4 => 1,
-                    1 => 3,
+                    7 => 1,
+                    1 => 6,
+                    6 => 3,
                     3 => 2,
                     _ => 0,
                 }
             }
-            Enter if form.focus == 2 || form.focus == 3 => {
+            Enter if matches!(form.focus, 2 | 3 | 6) => {
                 form.dropdown = Some(form.focus);
-                form.dropdown_original = Some(if form.focus == 2 {
-                    form.issue_type
-                } else {
-                    form.priority
+                form.dropdown_original = Some(match form.focus {
+                    2 => form.issue_type,
+                    3 => form.priority,
+                    _ => form.harness,
                 });
             }
             Left | Right if form.focus == 2 => {
@@ -1426,17 +1675,43 @@ impl App {
             Left | Right if form.focus == 3 => {
                 form.priority = cycle_choice(form.priority, 5, key.code == Right);
             }
+            Left | Right if form.focus == 6 => {
+                form.harness =
+                    cycle_choice(form.harness, beads::HARNESSES.len() + 1, key.code == Right);
+            }
             Enter if form.focus == 4 => {
                 if !form.title.trim().is_empty() {
+                    if edit_id.is_none()
+                        && form.generate_children
+                        && beads::BEAD_TYPES[form.issue_type] == "epic"
+                        && form.description.trim().is_empty()
+                    {
+                        self.notice =
+                            Some("Describe the Epic proposal before generating child tasks".into());
+                        return false;
+                    }
                     let input = CreateBead {
                         title: form.title.trim().into(),
                         description: form.description.clone(),
                         issue_type: beads::BEAD_TYPES[form.issue_type].into(),
                         priority: form.priority as u8,
+                        harness: if beads::BEAD_TYPES[form.issue_type] == "task" {
+                            form.harness
+                                .checked_sub(1)
+                                .map(|index| beads::HARNESSES[index].to_owned())
+                        } else {
+                            None
+                        },
                     };
                     self.mutation_busy = true;
                     let request = if let Some(id) = edit_id {
-                        Request::Update(UpdateBead { id, fields: input })
+                        Request::Update(UpdateBead {
+                            id,
+                            fields: input,
+                            previous_harness: form.previous_harness.clone(),
+                        })
+                    } else if form.generate_children && input.issue_type == "epic" {
+                        Request::CreateEpic(input, form.parent_id.clone())
                     } else if let Some(parent) = &form.parent_id {
                         Request::CreateChild(input, parent.clone())
                     } else {
@@ -1452,13 +1727,17 @@ impl App {
             }
             Enter if form.focus == 5 => {
                 self.modal = None;
+                return false;
             }
-            Char(' ') if form.focus == 2 || form.focus == 3 => {
+            Enter | Char(' ') if form.focus == 7 => {
+                form.generate_children = !form.generate_children;
+            }
+            Char(' ') if matches!(form.focus, 2 | 3 | 6) => {
                 form.dropdown = Some(form.focus);
-                form.dropdown_original = Some(if form.focus == 2 {
-                    form.issue_type
-                } else {
-                    form.priority
+                form.dropdown_original = Some(match form.focus {
+                    2 => form.issue_type,
+                    3 => form.priority,
+                    _ => form.harness,
                 });
             }
             Enter if form.focus == 0 => {
@@ -1470,7 +1749,13 @@ impl App {
                 form.description.insert(i, '\n');
                 form.description_cursor = i + 1;
             }
-            Enter if form.focus == 1 && key.modifiers.is_empty() => form.focus = 4,
+            Enter if form.focus == 1 && key.modifiers.is_empty() => {
+                form.focus = if edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic" {
+                    7
+                } else {
+                    4
+                };
+            }
             Up if form.focus == 1 => {
                 form.description_cursor = crate::ui::move_description_vertical(
                     &form.description,
@@ -1552,6 +1837,12 @@ impl App {
             }
             _ => {}
         }
+        if beads::BEAD_TYPES[form.issue_type] != "epic" {
+            form.generate_children = false;
+            if form.focus == 7 {
+                form.focus = 4;
+            }
+        }
         false
     }
     fn save_settings(&mut self, proposed: Settings) {
@@ -1591,6 +1882,38 @@ impl App {
             self.toast = Some(Toast::result(message, true));
             return;
         };
+        self.start_launch(bead, false);
+    }
+    fn toggle_ready(&mut self) {
+        if self.mutation_busy {
+            return;
+        }
+        let Some(bead) = self.selected.and_then(|i| self.beads.get(i)) else {
+            self.notice = Some("Select an open task first".into());
+            return;
+        };
+        if bead.status != "open" || bead.data["issue_type"] != "task" {
+            self.notice = Some("Only open tasks can be marked Ready".into());
+            return;
+        }
+        let id = bead.id.clone();
+        let ready = !beads::is_ready(bead);
+        if self.known_handoffs.contains(&id) && ready {
+            self.notice = Some("This task already has a tracked handoff".into());
+            return;
+        }
+        if ready {
+            self.scheduler_attempted.remove(&id);
+        } else {
+            self.scheduler_attempted.insert(id.clone());
+        }
+        self.mutation_busy = true;
+        if self.requests.send(Request::SetReady(id, ready)).is_err() {
+            self.mutation_busy = false;
+            self.notice = Some("Ready change could not be queued".into());
+        }
+    }
+    fn start_launch(&mut self, bead: Bead, scheduled: bool) {
         self.launch_seq = self.launch_seq.wrapping_add(1);
         let seq = self.launch_seq;
         self.notice = None;
@@ -1602,6 +1925,7 @@ impl App {
             seq,
             bead,
             launch_queued: false,
+            scheduled,
         });
         if self.requests.send(Request::Discover(seq)).is_err() {
             self.handoff = None;
@@ -1669,8 +1993,16 @@ impl App {
 fn status_order(status: &str) -> (u8, &str) {
     match status {
         "open" => (0, status),
-        "closed" => (2, status),
-        _ => (1, status),
+        "ready" => (1, status),
+        "closed" => (3, status),
+        _ => (2, status),
+    }
+}
+pub fn display_status(bead: &Bead) -> &str {
+    if beads::is_ready(bead) {
+        "ready"
+    } else {
+        normalized_status(&bead.status)
     }
 }
 pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'static str {
@@ -1721,7 +2053,7 @@ pub struct ListTarget {
 pub fn group_statuses(beads: &[Bead]) -> Vec<String> {
     let mut groups = beads
         .iter()
-        .map(|b| normalized_status(&b.status).to_owned())
+        .map(|b| display_status(b).to_owned())
         .collect::<Vec<_>>();
     groups.sort_by(|a, b| status_order(a).cmp(&status_order(b)).then_with(|| a.cmp(b)));
     groups.dedup();
@@ -1762,7 +2094,7 @@ pub fn list_layout(beads: &[Bead], collapsed: &HashSet<String>) -> ListLayout {
         let indices = beads
             .iter()
             .enumerate()
-            .filter(|(_, b)| normalized_status(&b.status) == status)
+            .filter(|(_, b)| display_status(b) == status)
             .map(|(i, _)| i)
             .collect::<Vec<_>>();
         let is_collapsed = collapsed.contains(&status);
@@ -1804,6 +2136,7 @@ pub fn run(t: &mut Tui) -> std::io::Result<()> {
         app.receive();
         app.poll_refresh(Instant::now());
         app.poll_worktrees(Instant::now());
+        app.poll_scheduler();
         t.draw(|f| ui::render(f, start.elapsed(), &mut app))?;
         if let Some(e) = event::poll_event(Duration::from_millis(35))? {
             match e {
@@ -1842,7 +2175,7 @@ mod tests {
         );
         app.modal_ready = true;
         app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-        for _ in 0..4 {
+        for _ in 0..5 {
             app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         }
         app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
@@ -1925,6 +2258,8 @@ mod tests {
             settings_load_error: None,
             worktrees: Vec::new(),
             accepted_handoffs: HashSet::new(),
+            known_handoffs: HashSet::new(),
+            scheduler_attempted: HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,
@@ -1959,6 +2294,146 @@ mod tests {
         let bead = &a.beads[a.selected.expect("selected bead")];
         assert_eq!(bead.id, id);
         assert_eq!(a.detail.as_ref(), Some(&bead.data));
+    }
+    #[test]
+    fn ready_group_is_distinct_while_beads_status_stays_open() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        assert_eq!(a.beads[0].status, "open");
+        assert_eq!(group_statuses(&a.beads), ["open", "ready"]);
+        let layout = list_layout(&a.beads, &HashSet::new());
+        assert_eq!(layout.groups[1].indices, [0]);
+        a.select(0);
+        assert_eq!(a.focused_status().as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn scheduler_uses_selected_harness_once_and_clears_ready_after_launch() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:opencode"]);
+        a.poll_scheduler();
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!("discovery not queued")
+        };
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        let (out, responses) = mpsc::channel();
+        a.responses = responses;
+        out.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        let Request::LaunchReady(sent_seq, _, agent, bead) = rx.try_recv().unwrap() else {
+            panic!("launch not queued")
+        };
+        assert_eq!(sent_seq, seq);
+        assert_eq!(agent.id, "opencode");
+        assert_eq!(bead.id, "b0");
+        out.send(Response::Launched(
+            seq,
+            Ok(LaunchOutcome {
+                message: "Sent".into(),
+                reserved: false,
+            }),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+        assert!(a.known_handoffs.contains("b0"));
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn scheduler_defers_unavailable_harness_and_existing_handoffs() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:gemini"]);
+        a.poll_scheduler();
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        let (out, responses) = mpsc::channel();
+        a.responses = responses;
+        out.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(rx.try_recv().is_err());
+        assert!(a.notice.as_deref().unwrap().contains("unavailable"));
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        a.scheduler_attempted.remove("b0");
+        a.known_handoffs.insert("b0".into());
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn ready_toggle_uses_label_mutation_and_does_not_change_beads_status() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("task");
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        press(&mut a, KeyCode::Char('R'));
+        assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, true)) if id == "b0"));
+        assert_eq!(a.beads[0].status, "open");
+        a.mutation_busy = false;
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        press(&mut a, KeyCode::Char('R'));
+        assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+    }
+
+    #[test]
+    fn prepared_parent_waits_for_children_then_can_resume() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        a.beads[1].data["parent"] = json!("b0");
+        a.known_handoffs.insert("b0".into());
+        a.worktrees.push(ManagedWorktree {
+            id: "handoff".into(),
+            bead_id: "b0".into(),
+            parent_bead_id: None,
+            handoff_accepted: false,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/parent".into(),
+            target_branch: "main".into(),
+            workspace_id: "w1".into(),
+            status: worktrees::WorktreeStatus::Reserved,
+            detail: None,
+        });
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        a.beads[1].status = "closed".into();
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+    }
+
+    #[test]
+    fn ready_child_waits_for_parent_checkout_even_at_higher_priority() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        a.beads[0].priority = 3;
+        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[1].priority = 0;
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+        assert_eq!(
+            a.handoff.as_ref().map(|item| item.bead.id.as_str()),
+            Some("b0")
+        );
     }
     fn unloaded_app() -> App {
         let mut a = app();
@@ -2145,6 +2620,7 @@ mod tests {
             seq,
             Ok(LaunchOutcome {
                 message: "Prompt sent · workspace ws-new".into(),
+                reserved: false,
             }),
         ))
         .unwrap();
@@ -3459,9 +3935,121 @@ mod tests {
         assert_eq!(a.selected, Some(0));
     }
     #[test]
+    fn epic_toggle_only_dispatches_opted_in_epics() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        press(&mut a, KeyCode::Char('n'));
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "Plan launch".into();
+        form.description = "Large proposal".into();
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.focus = 7;
+        press(&mut a, KeyCode::Enter);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert!(form.generate_children);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::CreateEpic(input, None)) if input.issue_type == "epic" && input.description == "Large proposal")
+        );
+
+        let mut b = app();
+        let (tx, rx) = mpsc::channel();
+        b.requests = tx;
+        press(&mut b, KeyCode::Char('n'));
+        let Some(Modal::Create(form)) = b.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "Ordinary".into();
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.generate_children = true;
+        form.focus = 2;
+        press(&mut b, KeyCode::Left);
+        let Some(Modal::Create(form)) = b.modal.as_mut() else {
+            panic!()
+        };
+        assert!(!form.generate_children);
+        form.focus = 4;
+        press(&mut b, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Create(input)) if input.issue_type == "feature")
+        );
+
+        let mut empty = app();
+        let (tx, rx) = mpsc::channel();
+        empty.requests = tx;
+        press(&mut empty, KeyCode::Char('n'));
+        let Some(Modal::Create(form)) = empty.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "Needs proposal".into();
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.generate_children = true;
+        form.focus = 4;
+        press(&mut empty, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        assert!(empty.notice.as_deref().unwrap().contains("proposal"));
+    }
+    #[test]
+    fn epic_form_keeps_harness_and_generation_controls_separate() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('n'));
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.focus = 3;
+        press(&mut a, KeyCode::Tab);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.focus, 6);
+        press(&mut a, KeyCode::Tab);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.focus, 1);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Enter);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.focus, 7);
+        assert!(form.generate_children);
+        assert!(form.dropdown.is_none());
+        press(&mut a, KeyCode::Tab);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.focus, 4);
+        press(&mut a, KeyCode::BackTab);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.focus, 7);
+    }
+    #[test]
     fn description_accepts_shortcut_letters_and_shift_enter_but_not_control_chars() {
         let mut a = app();
         press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
@@ -3485,6 +4073,7 @@ mod tests {
         for c in "Title".chars() {
             press(&mut a, KeyCode::Char(c));
         }
+        press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
@@ -3516,21 +4105,21 @@ mod tests {
         let mut a = app();
         press(&mut a, KeyCode::Char('n'));
         let mut forward = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut a, KeyCode::Tab);
             if let Some(Modal::Create(f)) = &a.modal {
                 forward.push(f.focus)
             }
         }
-        assert_eq!(forward, [2, 3, 1, 4, 5, 0]);
+        assert_eq!(forward, [2, 3, 6, 1, 4, 5, 0]);
         let mut reverse = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut a, KeyCode::BackTab);
             if let Some(Modal::Create(f)) = &a.modal {
                 reverse.push(f.focus)
             }
         }
-        assert_eq!(reverse, [5, 4, 1, 3, 2, 0]);
+        assert_eq!(reverse, [5, 4, 1, 6, 3, 2, 0]);
     }
     #[test]
     fn dropdown_escape_closes_choice_before_form_and_delete_captures_selection() {
@@ -3652,7 +4241,7 @@ mod tests {
         for c in "q/rn界".chars() {
             press(&mut a, KeyCode::Char(c));
         }
-        for _ in 0..4 {
+        for _ in 0..5 {
             press(&mut a, KeyCode::Tab);
         }
         press(&mut a, KeyCode::Enter);
@@ -3684,7 +4273,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.requests = tx;
         press(&mut a, KeyCode::Char('n'));
-        for _ in 0..4 {
+        for _ in 0..5 {
             press(&mut a, KeyCode::Tab);
         }
         press(&mut a, KeyCode::Enter);

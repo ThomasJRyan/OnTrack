@@ -331,6 +331,7 @@ pub fn status_color(theme: Theme, status: &str) -> Color {
     let p = definition(theme).palette;
     match status {
         "open" => p.success,
+        "ready" => p.accent,
         "closed" | "blocked" => p.danger,
         "in_progress" => p.warning,
         "deferred" => p.info,

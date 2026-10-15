@@ -1,6 +1,7 @@
 mod app;
 mod beads;
 mod detail;
+mod epic;
 mod event;
 mod herdr;
 mod hotkeys;

@@ -34,6 +34,7 @@ pub struct LaunchContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchOutcome {
     pub message: String,
+    pub reserved: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,14 +204,32 @@ pub fn discover() -> io::Result<LaunchContext> {
 }
 
 pub fn launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result<LaunchOutcome> {
+    launch_mode(context, agent, bead, false)
+}
+
+pub fn launch_ready(
+    context: &LaunchContext,
+    agent: &Agent,
+    bead: &Bead,
+) -> io::Result<LaunchOutcome> {
+    launch_mode(context, agent, bead, true)
+}
+
+fn launch_mode(
+    context: &LaunchContext,
+    agent: &Agent,
+    bead: &Bead,
+    require_ready: bool,
+) -> io::Result<LaunchOutcome> {
     let name = crate::worktrees::reserved_name(&bead.id)?.unwrap_or_else(|| unique_name(&bead.id));
-    handoff_with(
+    handoff_with_mode(
         &mut SystemExecutor,
         &current_dir()?,
         context,
         agent,
         bead,
         &name,
+        require_ready,
     )
 }
 
@@ -255,6 +274,7 @@ pub(crate) fn relaunch_from(
         },
     )?;
     Ok(LaunchOutcome {
+        reserved: result.reserved,
         message: format!(
             "Task restarted · new workspace {} · pane {} · branch {}",
             result.workspace_id, result.pane_id, result.branch
@@ -307,6 +327,7 @@ impl From<Discovery> for LaunchContext {
     }
 }
 
+#[cfg(test)]
 fn handoff_with(
     executor: &mut impl Executor,
     cwd: &Path,
@@ -314,6 +335,18 @@ fn handoff_with(
     agent: &Agent,
     bead: &Bead,
     name: &str,
+) -> io::Result<LaunchOutcome> {
+    handoff_with_mode(executor, cwd, context, agent, bead, name, false)
+}
+
+fn handoff_with_mode(
+    executor: &mut impl Executor,
+    cwd: &Path,
+    context: &LaunchContext,
+    agent: &Agent,
+    bead: &Bead,
+    name: &str,
+    require_ready: bool,
 ) -> io::Result<LaunchOutcome> {
     if !context
         .agents
@@ -324,7 +357,7 @@ fn handoff_with(
             "Launch validation: select an agent from discovery; nothing created",
         ));
     }
-    let outcome = launch_with(
+    let outcome = launch_with_mode(
         executor,
         cwd,
         &Request {
@@ -334,8 +367,10 @@ fn handoff_with(
             title: &bead.title,
             name,
         },
+        require_ready,
     )?;
     Ok(LaunchOutcome {
+        reserved: outcome.reserved,
         message: if outcome.reserved {
             format!(
                 "Parent worktree prepared in workspace {} on branch {}. Complete and integrate children, then press h on the parent to start its agent.",
@@ -539,7 +574,7 @@ fn main_checkout_required(checkout: &Path) -> io::Error {
     ))
 }
 
-fn supported_agents(bytes: &[u8]) -> io::Result<HashSet<String>> {
+pub(crate) fn supported_agents(bytes: &[u8]) -> io::Result<HashSet<String>> {
     let help = std::str::from_utf8(bytes).map_err(|_| invalid("Agent help is not UTF-8"))?;
     let kinds = help
         .split_once("[possible values:")
@@ -557,7 +592,10 @@ fn supported_agents(bytes: &[u8]) -> io::Result<HashSet<String>> {
     Ok(result)
 }
 
-fn available_agents(bytes: &[u8], supported: &HashSet<String>) -> io::Result<Vec<String>> {
+pub(crate) fn available_agents(
+    bytes: &[u8],
+    supported: &HashSet<String>,
+) -> io::Result<Vec<String>> {
     let status =
         std::str::from_utf8(bytes).map_err(|_| invalid("Herdr integration status is not UTF-8"))?;
     let mut seen = HashSet::new();
@@ -614,6 +652,15 @@ fn launch_with(
     cwd: &Path,
     request: &Request<'_>,
 ) -> io::Result<Launch> {
+    launch_with_mode(executor, cwd, request, false)
+}
+
+fn launch_with_mode(
+    executor: &mut impl Executor,
+    cwd: &Path,
+    request: &Request<'_>,
+    require_ready: bool,
+) -> io::Result<Launch> {
     // Capture the full, authoritative show response before any Herdr mutation.
     let bead = executor
         .show_bead(request.id)
@@ -622,6 +669,18 @@ fn launch_with(
         return Err(invalid(
             "Bead capture: expected the requested full issue object; nothing created",
         ));
+    }
+    if require_ready {
+        if !crate::beads::ready_record(&bead) {
+            return Err(io::Error::other(
+                "Scheduled Bead is no longer an open Ready task; nothing created",
+            ));
+        }
+        if crate::beads::harness(&bead) != Some(request.agent) {
+            return Err(io::Error::other(
+                "Scheduled Bead harness changed before launch; nothing created",
+            ));
+        }
     }
     let open_children = executor
         .open_descendants(request.id)
@@ -1688,6 +1747,25 @@ mod tests {
             .collect();
         assert_eq!(git_calls[0][1], cwd().to_str().unwrap());
         assert_eq!(git_calls[1][1], "/new worktree/path");
+    }
+
+    #[test]
+    fn scheduled_launch_rechecks_live_ready_marker_before_any_herdr_mutation() {
+        let mut executor = FakeExecutor::launch();
+        let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
+        assert!(error.to_string().contains("no longer an open Ready task"));
+        assert_eq!(executor.calls, vec![vec!["show_bead", "OnTrack-z2y"]]);
+        assert!(executor.mutations().is_empty());
+
+        let mut executor = FakeExecutor::launch();
+        let mut changed = bead();
+        changed["status"] = json!("open");
+        changed["issue_type"] = json!("task");
+        changed["labels"] = json!([crate::beads::READY_LABEL, "ontrack:agent:gemini"]);
+        executor.bead = Some(Ok(changed));
+        let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
+        assert!(error.to_string().contains("harness changed"));
+        assert_eq!(executor.calls, vec![vec!["show_bead", "OnTrack-z2y"]]);
     }
 
     #[test]
