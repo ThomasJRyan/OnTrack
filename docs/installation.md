@@ -13,9 +13,16 @@ missing; it does not run another project's install script or change existing
 Beads or Herdr installations. The Beads project documents `brew install beads`
 and a checksum-verifying install script. Herdr documents `brew install herdr`
 and its own installer. Check `bd version` and `herdr --version` after installing.
-OnTrack needs a `bd` version supporting the JSON commands in the
+OnTrack has no pinned numeric minimum for `bd` or Herdr. It needs a `bd`
+version supporting the JSON commands in the
 [development guide](development.md#beads-cli-contract), and Herdr integration
 features described in the [user guide](user-guide.md#launch-an-agent-with-herdr).
+The Herdr CLI contract in the development guide was checked with Herdr 0.9.1;
+the installer checks only that the commands exist, so confirm their versions
+and update either dependency through its own installation method if a required
+command or response format is unavailable. For this repository's embedded Dolt
+workspace, install an embedded-capable `bd` build as described in the
+[Beads installation guide](https://beads.gascity.com/getting-started/installation/).
 
 ## Install
 
@@ -109,3 +116,5 @@ invalid checksums, and malformed archives.
 Test the installer without network access with `bash tests/installer.sh`. Its
 mock release exercises installation, replacement, failure handling, and
 preservation of the existing executable when verification fails.
+See the [release guide](releases.md) for tagging, CI gates, native builds, and
+the complete published asset set.

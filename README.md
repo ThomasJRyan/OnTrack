@@ -18,7 +18,7 @@ Versioned Linux and macOS binaries are published from Git tags; see [releases](d
 
 ## Requirements
 
-For source builds, Rust 1.88 or newer. OnTrack needs the `bd` command-line tool; the release check also needs `curl`, and the release installer checks for Herdr. OnTrack initializes Beads in the launch directory when no workspace is available. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and dependencies.
+Source builds need Rust 1.88 or newer and the `bd` command-line tool; the release check also needs `curl`. Release installation checks for both `bd` and Herdr. OnTrack initializes Beads in the launch directory when no workspace is available. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
 
 ## Run
 
@@ -28,7 +28,7 @@ cargo run
 
 Issues are grouped into coloured, collapsible panes (Open, Ready, other statuses, Closed), with Closed collapsed on launch. Press `Ctrl+?` for hotkeys, `r` (or `Shift+R`) to toggle Ready for an open Task or Epic, `u` to check for a release, `w` for tracked handoffs, `s` for settings, `n` to create a bead, `Shift+N` to create a child task, `e` to edit, and `d` to delete (confirmation required). `Esc` goes back or closes a dialog; `q` and `Ctrl+C` quit. See the [user guide](docs/user-guide.md) for controls and the [development guide](docs/development.md) for scheduling and tracked worktrees.
 
-See the [installation guide](docs/installation.md) for install, update, and removal; the [user guide](docs/user-guide.md) for controls; the [settings guide](docs/settings.md) for preferences; the [development guide](docs/development.md) for architecture; the [release guide](docs/releases.md) for publishing; and the [official Beads documentation](https://beads.gascity.com) for workspace setup.
+See the [installation guide](docs/installation.md) for release installs, the [user guide](docs/user-guide.md) for controls, the [settings guide](docs/settings.md) for preferences, the [development guide](docs/development.md) for architecture and checks, the [release guide](docs/releases.md) for publishing, and the [official Beads documentation](https://beads.gascity.com) for workspace setup.
 
 ## Checks
 
