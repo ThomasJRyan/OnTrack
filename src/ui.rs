@@ -2006,15 +2006,8 @@ fn worktree_footer_text(width: usize) -> String {
         " · c close",
         " · x remove",
         " · R restart",
-        " · r refresh",
-        " · w back",
-        " · ↑/↓ select",
         " · PgUp/PgDn scroll",
-        " · q quit",
         " · Ctrl+? keys",
-        " · k/j select",
-        " · Esc/Backspace back",
-        " · Ctrl+C quit",
     ] {
         if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
             footer.push_str(hint);
@@ -3273,7 +3266,7 @@ mod tests {
         assert_eq!(app.detail_rect.height, 13);
     }
     #[test]
-    fn worktree_footer_lists_all_view_actions_on_wide_terminal_and_fits_one_row() {
+    fn worktree_footer_shows_essential_actions_and_fits_one_row() {
         let hints = worktree_footer_text(200);
         for key in [
             "Enter switch",
@@ -3281,14 +3274,7 @@ mod tests {
             "c close",
             "x remove",
             "R restart",
-            "r refresh",
-            "w back",
-            "↑/↓ select",
             "PgUp/PgDn scroll",
-            "k/j select",
-            "Esc/Backspace back",
-            "q quit",
-            "Ctrl+C quit",
             "Ctrl+? keys",
         ] {
             assert!(hints.contains(key), "missing {key}: {hints}");
@@ -3297,6 +3283,9 @@ mod tests {
             let footer = worktree_footer_text(width);
             assert!(Span::raw(footer.as_str()).width() <= width);
             assert!(!footer.contains('\n'));
+            for hidden in ["refresh", "select", "quit", "back"] {
+                assert!(!footer.contains(hidden), "unexpected {hidden}: {footer}");
+            }
         }
     }
     #[test]
