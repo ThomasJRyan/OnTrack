@@ -91,6 +91,36 @@ fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
         "↑ / ↓ move · ← / → theme · Enter / Space toggle · Tab moves"
     }
 }
+fn settings_columns(width: usize) -> (usize, usize) {
+    let title = width * 2 / 3;
+    (title, width - title)
+}
+fn settings_row(
+    label: &str,
+    value: &str,
+    width: usize,
+    label_style: Style,
+    value_style: Style,
+) -> Line<'static> {
+    let (title_width, value_width) = settings_columns(width);
+    let title = truncate_display(label, title_width);
+    let title_padding = title_width.saturating_sub(Span::raw(title.as_str()).width());
+    let value = truncate_display(value, value_width);
+    let value_padding = value_width.saturating_sub(Span::raw(value.as_str()).width());
+    let left_padding = value_padding / 2;
+    Line::from(vec![
+        Span::styled(format!("{title}{}", " ".repeat(title_padding)), label_style),
+        Span::styled(
+            format!(
+                "{}{}{}",
+                " ".repeat(left_padding),
+                value,
+                " ".repeat(value_padding - left_padding)
+            ),
+            value_style,
+        ),
+    ])
+}
 const MAX_VISIBLE_THEMES: usize = 6;
 fn visible_theme_window(theme: Theme, available_height: u16) -> (usize, usize) {
     let total = crate::theme::CATALOG.len();
@@ -806,46 +836,65 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 dropdown_open,
                 focus,
             } => {
+                let selected_style = Style::default()
+                    .fg(palette.selected_foreground)
+                    .bg(palette.selected_background)
+                    .add_modifier(Modifier::BOLD);
+                let value_style = Style::default().fg(teal).add_modifier(Modifier::BOLD);
+                let row_width = inner.width as usize;
                 let mut lines = vec![
-                    Line::from("Tracked worktree cleanup preferences"),
+                    Line::from("Tracked worktree cleanup preferences").alignment(Alignment::Center),
                     Line::from(""),
-                    Line::from(Span::styled(
-                        format!("Theme  [ {}  ▾ ]", draft.theme.label()),
+                    settings_row(
+                        "Theme",
+                        &format!("{} ▾", draft.theme.label()),
+                        row_width,
                         if *focus == 0 {
-                            Style::default()
-                                .fg(palette.selected_foreground)
-                                .bg(palette.selected_background)
-                                .add_modifier(Modifier::BOLD)
+                            value_style
                         } else {
-                            Style::default().fg(teal).add_modifier(Modifier::BOLD)
+                            Style::default().fg(ink)
                         },
-                    )),
+                        if *focus == 0 {
+                            selected_style
+                        } else {
+                            value_style
+                        },
+                    ),
                 ];
                 if *dropdown_open {
                     let (start, count) = visible_theme_window(draft.theme, a.height);
                     let end = start + count;
                     if start > 0 {
-                        lines.push(
-                            Line::from("  ↑ earlier themes").style(Style::default().fg(muted)),
-                        );
+                        lines.push(settings_row(
+                            "",
+                            "↑ earlier themes",
+                            row_width,
+                            Style::default(),
+                            Style::default().fg(muted),
+                        ));
                     }
                     for theme in Theme::ALL.iter().skip(start).take(count).copied() {
                         let selected = draft.theme == theme;
-                        lines.push(Line::from(Span::styled(
-                            format!("  {} {}", if selected { "›" } else { " " }, theme.label()),
+                        lines.push(settings_row(
+                            "",
+                            &format!("{} {}", if selected { "›" } else { " " }, theme.label()),
+                            row_width,
+                            Style::default(),
                             if selected {
-                                Style::default()
-                                    .fg(palette.selected_foreground)
-                                    .bg(palette.selected_background)
-                                    .add_modifier(Modifier::BOLD)
+                                selected_style
                             } else {
                                 Style::default().fg(ink)
                             },
-                        )));
+                        ));
                     }
                     if end < crate::theme::CATALOG.len() {
-                        lines
-                            .push(Line::from("  ↓ later themes").style(Style::default().fg(muted)));
+                        lines.push(settings_row(
+                            "",
+                            "↓ later themes",
+                            row_width,
+                            Style::default(),
+                            Style::default().fg(muted),
+                        ));
                     }
                 }
                 for (index, (label, enabled)) in [
@@ -863,55 +912,62 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .enumerate()
                 {
                     let focused = *focus == index + 1;
-                    lines.push(Line::from(Span::styled(
-                        format!(
-                            "{} [{}] {label}",
-                            if focused { "›" } else { " " },
-                            if enabled { "x" } else { " " }
-                        ),
+                    lines.push(settings_row(
+                        label,
+                        if enabled { "[x]" } else { "[ ]" },
+                        row_width,
                         if focused {
-                            Style::default()
-                                .fg(palette.selected_foreground)
-                                .bg(palette.selected_background)
-                                .add_modifier(Modifier::BOLD)
+                            value_style
                         } else {
                             Style::default().fg(ink)
                         },
-                    )));
+                        if focused {
+                            selected_style
+                        } else {
+                            Style::default().fg(ink)
+                        },
+                    ));
                 }
-                lines.push(Line::from(Span::styled(
-                    "Removing a checkout also closes its Herdr workspace.",
-                    Style::default().fg(muted),
-                )));
+                lines.push(
+                    Line::from(Span::styled(
+                        "Removing a checkout also closes its Herdr workspace.",
+                        Style::default().fg(muted),
+                    ))
+                    .alignment(Alignment::Center),
+                );
                 lines.push(Line::from(""));
-                lines.push(Line::from(Span::styled(
-                    "[ Close ]",
-                    if *focus == 4 {
-                        Style::default()
-                            .fg(palette.selected_foreground)
-                            .bg(palette.selected_background)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(teal).add_modifier(Modifier::BOLD)
-                    },
-                )));
+                lines.push(
+                    Line::from(Span::styled(
+                        "[ Close ]",
+                        if *focus == 4 {
+                            selected_style
+                        } else {
+                            value_style
+                        },
+                    ))
+                    .alignment(Alignment::Center),
+                );
                 if let Some(error) = error {
                     lines.extend(
                         wrap_words(error, inner.width as usize)
                             .into_iter()
                             .map(|line| {
                                 Line::from(Span::styled(line, Style::default().fg(palette.danger)))
+                                    .alignment(Alignment::Center)
                             }),
                     );
                 }
                 lines.extend(
                     wrap_words(settings_hint(*dropdown_open, *focus), inner.width as usize)
                         .into_iter()
-                        .map(|line| Line::from(line).style(Style::default().fg(muted))),
+                        .map(|line| {
+                            Line::from(line)
+                                .style(Style::default().fg(muted))
+                                .alignment(Alignment::Center)
+                        }),
                 );
                 f.render_widget(
                     Paragraph::new(lines)
-                        .alignment(Alignment::Center)
                         .wrap(Wrap { trim: false })
                         .style(Style::default().fg(ink)),
                     inner,
@@ -2282,6 +2338,76 @@ mod tests {
         });
         assert!(draw((18, 5), &mut a).0.contains("Resize"));
         assert!(!a.modal_ready);
+    }
+    #[test]
+    fn settings_rows_keep_wider_left_titles_and_centered_values() {
+        fn locate(buffer: &ratatui::buffer::Buffer, text: &str) -> (u16, u16) {
+            let chars: Vec<String> = text.chars().map(|ch| ch.to_string()).collect();
+            for y in 0..buffer.area.height {
+                for x in 0..buffer.area.width.saturating_sub(chars.len() as u16) {
+                    if chars
+                        .iter()
+                        .enumerate()
+                        .all(|(offset, ch)| buffer[(x + offset as u16, y)].symbol() == ch)
+                    {
+                        return (x, y);
+                    }
+                }
+            }
+            panic!("could not find {text:?}");
+        }
+
+        let mut state = app();
+        state.modal = Some(crate::app::Modal::Settings {
+            draft: crate::settings::Settings {
+                auto_merge: true,
+                auto_remove_checkout: true,
+                ..Default::default()
+            },
+            error: None,
+            dropdown_open: true,
+            focus: 3,
+        });
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render(f, Duration::from_secs(2), &mut state))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(settings_columns(60), (40, 20));
+        let title_x = locate(buffer, "Theme").0;
+        for label in [
+            "Auto-request merge",
+            "Close Herdr workspace after integration",
+            "Remove checkout + close Herdr workspace",
+        ] {
+            assert_eq!(locate(buffer, label).0, title_x);
+        }
+        assert_eq!(title_x, 10);
+        assert_eq!(locate(buffer, "OnTrack Dark ▾").0, 53);
+        assert_eq!(locate(buffer, "› OnTrack Dark").0, 53);
+        for label in [
+            "Auto-request merge",
+            "Remove checkout + close Herdr workspace",
+        ] {
+            let y = locate(buffer, label).1;
+            assert_eq!(buffer[(58, y)].symbol(), "[");
+            assert_eq!(buffer[(59, y)].symbol(), "x");
+        }
+        let workspace_y = locate(buffer, "Close Herdr workspace after integration").1;
+        assert_eq!(buffer[(58, workspace_y)].symbol(), "[");
+        assert_eq!(buffer[(59, workspace_y)].symbol(), " ");
+
+        state.modal = Some(crate::app::Modal::Settings {
+            draft: crate::settings::Settings::default(),
+            error: None,
+            dropdown_open: false,
+            focus: 2,
+        });
+        let compact = draw((40, 18), &mut state).0;
+        assert!(state.modal_ready);
+        assert!(compact.contains("Theme"));
+        assert!(compact.contains("Remove checkout + clo…"));
+        assert!(compact.contains("[ ]"));
     }
     #[test]
     fn light_create_type_dropdown_uses_catalog_selection_colors() {

@@ -5,7 +5,7 @@ A terminal browser for Beads issues in the current workspace.
 - Browse open and closed Beads, with explicit create and permanent-delete actions.
 - Two-pane browsing with scrollable, Markdown-rendered descriptions, notes, comments, relationships, and complete Beads details.
 - Automatic background refresh picks up external changes, with cached records and visible errors; no watcher setup required.
-- Persistent dark or light appearance with a live preview in settings.
+- Persistent theme selection in a structured settings dialog with a live preview.
 - Press `h` to hand a selected Bead to an installed Herdr agent in a new worktree, after explicit confirmation. See the [user guide](docs/user-guide.md) for setup and recovery limits.
 - Press `w` to inspect OnTrack-tracked outstanding worktrees independently of Bead status, request a merge, or confirm safe cleanup.
 
