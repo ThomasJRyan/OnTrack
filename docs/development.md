@@ -1,6 +1,6 @@
 # Development guide
 
-ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only, while create and delete are explicit user actions. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
+ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only, while create, edit, and delete are explicit user actions. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
 ## Modules
 
@@ -24,7 +24,7 @@ Theme is explicit app state (`App::theme`) threaded into rendering; do not intro
 
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
-The new-bead Description field uses `wrapped_description` to insert visual line breaks before whole words and map its byte cursor to display cells; words wider than the field still wrap by character. It preserves explicit newlines and the stored text. While Description has focus, Shift+Enter inserts a newline and plain Enter focuses Create without submitting. Terminal setup enables Crossterm's keyboard enhancement protocol so supported terminals can distinguish modified Enter; restoration pops that mode on normal exit, initialization failure, and panic. Terminals without modified-key reporting cannot distinguish Shift+Enter from Enter.
+The create/edit Description field uses `wrapped_description` to insert visual line breaks before whole words and map its byte cursor to display cells; words wider than the field still wrap by character. It preserves explicit newlines and the stored text. While Description has focus, Shift+Enter inserts a newline and plain Enter focuses the form's action without submitting. Terminal setup enables Crossterm's keyboard enhancement protocol so supported terminals can distinguish modified Enter; restoration pops that mode on normal exit, initialization failure, and panic. Terminals without modified-key reporting cannot distinguish Shift+Enter from Enter.
 
 The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
 Settings rows in `src/ui.rs` share a two-thirds title column and one-third
@@ -40,10 +40,11 @@ The subprocess inherits the application's working directory. Commands are passed
 bd --readonly --no-color list --all --limit 0 --json
 bd --readonly --no-color show --id=ISSUE_ID --json --long --include-comments --include-dependents
 bd --no-color create --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json
+bd --no-color update --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json -- ISSUE_ID
 bd --no-color delete --force --json -- ISSUE_ID
 ```
 
-Create returns a JSON object containing the created ID; delete is successful on a successful command exit. Create/delete are not passed `--readonly`; delete uses `--force` for the selected issue only and never requests cascading deletion. The worker processes queued requests sequentially, preserving mutation order.
+Create returns a JSON object containing the created ID; update and delete are successful on a successful command exit. Mutations are not passed `--readonly`; update sends only the four form fields, and delete uses `--force` for the selected issue only and never requests cascading deletion. The worker processes queued requests sequentially, preserving mutation order. Edit opening fetches the current `bd show` record on that worker, validates the editable type and priority, and ignores stale load responses using a request sequence. A failed update leaves the draft open; success triggers an immediate refresh and reselects the same ID.
 
 `--all` includes closed issues and `--limit 0` removes the default list cap. `--id=ISSUE_ID` is a single argument. The list and show responses must be JSON arrays. List parsing requires nonempty string `id`, `title`, and `status`; a missing or null priority defaults to 2, and supplied priority must be an unsigned integer. Each `Bead` retains the entire JSON object as well as its summary fields.
 
@@ -141,7 +142,7 @@ Unit tests do not replace an interactive terminal cleanup check. When changing f
 
 ## Mutations
 
-Create and delete are explicit, asynchronous CLI operations. The create form uses the Beads type vocabulary and P0–P4 priorities; deletion requires a second, affirmative confirmation and never cascades. Each worker request is processed in channel order, without batching mutations together, and the UI disables repeat submissions while one is in flight. The CLI adapter is defined in `src/beads.rs`; the UI only calls its create/delete functions and refreshes the normal list/detail views after success.
+Create, edit, and delete are explicit, asynchronous CLI operations. The create and edit forms use the Beads type vocabulary and P0–P4 priorities; deletion requires a second, affirmative confirmation and never cascades. Each worker request is processed in channel order, without batching mutations together, and the UI disables repeat submissions while one is in flight. The CLI adapter is defined in `src/beads.rs`; the UI calls its create/update/delete functions and refreshes the normal list/detail views after success.
 
 ## Status-grouped list
 

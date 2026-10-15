@@ -753,7 +753,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     );
     if let Some(modal) = &app.modal {
         let width = match modal {
-            crate::app::Modal::Create(_) => 70,
+            crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. } => 70,
             crate::app::Modal::Settings { .. } => 64,
             crate::app::Modal::Launch(_) => 58,
             _ => 62,
@@ -795,13 +795,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 };
                 (9 + option_lines + error_lines + hint_lines + 2) as u16
             }
-            crate::app::Modal::Create(form) => {
-                if form.dropdown.is_some() {
-                    19
-                } else {
-                    15
-                }
+            crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
+                if form.dropdown.is_some() { 19 } else { 15 }
             }
+            crate::app::Modal::EditLoading { .. } => 8,
             crate::app::Modal::ConfirmDelete { .. } => delete_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
@@ -818,11 +815,16 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .max(7) as u16,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
         };
-        let min_width = if matches!(modal, crate::app::Modal::Create(_)) {
+        let min_width = if matches!(
+            modal,
+            crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. }
+        ) {
             70
         } else if matches!(
             modal,
-            crate::app::Modal::Settings { .. } | crate::app::Modal::Launch(_)
+            crate::app::Modal::Settings { .. }
+                | crate::app::Modal::Launch(_)
+                | crate::app::Modal::EditLoading { .. }
         ) {
             38
         } else {
@@ -864,6 +866,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         let frame = Block::default()
             .title(match modal {
                 crate::app::Modal::Create(_) => " NEW BEAD ",
+                crate::app::Modal::EditLoading { .. } | crate::app::Modal::Edit { .. } => {
+                    " EDIT BEAD "
+                }
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 crate::app::Modal::Launch(_) => " HAND OFF BEAD ",
                 _ => " DELETE BEAD? ",
@@ -879,6 +884,18 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             area.height.saturating_sub(2),
         );
         match modal {
+            crate::app::Modal::EditLoading { id, error, .. } => {
+                let message = error.as_ref().map_or_else(
+                    || format!("Loading {id}…"),
+                    |error| format!("Could not load {id}: {error}\nPress e to retry · Esc cancels"),
+                );
+                f.render_widget(
+                    Paragraph::new(message)
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().fg(if error.is_some() { gold } else { ink })),
+                    inner,
+                );
+            }
             crate::app::Modal::Settings {
                 draft,
                 error,
@@ -1022,7 +1039,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     inner,
                 );
             }
-            crate::app::Modal::Create(form) => {
+            crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
+                let editing = matches!(modal, crate::app::Modal::Edit { .. });
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -1199,7 +1217,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Paragraph::new(wrapped_description)
                         .block(
                             Block::default()
-                                .title(" Description · Shift+Enter newline · Enter Create ")
+                                .title(if editing {
+                                    " Description · Shift+Enter newline · Enter Save "
+                                } else {
+                                    " Description · Shift+Enter newline · Enter Create "
+                                })
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(if form.focus == 1 {
                                     teal
@@ -1224,7 +1246,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 }
                 let actions = Paragraph::new(Line::from(vec![
                     Span::styled(
-                        "[ Create ]",
+                        if editing { "[ Save ]" } else { "[ Create ]" },
                         if app.mutation_busy {
                             Style::default().fg(muted)
                         } else if form.focus == 4 {
@@ -1254,7 +1276,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 ]));
                 f.render_widget(actions, rows[3]);
                 let feedback = if app.mutation_busy {
-                    Some("Creating… · form locked until the command finishes")
+                    Some(if editing {
+                        "Saving… · form locked until the command finishes"
+                    } else {
+                        "Creating… · form locked until the command finishes"
+                    })
                 } else {
                     app.notice.as_deref()
                 };
@@ -1377,7 +1403,7 @@ fn footer_text(state: &str, width: usize) -> String {
     // long status/error cannot push create, delete, or handoff offscreen. At
     // narrow widths, spend the remaining cells on the start of the status and
     // mark its truncation rather than letting Ratatui clip the actions.
-    let actions = " · n new · d delete · h hand off · r refresh · q quit";
+    let actions = " · n new · e edit · d delete · h hand off · r refresh · q quit";
     let state_width = width.saturating_sub(1 + Span::raw(actions).width());
     let state = truncate_display(state, state_width);
     let core = if state.is_empty() {
@@ -1385,7 +1411,7 @@ fn footer_text(state: &str, width: usize) -> String {
     } else {
         format!(" {state}{actions}")
     };
-    let navigation = " · ↑↓ · ←/→ groups · Tab panes · s settings · w worktrees";
+    let navigation = " · ↑↓ · ←/→ · Tab panes · s settings · w worktrees";
     if Span::raw(core.as_str()).width() + Span::raw(navigation).width() <= width {
         format!("{core}{navigation}")
     } else {
@@ -1748,6 +1774,7 @@ mod tests {
             list_error: None,
             detail_error: None,
             detail_seq: 0,
+            edit_seq: 0,
             launch_seq: 0,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
@@ -2184,6 +2211,7 @@ mod tests {
         let status = draw((120, 40), &mut a).0;
         assert!(status.contains("LIST ERROR"));
         assert!(status.contains("n new"));
+        assert!(status.contains("e edit"));
         assert!(status.contains("d delete"));
         assert!(status.contains("h hand off"));
         a.list_error = None;
@@ -2201,6 +2229,28 @@ mod tests {
         let entered = draw((100, 30), &mut a).0;
         assert!(entered.contains("Visible title"));
         assert!(!entered.contains("Title · required"));
+        a.modal = Some(crate::app::Modal::Edit {
+            id: "demo-1".into(),
+            form: crate::app::CreateForm {
+                title: "Edited title".into(),
+                cursor: 12,
+                description: "Existing description".into(),
+                ..Default::default()
+            },
+        });
+        let edit = draw((100, 30), &mut a).0;
+        assert!(edit.contains("EDIT BEAD"));
+        assert!(edit.contains("Edited title"));
+        assert!(edit.contains("Existing description"));
+        assert!(edit.contains("[ Save ]"));
+        a.modal = Some(crate::app::Modal::EditLoading {
+            id: "demo-1".into(),
+            seq: 1,
+            error: Some("offline".into()),
+        });
+        let loading_error = draw((100, 30), &mut a).0;
+        assert!(loading_error.contains("offline"));
+        assert!(loading_error.contains("retry"));
         a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm::default()));
         let tiny = draw((12, 5), &mut a).0;
         assert!(tiny.contains("Resize"));
