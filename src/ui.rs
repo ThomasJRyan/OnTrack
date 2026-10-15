@@ -2685,6 +2685,10 @@ mod tests {
     #[test]
     fn worktree_status_text_uses_theme_colours_in_list_and_detail() {
         use crate::worktrees::{ManagedWorktree, WorktreeStatus};
+        assert_eq!(
+            crate::app::worktree_status_label(WorktreeStatus::Unmerged),
+            "READY TO MERGE"
+        );
         let statuses = [
             WorktreeStatus::Reserved,
             WorktreeStatus::InProgress,

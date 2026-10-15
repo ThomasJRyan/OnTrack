@@ -207,12 +207,19 @@ defer; manual merge remains the user-controlled path.
 `inspect` in `src/worktrees.rs` remains the Git-based safety classification.
 For an active branch with task commits outside its target, `inspect_for_display`
 shows `InProgress` until a live `bd show` identifies the same Bead as closed and
-the recorded Herdr agent passes the existing settled-session check, including
-post-handoff lifecycle activity. Failed or unavailable completion observations
-remain `InProgress`; an untouched launch-base branch is also `InProgress`.
-`Unmerged` therefore means outstanding task commits with completion evidence.
+the recorded Herdr agent has settled after prompt activity. A launch with a
+native session uses the strict settled-session check. For older launch responses
+without a session, the display checks the captured pre-prompt `agent_info`,
+later lifecycle sequence, pane/workspace/kind, checkout paths, and terminal ID
+when present. Failed or unavailable completion observations remain `InProgress`;
+an untouched launch-base branch is also `InProgress`. The internal `Unmerged`
+status renders as `READY TO MERGE` in both worktree panes. New handoff prompts
+ask agents to close the Bead only after checked and committed work; unfinished
+work must keep its Bead open or in progress.
 The display check makes read-only Beads and Herdr calls during worktree refresh;
-it does not change merge, finalization, or cleanup gates. Explicit manual merge
+it does not change merge, finalization, or cleanup gates. In particular, a
+legacy launch without a recorded session cannot trigger automatic merge, even
+when the display says `READY TO MERGE`. Explicit manual merge
 confirmation remains available for `InProgress` rows and is still subject to
 the existing Git and agent checks.
 `inspect_for_display` only changes a `NeedsResolution` merge-request row to

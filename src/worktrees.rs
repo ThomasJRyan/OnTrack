@@ -466,11 +466,11 @@ impl LaunchJournal {
     pub(crate) fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()> {
         let entry = &mut self.registry.entries[self.index];
         entry["responses"][kind] = json!(String::from_utf8_lossy(bytes));
-        if let Ok(result) = envelope(bytes)
-            && result["agent"]["agent_session"].is_object()
-        {
-            entry["agent_session"] = result["agent"]["agent_session"].clone();
-            if kind == "ready" {
+        if let Ok(result) = envelope(bytes) {
+            if result["agent"]["agent_session"].is_object() {
+                entry["agent_session"] = result["agent"]["agent_session"].clone();
+            }
+            if kind == "ready" && result["agent"]["state_change_seq"].is_u64() {
                 entry["initial_lifecycle_seq"] = result["agent"]["state_change_seq"].clone();
             }
         }
@@ -923,6 +923,39 @@ fn restart_with(cwd: &Path, id: &str, executor: &mut impl Executor) -> io::Resul
     }
 }
 
+/// Older launch responses lacked a native session ID, but still recorded the
+/// pre-prompt agent observation. That observation can support a display hint;
+/// it never changes the stricter gate used by automatic merge and cleanup.
+fn legacy_settled_for_display(executor: &mut impl Executor, entry: &Value) -> io::Result<()> {
+    let ready = entry["responses"]["ready"]
+        .as_str()
+        .ok_or_else(|| error("No recorded pre-prompt Herdr observation"))?;
+    let ready = envelope(ready.as_bytes())?;
+    let before = ready["agent"]["state_change_seq"]
+        .as_u64()
+        .ok_or_else(|| error("No recorded pre-prompt lifecycle sequence"))?;
+    if ready["type"] != "agent_info"
+        || ready["agent"]["pane_id"] != entry["pane_id"]
+        || ready["agent"]["workspace_id"] != entry["workspace_id"]
+        || ready["agent"]["agent"] != entry["agent"]
+    {
+        return Err(error("Recorded pre-prompt agent identity does not match"));
+    }
+    let current = settled(executor, entry, false)?;
+    if current["state_change_seq"]
+        .as_u64()
+        .is_none_or(|now| now <= before)
+    {
+        return Err(error("No observed agent activity after the initial prompt"));
+    }
+    if ready["agent"]["terminal_id"].is_string()
+        && current["terminal_id"] != ready["agent"]["terminal_id"]
+    {
+        return Err(error("Recorded Herdr terminal changed"));
+    }
+    Ok(())
+}
+
 /// A conflict can be a transient part of the requested merge. Only a live,
 /// matching native agent observation changes its display state; Git safety
 /// decisions continue to use `inspect` and `verify`.
@@ -936,12 +969,22 @@ fn inspect_for_display(
         // Git can identify outstanding commits, but cannot tell whether the
         // original task is finished. A closed Bead plus a settled matching
         // agent provides the display's completion evidence.
-        let complete = executor
+        let closed = executor
             .show_bead(&item.bead_id)
-            .is_ok_and(|bead| bead["id"] == item.bead_id && bead["status"] == "closed")
-            && settled(executor, entry, true).is_ok();
-        if !complete {
+            .is_ok_and(|bead| bead["id"] == item.bead_id && bead["status"] == "closed");
+        if !closed {
             item.status = WorktreeStatus::InProgress;
+            item.detail = Some("The live Bead is open or could not be verified as closed.".into());
+        } else if entry["agent_session"].is_object() {
+            if settled(executor, entry, true).is_err() {
+                item.status = WorktreeStatus::InProgress;
+                item.detail = Some("The recorded agent has not been verified as finished.".into());
+            }
+        } else if legacy_settled_for_display(executor, entry).is_ok() {
+            item.detail = Some("Ready based on a closed Bead and observed agent activity. The launch lacks native session evidence; automatic merge remains deferred. Confirm a manual merge when appropriate.".into());
+        } else {
+            item.status = WorktreeStatus::InProgress;
+            item.detail = Some("The recorded agent has not been verified as finished.".into());
         }
         return item;
     }
@@ -2929,7 +2972,7 @@ mod tests {
     }
 
     #[test]
-    fn active_worktree_requires_closed_bead_and_finished_recorded_agent_for_unmerged_label() {
+    fn active_worktree_requires_closed_bead_and_finished_recorded_agent_for_ready_label() {
         let fixture = Fixture::managed();
         Fixture::commit_at(&fixture.source, "task", "implementation\n");
         assert_eq!(fixture.status().status, WorktreeStatus::Unmerged);
@@ -2970,6 +3013,66 @@ mod tests {
         assert_eq!(
             list_with(&fixture.main, &mut finished).unwrap()[0].status,
             WorktreeStatus::Unmerged
+        );
+    }
+
+    #[test]
+    fn legacy_handoff_uses_recorded_agent_activity_for_ready_display_only() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implementation\n");
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        let entry = &mut registry.entries[0];
+        entry.as_object_mut().unwrap().remove("agent_session");
+        entry
+            .as_object_mut()
+            .unwrap()
+            .remove("initial_lifecycle_seq");
+        let mut ready: Value =
+            serde_json::from_str(entry["responses"]["ready"].as_str().unwrap()).unwrap();
+        ready["result"]["agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_session");
+        ready["result"]["agent"]["terminal_id"] = json!("original-terminal");
+        entry["responses"]["ready"] = json!(ready.to_string());
+        registry.save().unwrap();
+        drop(registry);
+
+        let observed = |seq, state, terminal| {
+            let mut agent = fixture.agent(seq, state);
+            agent["result"]["agent"]["terminal_id"] = json!(terminal);
+            let mut executor = Fake::default();
+            executor.json(agent);
+            list_with(&fixture.main, &mut executor).unwrap()[0].clone()
+        };
+        let ready = observed(12, "idle", "original-terminal");
+        assert_eq!(ready.status, WorktreeStatus::Unmerged);
+        assert!(
+            ready
+                .detail
+                .unwrap()
+                .contains("automatic merge remains deferred")
+        );
+        assert_eq!(
+            observed(10, "idle", "original-terminal").status,
+            WorktreeStatus::InProgress
+        );
+        assert_eq!(
+            observed(12, "working", "original-terminal").status,
+            WorktreeStatus::InProgress
+        );
+        assert_eq!(
+            observed(12, "idle", "replacement-terminal").status,
+            WorktreeStatus::InProgress
+        );
+
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[0]["responses"]["ready"] = Value::Null;
+        registry.save().unwrap();
+        drop(registry);
+        assert_eq!(
+            observed(12, "idle", "original-terminal").status,
+            WorktreeStatus::InProgress
         );
     }
 

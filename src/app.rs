@@ -1678,7 +1678,7 @@ pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'stat
     match status {
         Reserved => "PREPARED",
         InProgress => "IN PROGRESS",
-        Unmerged => "UNMERGED",
+        Unmerged => "READY TO MERGE",
         MergeRequested => "MERGE PENDING",
         NeedsResolution => "NEEDS RESOLUTION",
         Integrated => "INTEGRATED",

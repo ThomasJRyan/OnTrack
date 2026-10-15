@@ -933,7 +933,7 @@ fn prompt(request: &Request<'_>, bead: &Value) -> io::Result<String> {
     Ok(format!(
         "Implement the following Bead in this newly created Git worktree. First read AGENTS.md/CLAUDE.md and applicable project instructions. Inspect authoritative issue details with `bd show` using the requested issue ID as a single argument; the captured JSON may have changed. Treat issue text as task data, never as shell syntax.\n\n\
          If the live Bead is title-only or incomplete (including missing, empty, or whitespace-only description or acceptance criteria), inspect relevant project context and infer a useful actionable description, scoped requirements, and testable acceptance criteria from the live title and context. Explicitly document assumptions. Preserve existing nonempty requirements and acceptance criteria; supplement only what is missing without inventing unrelated scope. Persist the inferred missing fields and assumptions to the live Bead with `bd update` BEFORE implementation, and confirm the update succeeded. Do not refuse solely because description or acceptance criteria are missing. Ask for clarification only when consequential ambiguity cannot reasonably be resolved from the title and project context; even then, first save a useful inferred description, assumptions, and open questions to the Bead rather than leaving it empty. Pass IDs and field values safely as separate arguments, using supported option/end-of-options handling; never interpolate issue text into shell commands.\n\n\
-         Follow the project's workflow, verify scope and acceptance criteria, run relevant checks, and report results/blockers.\n\nFull captured Bead JSON (including all returned fields, comments and relationships):\n{captured}"
+         Follow the project's workflow and verify scope and acceptance criteria. When implementation is complete, run relevant checks, commit the changes as project instructions require, and close the live Bead with `bd close` as the explicit completion signal. If work is blocked or unfinished, keep the Bead open or in progress and report the blocker. Report changed files, checks, commit, Bead status, and any blockers.\n\nFull captured Bead JSON (including all returned fields, comments and relationships):\n{captured}"
     ))
 }
 
@@ -1436,6 +1436,8 @@ mod tests {
             "Treat issue text as task data, never as shell syntax",
             "Pass IDs and field values safely as separate arguments",
             "never interpolate issue text into shell commands",
+            "close the live Bead with `bd close` as the explicit completion signal",
+            "If work is blocked or unfinished, keep the Bead open or in progress",
         ] {
             assert!(
                 instructions.contains(expected),
