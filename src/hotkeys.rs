@@ -13,6 +13,7 @@ pub enum Context {
     EditLoading,
     Delete,
     WorktreeConfirm,
+    Release,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +37,7 @@ impl Context {
             Some(Modal::EditLoading { .. }) => Self::EditLoading,
             Some(Modal::ConfirmDelete { .. }) => Self::Delete,
             Some(Modal::ConfirmWorktree { .. }) => Self::WorktreeConfirm,
+            Some(Modal::Release) => Self::Release,
             None if app.worktrees_view => Self::Worktrees,
             None if app.focus_detail => Self::Details,
             None => Self::Issues,
@@ -54,6 +56,7 @@ impl Context {
             Self::EditLoading => "Loading edit",
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
+            Self::Release => "Release check",
         }
     }
 
@@ -76,6 +79,7 @@ impl Context {
                     "Toggle Ready for an open Task or Epic and its tasks",
                 ),
                 ("w", "Open outstanding worktrees"),
+                ("u", "Check for a newer OnTrack release"),
                 ("Esc", "Stay in the issue browser"),
             ],
             Self::Details => vec![
@@ -94,6 +98,7 @@ impl Context {
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
                 ("w", "Open outstanding worktrees"),
+                ("u", "Check for a newer OnTrack release"),
                 ("Esc", "Stay in the issue browser"),
             ],
             Self::Worktrees => vec![
@@ -154,6 +159,10 @@ impl Context {
                 ("y / Y", "Confirm action"),
                 ("n / N / Enter", "Cancel action"),
                 ("Esc", "Cancel action"),
+            ],
+            Self::Release => vec![
+                ("r", "Check GitHub again"),
+                ("Esc", "Return to issue browser"),
             ],
         };
         rows.extend([

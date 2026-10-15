@@ -9,7 +9,7 @@ ontrack browses Beads issues in a two-pane terminal view and can create, edit, o
 - OnTrack initializes Beads in the launch directory if no workspace is accessible there. An existing workspace, including one inherited from a parent directory, is reused.
 - An interactive terminal supporting raw mode and the alternate screen; mouse support is needed for clicking and wheel input.
 
-See the [official Beads documentation](https://beads.gascity.com) for installing `bd` and setting up a workspace.
+See the [official Beads documentation](https://beads.gascity.com) for installing `bd` and setting up a workspace. For supported binary downloads and checksum verification, see the [release guide](releases.md).
 
 From this repository, when it is the workspace you want to browse:
 
@@ -132,6 +132,12 @@ The new checkout contains committed Git content only; uncommitted changes are no
 The top-right toast stays visible during discovery and launch, then shows success for seven seconds or failure for fifteen seconds. The footer also shows the result or error while space permits, and `w` shows recorded worktrees for recovery. Compact terminals shorten the toast with a pointer to the footer and tracked worktrees. If a failure may have created a worktree or sent a prompt, inspect the recorded and Herdr/Git state before pressing `h` again.
 
 Backend work does not run on the terminal input loop, so browsing remains responsive while a command is slow. Handoff keeps the browser usable; create, edit, and delete mutations still lock their dialogs until a result arrives. Worker requests are queued and executed in order without coalescing. Quitting restores raw-mode, mouse-capture, and alternate-screen settings through the application's cleanup path.
+
+## Check for updates
+
+Press `u` in the issue browser to check the latest published stable OnTrack release on GitHub. The dialog shows your running version and, when an update exists, the newer version and its release link. Press `r` in the dialog to check again or `Esc` to resume browsing. The request continues in the background if you close the dialog; press `u` again to see its result. An offline connection or GitHub error is shown in the dialog and does not stop issue browsing. This check does not install an update.
+
+The check uses the `curl` command with an eight-second request limit. Ensure `curl` is installed and available on `PATH`.
 
 ## Troubleshooting
 

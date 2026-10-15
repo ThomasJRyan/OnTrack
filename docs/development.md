@@ -2,8 +2,7 @@
 
 ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only. Create, edit, delete, and Ready toggles are user actions; the scheduler automatically hands off Ready tasks through the existing tracked Herdr path. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
-Release binary names, checksum expectations, supported targets, and offline
-installer checks are documented in the [installation guide](installation.md#release-asset-contract-for-maintainers).
+Tagged builds and release asset naming are documented in the [release guide](releases.md); installer behavior and offline checks are in the [installation guide](installation.md#release-asset-contract-for-maintainers). The workflow uses `scripts/release_asset.py` for tag validation, archive creation, and checksum verification; keep its target list aligned with the native runner matrix in `.github/workflows/release.yml`.
 
 ## Modules
 
@@ -152,6 +151,12 @@ Selection uses the issue's cached list JSON immediately, marks details as loadin
 
 Keep CLI calls off the input/render loop and preserve stale-response filtering when changing the worker. The worker is not joined on quit, so terminal cleanup does not wait for a slow CLI call; in-flight commands are not cancelled on quit.
 
+## Release check
+
+`src/release.rs` queries the official `ThomasJRyan/OnTrack` GitHub Releases [`latest` endpoint](https://docs.github.com/en/rest/releases/releases#get-the-latest-release) with `curl`. GitHub's latest endpoint selects a published stable release; an HTTP 404 is reported as no public release available (which can also mean the repository is inaccessible). The response must have a semantic-version tag (an optional leading `v` is accepted) and an OnTrack GitHub release URL. The running version comes from `CARGO_PKG_VERSION`, and `semver` compares versions, including prerelease precedence. The HTTP request has connection and overall time limits and a response-size cap.
+
+Pressing `u` queues a check. The worker starts a separate request thread so a slow network call cannot hold the Beads request queue or terminal input loop. The result is kept in the app state and shown by the release dialog; closing the dialog does not cancel the check. `r` retries inside the dialog. `check_with` accepts a controlled fetch function, allowing focused success, no-release, malformed-response, and network-error tests without GitHub access.
+
 ## Terminal cleanup invariants
 
 `main` attempts restoration after `app::run` returns, before returning its error. Terminal initialization attempts cleanup if entering the alternate screen, enabling mouse capture, or constructing the terminal fails. The installed panic hook attempts cleanup before invoking the previous hook. Restoration attempts cursor display, disables raw mode and mouse capture, and leaves the alternate screen; preserve these paths when changing startup or exit handling.
@@ -174,6 +179,8 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build
 ```
+
+GitHub Actions runs these gates on pull requests and pushes to `main`. See the [CI guide](ci.md) for workflow details, logs, and branch protection setup.
 
 The same commands can run from a linked Git worktree. Keep the default test concurrency for `cargo test` to exercise fixture and registry lock isolation.
 

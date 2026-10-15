@@ -5,6 +5,7 @@ use crate::{
     beads::{self, Bead, CreateBead, UpdateBead},
     event,
     hotkeys::{self, Help},
+    release,
     settings::{self, DefaultAgent, Settings, Theme},
     ui,
 };
@@ -40,6 +41,7 @@ pub(super) enum Request {
     WorktreeAction(String, WorktreeAction),
     RestartWorktree(String),
     ReconcileWorktrees(CleanupPolicy),
+    CheckRelease,
 }
 pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
@@ -58,6 +60,7 @@ pub(super) enum Response {
     WorkspaceFocused(String, std::io::Result<()>),
     WorktreeChanged(std::io::Result<ManagedWorktree>),
     WorktreeRestarted(std::io::Result<String>),
+    ReleaseChecked(Result<release::CheckResult, String>),
 }
 pub(super) enum WorktreeFocusFeedback {
     Success(String),
@@ -83,6 +86,8 @@ pub struct App {
     pub(super) launch_seq: u64,
     pub(super) handoff: Option<PendingHandoff>,
     pub toast: Option<Toast>,
+    pub release_result: Option<Result<release::CheckResult, String>>,
+    pub release_inflight: bool,
     pub list_rect: Rect,
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
@@ -145,6 +150,7 @@ pub enum Modal {
         id: String,
         action: u8,
     },
+    Release,
 }
 #[derive(Debug, Clone)]
 pub struct Toast {
@@ -411,6 +417,13 @@ impl App {
                     Request::ReconcileWorktrees(policy) => {
                         Response::Worktrees(worktrees::reconcile(policy))
                     }
+                    Request::CheckRelease => {
+                        let replies = out.clone();
+                        thread::spawn(move || {
+                            let _ = replies.send(Response::ReleaseChecked(release::check()));
+                        });
+                        continue;
+                    }
                 };
                 if out.send(response).is_err() {
                     break;
@@ -453,6 +466,8 @@ impl App {
             launch_seq: 0,
             handoff: None,
             toast: None,
+            release_result: None,
+            release_inflight: false,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -1330,6 +1345,20 @@ impl App {
                         self.worktrees_next_refresh = now;
                     }
                 }
+                Response::ReleaseChecked(result) => {
+                    self.release_inflight = false;
+                    self.notice = Some(match &result {
+                        Ok(release::CheckResult::Available { version, .. }) => {
+                            format!("Update v{version} available · press u for release link")
+                        }
+                        Ok(release::CheckResult::Current { .. }) => "OnTrack is up to date".into(),
+                        Ok(release::CheckResult::NoPublishedRelease) => {
+                            "No public OnTrack release is available".into()
+                        }
+                        Err(error) => format!("Update check failed: {error}"),
+                    });
+                    self.release_result = Some(result);
+                }
             }
         }
     }
@@ -1413,6 +1442,7 @@ impl App {
                 self.poll_worktrees(Instant::now());
             }
             KeyCode::Char('r' | 'R') => self.toggle_ready(),
+            KeyCode::Char('u') => self.open_release(),
             KeyCode::Char('s') => {
                 let load_error = self
                     .settings_load_error
@@ -1606,6 +1636,24 @@ impl App {
         });
         self.modal_ready = false;
     }
+    fn open_release(&mut self) {
+        self.modal = Some(Modal::Release);
+        self.modal_ready = false;
+        if !self.release_inflight && self.release_result.is_none() {
+            self.start_release_check();
+        }
+    }
+    fn start_release_check(&mut self) {
+        if self.release_inflight {
+            return;
+        }
+        self.release_inflight = true;
+        self.release_result = None;
+        if self.requests.send(Request::CheckRelease).is_err() {
+            self.release_inflight = false;
+            self.release_result = Some(Err("Update check could not be queued".into()));
+        }
+    }
     fn modal_key(&mut self, key: KeyEvent) -> bool {
         use crossterm::event::KeyCode::*;
         if self.mutation_busy {
@@ -1636,6 +1684,12 @@ impl App {
                 return false;
             }
             self.modal = None;
+            return false;
+        }
+        if matches!(self.modal, Some(Modal::Release)) {
+            if key.code == KeyCode::Char('r') {
+                self.start_release_check();
+            }
             return false;
         }
         if let Some(Modal::ConfirmWorktree { id, action }) = self.modal.as_ref() {
@@ -2377,6 +2431,34 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn release_check_is_dismissible_and_late_result_remains_available() {
+        let (mut app, requests, replies) = connected_app();
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::CheckRelease)));
+        assert!(app.release_inflight);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        replies
+            .send(Response::ReleaseChecked(Ok(
+                release::CheckResult::Available {
+                    version: semver::Version::parse("1.2.0").unwrap(),
+                    url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+                },
+            )))
+            .unwrap();
+        app.receive();
+        assert!(!app.release_inflight);
+        assert!(app.notice.as_deref().unwrap().contains("v1.2.0"));
+        assert!(matches!(
+            app.release_result,
+            Some(Ok(release::CheckResult::Available { .. }))
+        ));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::Release)));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
     fn shift_n_creates_child_of_selected_task_and_n_stays_top_level() {
         let mut app = app();
         app.beads[0].data["issue_type"] = json!("task");
@@ -2527,6 +2609,8 @@ mod tests {
             launch_seq: 0,
             handoff: None,
             toast: None,
+            release_result: None,
+            release_inflight: false,
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,

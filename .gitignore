@@ -6,4 +6,5 @@
 .beads/proxieddb/
 *.gate.lock*
 /target/
+__pycache__/
 .beads/issues.jsonl

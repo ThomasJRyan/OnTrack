@@ -104,7 +104,8 @@ archive must contain a regular file named `ontrack` at its root; the sidecar
 contains the archive's SHA-256 hash and exact filename in the standard
 `HASH  FILENAME` format. The installer also checks GitHub's API asset digest
 when it is present. It rejects missing assets, unexpected download URLs,
-invalid checksums, and malformed archives.
+invalid checksums, and malformed archives. See the [release guide](releases.md)
+for the publishing workflow.
 
 Test the installer without network access with `bash tests/installer.sh`. Its
 mock release exercises installation, replacement, failure handling, and
