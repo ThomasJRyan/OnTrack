@@ -104,7 +104,7 @@ impl Context {
                 ("Text / Space", "Type in title or description"),
                 ("Tab / Shift+Tab", "Move between form controls"),
                 ("← / →", "Move text cursor or cycle focused choice"),
-                ("↑ / ↓", "Move description cursor between lines"),
+                ("↑ / ↓", "Move description cursor between visible lines"),
                 ("Home / End", "Move to start / end of text line"),
                 ("Backspace / Delete", "Remove text beside the cursor"),
                 (
