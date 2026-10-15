@@ -613,6 +613,26 @@ fn target_checkout(repo: &RepositoryIdentity, entry: &Value) -> io::Result<PathB
     Ok(target)
 }
 
+/// A removed child's parent checkout may later be removed too. For historical
+/// status only, the retained parent branch still proves integration by ancestry.
+/// Live merge and cleanup paths continue to require the verified checkout.
+fn removed_checkout_target_tip(repo: &RepositoryIdentity, entry: &Value) -> io::Result<String> {
+    if entry["parent_bead_id"].is_string() {
+        let recorded = Path::new(field(entry, "target_path")?);
+        if !recorded.is_absolute() {
+            return Err(error("Recorded parent target path is not absolute"));
+        }
+        if matches!(fs::symlink_metadata(recorded), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+            return tip(
+                &repo.main_root,
+                &format!("refs/heads/{}", field(entry, "target_branch")?),
+            );
+        }
+    }
+    let target = target_checkout_identity(repo, entry)?;
+    tip(&target, "HEAD")
+}
+
 const NO_TASK_COMMITS: &str = "No task commits beyond the recorded launch base. No-op completion is not supported: inspect the task and keep the checkout; closing a Bead alone never authorizes integration or cleanup.";
 const CLOSED_REMOVAL_UNAVAILABLE: &str = "Checkout removal unavailable after workspace closure: installed Herdr help documents only --workspace ID; safe removal using a closed ID is unverified. Do not reuse the closed ID. Inspect the recorded checkout and current branch integration, then use Git's non-force worktree removal for that exact path, retaining the branch; OnTrack will not automatically adopt a replacement workspace.";
 
@@ -767,7 +787,6 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
             // must block new merges and cleanup, but it cannot invalidate an
             // already removed checkout whose branch is contained in the
             // target history.
-            let target = target_checkout_identity(repo, entry)?;
             let source = tip(
                 &repo.main_root,
                 &format!("refs/heads/{}", field(entry, "branch")?),
@@ -777,7 +796,11 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
                     "Removed checkout path exists again; identity requires inspection",
                 ));
             }
-            if !ancestor(&repo.main_root, &source, &tip(&target, "HEAD")?)? {
+            if !ancestor(
+                &repo.main_root,
+                &source,
+                &removed_checkout_target_tip(repo, entry)?,
+            )? {
                 return Err(error(
                     "Preserved source branch advanced after checkout removal; new work is outstanding",
                 ));
@@ -2265,6 +2288,188 @@ mod tests {
             WorktreeStatus::Integrated
         );
         assert_eq!(tip(&fixture.main, "HEAD").unwrap(), default_tip);
+    }
+
+    #[test]
+    fn removed_child_stays_removed_after_parent_checkout_is_removed() {
+        let fixture = Fixture::managed();
+        let child_path = fixture.directory.join("child");
+        let child_branch = "ontrack/child-task";
+        let child = json!({"id":"Bead-1.1", "title":"Child", "parent":"Bead-1"});
+        let mut journal = LaunchJournal::begin(
+            &fixture.main,
+            &child,
+            child_branch,
+            "opencode",
+            "child-task",
+            "wMain",
+        )
+        .unwrap();
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                child_branch,
+                child_path.to_str().unwrap(),
+                BRANCH,
+            ],
+        )
+        .unwrap();
+        let created = json!({"workspace":{"workspace_id":"wChild"},
+            "root_pane":{"pane_id":"wChild:p1"},
+            "worktree":{"path":child_path,"branch":child_branch}});
+        journal.created(&created).unwrap();
+        journal.phase("active").unwrap();
+        drop(journal);
+
+        Fixture::commit_at(&child_path, "child-task", "child work\n");
+        git(&fixture.source, &["merge", "--ff-only", child_branch]).unwrap();
+        git(
+            &fixture.main,
+            &["worktree", "remove", child_path.to_str().unwrap()],
+        )
+        .unwrap();
+        let child_tip = tip(&fixture.main, &format!("refs/heads/{child_branch}")).unwrap();
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[1]["checkout_removed"] = json!(true);
+        registry.entries[1]["workspace_closed"] = json!(true);
+        registry.save().unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::CheckoutRemoved
+        );
+        drop(registry);
+
+        Fixture::commit_at(&fixture.source, "parent-task", "parent work\n");
+        git(&fixture.main, &["merge", "--ff-only", BRANCH]).unwrap();
+        git(
+            &fixture.main,
+            &["worktree", "remove", fixture.source.to_str().unwrap()],
+        )
+        .unwrap();
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[0]["checkout_removed"] = json!(true);
+        registry.entries[0]["workspace_closed"] = json!(true);
+        registry.save().unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::CheckoutRemoved
+        );
+        drop(registry);
+        assert_eq!(
+            list_with(&fixture.main, &mut Fake::default()).unwrap()[1].status,
+            WorktreeStatus::CheckoutRemoved
+        );
+
+        let advanced_path = fixture.directory.join("advanced-child");
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                advanced_path.to_str().unwrap(),
+                child_branch,
+            ],
+        )
+        .unwrap();
+        Fixture::commit_at(&advanced_path, "later-child", "new work\n");
+        git(
+            &fixture.main,
+            &["worktree", "remove", advanced_path.to_str().unwrap()],
+        )
+        .unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::NeedsAttention
+        );
+        drop(registry);
+
+        git(
+            &fixture.main,
+            &[
+                "update-ref",
+                &format!("refs/heads/{child_branch}"),
+                &child_tip,
+            ],
+        )
+        .unwrap();
+        fs::create_dir(&child_path).unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::NeedsAttention
+        );
+        drop(registry);
+
+        fs::remove_dir(&child_path).unwrap();
+        git(&fixture.main, &["branch", "-D", BRANCH]).unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn active_child_cannot_merge_without_parent_checkout() {
+        let fixture = Fixture::managed();
+        let child_path = fixture.directory.join("child");
+        let child_branch = "ontrack/child-task";
+        let child = json!({"id":"Bead-1.1", "title":"Child", "parent":"Bead-1"});
+        let mut journal = LaunchJournal::begin(
+            &fixture.main,
+            &child,
+            child_branch,
+            "opencode",
+            "child-task",
+            "wMain",
+        )
+        .unwrap();
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                child_branch,
+                child_path.to_str().unwrap(),
+                BRANCH,
+            ],
+        )
+        .unwrap();
+        let created = json!({"workspace":{"workspace_id":"wChild"},
+            "root_pane":{"pane_id":"wChild:p1"},
+            "worktree":{"path":child_path,"branch":child_branch}});
+        journal.created(&created).unwrap();
+        journal.phase("active").unwrap();
+        drop(journal);
+        Fixture::commit_at(&child_path, "child-task", "child work\n");
+
+        git(
+            &fixture.main,
+            &["worktree", "remove", fixture.source.to_str().unwrap()],
+        )
+        .unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::NeedsAttention
+        );
+        drop(registry);
+        let mut executor = Fake::default();
+        assert!(
+            act_with(
+                &fixture.main,
+                "child-task",
+                Action::RequestMerge,
+                &mut executor
+            )
+            .is_err()
+        );
+        assert!(executor.calls.is_empty());
     }
 
     #[test]
