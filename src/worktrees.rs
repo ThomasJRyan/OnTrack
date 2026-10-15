@@ -18,6 +18,8 @@ use crate::herdr::{Executor, RepositoryIdentity, SystemExecutor, envelope};
 pub struct ManagedWorktree {
     pub id: String,
     pub bead_id: String,
+    /// Herdr accepted the initial prompt and the active phase was persisted.
+    pub handoff_accepted: bool,
     pub branch: String,
     pub target_branch: String,
     pub workspace_id: String,
@@ -512,6 +514,7 @@ fn view(entry: &Value, status: WorktreeStatus, detail: Option<String>) -> Manage
     ManagedWorktree {
         id: string("id"),
         bead_id: string("bead_id"),
+        handoff_accepted: entry["phase"] == "active",
         branch: string("branch"),
         target_branch: string("target_branch"),
         workspace_id: string("workspace_id"),
@@ -1400,9 +1403,18 @@ mod tests {
         );
         drop(journal);
         assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        assert!(!fixture.status().handoff_accepted);
         assert!(
             LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain").is_err()
         );
+    }
+
+    #[test]
+    fn accepted_handoff_is_derived_from_durable_active_phase() {
+        let pending = json!({"id":"wt", "bead_id":"bead", "phase":"initial_prompt_possibly_sent"});
+        let active = json!({"id":"wt", "bead_id":"bead", "phase":"active"});
+        assert!(!view(&pending, WorktreeStatus::NeedsAttention, None).handoff_accepted);
+        assert!(view(&active, WorktreeStatus::Unmerged, None).handoff_accepted);
     }
 
     #[test]

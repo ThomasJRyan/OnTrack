@@ -29,6 +29,8 @@ Issues are shown in rounded, colour-coded panes. Open appears first and closed l
 
 The left pane lists all returned issues, including closed ones, without the CLI's usual list cap. Each entry shows its colour-coded issue type, priority, status, and a white title; IDs remain available in the selected issue's full detail record. The rounded details pane shares the issue list's theme background. It presents narrative fields as Markdown, while metadata, comments, relationships, and unfamiliar nested values remain available as you scroll.
 
+An Open issue shows `· sent` beside its status after Herdr confirms the initial agent prompt and OnTrack saves the handoff. The marker survives refresh and restart through the tracked worktree record. The Beads status still reads Open until the agent changes it; once it changes, the marker disappears. A cancelled handoff or one without confirmed prompt submission does not show the marker. Use `w` to inspect any incomplete or uncertain launch.
+
 | Input | Action |
 | --- | --- |
 | `↑` / `↓` with the list focused | Move through visible issues and collapsed group headers; expanded headers are skipped. Clamp at either end. |

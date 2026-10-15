@@ -71,6 +71,7 @@ pub struct App {
     pub worktrees_error: Option<String>,
     pub worktrees_inflight: bool,
     pub worktrees_discovered: bool,
+    pub worktrees_refresh_pending: bool,
     pub worktree_action_pending: bool,
     pub worktrees_next_refresh: Instant,
     pub notice: Option<String>,
@@ -283,6 +284,7 @@ impl App {
             worktrees_error: None,
             worktrees_inflight: false,
             worktrees_discovered: false,
+            worktrees_refresh_pending: false,
             worktree_action_pending: false,
             worktrees_next_refresh: Instant::now(),
             notice: settings_error,
@@ -673,6 +675,14 @@ impl App {
                         match result {
                             Ok(outcome) => {
                                 self.notice = Some(outcome.message);
+                                // The launch journal is now active. Reload it even if the
+                                // initial worktree scan found no managed handoffs.
+                                if self.worktrees_inflight {
+                                    self.worktrees_refresh_pending = true;
+                                } else {
+                                    self.worktrees_discovered = false;
+                                    self.worktrees_next_refresh = now;
+                                }
                                 if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
                                     modal.finished = true;
                                     modal.scroll = 0;
@@ -711,6 +721,10 @@ impl App {
                             }
                             Err(error) => self.worktrees_error = Some(error.to_string()),
                         }
+                    }
+                    if std::mem::take(&mut self.worktrees_refresh_pending) {
+                        self.worktrees_discovered = false;
+                        self.worktrees_next_refresh = now;
                     }
                 }
                 Response::WorktreeChanged(result) => {
@@ -1508,6 +1522,7 @@ mod tests {
             worktrees_error: None,
             worktrees_inflight: false,
             worktrees_discovered: true,
+            worktrees_refresh_pending: false,
             worktree_action_pending: false,
             worktrees_next_refresh: Instant::now(),
             notice: None,
@@ -1736,6 +1751,8 @@ mod tests {
         a.receive();
         press(&mut a, KeyCode::Enter);
         assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
+        // A snapshot that began before launch must not hide the new handoff.
+        a.worktrees_inflight = true;
         tx.send(Response::Launched(
             seq,
             Ok(LaunchOutcome {
@@ -1745,6 +1762,11 @@ mod tests {
         .unwrap();
         a.receive();
         assert!(!a.mutation_busy);
+        assert!(a.worktrees_refresh_pending);
+        tx.send(Response::Worktrees(Ok(vec![]))).unwrap();
+        a.receive();
+        a.poll_worktrees(Instant::now());
+        assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
         assert_eq!(
             a.notice.as_deref(),
             Some("Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0")
@@ -3468,6 +3490,7 @@ mod tests {
         a.worktrees.push(ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "b1".into(),
+            handoff_accepted: true,
             branch: "ontrack/b1".into(),
             target_branch: "main".into(),
             workspace_id: "ws1".into(),
@@ -3528,6 +3551,7 @@ mod tests {
         let item = ManagedWorktree {
             id: "tracked-closed".into(),
             bead_id: a.beads[0].id.clone(),
+            handoff_accepted: true,
             branch: "ontrack/b0".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),
@@ -3547,6 +3571,7 @@ mod tests {
         let before = ManagedWorktree {
             id: "wt".into(),
             bead_id: "b0".into(),
+            handoff_accepted: true,
             branch: "ontrack/b0".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),

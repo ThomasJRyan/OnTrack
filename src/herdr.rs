@@ -977,9 +977,25 @@ mod tests {
     }
 
     fn cwd() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .unwrap()
+        static MAIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        MAIN.get_or_init(|| {
+            let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(manifest)
+                .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            let common = PathBuf::from(String::from_utf8(output.stdout).unwrap().trim());
+            common
+                .canonicalize()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .to_path_buf()
+        })
+        .clone()
     }
 
     fn identity() -> RepositoryIdentity {
@@ -1538,7 +1554,10 @@ mod tests {
         }
         // Filesystem-only .git markers, not real Git worktrees or config. Cover
         // both a sibling checkout and a nested linked checkout inside main.
-        for base in [std::env::temp_dir(), cwd().join("target")] {
+        for base in [
+            std::env::temp_dir(),
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+        ] {
             let linked = Fixture(base.join(unique_name("linked-fixture")));
             std::fs::create_dir(&linked.0).unwrap();
             std::fs::write(

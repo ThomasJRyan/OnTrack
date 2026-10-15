@@ -554,7 +554,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     } else {
                         bead.status.as_str()
                     };
-                    Line::from(vec![
+                    let handed_off = status == "open"
+                        && app.worktrees.iter().any(|worktree| {
+                            worktree.bead_id == bead.id && worktree.handoff_accepted
+                        });
+                    let mut spans = vec![
                         Span::styled(
                             if selected { "› " } else { "  " },
                             Style::default()
@@ -589,7 +593,14 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             status,
                             Style::default().fg(themed_status_color(status, app.theme)),
                         ),
-                    ])
+                    ];
+                    if handed_off {
+                        spans.push(Span::styled(
+                            " · sent",
+                            Style::default().fg(gold).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    Line::from(spans)
                 } else {
                     Line::from(vec![
                         Span::raw("  "),
@@ -1681,6 +1692,7 @@ mod tests {
             worktrees_error: None,
             worktrees_inflight: false,
             worktrees_discovered: true,
+            worktrees_refresh_pending: false,
             worktree_action_pending: false,
             worktrees_next_refresh: std::time::Instant::now(),
             notice: None,
@@ -1777,6 +1789,27 @@ mod tests {
         for x in ["unknown", "comments", "hello comment", "界", "5"] {
             assert!(s.contains(x), "{x}")
         }
+    }
+
+    #[test]
+    fn open_issue_shows_confirmed_agent_handoff_only() {
+        let mut a = app();
+        a.beads[0].status = "open".into();
+        a.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "wt-1".into(),
+            bead_id: "demo-1".into(),
+            handoff_accepted: false,
+            branch: "ontrack/demo-1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: crate::worktrees::WorktreeStatus::NeedsAttention,
+            detail: None,
+        });
+        assert!(!draw((80, 24), &mut a).0.contains("· sent"));
+        a.worktrees[0].handoff_accepted = true;
+        assert!(draw((80, 24), &mut a).0.contains("open · sent"));
+        a.beads[0].status = "in_progress".into();
+        assert!(!draw((80, 24), &mut a).0.contains("· sent"));
     }
     #[test]
     fn list_and_detail_backgrounds_match_across_themes() {
@@ -2180,6 +2213,7 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "handoff-1".into(),
             bead_id: "closed-1".into(),
+            handoff_accepted: true,
             branch: "ontrack/closed-1".into(),
             target_branch: "main".into(),
             workspace_id: "ws-7".into(),
@@ -2202,6 +2236,7 @@ mod tests {
             app.worktrees.push(crate::worktrees::ManagedWorktree {
                 id: format!("wt-{index}"),
                 bead_id: format!("bead-{index}"),
+                handoff_accepted: true,
                 branch: format!("ontrack/bead-{index}"),
                 target_branch: "main".into(),
                 workspace_id: format!("ws-{index}"),
@@ -2227,6 +2262,7 @@ mod tests {
         state.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "wt-remove".into(),
             bead_id: "b-closed".into(),
+            handoff_accepted: true,
             branch: "ontrack/b".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),
