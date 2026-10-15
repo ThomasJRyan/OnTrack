@@ -2687,6 +2687,7 @@ mod tests {
         use crate::worktrees::{ManagedWorktree, WorktreeStatus};
         let statuses = [
             WorktreeStatus::Reserved,
+            WorktreeStatus::InProgress,
             WorktreeStatus::Unmerged,
             WorktreeStatus::MergeRequested,
             WorktreeStatus::NeedsResolution,
