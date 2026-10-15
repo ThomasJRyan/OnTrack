@@ -2132,6 +2132,34 @@ pub fn group_statuses(beads: &[Bead]) -> Vec<String> {
     groups.dedup();
     groups
 }
+
+/// The visible ancestry of an issue within its status pane, from root to issue.
+/// A parent in another pane (or missing from the list) starts a new visible root.
+pub(crate) fn issue_path(
+    beads: &[Bead],
+    positions: &HashMap<&str, usize>,
+    index: usize,
+) -> Vec<usize> {
+    let status = display_status(&beads[index]);
+    let mut path = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = Some(index);
+    while let Some(i) = current {
+        if !seen.insert(i) {
+            break;
+        }
+        path.push(i);
+        current = beads[i]
+            .data
+            .get("parent")
+            .and_then(|parent| parent.as_str())
+            .and_then(|id| positions.get(id).copied())
+            .filter(|&parent| display_status(&beads[parent]) == status);
+    }
+    path.reverse();
+    path
+}
+
 fn order_worktrees(items: &mut [ManagedWorktree]) {
     let positions: HashMap<_, _> = items
         .iter()
@@ -2158,18 +2186,24 @@ fn order_worktrees(items: &mut [ManagedWorktree]) {
 }
 
 pub fn list_layout(beads: &[Bead], collapsed: &HashSet<String>) -> ListLayout {
+    let positions = beads
+        .iter()
+        .enumerate()
+        .map(|(index, bead)| (bead.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
     let mut layout = ListLayout {
         groups: Vec::new(),
         targets: Vec::new(),
         height: 0,
     };
     for status in group_statuses(beads) {
-        let indices = beads
+        let mut indices = beads
             .iter()
             .enumerate()
             .filter(|(_, b)| display_status(b) == status)
             .map(|(i, _)| i)
             .collect::<Vec<_>>();
+        indices.sort_by_cached_key(|&index| issue_path(beads, &positions, index));
         let is_collapsed = collapsed.contains(&status);
         let y = layout.height;
         let height = if is_collapsed {
@@ -2292,6 +2326,69 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["parent", "child", "grandchild", "other"]
         );
+    }
+
+    #[test]
+    fn issue_layout_groups_children_under_visible_parents() {
+        let bead = |id: &str, parent: Option<&str>, status: &str| Bead {
+            id: id.into(),
+            title: id.into(),
+            status: status.into(),
+            priority: 2,
+            data: json!({"parent": parent}),
+        };
+        // Input is ID order, like the refreshed list. A child can precede its parent.
+        let beads = vec![
+            bead("a-child", Some("z-parent"), "open"),
+            bead("b-grandchild", Some("a-child"), "open"),
+            bead("c-other", None, "open"),
+            bead("d-detached", Some("z-parent"), "closed"),
+            bead("e-orphan", Some("missing"), "open"),
+            bead("z-parent", None, "open"),
+        ];
+        let layout = list_layout(&beads, &HashSet::new());
+        let open = layout
+            .groups
+            .iter()
+            .find(|group| group.status == "open")
+            .unwrap();
+        assert_eq!(open.indices, [2, 4, 5, 0, 1]);
+        let closed = layout
+            .groups
+            .iter()
+            .find(|group| group.status == "closed")
+            .unwrap();
+        assert_eq!(closed.indices, [3]);
+        let positions = beads
+            .iter()
+            .enumerate()
+            .map(|(index, bead)| (bead.id.as_str(), index))
+            .collect();
+        assert_eq!(issue_path(&beads, &positions, 1), [5, 0, 1]);
+        assert_eq!(issue_path(&beads, &positions, 3), [3]);
+        assert_eq!(issue_path(&beads, &positions, 4), [4]);
+
+        let mut app = app();
+        app.beads = beads;
+        app.collapsed.clear();
+        app.selected = Some(5);
+        app.step(1);
+        assert_eq!(app.selected, Some(0));
+        app.step(1);
+        assert_eq!(app.selected, Some(1));
+        app.list_rect = Rect::new(5, 7, 40, 24);
+        let parent_row = list_layout(&app.beads, &app.collapsed)
+            .targets
+            .iter()
+            .find(|target| target.row == DisplayRow::Bead(5))
+            .unwrap()
+            .y;
+        app.mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            6,
+            7 + parent_row as u16,
+        );
+        assert_eq!(app.selected, Some(5));
     }
     fn app() -> App {
         let (tx, _rx) = mpsc::channel();
