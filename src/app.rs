@@ -4029,6 +4029,32 @@ mod tests {
         assert!(!a.worktrees_view);
     }
     #[test]
+    fn tracked_worktree_reconciles_with_cleanup_preferences_disabled() {
+        let (mut app, rx, _) = connected_app();
+        app.worktrees_discovered = true;
+        app.worktrees.push(ManagedWorktree {
+            id: "tracked".into(),
+            bead_id: "bead".into(),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/task".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        });
+        app.poll_worktrees(Instant::now());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Request::ReconcileWorktrees(CleanupPolicy {
+                auto_merge: false,
+                auto_close_workspace: false,
+                auto_remove_checkout: false,
+            }))
+        ));
+    }
+    #[test]
     fn closed_bead_does_not_remove_its_managed_worktree() {
         let (mut a, _, tx) = connected_app();
         a.beads[0].status = "closed".into();

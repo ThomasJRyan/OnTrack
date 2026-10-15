@@ -531,6 +531,18 @@ fn view(entry: &Value, status: WorktreeStatus, detail: Option<String>) -> Manage
     }
 }
 
+fn checkout_missing(entry: &Value) -> io::Result<bool> {
+    let path = Path::new(field(entry, "path")?);
+    if !path.is_absolute() {
+        return Err(error("Recorded checkout path is not absolute"));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
 fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
     use WorktreeStatus::*;
     if entry["phase"] != "active" {
@@ -548,6 +560,17 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
         );
     }
     if entry["checkout_removed"] == true {
+        if entry["checkout_removed_externally"] == true {
+            return match checkout_missing(entry) {
+                Ok(true) => view(entry, CheckoutRemoved, None),
+                Ok(false) => view(
+                    entry,
+                    NeedsAttention,
+                    Some("Removed checkout path exists again; identity requires inspection".into()),
+                ),
+                Err(e) => view(entry, NeedsAttention, Some(e.to_string())),
+            };
+        }
         let check = (|| {
             let target = default_branch(repo)?;
             if target != field(entry, "target_branch")? {
@@ -1143,6 +1166,14 @@ fn reconcile_with(
             // it NEVER retries the close/remove command.
             if registry.entries[index]["cleanup_pending"].is_string() {
                 return confirm_cleanup(&mut registry, index, executor);
+            }
+            // External removal is a checkout-existence observation, not a
+            // claim that the preserved source branch was integrated.
+            if checkout_missing(&registry.entries[index])? {
+                registry.entries[index]["checkout_removed"] = json!(true);
+                registry.entries[index]["checkout_removed_externally"] = json!(true);
+                registry.save()?;
+                return Ok(());
             }
             let status = inspect(&registry.repo, &registry.entries[index]).status;
             if matches!(status, WorktreeStatus::MergeRequested) {
@@ -1874,6 +1905,65 @@ mod tests {
                 .any(|s| s == "--force" || s == "--group" || s == "close")
         );
         assert!(tip(&fixture.main, &format!("refs/heads/{BRANCH}")).is_ok());
+    }
+
+    #[test]
+    fn reconcile_records_externally_removed_checkout_without_cleanup_commands() {
+        for git_removal in [true, false] {
+            let fixture = Fixture::managed();
+            Fixture::commit_at(&fixture.source, "task", "unmerged work\n");
+            let source_tip = tip(&fixture.source, "HEAD").unwrap();
+            if git_removal {
+                git(
+                    &fixture.main,
+                    &["worktree", "remove", fixture.source.to_str().unwrap()],
+                )
+                .unwrap();
+            } else {
+                fs::remove_dir_all(&fixture.source).unwrap();
+            }
+
+            let mut executor = Fake::default();
+            let rows =
+                reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+            assert_eq!(rows[0].status, WorktreeStatus::CheckoutRemoved);
+            assert!(executor.calls.is_empty());
+            assert_eq!(
+                tip(&fixture.main, &format!("refs/heads/{BRANCH}")).unwrap(),
+                source_tip
+            );
+            let registry = Registry::open(&fixture.main).unwrap();
+            assert_eq!(registry.entries[0]["checkout_removed"], true);
+            assert_eq!(registry.entries[0]["checkout_removed_externally"], true);
+            drop(registry);
+
+            assert_eq!(fixture.status().status, WorktreeStatus::CheckoutRemoved);
+            assert_eq!(
+                reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap()[0]
+                    .status,
+                WorktreeStatus::CheckoutRemoved
+            );
+            fs::create_dir(&fixture.source).unwrap();
+            assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        }
+    }
+
+    #[test]
+    fn reconcile_keeps_present_or_invalid_checkout_paths_visible() {
+        let fixture = Fixture::managed();
+        let mut executor = Fake::default();
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::Unmerged);
+        assert!(executor.calls.is_empty());
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["checkout_removed"], false);
+        registry.entries[0]["path"] = json!("relative/checkout");
+        registry.save().unwrap();
+        drop(registry);
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::NeedsAttention);
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["checkout_removed"], false);
     }
 
     #[test]

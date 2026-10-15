@@ -166,6 +166,15 @@ retains those records, and `NeedsAttention` rows remain visible when inspection
 finds a problem after removal. Selection clamps to a remaining row or the empty
 state. Accepted handoff IDs are retained separately from visible rows so an Open
 Bead's `· sent` marker still reflects its confirmed handoff.
+The existing periodic reconciliation checks the recorded path of each active
+handoff before considering automatic actions. A confirmed missing path sets
+`checkout_removed` and `checkout_removed_externally` in the registry even when
+cleanup preferences are off; it does not call Herdr, remove a Git branch, or
+claim that branch was integrated. An invalid path or filesystem inspection
+error is retained as `NeedsAttention`. A pending cleanup operation still uses
+its existing read-only confirmation before this check. External-removal records
+remain removed across restarts while the path is absent; if it reappears, they
+surface as `NeedsAttention` for identity review.
 The launch journal stores the authoritative Bead title and description before
 Herdr creates a worktree. The right pane prefers current text from the already
 refreshed Beads list and falls back to this registry snapshot after Bead removal
