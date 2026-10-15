@@ -168,7 +168,7 @@ fn launch_with(
         )));
     }
     let prompt = format!(
-        "Create actionable direct child Beads for Epic {epic_id} from the proposal below. Read AGENTS.md and CLAUDE.md first. Use bd create with --parent={epic_id} for each child; give each task a useful description and acceptance criteria. Do not implement the tasks. Verify at least one direct child exists. Report the child IDs and then finish your turn. The OnTrack parent process will verify and close this workspace; if it is no longer running, close only this workspace ({}) after verification.\n\nProposal:\n{proposal}",
+        "Create actionable direct child Beads for Epic {epic_id} from the proposal below. Read AGENTS.md and CLAUDE.md first. Use bd create with --parent={epic_id} for each child; give each task a useful description and acceptance criteria. Choose a Beads priority for each child on the P0-P4 scale (P0 highest, P4 lowest), comparing the tasks by impact, urgency, and which work enables other tasks. Pass --priority=N explicitly on every bd create. Make meaningful priority distinctions when the proposal supports them instead of assigning every child the same default priority. Equal priorities are fine when tasks are genuinely comparable or the proposal gives too little evidence; do not invent urgency just to vary the numbers. Do not implement the tasks. Verify at least one direct child exists. Report the child IDs and then finish your turn. The OnTrack parent process will verify and close this workspace; if it is no longer running, close only this workspace ({}) after verification.\n\nProposal:\n{proposal}",
         session.workspace_id
     );
     // Wait for the server to observe this prompt's working state before a
@@ -216,30 +216,52 @@ fn finish_with(
     session: &Session,
     epic_id: &str,
 ) -> io::Result<Vec<String>> {
-    let waited = result(
-        &backend.herdr(&[
-            "agent",
-            "wait",
-            &session.pane_id,
-            "--until",
-            "done",
-            "--until",
-            "idle",
-            "--until",
-            "blocked",
-        ])?,
-        "agent_info",
-    )?;
-    if waited["agent"]["pane_id"] != session.pane_id
-        || waited["agent"]["workspace_id"] != session.workspace_id
-        || !matches!(
-            waited["agent"]["agent_status"].as_str(),
-            Some("done" | "idle")
-        )
-    {
-        return Err(invalid(
-            "Herdr wait returned a different agent or unfinished state",
-        ));
+    match backend.herdr(&[
+        "agent",
+        "wait",
+        &session.pane_id,
+        "--until",
+        "done",
+        "--until",
+        "idle",
+        "--until",
+        "blocked",
+    ]) {
+        Ok(bytes) => {
+            let waited = result(&bytes, "agent_info")?;
+            if waited["agent"]["pane_id"] != session.pane_id
+                || waited["agent"]["workspace_id"] != session.workspace_id
+                || !matches!(
+                    waited["agent"]["agent_status"].as_str(),
+                    Some("done" | "idle")
+                )
+            {
+                return Err(invalid(
+                    "Herdr wait returned a different agent or unfinished state",
+                ));
+            }
+        }
+        Err(wait_error) => {
+            // An agent may exit after completing the prompt, removing its name
+            // before Herdr can return a settled state. Confirm that the same
+            // pane is still present and has no replacement agent.
+            let pane = result(
+                &backend.herdr(&["pane", "get", &session.pane_id])?,
+                "pane_info",
+            )?;
+            if pane["pane"]["pane_id"] != session.pane_id
+                || pane["pane"]["workspace_id"] != session.workspace_id
+                || !pane["pane"]["agent"].is_null()
+                || !pane["pane"]["agent_status"].is_null()
+            {
+                return Err(io::Error::new(
+                    wait_error.kind(),
+                    format!(
+                        "Herdr agent wait failed and the planning pane is not empty: {wait_error}"
+                    ),
+                ));
+            }
+        }
     }
     let children = backend.children(epic_id)?;
     if children.is_empty() {
@@ -268,7 +290,7 @@ mod tests {
     use std::collections::VecDeque;
 
     struct Mock {
-        responses: VecDeque<Vec<u8>>,
+        responses: VecDeque<io::Result<Vec<u8>>>,
         calls: Vec<Vec<String>>,
         children: Vec<String>,
     }
@@ -278,7 +300,7 @@ mod tests {
             Self {
                 responses: responses
                     .into_iter()
-                    .map(|value| json!({"result": value}).to_string().into_bytes())
+                    .map(|value| Ok(json!({"result": value}).to_string().into_bytes()))
                     .collect(),
                 calls: Vec::new(),
                 children: children.into_iter().map(str::to_owned).collect(),
@@ -292,7 +314,7 @@ mod tests {
                 .push(args.iter().map(|arg| (*arg).to_owned()).collect());
             self.responses
                 .pop_front()
-                .ok_or_else(|| invalid("No mock response"))
+                .unwrap_or_else(|| Err(invalid("No mock response")))
         }
 
         fn show(&mut self, _id: &str) -> io::Result<Value> {
@@ -357,6 +379,14 @@ mod tests {
         );
         assert!(backend.calls[5][3].contains("--parent=epic-1"));
         assert!(backend.calls[5][3].contains("A large proposal"));
+        assert!(backend.calls[5][3].contains("useful description and acceptance criteria"));
+        assert!(backend.calls[5][3].contains("P0-P4 scale (P0 highest, P4 lowest)"));
+        assert!(
+            backend.calls[5][3].contains("impact, urgency, and which work enables other tasks")
+        );
+        assert!(backend.calls[5][3].contains("--priority=N explicitly on every bd create"));
+        assert!(backend.calls[5][3].contains("meaningful priority distinctions"));
+        assert!(backend.calls[5][3].contains("Equal priorities are fine"));
         assert_eq!(&backend.calls[5][4..], ["--wait", "--until", "working"]);
     }
 
@@ -383,5 +413,65 @@ mod tests {
         let mut blocked = Mock::new(vec![blocked], vec!["epic-1.1"]);
         assert!(finish_with(&mut blocked, &session, "epic-1").is_err());
         assert_eq!(blocked.calls.len(), 1);
+    }
+
+    #[test]
+    fn exited_agent_with_direct_children_closes_planning_workspace() {
+        let session = Session {
+            workspace_id: "wEpic".into(),
+            pane_id: "wEpic:p1".into(),
+        };
+        let empty_pane =
+            json!({"type":"pane_info","pane":{"workspace_id":"wEpic","pane_id":"wEpic:p1"}});
+        let closed = json!({"type":"workspace_closed","workspace_id":"wEpic"});
+        let mut backend = Mock::new(vec![empty_pane, closed], vec!["epic-1.1"]);
+        backend
+            .responses
+            .push_front(Err(io::Error::other("agent exited")));
+
+        assert_eq!(
+            finish_with(&mut backend, &session, "epic-1").unwrap(),
+            ["epic-1.1"]
+        );
+        assert_eq!(backend.calls[1], ["pane", "get", "wEpic:p1"]);
+        assert_eq!(backend.calls[2], ["workspace", "close", "wEpic"]);
+    }
+
+    #[test]
+    fn exited_agent_without_children_or_intact_empty_pane_stays_open() {
+        let session = Session {
+            workspace_id: "wEpic".into(),
+            pane_id: "wEpic:p1".into(),
+        };
+        let empty_pane =
+            json!({"type":"pane_info","pane":{"workspace_id":"wEpic","pane_id":"wEpic:p1"}});
+        let mut no_children = Mock::new(vec![empty_pane.clone()], vec![]);
+        no_children
+            .responses
+            .push_front(Err(io::Error::other("agent exited")));
+        assert!(finish_with(&mut no_children, &session, "epic-1").is_err());
+        assert_eq!(no_children.calls.len(), 2);
+
+        for pane in [
+            json!({"type":"pane_info","pane":{"workspace_id":"wOther","pane_id":"wEpic:p1"}}),
+            json!({"type":"pane_info","pane":{"workspace_id":"wEpic","pane_id":"wEpic:p1","agent":"codex","agent_status":"idle"}}),
+        ] {
+            let mut unsafe_pane = Mock::new(vec![pane], vec!["epic-1.1"]);
+            unsafe_pane
+                .responses
+                .push_front(Err(io::Error::other("agent exited")));
+            assert!(finish_with(&mut unsafe_pane, &session, "epic-1").is_err());
+            assert_eq!(unsafe_pane.calls.len(), 2);
+        }
+
+        let mut missing_pane = Mock::new(vec![], vec!["epic-1.1"]);
+        missing_pane
+            .responses
+            .push_back(Err(io::Error::other("agent exited")));
+        missing_pane
+            .responses
+            .push_back(Err(io::Error::other("pane not found")));
+        assert!(finish_with(&mut missing_pane, &session, "epic-1").is_err());
+        assert_eq!(missing_pane.calls.len(), 2);
     }
 }

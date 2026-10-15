@@ -7,6 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
+use std::collections::HashMap;
 use std::time::Duration;
 #[cfg(test)]
 const MUTED: Color = Color::Rgb(123, 144, 148);
@@ -639,6 +640,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     app.list_rect = split[0];
     app.detail_rect = split[1];
     let layout = crate::app::list_layout(&app.beads, &app.collapsed);
+    let bead_positions = app
+        .beads
+        .iter()
+        .enumerate()
+        .map(|(index, bead)| (bead.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
     let (type_width, priority_width) = metadata_column_widths(&app.beads);
     let viewport = split[0].height as usize;
     let focused_target = app
@@ -806,8 +813,22 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     }
                     Line::from(spans)
                 } else {
+                    let path = crate::app::issue_path(&app.beads, &bead_positions, i);
+                    let depth = path.len().saturating_sub(1);
+                    let width = split[0].width.saturating_sub(2) as usize;
+                    let parent = bead.data.get("parent").and_then(|value| value.as_str());
+                    let prefix = if depth > 0 {
+                        format!("{}↳ ", "  ".repeat(depth.min(width.saturating_sub(4) / 2)))
+                    } else if let Some(parent) = parent.filter(|parent| !parent.trim().is_empty()) {
+                        format!(
+                            "  ↳ {} · ",
+                            truncate_display(parent, width.saturating_sub(8) / 2)
+                        )
+                    } else {
+                        "  ".to_owned()
+                    };
                     Line::from(vec![
-                        Span::raw("  "),
+                        Span::raw(prefix),
                         Span::styled(bead.title.clone(), Style::default().fg(ink)),
                     ])
                 };
@@ -831,7 +852,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         .map(|v| crate::detail::render(v, selected_title, inner_width))
         .unwrap_or_else(|| {
             ratatui::text::Text::from(if app.beads.is_empty() {
-                "No issues found in this workspace.\n\nPress r to refresh."
+                "No issues found in this workspace.\n\nThe issue list refreshes automatically."
             } else {
                 "Select an issue to inspect its full record."
             })
@@ -1728,7 +1749,7 @@ fn footer_text(state: &str, width: usize) -> String {
     // long status/error cannot push create, delete, or handoff offscreen. At
     // narrow widths, spend the remaining cells on the start of the status and
     // mark its truncation rather than letting Ratatui clip the actions.
-    let actions = " · n new · e edit · d delete · h hand off · r refresh · q quit";
+    let actions = " · n new · e edit · d delete · h hand off · r ready · q quit";
     let state_width = width.saturating_sub(1 + Span::raw(actions).width());
     let state = truncate_display(state, state_width);
     let core = if state.is_empty() {
@@ -2065,6 +2086,49 @@ mod tests {
         };
         assert!(row(app.list_rect.y + 1).contains("› parent"));
         assert!(row(app.list_rect.y + 3).contains("    child"));
+    }
+    #[test]
+    fn issue_rows_indent_nested_children_and_identify_split_parents() {
+        let mut app = app();
+        let bead = |id: &str, title: &str, parent: Option<&str>, status: &str| Bead {
+            id: id.into(),
+            title: title.into(),
+            status: status.into(),
+            priority: 2,
+            data: json!({"issue_type": "task", "parent": parent}),
+        };
+        app.beads = vec![
+            bead("child", "Child", Some("parent"), "open"),
+            bead("grandchild", "Grandchild", Some("child"), "open"),
+            bead("parent", "Parent", None, "open"),
+            bead("split", "Split child", Some("parent"), "closed"),
+        ];
+        app.selected = Some(2);
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        terminal
+            .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
+            .unwrap();
+        let layout = crate::app::list_layout(&app.beads, &app.collapsed);
+        let row = |index: usize| {
+            let target = layout
+                .targets
+                .iter()
+                .find(|target| target.row == DisplayRow::Bead(index))
+                .unwrap();
+            let y = app.list_rect.y + (target.y + 1 - app.list_offset) as u16;
+            (0..app.list_rect.width)
+                .map(|x| terminal.backend().buffer()[(app.list_rect.x + x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(2).contains("  Parent"));
+        assert!(row(0).contains("  ↳ Child"));
+        assert!(row(1).contains("    ↳ Grandchild"));
+        assert!(row(3).contains("↳ parent · Split child"));
+
+        let mut compact = Terminal::new(TestBackend::new(40, 16)).unwrap();
+        compact
+            .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
+            .unwrap();
     }
     fn app() -> App {
         let (tx, _) = mpsc::channel();
@@ -2800,7 +2864,7 @@ mod tests {
     fn footer_keeps_mutation_and_handoff_shortcuts_ahead_of_optional_navigation() {
         for width in [64, 90, 120] {
             let footer = footer_text("LIST ERROR · current failure", width);
-            for action in ["n new", "d delete", "h hand off", "r refresh", "q quit"] {
+            for action in ["n new", "d delete", "h hand off", "r ready", "q quit"] {
                 assert!(
                     footer.contains(action),
                     "{action} missing at width {width}: {footer}"
