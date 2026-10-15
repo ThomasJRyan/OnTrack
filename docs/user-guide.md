@@ -78,7 +78,7 @@ In the `w` view, select a handoff with Up / Down and press Enter to switch to it
 
 Once OnTrack verifies checkout removal, that handoff leaves the `w` view immediately and stays hidden after refresh or restart. The record remains in the local registry. If later checks find a new problem, its `NEEDS ATTENTION` status makes it visible again. A closed Herdr workspace with its checkout still present remains visible.
 
-Worktree statuses appear as coloured labels in both the list and details. Merge Pending uses the theme warning colour, Integrated uses success, and states needing attention use danger. Other labels use the theme's info, secondary accent, or muted colours. The words remain visible, including when a row is selected, so colour is not the only state cue.
+Worktree statuses appear as coloured text in both the list and details, on the pane's normal background. Merge Pending uses the theme warning colour, Integrated uses success, and states needing attention use danger. Other labels use the theme's info, secondary accent, or muted colours. The words remain visible, including when a row is selected, so colour is not the only state cue.
 
 During a requested merge, Git may briefly contain unresolved files or the target branch may advance while the agent is still working. When Herdr confirms the recorded agent is working, OnTrack keeps the label at `MERGE PENDING` and shows the Git concern in the details. If the agent is idle, done, blocked, or cannot be verified, the same unresolved Git state shows `NEEDS RESOLUTION`. That label calls for inspection; it does not mean OnTrack has verified that the agent failed. A pending label does not make the worktree eligible for integration or cleanup.
 

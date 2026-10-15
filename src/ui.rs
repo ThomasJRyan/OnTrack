@@ -83,27 +83,8 @@ fn themed_priority_color(priority: u64, theme: Theme) -> Color {
     crate::theme::priority_color(theme, priority)
 }
 fn worktree_status_style(theme: Theme, status: crate::worktrees::WorktreeStatus) -> Style {
-    let color = crate::theme::worktree_status_color(theme, status);
-    let Color::Rgb(red, green, blue) = color else {
-        return Style::default().fg(color).add_modifier(Modifier::BOLD);
-    };
-    let channel = |value: u8| {
-        let value = f64::from(value) / 255.0;
-        if value <= 0.04045 {
-            value / 12.92
-        } else {
-            ((value + 0.055) / 1.055).powf(2.4)
-        }
-    };
-    let luminance = 0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue);
-    let foreground = if luminance > 0.179 {
-        Color::Black
-    } else {
-        Color::White
-    };
     Style::default()
-        .fg(foreground)
-        .bg(color)
+        .fg(crate::theme::worktree_status_color(theme, status))
         .add_modifier(Modifier::BOLD)
 }
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
@@ -2271,7 +2252,7 @@ mod tests {
         assert!(screen.contains("Git integration"));
     }
     #[test]
-    fn worktree_status_badges_use_theme_colours_in_list_and_detail() {
+    fn worktree_status_text_uses_theme_colours_in_list_and_detail() {
         use crate::worktrees::{ManagedWorktree, WorktreeStatus};
         let statuses = [
             WorktreeStatus::Unmerged,
@@ -2323,40 +2304,32 @@ mod tests {
             for status in statuses {
                 let label = crate::app::worktree_status_label(status);
                 let (x, y) = locate(buffer, app.list_rect, label);
-                let cell = &buffer[(x, y)];
-                assert_eq!(cell.bg, crate::theme::worktree_status_color(theme, status));
-                assert!(matches!(cell.fg, Color::Black | Color::White));
-                assert!(cell.modifier.contains(Modifier::BOLD));
+                for offset in 0..label.len() as u16 {
+                    let cell = &buffer[(x + offset, y)];
+                    assert_eq!(cell.fg, crate::theme::worktree_status_color(theme, status));
+                    assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel);
+                    assert!(cell.modifier.contains(Modifier::BOLD));
+                }
             }
-            let selected = statuses[0];
-            let (x, y) = locate(
-                buffer,
-                app.detail_rect,
-                crate::app::worktree_status_label(selected),
-            );
-            assert_eq!(
-                buffer[(x, y)].bg,
-                crate::theme::worktree_status_color(theme, selected)
-            );
             assert_eq!(
                 buffer[(app.list_rect.x + 1, app.list_rect.y + 1)].bg,
                 crate::theme::definition(theme).palette.selected_background
             );
-            app.selected_worktree = 3;
-            terminal
-                .draw(|f| render(f, Duration::from_secs(2), &mut app))
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            let integrated = WorktreeStatus::Integrated;
-            let (x, y) = locate(
-                buffer,
-                app.detail_rect,
-                crate::app::worktree_status_label(integrated),
-            );
-            assert_eq!(
-                buffer[(x, y)].bg,
-                crate::theme::worktree_status_color(theme, integrated)
-            );
+            for (index, status) in statuses.into_iter().enumerate() {
+                app.selected_worktree = index;
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let label = crate::app::worktree_status_label(status);
+                let (x, y) = locate(buffer, app.detail_rect, label);
+                for offset in 0..label.len() as u16 {
+                    let cell = &buffer[(x + offset, y)];
+                    assert_eq!(cell.fg, crate::theme::worktree_status_color(theme, status));
+                    assert_eq!(cell.bg, crate::theme::definition(theme).palette.background);
+                    assert!(cell.modifier.contains(Modifier::BOLD));
+                }
+            }
         }
     }
     #[test]
