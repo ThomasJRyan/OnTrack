@@ -19,7 +19,7 @@ cargo run
 
 To browse another workspace, build with `cargo build`, change to that workspace, and launch the built binary using its absolute path. The launch directory, not the binary's location, determines which workspace `bd` uses. Do not launch the interactive application in a runner without a terminal.
 
-Before opening the terminal interface, OnTrack runs non-interactive `bd init --init-if-missing`. If `bd` is missing or initialization fails, OnTrack exits with an error naming the launch directory; install or repair `bd`, then retry. This startup step does not replace project agent instructions or install Beads hooks.
+Before opening the terminal interface, OnTrack runs non-interactive `bd init --init-if-missing`, then sets `export.auto` to `false` in the active Beads workspace. This also disables issue JSONL auto-export in an existing or inherited workspace where it was enabled. If `bd` is missing or either step fails, OnTrack exits with an error naming the launch directory; check `bd` and workspace permissions, then retry. Startup does not replace project agent instructions or install Beads hooks.
 
 A brief splash precedes the browser. A terminal-drawn anime girl blinks and waves beneath the ONTRACK wordmark; narrower terminals use a compact title, and very small terminals show text only. The animation lasts about 1.2 seconds and uses the selected theme. Issue loading starts in the background; quit keys work during startup too.
 

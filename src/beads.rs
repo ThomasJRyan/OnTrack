@@ -89,6 +89,7 @@ const INIT_ARGS: &[&str] = &[
     "--skip-hooks",
     "--quiet",
 ];
+const DISABLE_EXPORT_ARGS: &[&str] = &["--no-color", "config", "set", "export.auto", "false"];
 
 /// Ensure the launch directory can use Beads before the terminal enters raw mode.
 pub fn ensure_workspace() -> io::Result<()> {
@@ -106,13 +107,22 @@ fn ensure_workspace_in(directory: &Path) -> io::Result<()> {
 
 fn ensure_workspace_in_with(
     directory: &Path,
-    execute: impl FnOnce(&Path, &[&str]) -> io::Result<Output>,
+    mut execute: impl FnMut(&Path, &[&str]) -> io::Result<Output>,
 ) -> io::Result<()> {
     run_bd_with(INIT_ARGS, |args| execute(directory, args)).map_err(|error| {
         io::Error::new(
             error.kind(),
             format!(
                 "Could not initialize Beads for {}: {error}. Install or check bd, then retry",
+                directory.display()
+            ),
+        )
+    })?;
+    run_bd_with(DISABLE_EXPORT_ARGS, |args| execute(directory, args)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Could not disable Beads issue export for {}: {error}. Check bd and workspace permissions, then retry",
                 directory.display()
             ),
         )
@@ -543,16 +553,50 @@ mod tests {
         ensure_workspace_in(&directory).unwrap();
         assert!(directory.join(".beads").is_dir());
         assert!(!directory.join("AGENTS.md").exists());
+        assert_eq!(config_value(&directory, "export.auto"), "false");
 
         let marker = directory.join(".beads/ontrack-marker");
         std::fs::write(&marker, b"keep").unwrap();
+        set_config(&directory, "export.auto", "true");
+        set_config(&directory, "list.limit", "17");
         ensure_workspace_in(&directory).unwrap();
         assert_eq!(std::fs::read(&marker).unwrap(), b"keep");
+        assert_eq!(config_value(&directory, "export.auto"), "false");
+        assert_eq!(config_value(&directory, "list.limit"), "17");
 
         let nested = directory.join("nested");
         std::fs::create_dir(&nested).unwrap();
+        set_config(&directory, "export.auto", "true");
         ensure_workspace_in(&nested).unwrap();
         assert!(!nested.join(".beads").exists());
+        assert_eq!(config_value(&directory, "export.auto"), "false");
+    }
+
+    fn config_value(directory: &Path, key: &str) -> String {
+        let output = Command::new("bd")
+            .args(["config", "get", key])
+            .current_dir(directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn set_config(directory: &Path, key: &str, value: &str) {
+        let output = Command::new("bd")
+            .args(["config", "set", key, value])
+            .current_dir(directory)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -567,6 +611,50 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(error.to_string().contains("/missing-workspace"));
         assert!(error.to_string().contains("Install or check bd"));
+    }
+
+    #[test]
+    fn startup_does_not_configure_export_when_init_fails() {
+        let directory = Path::new("/missing-workspace");
+        let mut calls = 0;
+        let error = ensure_workspace_in_with(directory, |actual_directory, args| {
+            calls += 1;
+            assert_eq!(actual_directory, directory);
+            assert_eq!(args, INIT_ARGS);
+            Err(io::Error::other("init denied"))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains("init denied"));
+    }
+
+    #[test]
+    fn startup_reports_export_config_failure() {
+        let directory = Path::new("/read-only-workspace");
+        let mut calls = 0;
+        let error = ensure_workspace_in_with(directory, |actual_directory, args| {
+            calls += 1;
+            assert_eq!(actual_directory, directory);
+            match calls {
+                1 => assert_eq!(args, INIT_ARGS),
+                2 => assert_eq!(args, DISABLE_EXPORT_ARGS),
+                _ => panic!("unexpected bd invocation"),
+            }
+            if calls == 2 {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "config denied",
+                ))
+            } else {
+                Command::new("true").output()
+            }
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("/read-only-workspace"));
+        assert!(error.to_string().contains("config denied"));
+        assert!(error.to_string().contains("workspace permissions"));
     }
 
     #[test]
