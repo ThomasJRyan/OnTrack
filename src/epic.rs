@@ -168,7 +168,7 @@ fn launch_with(
         )));
     }
     let prompt = format!(
-        "Create actionable direct child Beads for Epic {epic_id} from the proposal below. Read AGENTS.md and CLAUDE.md first. Use bd create with --parent={epic_id} for each child; give each task a useful description and acceptance criteria. Do not implement the tasks. Verify at least one direct child exists. Report the child IDs and then finish your turn. The OnTrack parent process will verify and close this workspace; if it is no longer running, close only this workspace ({}) after verification.\n\nProposal:\n{proposal}",
+        "Create actionable direct child Beads for Epic {epic_id} from the proposal below. Read AGENTS.md and CLAUDE.md first. Use bd create with --parent={epic_id} for each child; give each task a useful description and acceptance criteria. Choose a Beads priority for each child on the P0-P4 scale (P0 highest, P4 lowest), comparing the tasks by impact, urgency, and which work enables other tasks. Pass --priority=N explicitly on every bd create. Make meaningful priority distinctions when the proposal supports them instead of assigning every child the same default priority. Equal priorities are fine when tasks are genuinely comparable or the proposal gives too little evidence; do not invent urgency just to vary the numbers. Do not implement the tasks. Verify at least one direct child exists. Report the child IDs and then finish your turn. The OnTrack parent process will verify and close this workspace; if it is no longer running, close only this workspace ({}) after verification.\n\nProposal:\n{proposal}",
         session.workspace_id
     );
     // Wait for the server to observe this prompt's working state before a
@@ -357,6 +357,14 @@ mod tests {
         );
         assert!(backend.calls[5][3].contains("--parent=epic-1"));
         assert!(backend.calls[5][3].contains("A large proposal"));
+        assert!(backend.calls[5][3].contains("useful description and acceptance criteria"));
+        assert!(backend.calls[5][3].contains("P0-P4 scale (P0 highest, P4 lowest)"));
+        assert!(
+            backend.calls[5][3].contains("impact, urgency, and which work enables other tasks")
+        );
+        assert!(backend.calls[5][3].contains("--priority=N explicitly on every bd create"));
+        assert!(backend.calls[5][3].contains("meaningful priority distinctions"));
+        assert!(backend.calls[5][3].contains("Equal priorities are fine"));
         assert_eq!(&backend.calls[5][4..], ["--wait", "--until", "working"]);
     }
 
