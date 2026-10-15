@@ -33,6 +33,7 @@ pub struct ManagedWorktree {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeStatus {
     Reserved,
+    InProgress,
     Unmerged,
     MergeRequested,
     NeedsResolution,
@@ -771,7 +772,7 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
         return view(
             entry,
             if verified.source_tip == entry["base"] {
-                Unmerged
+                InProgress
             } else {
                 NeedsAttention
             },
@@ -931,6 +932,19 @@ fn inspect_for_display(
     executor: &mut impl Executor,
 ) -> ManagedWorktree {
     let mut item = inspect(repo, entry);
+    if item.status == WorktreeStatus::Unmerged {
+        // Git can identify outstanding commits, but cannot tell whether the
+        // original task is finished. A closed Bead plus a settled matching
+        // agent provides the display's completion evidence.
+        let complete = executor
+            .show_bead(&item.bead_id)
+            .is_ok_and(|bead| bead["id"] == item.bead_id && bead["status"] == "closed")
+            && settled(executor, entry, true).is_ok();
+        if !complete {
+            item.status = WorktreeStatus::InProgress;
+        }
+        return item;
+    }
     if item.status != WorktreeStatus::NeedsResolution || !entry["merge_request"].is_object() {
         return item;
     }
@@ -1693,7 +1707,10 @@ mod tests {
             .status,
             WorktreeStatus::MergeRequested
         );
-        let mut finish = Fake::default();
+        let mut finish = Fake {
+            bead: Some(json!({"id":"Bead-1","status":"open"})),
+            ..Fake::default()
+        };
         finish.json(agent);
         let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut finish).unwrap();
         assert_eq!(rows[1].status, WorktreeStatus::Integrated);
@@ -2648,7 +2665,7 @@ mod tests {
         let fixture = Fixture::managed();
         let mut executor = Fake::default();
         let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
-        assert_eq!(rows[0].status, WorktreeStatus::Unmerged);
+        assert_eq!(rows[0].status, WorktreeStatus::InProgress);
         assert!(executor.calls.is_empty());
         let mut registry = Registry::open(&fixture.main).unwrap();
         assert_eq!(registry.entries[0]["checkout_removed"], false);
@@ -2912,6 +2929,51 @@ mod tests {
     }
 
     #[test]
+    fn active_worktree_requires_closed_bead_and_finished_recorded_agent_for_unmerged_label() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implementation\n");
+        assert_eq!(fixture.status().status, WorktreeStatus::Unmerged);
+
+        let mut open = Fake {
+            bead: Some(json!({"id":"Bead-1","status":"in_progress"})),
+            ..Fake::default()
+        };
+        let rows = list_with(&fixture.main, &mut open).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::InProgress);
+        assert_eq!(open.calls, vec![vec!["show_bead", "Bead-1"]]);
+
+        let mut working = Fake::default();
+        working.json(fixture.agent(12, "working"));
+        assert_eq!(
+            list_with(&fixture.main, &mut working).unwrap()[0].status,
+            WorktreeStatus::InProgress
+        );
+
+        let mut changed_session = Fake::default();
+        let mut agent = fixture.agent(12, "done");
+        agent["result"]["agent"]["agent_session"]["value"] = json!("another-session");
+        changed_session.json(agent);
+        assert_eq!(
+            list_with(&fixture.main, &mut changed_session).unwrap()[0].status,
+            WorktreeStatus::InProgress
+        );
+
+        let mut idle_before_task_activity = Fake::default();
+        idle_before_task_activity.json(fixture.agent(10, "idle"));
+        assert_eq!(
+            list_with(&fixture.main, &mut idle_before_task_activity).unwrap()[0].status,
+            WorktreeStatus::InProgress
+        );
+
+        let mut finished = Fake::default();
+        finished.json(fixture.agent(12, "done"));
+        assert_eq!(
+            list_with(&fixture.main, &mut finished).unwrap()[0].status,
+            WorktreeStatus::Unmerged
+        );
+    }
+
+    #[test]
     fn immediately_closed_bead_does_not_complete_or_clean_untouched_checkout() {
         let fixture = Fixture::managed();
         let before = tip(&fixture.main, "HEAD").unwrap();
@@ -2927,7 +2989,7 @@ mod tests {
             &mut executor,
         )
         .unwrap();
-        assert_eq!(rows[0].status, WorktreeStatus::Unmerged);
+        assert_eq!(rows[0].status, WorktreeStatus::InProgress);
         assert!(rows[0].detail.as_ref().unwrap().contains("No task commits"));
         assert!(executor.calls.is_empty());
         assert!(fixture.source.exists());

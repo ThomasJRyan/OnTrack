@@ -202,6 +202,16 @@ that an agent is idle or its changes safe to merge. Automatic merge may therefor
 defer; manual merge remains the user-controlled path.
 
 `inspect` in `src/worktrees.rs` remains the Git-based safety classification.
+For an active branch with task commits outside its target, `inspect_for_display`
+shows `InProgress` until a live `bd show` identifies the same Bead as closed and
+the recorded Herdr agent passes the existing settled-session check, including
+post-handoff lifecycle activity. Failed or unavailable completion observations
+remain `InProgress`; an untouched launch-base branch is also `InProgress`.
+`Unmerged` therefore means outstanding task commits with completion evidence.
+The display check makes read-only Beads and Herdr calls during worktree refresh;
+it does not change merge, finalization, or cleanup gates. Explicit manual merge
+confirmation remains available for `InProgress` rows and is still subject to
+the existing Git and agent checks.
 `inspect_for_display` only changes a `NeedsResolution` merge-request row to
 `MergeRequested` when a read-only Herdr `agent get` response reports `working`
 for the recorded pane, workspace, and agent kind, with the recorded session

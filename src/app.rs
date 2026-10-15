@@ -1185,7 +1185,9 @@ impl App {
         if action == 0
             && !matches!(
                 item.status,
-                worktrees::WorktreeStatus::Unmerged | worktrees::WorktreeStatus::NeedsResolution
+                worktrees::WorktreeStatus::InProgress
+                    | worktrees::WorktreeStatus::Unmerged
+                    | worktrees::WorktreeStatus::NeedsResolution
             )
         {
             self.worktrees_error = Some("This worktree is not ready for a merge request".into());
@@ -1656,6 +1658,7 @@ pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'stat
     use worktrees::WorktreeStatus::*;
     match status {
         Reserved => "PREPARED",
+        InProgress => "IN PROGRESS",
         Unmerged => "UNMERGED",
         MergeRequested => "MERGE PENDING",
         NeedsResolution => "NEEDS RESOLUTION",
@@ -4095,7 +4098,7 @@ mod tests {
             branch: "ontrack/b1".into(),
             target_branch: "main".into(),
             workspace_id: "ws1".into(),
-            status: worktrees::WorktreeStatus::Unmerged,
+            status: worktrees::WorktreeStatus::InProgress,
             detail: None,
         });
         press(&mut a, KeyCode::Char('m'));
