@@ -24,6 +24,8 @@ Theme is explicit app state (`App::theme`) threaded into rendering; do not intro
 
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
+The new-bead Description field uses `wrapped_description` to insert visual line breaks before whole words and map its byte cursor to display cells; words wider than the field still wrap by character. It preserves explicit newlines and the stored text. While Description has focus, Shift+Enter inserts a newline and plain Enter focuses Create without submitting. Terminal setup enables Crossterm's keyboard enhancement protocol so supported terminals can distinguish modified Enter; restoration pops that mode on normal exit, initialization failure, and panic. Terminals without modified-key reporting cannot distinguish Shift+Enter from Enter.
+
 The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
 
 ## Beads CLI contract

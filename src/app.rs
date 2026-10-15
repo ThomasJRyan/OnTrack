@@ -1165,11 +1165,12 @@ impl App {
                 form.focus = 1;
                 form.description_cursor = form.description.len();
             }
-            Enter if form.focus == 1 => {
+            Enter if form.focus == 1 && key.modifiers == crossterm::event::KeyModifiers::SHIFT => {
                 let i = form.description_cursor.min(form.description.len());
                 form.description.insert(i, '\n');
                 form.description_cursor = i + 1;
             }
+            Enter if form.focus == 1 && key.modifiers.is_empty() => form.focus = 4,
             Up if form.focus == 1 => {
                 form.description_cursor =
                     move_vertical(&form.description, form.description_cursor, false)
@@ -3058,7 +3059,7 @@ mod tests {
         assert_eq!(a.selected, Some(0));
     }
     #[test]
-    fn description_accepts_shortcut_letters_and_newlines_but_not_control_chars() {
+    fn description_accepts_shortcut_letters_and_shift_enter_but_not_control_chars() {
         let mut a = app();
         press(&mut a, KeyCode::Char('n'));
         press(&mut a, KeyCode::Tab);
@@ -3067,13 +3068,48 @@ mod tests {
         for c in ['q', 'r', 'n', 'd'] {
             press(&mut a, KeyCode::Char(c));
         }
-        press(&mut a, KeyCode::Enter);
+        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         press(&mut a, KeyCode::Char('界'));
         a.modal_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         let Some(Modal::Create(form)) = a.modal.as_ref() else {
             panic!()
         };
         assert_eq!(form.description, "qrnd\n界");
+    }
+    #[test]
+    fn enter_from_description_focuses_create_without_submitting() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        press(&mut a, KeyCode::Char('n'));
+        for c in "Title".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Tab);
+        for c in "two words".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Left);
+        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!("form closed")
+        };
+        assert_eq!(form.description, "two word\ns");
+        assert_eq!(form.focus, 1);
+        press(&mut a, KeyCode::Enter);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!("form closed")
+        };
+        assert_eq!(form.focus, 4);
+        assert_eq!(form.description, "two word\ns");
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Enter);
+        let Ok(Request::Create(input)) = rx.try_recv() else {
+            panic!("missing create")
+        };
+        assert_eq!(input.description, "two word\ns");
     }
     #[test]
     fn form_tab_order_follows_visual_layout_and_wraps_both_directions() {
