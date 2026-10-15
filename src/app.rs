@@ -29,6 +29,7 @@ pub(super) enum Request {
     CreateChild(CreateBead, String),
     Update(UpdateBead),
     SetReady(String, bool),
+    SetEpicReady(String, bool, HashSet<String>),
     Delete(String),
     DiscoverHarnesses(u64),
     Discover(u64),
@@ -48,7 +49,7 @@ pub(super) enum Response {
     EpicLaunched(String, std::io::Result<crate::epic::Session>),
     EpicFinished(String, std::io::Result<Vec<String>>),
     Updated(String, std::io::Result<()>),
-    ReadySet(String, bool, std::io::Result<()>),
+    ReadySet(String, bool, std::io::Result<Vec<String>>),
     Deleted(std::io::Result<()>),
     HarnessesDiscovered(u64, std::io::Result<Vec<String>>),
     Discovered(u64, std::io::Result<LaunchContext>),
@@ -364,9 +365,16 @@ impl App {
                     Request::Update(input) => {
                         Response::Updated(input.id.clone(), beads::update_bead(&input))
                     }
-                    Request::SetReady(id, ready) => {
-                        Response::ReadySet(id.clone(), ready, beads::set_ready(&id, ready))
-                    }
+                    Request::SetReady(id, ready) => Response::ReadySet(
+                        id.clone(),
+                        ready,
+                        beads::set_ready(&id, ready).map(|()| vec![id]),
+                    ),
+                    Request::SetEpicReady(id, ready, known_handoffs) => Response::ReadySet(
+                        id.clone(),
+                        ready,
+                        beads::set_epic_ready(&id, ready, &known_handoffs),
+                    ),
                     Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
                     Request::DiscoverHarnesses(seq) => {
                         Response::HarnessesDiscovered(seq, crate::herdr::installed_harnesses())
@@ -496,6 +504,7 @@ impl App {
             .iter()
             .filter(|bead| {
                 beads::is_ready(bead)
+                    && bead.data["issue_type"] == "task"
                     && self.scheduler_eligible(bead)
                     && !self.scheduler_attempted.contains(&bead.id)
             })
@@ -934,8 +943,16 @@ impl App {
                 Response::ReadySet(id, ready, result) => {
                     self.mutation_busy = false;
                     match result {
-                        Ok(()) => {
-                            if let Some(bead) = self.beads.iter_mut().find(|bead| bead.id == id) {
+                        Ok(ids) => {
+                            for changed_id in &ids {
+                                if ready {
+                                    self.scheduler_attempted.remove(changed_id);
+                                } else {
+                                    self.scheduler_attempted.insert(changed_id.clone());
+                                }
+                            }
+                            for bead in self.beads.iter_mut().filter(|bead| ids.contains(&bead.id))
+                            {
                                 let labels = bead.data["labels"].as_array_mut();
                                 if ready {
                                     if let Some(labels) = labels {
@@ -967,7 +984,8 @@ impl App {
                             self.refresh_at(now);
                         }
                         Err(error) => {
-                            self.notice = Some(format!("Could not update Ready for {id}: {error}"))
+                            self.notice = Some(format!("Could not update Ready for {id}: {error}"));
+                            self.refresh_at(now);
                         }
                     }
                 }
@@ -1961,11 +1979,12 @@ impl App {
             return;
         }
         let Some(bead) = self.selected.and_then(|i| self.beads.get(i)) else {
-            self.notice = Some("Select an open task first".into());
+            self.notice = Some("Select an open Task or Epic first".into());
             return;
         };
-        if bead.status != "open" || bead.data["issue_type"] != "task" {
-            self.notice = Some("Only open tasks can be marked Ready".into());
+        let epic = bead.data["issue_type"] == "epic";
+        if bead.status != "open" || (!epic && bead.data["issue_type"] != "task") {
+            self.notice = Some("Only open Tasks and Epics can be marked Ready".into());
             return;
         }
         let id = bead.id.clone();
@@ -1974,13 +1993,13 @@ impl App {
             self.notice = Some("This task already has a tracked handoff".into());
             return;
         }
-        if ready {
-            self.scheduler_attempted.remove(&id);
-        } else {
-            self.scheduler_attempted.insert(id.clone());
-        }
         self.mutation_busy = true;
-        if self.requests.send(Request::SetReady(id, ready)).is_err() {
+        let request = if epic {
+            Request::SetEpicReady(id, ready, self.known_handoffs.clone())
+        } else {
+            Request::SetReady(id, ready)
+        };
+        if self.requests.send(request).is_err() {
             self.mutation_busy = false;
             self.notice = Some("Ready change could not be queued".into());
         }
@@ -2461,6 +2480,66 @@ mod tests {
         a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
         press(&mut a, KeyCode::Char('R'));
         assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+    }
+
+    #[test]
+    fn epic_ready_toggle_queues_cascade_and_only_tasks_are_scheduled() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        assert_eq!(display_status(&a.beads[0]), "ready");
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+
+        a.beads[0].data["labels"] = json!([]);
+        a.known_handoffs.insert("b2".into());
+        press(&mut a, KeyCode::Char('R'));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Request::SetEpicReady(id, true, handoffs))
+                if id == "b0" && handoffs.contains("b2")
+        ));
+        assert_eq!(a.beads[0].status, "open");
+    }
+
+    #[test]
+    fn epic_ready_response_updates_confirmed_ids_and_refreshes_after_failure() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[1].data["issue_type"] = json!("task");
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        let (replies, responses) = mpsc::channel();
+        a.responses = responses;
+        a.mutation_busy = true;
+        replies
+            .send(Response::ReadySet(
+                "b0".into(),
+                true,
+                Ok(vec!["b0".into(), "b1".into()]),
+            ))
+            .unwrap();
+        a.receive();
+        assert!(a.beads.iter().take(2).all(beads::is_ready));
+        assert!(!a.mutation_busy);
+        assert!(matches!(queued.try_recv(), Ok(Request::List)));
+
+        a.refresh_inflight = false;
+        a.mutation_busy = true;
+        replies
+            .send(Response::ReadySet(
+                "b0".into(),
+                false,
+                Err(std::io::Error::other("partial update")),
+            ))
+            .unwrap();
+        a.receive();
+        assert!(matches!(queued.try_recv(), Ok(Request::List)));
+        assert!(a.notice.as_deref().unwrap().contains("partial update"));
     }
 
     #[test]

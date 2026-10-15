@@ -73,7 +73,7 @@ impl Context {
                 ("h", "Hand selected bead to Herdr"),
                 (
                     "Shift+R",
-                    "Mark selected open task Ready or return it to Open",
+                    "Toggle Ready for an open Task or Epic and its tasks",
                 ),
                 ("w", "Open outstanding worktrees"),
                 ("Esc", "Stay in the issue browser"),
