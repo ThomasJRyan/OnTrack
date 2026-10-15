@@ -6,3 +6,4 @@
 .beads/proxieddb/
 *.gate.lock*
 /target/
+.beads/issues.jsonl
