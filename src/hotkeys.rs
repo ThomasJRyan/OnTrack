@@ -13,6 +13,9 @@ pub enum Context {
     EditLoading,
     Delete,
     WorktreeConfirm,
+    Release,
+    UpdateConfirm,
+    UpdateInstalling,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +39,9 @@ impl Context {
             Some(Modal::EditLoading { .. }) => Self::EditLoading,
             Some(Modal::ConfirmDelete { .. }) => Self::Delete,
             Some(Modal::ConfirmWorktree { .. }) => Self::WorktreeConfirm,
+            Some(Modal::Release) => Self::Release,
+            Some(Modal::ConfirmUpdate(_)) => Self::UpdateConfirm,
+            Some(Modal::InstallingUpdate(_)) => Self::UpdateInstalling,
             None if app.worktrees_view => Self::Worktrees,
             None if app.focus_detail => Self::Details,
             None => Self::Issues,
@@ -54,6 +60,9 @@ impl Context {
             Self::EditLoading => "Loading edit",
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
+            Self::Release => "Release check",
+            Self::UpdateConfirm => "Update confirmation",
+            Self::UpdateInstalling => "Installing update",
         }
     }
 
@@ -76,6 +85,7 @@ impl Context {
                     "Toggle Ready for an open Task or Epic and its tasks",
                 ),
                 ("w", "Open outstanding worktrees"),
+                ("u", "Check for a newer OnTrack release"),
                 ("Esc", "Stay in the issue browser"),
             ],
             Self::Details => vec![
@@ -94,6 +104,7 @@ impl Context {
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
                 ("w", "Open outstanding worktrees"),
+                ("u", "Check for a newer OnTrack release"),
                 ("Esc", "Stay in the issue browser"),
             ],
             Self::Worktrees => vec![
@@ -155,6 +166,16 @@ impl Context {
                 ("n / N / Enter", "Cancel action"),
                 ("Esc", "Cancel action"),
             ],
+            Self::Release => vec![
+                ("r", "Check GitHub again"),
+                ("i", "Prepare a compatible release for installation"),
+                ("Esc", "Return to issue browser"),
+            ],
+            Self::UpdateConfirm => vec![
+                ("y / Y", "Install the verified release"),
+                ("n / N / Enter / Esc", "Cancel installation"),
+            ],
+            Self::UpdateInstalling => vec![("Esc / c", "Request cancellation before replacement")],
         };
         rows.extend([
             ("Ctrl+?", "Open or close this hotkey reference"),

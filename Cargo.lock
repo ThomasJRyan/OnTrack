@@ -781,6 +781,7 @@ dependencies = [
  "ratcn",
  "semver",
  "serde_json",
+ "sha2",
  "tui-markdown",
 ]
 
