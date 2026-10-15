@@ -7,10 +7,11 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Defines the terminal type, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
-| `src/settings.rs` | Loads and saves the small JSON appearance configuration under the user's XDG config directory. |
+| `src/settings.rs` | Loads and atomically saves theme and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
 | `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/herdr.rs` | Discovers usable Codex/OpenCode integrations, maps the current checkout to a Herdr workspace, and explicitly creates a worktree and starts/prompts an agent. |
+| `src/worktrees.rs` | Journals OnTrack-created handoffs separately from Beads and verifies Git/Herdr evidence before merge finalization or cleanup. |
 | `src/app.rs` | Holds selection, focus, scrolling, modal form state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
 | `src/ui.rs` | Renders splash, issue list, wrapped Markdown details, and status; maintains list visibility and scroll bounds. |
@@ -23,7 +24,7 @@ Theme is explicit app state (`App::theme`) threaded into rendering; do not intro
 
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
-The `s` settings dialog applies and saves theme changes immediately. Up / Down navigates setting rows, while Left / Right changes values. Its bounded dropdown scrolls to keep the selection visible. Esc closes an open dropdown before closing the dialog; closing never reverts successful changes or writes settings. Config read/write errors are presented in the UI and must not be reported as successful saves. See the [settings guide](settings.md) for stable theme IDs and instructions for extending the catalog.
+The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
 
 ## Beads CLI contract
 
@@ -133,3 +134,27 @@ Create and delete are explicit, asynchronous CLI operations. The create form use
 List results are sorted deterministically by status (open first, closed last, other statuses alphabetically), then ID. `list_layout` in `src/app.rs` is the shared geometry model for navigation, viewport scrolling, mouse hit-testing, and rendering. Expanded panes place the first bead directly below the header; keep the app geometry and renderer in sync if row spacing changes. Keyboard navigation targets visible bead rows and collapsed group headers in rendered order; expanded headers are skipped. A collapsed-header selection has no bead/detail/delete identity and must retain a clear rendered selection state. Refresh preserves that selection only while the same group remains collapsed. Keep selected IDs aligned with detail/delete actions when changing this view.
 
 The list row's first line derives issue type from the retained `Bead.data` (`issue_type`, with `type` as a fallback); it does not replace the internal bead ID. Type, priority, and status spans each have a semantic colour helper in `src/ui.rs`; the display-width-aware metadata columns are shared across the list. Preserve white title text independently of selection emphasis and keep missing/custom types safe to display.
+## Tracked worktree lifecycle
+
+OnTrack records only worktrees created by its own confirmed Herdr handoffs; it
+does not adopt pre-existing Git worktrees. Outstanding work is a separate view
+from Beads: a closed or missing Bead does not remove the managed-worktree record.
+The verified repository target branch is shown to the user. A merge request is
+pending work, not a completed merge; Git ancestry/cleanliness checks decide
+integration. Conflicts and uncertain outcomes remain inspectable for manual
+recovery. Cleanup is permitted only after verified integration. Checkout removal
+is one confirmed operation that removes the checkout and closes its Herdr
+workspace; when both cleanup switches are enabled, removal runs instead of a
+separate close. It never force-removes a checkout or deletes a branch. Bead
+closure is an eligibility signal only, not evidence
+that an agent is idle or its changes safe to merge. Automatic merge may therefore
+defer; manual merge remains the user-controlled path.
+
+Manual merge provenance is persisted separately from automatic requests: optional
+agent-session metadata is not required for an explicitly confirmed manual merge,
+but current Git identity, cleanliness and ancestry checks still apply. Native
+idle/sequence evidence is not proof of a particular prompt turn completing.
+Cleanup revalidates the current Herdr workspace/path/branch mapping before any
+mutation. Untouched launch-base branches remain unmerged. Close-first/remove-later
+is explicitly unsupported; recovery guidance avoids guessing a closed workspace
+ID or invoking force removal.

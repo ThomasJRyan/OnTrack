@@ -50,15 +50,39 @@ struct Launch {
 }
 
 // Keep both external boundaries injectable: tests never execute Herdr or bd.
-trait Executor {
+pub(crate) trait Executor {
     fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>>;
     fn show_bead(&mut self, id: &str) -> io::Result<Value>;
     fn git_identity(&mut self, checkout: &Path) -> io::Result<RepositoryIdentity>;
+    fn launch_intent(
+        &mut self,
+        _checkout: &Path,
+        _bead: &str,
+        _branch: &str,
+        _agent: &str,
+        _name: &str,
+        _workspace: &str,
+    ) -> io::Result<Option<crate::worktrees::LaunchJournal>> {
+        Ok(None)
+    }
 }
 
-struct SystemExecutor;
+pub(crate) struct SystemExecutor;
 
 impl Executor for SystemExecutor {
+    fn launch_intent(
+        &mut self,
+        checkout: &Path,
+        bead: &str,
+        branch: &str,
+        agent: &str,
+        name: &str,
+        workspace: &str,
+    ) -> io::Result<Option<crate::worktrees::LaunchJournal>> {
+        crate::worktrees::LaunchJournal::begin(checkout, bead, branch, agent, name, workspace)
+            .map(Some)
+    }
+
     fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
         let output = Command::new("herdr").args(args).output().map_err(|error| {
             io::Error::new(
@@ -183,9 +207,9 @@ fn handoff_with(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RepositoryIdentity {
-    common_dir: PathBuf,
-    main_root: PathBuf,
+pub(crate) struct RepositoryIdentity {
+    pub(crate) common_dir: PathBuf,
+    pub(crate) main_root: PathBuf,
 }
 
 fn repository_identity_with(
@@ -494,6 +518,38 @@ fn launch_with(
         } else {
             None
         };
+    let mut journal = executor.launch_intent(
+        &source.checkout,
+        request.id,
+        &branch,
+        request.agent,
+        request.name,
+        request.workspace_id,
+    )?;
+    let result = create_and_prompt(
+        executor,
+        request,
+        &source,
+        &branch,
+        &prompt,
+        expected_repository,
+        &mut journal,
+    );
+    if let (Err(error), Some(journal)) = (&result, journal.as_mut()) {
+        journal.failed(&error.to_string())?;
+    }
+    result
+}
+
+fn create_and_prompt(
+    executor: &mut impl Executor,
+    request: &Request<'_>,
+    source: &Source,
+    branch: &str,
+    prompt: &str,
+    expected_repository: Option<RepositoryIdentity>,
+    journal: &mut Option<crate::worktrees::LaunchJournal>,
+) -> io::Result<Launch> {
     let bytes = executor
         .run(&[
             "worktree",
@@ -501,7 +557,7 @@ fn launch_with(
             "--workspace",
             request.workspace_id,
             "--branch",
-            &branch,
+            branch,
             "--label",
             request.name,
             "--no-focus",
@@ -509,7 +565,7 @@ fn launch_with(
         .map_err(|error| {
             recovery(
                 request,
-                &branch,
+                branch,
                 None,
                 None,
                 &format!(
@@ -517,10 +573,13 @@ fn launch_with(
                 ),
             )
         })?;
+    if let Some(journal) = journal.as_mut() {
+        journal.capture("create", &bytes)?;
+    }
     let result = envelope(&bytes).map_err(|error| {
         recovery(
             request,
-            &branch,
+            branch,
             None,
             None,
             &format!("Worktree creation response: {error}"),
@@ -530,9 +589,12 @@ fn launch_with(
         .pointer("/workspace/workspace_id")
         .and_then(Value::as_str);
     let pane = result.pointer("/root_pane/pane_id").and_then(Value::as_str);
-    let recover = |message: &str| recovery(request, &branch, workspace, pane, message);
-    let target = created_target(&result, &source, &branch)
+    let recover = |message: &str| recovery(request, branch, workspace, pane, message);
+    let target = created_target(&result, source, branch)
         .map_err(|error| recover(&format!("Worktree creation response: {error}")))?;
+    if let Some(journal) = journal.as_mut() {
+        journal.created(&result)?;
+    }
     let trust_override = if let Some(expected) = expected_repository {
         let mut verify = || -> io::Result<String> {
             let path = Path::new(text(&result["worktree"], "path")?);
@@ -572,20 +634,51 @@ fn launch_with(
             "check_for_update_on_startup=false",
         ]);
     }
+    if let Some(journal) = journal.as_mut() {
+        journal.phase("agent_start_possibly_sent")?;
+    }
     executor
         .run(&start_args)
-        .and_then(|bytes| agent_response(&bytes, "agent_started", &target))
+        .and_then(|bytes| {
+            if let Some(journal) = journal.as_mut() {
+                journal.capture("start", &bytes)?;
+            }
+            agent_response(&bytes, "agent_started", &target)
+        })
         .map_err(|error| {
             recover(&format!(
                 "Agent start failed: {error}. The agent may still be running; no prompt was sent"
             ))
         })?;
+    if let Some(journal) = journal.as_mut() {
+        let bytes = executor.run(&["agent", "get", &target.pane_id])?;
+        journal.capture("ready", &bytes)?;
+        let ready = envelope(&bytes)?;
+        if ready["type"] != "agent_info"
+            || ready["agent"]["pane_id"] != target.pane_id
+            || ready["agent"]["workspace_id"] != target.workspace_id
+            || ready["agent"]["agent"] != request.agent
+        {
+            return Err(recover(
+                "Agent readiness identity changed; no initial prompt sent",
+            ));
+        }
+    }
     // No --wait: submit once and return rather than blocking for the agent's turn.
-    executor.run(&["agent", "prompt", &target.pane_id, &prompt])
-        .and_then(|bytes| agent_response(&bytes, "agent_prompted", &target))
+    if let Some(journal) = journal.as_mut() {
+        journal.phase("initial_prompt_possibly_sent")?;
+    }
+    executor.run(&["agent", "prompt", &target.pane_id, prompt])
+        .and_then(|bytes| {
+            if let Some(journal) = journal.as_mut() { journal.capture("prompt", &bytes)?; }
+            agent_response(&bytes, "agent_prompted", &target)
+        })
         .map_err(|error| recover(&format!(
             "Prompt submission failed: {error}. The agent started and the prompt may already have been delivered; do not resubmit blindly"
         )))?;
+    if let Some(journal) = journal.as_mut() {
+        journal.phase("active")?;
+    }
     Ok(target)
 }
 
@@ -692,7 +785,7 @@ fn recovery(
     ))
 }
 
-fn envelope(bytes: &[u8]) -> io::Result<Value> {
+pub(crate) fn envelope(bytes: &[u8]) -> io::Result<Value> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| invalid(format!("Invalid Herdr JSON: {error}")))?;
     if value.get("error").is_some_and(|error| !error.is_null()) {
@@ -760,13 +853,70 @@ mod tests {
         calls: Vec<Vec<String>>,
         bead: Option<io::Result<Value>>,
         identities: VecDeque<io::Result<RepositoryIdentity>>,
+        tracked_root: Option<PathBuf>,
     }
 
     impl Executor for FakeExecutor {
         fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
             self.calls
                 .push(args.iter().map(|arg| (*arg).to_owned()).collect());
+            if let Some(root) = self.tracked_root.as_ref() {
+                let registry: Value = serde_json::from_slice(
+                    &std::fs::read(root.join("main/.git/ontrack-worktrees/registry.json"))
+                        .unwrap_or_default(),
+                )
+                .unwrap_or(Value::Null);
+                match args {
+                    ["worktree", "create", ..] => {
+                        assert_eq!(registry["entries"][0]["phase"], "create_possibly_sent");
+                        let output = Command::new("git")
+                            .arg("-C")
+                            .arg(root.join("main"))
+                            .args(["worktree", "add", "-b", BRANCH])
+                            .arg(root.join("checkout"))
+                            .output()
+                            .unwrap();
+                        assert!(
+                            output.status.success(),
+                            "{}",
+                            String::from_utf8_lossy(&output.stderr)
+                        );
+                    }
+                    ["agent", "start", ..] if !args.contains(&"--help") => {
+                        assert!(registry["entries"][0]["responses"]["create"].is_string());
+                        assert_eq!(registry["entries"][0]["phase"], "agent_start_possibly_sent");
+                        assert_eq!(registry["entries"][0]["path"], json!(root.join("checkout")));
+                    }
+                    ["agent", "prompt", ..] => {
+                        assert_eq!(
+                            registry["entries"][0]["phase"],
+                            "initial_prompt_possibly_sent"
+                        );
+                        assert!(registry["entries"][0]["responses"]["ready"].is_string());
+                    }
+                    _ => {}
+                }
+            }
             self.outputs.pop_front().expect("unexpected command")
+        }
+
+        fn launch_intent(
+            &mut self,
+            checkout: &Path,
+            bead: &str,
+            branch: &str,
+            agent: &str,
+            name: &str,
+            workspace: &str,
+        ) -> io::Result<Option<crate::worktrees::LaunchJournal>> {
+            if self.tracked_root.is_some() {
+                crate::worktrees::LaunchJournal::begin(
+                    checkout, bead, branch, agent, name, workspace,
+                )
+                .map(Some)
+            } else {
+                Ok(None)
+            }
         }
 
         fn show_bead(&mut self, id: &str) -> io::Result<Value> {
@@ -1152,6 +1302,90 @@ mod tests {
             .collect();
         assert_eq!(git_calls[0][1], cwd().to_str().unwrap());
         assert_eq!(git_calls[1][1], "/new worktree/path");
+    }
+
+    #[test]
+    fn tracked_launch_persists_each_boundary_before_side_effect_and_keeps_uncertain_prompt() {
+        struct Fixture(PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        for fail_prompt in [false, true] {
+            let fixture = Fixture(Path::new("/tmp/opencode").join(unique_name("tracked-launch")));
+            let main = fixture.0.join("main");
+            std::fs::create_dir_all(&main).unwrap();
+            for args in [
+                vec!["init", "--initial-branch=trunk"],
+                vec!["config", "--local", "user.name", "OnTrack Test"],
+                vec!["config", "--local", "user.email", "test@example.invalid"],
+                vec!["config", "--local", "commit.gpgsign", "false"],
+                vec!["config", "--local", "core.hooksPath", "/dev/null"],
+                vec!["commit", "--allow-empty", "-m", "base"],
+            ] {
+                let output = Command::new("git")
+                    .arg("-C")
+                    .arg(&main)
+                    .args(args)
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            let mut executor = FakeExecutor {
+                tracked_root: Some(fixture.0.clone()),
+                bead: Some(Ok(bead())),
+                ..FakeExecutor::default()
+            };
+            executor.json(json!({"result":{"type":"worktree_list", "source":{"source_checkout_path":main, "source_workspace_id":"wY"}, "worktrees":[{"path":main,"branch":"trunk","open_workspace_id":"wY"}]}}));
+            executor.output(HELP);
+            executor.output(STATUS);
+            let mut created = created();
+            created["result"]["worktree"]["path"] = json!(fixture.0.join("checkout"));
+            executor.json(created);
+            executor.json(agent_result("agent_started"));
+            executor.json(json!({"result":{"type":"agent_info", "agent":{"pane_id":"wNew:p1","workspace_id":"wNew","agent":"opencode","state_change_seq":10,"agent_session":{"value":"native-session"}}}}));
+            if fail_prompt {
+                executor
+                    .outputs
+                    .push_back(Err(io::Error::other("submission timed out")));
+            } else {
+                executor.json(agent_result("agent_prompted"));
+            }
+            let mut request = request();
+            request.agent = "opencode";
+            assert_eq!(
+                launch_with(&mut executor, &main, &request).is_err(),
+                fail_prompt
+            );
+            let registry: Value = serde_json::from_slice(
+                &std::fs::read(main.join(".git/ontrack-worktrees/registry.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                registry["entries"][0]["phase"],
+                if fail_prompt {
+                    "initial_prompt_possibly_sent"
+                } else {
+                    "active"
+                }
+            );
+            assert_eq!(registry["entries"][0]["workspace_id"], "wNew");
+            assert_eq!(registry["entries"][0]["pane_id"], "wNew:p1");
+            assert_eq!(registry["entries"][0]["initial_lifecycle_seq"], 10);
+            if fail_prompt {
+                assert!(
+                    registry["entries"][0]["detail"]
+                        .as_str()
+                        .unwrap()
+                        .contains("do not resubmit blindly")
+                );
+            }
+        }
     }
 
     #[test]

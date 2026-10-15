@@ -84,18 +84,18 @@ fn themed_priority_color(priority: u64, theme: Theme) -> Color {
 }
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
-        "↑ / ↓ settings · ← / → change + save · Enter save · Tab Close · Esc back"
+        "↑ / ↓ move · ← / → theme · Enter / Space toggle · Tab moves · Esc close"
     } else if focus == 1 {
-        "Shift+Tab Theme · Enter / Space Close · Esc close"
+        "↑ / ↓ move · Enter / Space toggle · Tab moves · Esc close"
     } else {
-        "↑ / ↓ settings · ← / → change + save · Enter / Space options · Tab Close"
+        "↑ / ↓ move · ← / → theme · Enter / Space toggle · Tab moves"
     }
 }
 const MAX_VISIBLE_THEMES: usize = 6;
 fn visible_theme_window(theme: Theme, available_height: u16) -> (usize, usize) {
     let total = crate::theme::CATALOG.len();
     let visible = usize::from(available_height)
-        .saturating_sub(13)
+        .saturating_sub(20)
         .clamp(1, MAX_VISIBLE_THEMES.min(total));
     let selected = Theme::ALL
         .iter()
@@ -190,6 +190,185 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 a.width,
                 height,
             ),
+        );
+        return;
+    }
+    if app.worktrees_view {
+        app.modal_ready = true;
+        f.render_widget(Block::default().style(Style::default().bg(bg)), a);
+        let areas = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(2),
+                Constraint::Min(3),
+                Constraint::Length(3),
+            ])
+            .split(a);
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(
+                    " WORKTREES ",
+                    Style::default()
+                        .fg(palette.selected_foreground)
+                        .bg(palette.selected_background)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  ONTRACK  /  Git integration, not Bead status"),
+            ]))
+            .style(Style::default().fg(ink)),
+            areas[0],
+        );
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
+            .split(areas[1]);
+        let item_height = 2usize;
+        let visible = (usize::from(panes[0].height.saturating_sub(2)) / item_height).max(1);
+        if app.selected_worktree < app.worktree_offset {
+            app.worktree_offset = app.selected_worktree;
+        }
+        if app.selected_worktree >= app.worktree_offset + visible {
+            app.worktree_offset = app.selected_worktree + 1 - visible;
+        }
+        app.worktree_offset = app
+            .worktree_offset
+            .min(app.worktrees.len().saturating_sub(visible));
+        let mut rows = Vec::new();
+        if app.worktrees.is_empty() {
+            rows.push(Line::from(if app.worktrees_loading {
+                "Checking tracked handoffs…"
+            } else {
+                "No OnTrack-tracked handoffs."
+            }));
+            rows.push(Line::from("Existing worktrees are not adopted."));
+        }
+        for (index, item) in app
+            .worktrees
+            .iter()
+            .enumerate()
+            .skip(app.worktree_offset)
+            .take(visible)
+        {
+            let selected = index == app.selected_worktree;
+            let style = if selected {
+                Style::default()
+                    .fg(palette.selected_foreground)
+                    .bg(palette.selected_background)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(ink)
+            };
+            rows.push(Line::from(Span::styled(
+                truncate_display(
+                    &format!(
+                        "{} {} · {}",
+                        if selected { "›" } else { " " },
+                        item.bead_id,
+                        crate::app::worktree_status_label(item.status)
+                    ),
+                    panes[0].width.saturating_sub(2) as usize,
+                ),
+                style,
+            )));
+            rows.push(Line::from(Span::styled(
+                truncate_display(
+                    &format!("  {} → {}", item.branch, item.target_branch),
+                    panes[0].width.saturating_sub(2) as usize,
+                ),
+                Style::default().fg(muted),
+            )));
+        }
+        f.render_widget(
+            Paragraph::new(rows)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" TRACKED HANDOFFS ")
+                        .border_style(Style::default().fg(palette.border)),
+                )
+                .style(Style::default().fg(ink).bg(palette.panel)),
+            panes[0],
+        );
+        let selected = app.worktrees.get(app.selected_worktree);
+        let detail = if let Some(item) = selected {
+            let mut lines = vec![
+                Line::from(Span::styled(
+                    format!(
+                        "{} · {}",
+                        item.bead_id,
+                        crate::app::worktree_status_label(item.status)
+                    ),
+                    Style::default().fg(teal).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(format!("Branch: {}", item.branch)),
+                Line::from(format!("Target: {}", item.target_branch)),
+                Line::from(format!("Herdr workspace: {}", item.workspace_id)),
+            ];
+            if let Some(detail) = &item.detail {
+                lines.push(Line::from(Span::styled(
+                    format!("Detail: {detail}"),
+                    Style::default().fg(
+                        if matches!(
+                            item.status,
+                            crate::worktrees::WorktreeStatus::NeedsAttention
+                                | crate::worktrees::WorktreeStatus::NeedsResolution
+                        ) {
+                            palette.danger
+                        } else {
+                            muted
+                        },
+                    ),
+                )));
+            }
+            lines
+        } else {
+            vec![Line::from("Select a tracked handoff to inspect its state.")]
+        };
+        f.render_widget(
+            Paragraph::new(detail)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(" HANDOFF DETAILS ")
+                        .border_style(Style::default().fg(palette.border)),
+                )
+                .wrap(Wrap { trim: true })
+                .style(Style::default().fg(ink).bg(bg)),
+            panes[1],
+        );
+        let footer = if let Some(crate::app::Modal::ConfirmWorktree { id, action }) = &app.modal {
+            let operation = match action {
+                0 => "MERGE REQUEST · dispatch only; not integrated",
+                1 => "CLOSE WORKSPACE · integrated only",
+                _ => "REMOVE CHECKOUT AND CLOSE HERDR WORKSPACE · integrated only; branch kept",
+            };
+            format!("y confirm / Esc cancel · {operation} · {id}")
+        } else if let Some(error) = &app.worktrees_error {
+            format!("ERROR · {error} · w back")
+        } else if let Some(item) = selected.filter(|item| item.detail.is_some()) {
+            format!(
+                "{} · {} · r refresh",
+                crate::app::worktree_status_label(item.status),
+                item.detail.as_deref().unwrap_or_default()
+            )
+        } else {
+            "↑/↓ select · m request merge · c close · x remove · r refresh · w back".to_owned()
+        };
+        let footer_lines = wrap_words(&footer, areas[2].width as usize)
+            .into_iter()
+            .take(usize::from(areas[2].height))
+            .collect::<Vec<_>>();
+        f.render_widget(
+            Paragraph::new(footer_lines.join("\n")).style(
+                Style::default()
+                    .fg(if app.worktrees_error.is_some() || app.modal.is_some() {
+                        gold
+                    } else {
+                        muted
+                    })
+                    .bg(palette.panel_alt),
+            ),
+            areas[2],
         );
         return;
     }
@@ -527,14 +706,14 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 )
                 .len();
                 let option_lines = if *dropdown_open {
-                    let (start, count) = visible_theme_window(*draft, a.height);
+                    let (start, count) = visible_theme_window(draft.theme, a.height);
                     count
                         + usize::from(start > 0)
                         + usize::from(start + count < crate::theme::CATALOG.len())
                 } else {
                     0
                 };
-                (5 + option_lines + error_lines + hint_lines + 2) as u16
+                (9 + option_lines + error_lines + hint_lines + 2) as u16
             }
             crate::app::Modal::Create(form) => {
                 if form.dropdown.is_some() {
@@ -557,6 +736,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .saturating_add(3)
             .min(usize::from(a.height.saturating_sub(2)))
             .max(7) as u16,
+            crate::app::Modal::ConfirmWorktree { .. } => 8,
         };
         let min_width = if matches!(modal, crate::app::Modal::Create(_)) {
             70
@@ -626,10 +806,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 focus,
             } => {
                 let mut lines = vec![
-                    Line::from("Theme changes save immediately"),
+                    Line::from("Tracked worktree cleanup preferences"),
                     Line::from(""),
                     Line::from(Span::styled(
-                        format!("Theme  [ {}  ▾ ]", draft.label()),
+                        format!("Theme  [ {}  ▾ ]", draft.theme.label()),
                         if *focus == 0 {
                             Style::default()
                                 .fg(palette.selected_foreground)
@@ -641,7 +821,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     )),
                 ];
                 if *dropdown_open {
-                    let (start, count) = visible_theme_window(*draft, a.height);
+                    let (start, count) = visible_theme_window(draft.theme, a.height);
                     let end = start + count;
                     if start > 0 {
                         lines.push(
@@ -649,7 +829,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         );
                     }
                     for theme in Theme::ALL.iter().skip(start).take(count).copied() {
-                        let selected = *draft == theme;
+                        let selected = draft.theme == theme;
                         lines.push(Line::from(Span::styled(
                             format!("  {} {}", if selected { "›" } else { " " }, theme.label()),
                             if selected {
@@ -667,10 +847,45 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             .push(Line::from("  ↓ later themes").style(Style::default().fg(muted)));
                     }
                 }
+                for (index, (label, enabled)) in [
+                    ("Auto-request merge", draft.auto_merge),
+                    (
+                        "Close Herdr workspace after integration",
+                        draft.auto_close_workspace,
+                    ),
+                    (
+                        "Remove checkout + close Herdr workspace",
+                        draft.auto_remove_checkout,
+                    ),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let focused = *focus == index + 1;
+                    lines.push(Line::from(Span::styled(
+                        format!(
+                            "{} [{}] {label}",
+                            if focused { "›" } else { " " },
+                            if enabled { "x" } else { " " }
+                        ),
+                        if focused {
+                            Style::default()
+                                .fg(palette.selected_foreground)
+                                .bg(palette.selected_background)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(ink)
+                        },
+                    )));
+                }
+                lines.push(Line::from(Span::styled(
+                    "Removing a checkout also closes its Herdr workspace.",
+                    Style::default().fg(muted),
+                )));
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(
                     "[ Close ]",
-                    if *focus == 1 {
+                    if *focus == 4 {
                         Style::default()
                             .fg(palette.selected_foreground)
                             .bg(palette.selected_background)
@@ -1030,6 +1245,24 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Rect::new(inner.x, inner.y + viewport, inner.width, 1),
                 );
             }
+            crate::app::Modal::ConfirmWorktree { id, action } => {
+                let action = match action {
+                    0 => {
+                        "Request merge resolution from the recorded agent? This is pending, not merged."
+                    }
+                    1 => "Close the integrated Herdr workspace?",
+                    _ => {
+                        "Remove integrated checkout and close its Herdr workspace? Branch is preserved."
+                    }
+                };
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "{action}\n\nWorktree: {id}\n\ny confirm · n / Esc cancel"
+                    ))
+                    .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
         }
     }
 }
@@ -1046,7 +1279,7 @@ fn footer_text(state: &str, width: usize) -> String {
     } else {
         format!(" {state}{actions}")
     };
-    let navigation = " · ↑↓ move · ←/→ groups · Tab panes · s settings";
+    let navigation = " · ↑↓ · ←/→ groups · Tab panes · s settings · w worktrees";
     if Span::raw(core.as_str()).width() + Span::raw(navigation).width() <= width {
         format!("{core}{navigation}")
     } else {
@@ -1382,6 +1615,16 @@ mod tests {
             theme: crate::settings::Theme::Dark,
             settings_path: None,
             settings_load_error: None,
+            worktrees: Vec::new(),
+            selected_worktree: 0,
+            worktree_offset: 0,
+            worktrees_view: false,
+            worktrees_loading: false,
+            worktrees_error: None,
+            worktrees_inflight: false,
+            worktrees_discovered: true,
+            worktree_action_pending: false,
+            worktrees_next_refresh: std::time::Instant::now(),
             notice: None,
             mutation_busy: false,
             modal_ready: true,
@@ -1873,6 +2116,87 @@ mod tests {
         assert!(footer_text("READY", 120).contains("Tab panes"));
     }
     #[test]
+    fn outstanding_worktrees_render_target_state_and_pending_dispatch_on_compact_terminal() {
+        let mut app = app();
+        app.worktrees_view = true;
+        app.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "handoff-1".into(),
+            bead_id: "closed-1".into(),
+            branch: "ontrack/closed-1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws-7".into(),
+            status: crate::worktrees::WorktreeStatus::MergeRequested,
+            detail: Some("waiting for verified ancestry".into()),
+        });
+        let screen = draw((80, 16), &mut app).0;
+        assert!(screen.contains("WORKTREES"));
+        assert!(screen.contains("closed-1"));
+        assert!(screen.contains("MERGE PENDING"));
+        assert!(screen.contains("main"));
+        assert!(screen.contains("waiting for verified ancestry"));
+        assert!(screen.contains("Git integration"));
+    }
+    #[test]
+    fn selected_worktree_and_confirmation_stay_visible_with_long_lists() {
+        let mut app = app();
+        app.worktrees_view = true;
+        for index in 0..12 {
+            app.worktrees.push(crate::worktrees::ManagedWorktree {
+                id: format!("wt-{index}"),
+                bead_id: format!("bead-{index}"),
+                branch: format!("ontrack/bead-{index}"),
+                target_branch: "main".into(),
+                workspace_id: format!("ws-{index}"),
+                status: crate::worktrees::WorktreeStatus::Unmerged,
+                detail: None,
+            });
+        }
+        app.selected_worktree = 11;
+        app.modal = Some(crate::app::Modal::ConfirmWorktree {
+            id: "wt-11".into(),
+            action: 0,
+        });
+        let screen = draw((80, 9), &mut app).0;
+        assert!(screen.contains("bead-11"));
+        assert!(screen.contains("MERGE REQUEST"));
+        assert!(screen.contains("confirm"));
+        assert!(app.worktree_offset > 0);
+    }
+    #[test]
+    fn remove_confirmation_names_herdr_closure_and_keeps_consent_visible_compactly() {
+        let mut state = app();
+        state.worktrees_view = true;
+        state.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "wt-remove".into(),
+            bead_id: "b-closed".into(),
+            branch: "ontrack/b".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: crate::worktrees::WorktreeStatus::Integrated,
+            detail: None,
+        });
+        state.settings.auto_close_workspace = false;
+        state.modal = Some(crate::app::Modal::ConfirmWorktree {
+            id: "wt-remove".into(),
+            action: 2,
+        });
+        let screen = draw((80, 9), &mut state).0;
+        assert!(screen.contains("REMOVE CHECKOUT AND CLOSE HERDR WORKSPACE"));
+        assert!(screen.contains("y confirm / Esc cancel"));
+        let mut settings = app();
+        settings.modal = Some(crate::app::Modal::Settings {
+            draft: crate::settings::Settings {
+                auto_remove_checkout: true,
+                ..Default::default()
+            },
+            error: None,
+            dropdown_open: false,
+            focus: 3,
+        });
+        let screen = draw((80, 24), &mut settings).0;
+        assert!(screen.contains("Remove checkout + close Herdr workspace"));
+    }
+    #[test]
     fn wrapping_and_caret_share_unicode_line_map() {
         let (s, x, y) = wrapped_description("abcdefghij\nxy", 12, 4);
         assert_eq!(s, "abcd\nefgh\nij\nxy");
@@ -1898,7 +2222,10 @@ mod tests {
         a.theme = crate::settings::Theme::Light;
         let storage_error = "Could not save settings to '/home/alexander/.config/ontrack/settings.json': Permission denied while replacing the destination file. Check the parent directory permissions and try again.";
         a.modal = Some(crate::app::Modal::Settings {
-            draft: crate::settings::Theme::Light,
+            draft: crate::settings::Settings {
+                theme: crate::settings::Theme::Light,
+                ..crate::settings::Settings::default()
+            },
             error: Some(storage_error.into()),
             dropdown_open: true,
             focus: 0,
@@ -1922,25 +2249,31 @@ mod tests {
         assert!(text.contains("settings.json"));
         assert!(text.contains("Permission") && text.contains("denied"));
         assert!(text.contains("try again"));
-        assert!(text.contains("change + save"));
+        assert!(text.contains("← / → theme"));
         assert!(text.contains("Dark"));
-        assert!(text.contains("Enter save"));
-        assert!(text.contains("Esc") && text.contains("back"));
+        assert!(text.contains("Enter / Space toggle"));
+        assert!(text.contains("Esc") && text.contains("close"));
         assert!(a.modal_ready);
         assert_eq!(buffer[(0, 3)].bg, Color::Rgb(246, 248, 247));
         assert!(a.modal_ready);
         a.theme = Theme::Dark;
         a.modal = Some(crate::app::Modal::Settings {
-            draft: crate::settings::Theme::Dark,
+            draft: crate::settings::Settings {
+                theme: crate::settings::Theme::Dark,
+                ..crate::settings::Settings::default()
+            },
             error: None,
             dropdown_open: false,
             focus: 0,
         });
         let closed = draw((80, 24), &mut a).0;
         assert!(closed.contains("Dark"));
-        assert!(closed.contains("Enter / Space options"));
+        assert!(closed.contains("Enter / Space toggle"));
         a.modal = Some(crate::app::Modal::Settings {
-            draft: Theme::Light,
+            draft: crate::settings::Settings {
+                theme: crate::settings::Theme::Light,
+                ..crate::settings::Settings::default()
+            },
             error: None,
             dropdown_open: true,
             focus: 0,
@@ -2035,7 +2368,10 @@ mod tests {
                 );
                 assert!(rendered.contains("ONTRACK"), "{theme:?} at {size:?}");
                 app.modal = Some(crate::app::Modal::Settings {
-                    draft: theme,
+                    draft: crate::settings::Settings {
+                        theme,
+                        ..crate::settings::Settings::default()
+                    },
                     error: None,
                     dropdown_open: true,
                     focus: 0,
@@ -2075,7 +2411,10 @@ mod tests {
     fn theme_dropdown_keeps_late_selection_visible_and_marks_more_options() {
         let mut app = app();
         app.modal = Some(crate::app::Modal::Settings {
-            draft: Theme::RosePine,
+            draft: crate::settings::Settings {
+                theme: crate::settings::Theme::RosePine,
+                ..crate::settings::Settings::default()
+            },
             error: None,
             dropdown_open: true,
             focus: 0,
@@ -2087,7 +2426,10 @@ mod tests {
         assert!(app.modal_ready);
 
         app.modal = Some(crate::app::Modal::Settings {
-            draft: Theme::TokyoNight,
+            draft: crate::settings::Settings {
+                theme: crate::settings::Theme::TokyoNight,
+                ..crate::settings::Settings::default()
+            },
             error: None,
             dropdown_open: true,
             focus: 0,

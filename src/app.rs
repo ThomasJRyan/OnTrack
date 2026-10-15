@@ -1,4 +1,5 @@
 use crate::herdr::{Agent, LaunchContext, LaunchOutcome};
+use crate::worktrees::{self, Action as WorktreeAction, CleanupPolicy, ManagedWorktree};
 use crate::{
     Tui,
     beads::{self, Bead, CreateBead},
@@ -25,6 +26,9 @@ pub(super) enum Request {
     Delete(String),
     Discover(u64),
     Launch(u64, LaunchContext, Agent, Bead),
+    ListWorktrees,
+    WorktreeAction(String, WorktreeAction),
+    ReconcileWorktrees(CleanupPolicy),
 }
 pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
@@ -33,6 +37,8 @@ pub(super) enum Response {
     Deleted(std::io::Result<()>),
     Discovered(u64, std::io::Result<LaunchContext>),
     Launched(u64, std::io::Result<LaunchOutcome>),
+    Worktrees(std::io::Result<Vec<ManagedWorktree>>),
+    WorktreeChanged(std::io::Result<ManagedWorktree>),
 }
 pub struct App {
     pub beads: Vec<Bead>,
@@ -56,6 +62,16 @@ pub struct App {
     pub theme: Theme,
     pub settings_path: Option<PathBuf>,
     pub settings_load_error: Option<String>,
+    pub worktrees: Vec<ManagedWorktree>,
+    pub selected_worktree: usize,
+    pub worktree_offset: usize,
+    pub worktrees_view: bool,
+    pub worktrees_loading: bool,
+    pub worktrees_error: Option<String>,
+    pub worktrees_inflight: bool,
+    pub worktrees_discovered: bool,
+    pub worktree_action_pending: bool,
+    pub worktrees_next_refresh: Instant,
     pub notice: Option<String>,
     pub mutation_busy: bool,
     pub modal_ready: bool,
@@ -74,12 +90,16 @@ pub enum Modal {
         title: String,
     },
     Settings {
-        draft: Theme,
+        draft: Settings,
         error: Option<String>,
         dropdown_open: bool,
         focus: usize,
     },
     Launch(LaunchModal),
+    ConfirmWorktree {
+        id: String,
+        action: u8,
+    },
 }
 #[derive(Debug, Clone)]
 pub struct LaunchModal {
@@ -202,6 +222,13 @@ impl App {
                     Request::Launch(seq, context, agent, bead) => {
                         Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
                     }
+                    Request::ListWorktrees => Response::Worktrees(worktrees::list()),
+                    Request::WorktreeAction(id, action) => {
+                        Response::WorktreeChanged(worktrees::act(&id, action))
+                    }
+                    Request::ReconcileWorktrees(policy) => {
+                        Response::Worktrees(worktrees::reconcile(policy))
+                    }
                 };
                 if out.send(response).is_err() {
                     break;
@@ -246,6 +273,16 @@ impl App {
             theme,
             settings_path,
             settings_load_error: settings_error.clone(),
+            worktrees: Vec::new(),
+            selected_worktree: 0,
+            worktree_offset: 0,
+            worktrees_view: false,
+            worktrees_loading: false,
+            worktrees_error: None,
+            worktrees_inflight: false,
+            worktrees_discovered: false,
+            worktree_action_pending: false,
+            worktrees_next_refresh: Instant::now(),
             notice: settings_error,
             mutation_busy: false,
             modal_ready: true,
@@ -273,6 +310,41 @@ impl App {
     fn poll_refresh(&mut self, now: Instant) {
         if !self.refresh_inflight && now >= self.next_refresh {
             self.start_refresh(now);
+        }
+    }
+    fn poll_worktrees(&mut self, now: Instant) {
+        let automatic = self.settings.auto_merge
+            || self.settings.auto_close_workspace
+            || self.settings.auto_remove_checkout;
+        let should_poll = !self.worktrees_discovered
+            || automatic
+            || !self.worktrees.is_empty()
+            || self.worktrees_view;
+        if should_poll
+            && !self.worktrees_inflight
+            && !self.worktree_action_pending
+            && now >= self.worktrees_next_refresh
+        {
+            self.worktrees_inflight = true;
+            self.worktrees_loading = true;
+            let policy = CleanupPolicy {
+                auto_merge: self.settings.auto_merge,
+                auto_close_workspace: self.settings.auto_close_workspace,
+                auto_remove_checkout: self.settings.auto_remove_checkout,
+            };
+            let request = if !self.worktrees_discovered
+                || (self.worktrees_view && self.worktrees.is_empty())
+            {
+                Request::ListWorktrees
+            } else {
+                Request::ReconcileWorktrees(policy)
+            };
+            if self.requests.send(request).is_err() {
+                self.worktrees_inflight = false;
+                self.worktrees_loading = false;
+                self.worktrees_error = Some("Worktree refresh could not be queued".into());
+                self.worktrees_next_refresh = now + REFRESH_INTERVAL;
+            }
         }
     }
     fn start_refresh(&mut self, now: Instant) {
@@ -608,6 +680,57 @@ impl App {
                         }
                     }
                 }
+                Response::Worktrees(result) => {
+                    self.worktrees_inflight = false;
+                    self.worktrees_loading = false;
+                    self.worktrees_next_refresh = now + REFRESH_INTERVAL;
+                    self.worktrees_discovered = true;
+                    if !self.worktree_action_pending {
+                        match result {
+                            Ok(items) => {
+                                let selected_id = self
+                                    .worktrees
+                                    .get(self.selected_worktree)
+                                    .map(|item| item.id.clone());
+                                self.worktrees = items;
+                                self.selected_worktree = selected_id
+                                    .and_then(|id| {
+                                        self.worktrees.iter().position(|item| item.id == id)
+                                    })
+                                    .unwrap_or(self.selected_worktree)
+                                    .min(self.worktrees.len().saturating_sub(1));
+                                self.worktrees_error = None;
+                            }
+                            Err(error) => self.worktrees_error = Some(error.to_string()),
+                        }
+                    }
+                }
+                Response::WorktreeChanged(result) => {
+                    self.mutation_busy = false;
+                    self.modal = None;
+                    self.worktree_action_pending = false;
+                    match result {
+                        Ok(item) => {
+                            if let Some(index) = self
+                                .worktrees
+                                .iter()
+                                .position(|existing| existing.id == item.id)
+                            {
+                                self.worktrees[index] = item.clone();
+                            }
+                            self.notice = Some(format!(
+                                "{} · {}",
+                                item.branch,
+                                worktree_status_label(item.status)
+                            ));
+                            self.worktrees_next_refresh = now + REFRESH_INTERVAL;
+                        }
+                        Err(e) => {
+                            self.worktrees_error = Some(e.to_string());
+                            self.worktrees_next_refresh = now;
+                        }
+                    }
+                }
             }
         }
     }
@@ -621,7 +744,35 @@ impl App {
         if event::is_quit(k) {
             return true;
         }
+        if self.worktrees_view {
+            match k.code {
+                KeyCode::Char('w') | KeyCode::Esc | KeyCode::Backspace => {
+                    self.worktrees_view = false
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.selected_worktree = self.selected_worktree.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.selected_worktree =
+                        (self.selected_worktree + 1).min(self.worktrees.len().saturating_sub(1))
+                }
+                KeyCode::Char('r') => {
+                    self.worktrees_next_refresh = Instant::now();
+                    self.poll_worktrees(Instant::now());
+                }
+                KeyCode::Char('m') => self.confirm_worktree_action(0),
+                KeyCode::Char('c') => self.confirm_worktree_action(1),
+                KeyCode::Char('x') => self.confirm_worktree_action(2),
+                _ => {}
+            }
+            return false;
+        }
         match k.code {
+            KeyCode::Char('w') => {
+                self.worktrees_view = true;
+                self.worktrees_next_refresh = Instant::now();
+                self.poll_worktrees(Instant::now());
+            }
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('s') => {
                 let load_error = self
@@ -629,7 +780,7 @@ impl App {
                     .as_ref()
                     .map(|error| format!("Settings were not loaded; defaults are active. {error}"));
                 self.modal = Some(Modal::Settings {
-                    draft: self.settings.theme,
+                    draft: self.settings,
                     error: load_error,
                     dropdown_open: false,
                     focus: 0,
@@ -686,6 +837,40 @@ impl App {
         }
         false
     }
+    fn confirm_worktree_action(&mut self, action: u8) {
+        let Some(item) = self.worktrees.get(self.selected_worktree) else {
+            self.worktrees_error = Some("Select a managed worktree first".into());
+            return;
+        };
+        if action == 1 && item.status != worktrees::WorktreeStatus::Integrated {
+            self.worktrees_error =
+                Some("Cleanup is available only after verified integration".into());
+            return;
+        }
+        if action == 2
+            && !matches!(
+                item.status,
+                worktrees::WorktreeStatus::Integrated | worktrees::WorktreeStatus::WorkspaceClosed
+            )
+        {
+            self.worktrees_error = Some("Checkout removal requires verified integration".into());
+            return;
+        }
+        if action == 0
+            && !matches!(
+                item.status,
+                worktrees::WorktreeStatus::Unmerged | worktrees::WorktreeStatus::NeedsResolution
+            )
+        {
+            self.worktrees_error = Some("This worktree is not ready for a merge request".into());
+            return;
+        }
+        self.modal = Some(Modal::ConfirmWorktree {
+            id: item.id.clone(),
+            action,
+        });
+        self.modal_ready = false;
+    }
     fn modal_key(&mut self, key: KeyEvent) -> bool {
         use crossterm::event::KeyCode::*;
         if self.mutation_busy {
@@ -722,8 +907,32 @@ impl App {
             self.modal = None;
             return false;
         }
+        if let Some(Modal::ConfirmWorktree { id, action }) = self.modal.as_ref() {
+            if matches!(key.code, Char('y') | Char('Y')) {
+                let id = id.clone();
+                let action = match action {
+                    0 => WorktreeAction::RequestMerge,
+                    1 => WorktreeAction::CloseWorkspace,
+                    _ => WorktreeAction::RemoveCheckout,
+                };
+                self.mutation_busy = true;
+                if self
+                    .requests
+                    .send(Request::WorktreeAction(id, action))
+                    .is_err()
+                {
+                    self.mutation_busy = false;
+                    self.worktrees_error = Some("Action could not be queued".into());
+                } else {
+                    self.worktree_action_pending = true;
+                }
+            } else if matches!(key.code, Char('n') | Char('N') | Enter) {
+                self.modal = None;
+            }
+            return false;
+        }
         if matches!(self.modal, Some(Modal::Settings { .. })) {
-            let mut save_theme = None;
+            let mut save_settings = None;
             if let Some(Modal::Settings {
                 draft,
                 dropdown_open,
@@ -734,31 +943,39 @@ impl App {
                 match key.code {
                     Tab | BackTab => {
                         *dropdown_open = false;
-                        *focus = 1 - *focus;
+                        *focus = (*focus + if key.code == Tab { 1 } else { 4 }) % 5;
                     }
                     Up | Down => {
-                        *focus = 0;
+                        *focus = (*focus + if key.code == Down { 1 } else { 4 }) % 5;
                         *dropdown_open = false;
                     }
                     Left | Right if *focus == 0 => {
-                        *draft = cycle_theme(*draft, key.code == Right);
-                        save_theme = Some(*draft);
+                        draft.theme = cycle_theme(draft.theme, key.code == Right);
+                        save_settings = Some(*draft);
                     }
                     Enter | Char(' ') if *focus == 0 && *dropdown_open => {
                         *dropdown_open = false;
-                        save_theme = Some(*draft);
+                        save_settings = Some(*draft);
                     }
                     Enter | Char(' ') if *focus == 0 => {
                         *dropdown_open = true;
                     }
-                    Enter | Char(' ') if *focus == 1 => {
+                    Enter | Char(' ') if (1..=3).contains(focus) => {
+                        match *focus {
+                            1 => draft.auto_merge = !draft.auto_merge,
+                            2 => draft.auto_close_workspace = !draft.auto_close_workspace,
+                            _ => draft.auto_remove_checkout = !draft.auto_remove_checkout,
+                        }
+                        save_settings = Some(*draft);
+                    }
+                    Enter | Char(' ') if *focus == 4 => {
                         self.modal = None;
                     }
                     _ => {}
                 }
             }
-            if let Some(theme) = save_theme {
-                self.save_settings(theme);
+            if let Some(settings) = save_settings {
+                self.save_settings(settings);
             }
             return false;
         }
@@ -1020,8 +1237,7 @@ impl App {
         }
         false
     }
-    fn save_settings(&mut self, theme: Theme) {
-        let proposed = Settings { theme };
+    fn save_settings(&mut self, proposed: Settings) {
         let result = self
             .settings_path
             .as_deref()
@@ -1030,9 +1246,9 @@ impl App {
         match result {
             Ok(()) => {
                 self.settings = proposed;
-                self.theme = theme;
+                self.theme = proposed.theme;
                 self.settings_load_error = None;
-                self.notice = Some(format!("{} theme saved", theme.label()));
+                self.notice = Some("Settings saved".into());
                 if let Some(Modal::Settings { error, .. }) = self.modal.as_mut() {
                     *error = None;
                 }
@@ -1111,6 +1327,18 @@ fn status_order(status: &str) -> (u8, &str) {
         "open" => (0, status),
         "closed" => (2, status),
         _ => (1, status),
+    }
+}
+pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'static str {
+    use worktrees::WorktreeStatus::*;
+    match status {
+        Unmerged => "UNMERGED",
+        MergeRequested => "MERGE PENDING",
+        NeedsResolution => "NEEDS RESOLUTION",
+        Integrated => "INTEGRATED",
+        WorkspaceClosed => "WORKSPACE CLOSED",
+        CheckoutRemoved => "CHECKOUT REMOVED",
+        NeedsAttention => "NEEDS ATTENTION",
     }
 }
 fn normalized_status(status: &str) -> &str {
@@ -1204,6 +1432,7 @@ pub fn run(t: &mut Tui) -> std::io::Result<()> {
     loop {
         app.receive();
         app.poll_refresh(Instant::now());
+        app.poll_worktrees(Instant::now());
         t.draw(|f| ui::render(f, start.elapsed(), &mut app))?;
         if let Some(e) = event::poll_event(Duration::from_millis(35))? {
             match e {
@@ -1262,6 +1491,16 @@ mod tests {
             theme: Theme::Dark,
             settings_path: None,
             settings_load_error: None,
+            worktrees: Vec::new(),
+            selected_worktree: 0,
+            worktree_offset: 0,
+            worktrees_view: false,
+            worktrees_loading: false,
+            worktrees_error: None,
+            worktrees_inflight: false,
+            worktrees_discovered: true,
+            worktree_action_pending: false,
+            worktrees_next_refresh: Instant::now(),
             notice: None,
             mutation_busy: false,
             modal_ready: true,
@@ -2004,7 +2243,10 @@ mod tests {
         assert!(matches!(
             a.modal,
             Some(Modal::Settings {
-                draft: Theme::Dark,
+                draft: Settings {
+                    theme: Theme::Dark,
+                    ..
+                },
                 ..
             })
         ));
@@ -2102,7 +2344,9 @@ mod tests {
             "reopening does not change the saved theme"
         );
         assert!(matches!(a.modal, Some(Modal::Settings { .. })));
-        press(&mut a, KeyCode::Tab);
+        for _ in 0..4 {
+            press(&mut a, KeyCode::Tab);
+        }
         press(&mut a, KeyCode::Enter);
         assert!(a.modal.is_none());
         assert_eq!(
@@ -2144,7 +2388,7 @@ mod tests {
         assert_eq!(a.theme, Theme::Dark);
     }
     #[test]
-    fn settings_vertical_navigation_never_changes_or_saves_theme() {
+    fn settings_arrows_wrap_rows_and_reach_cleanup_toggles() {
         let dir = std::env::temp_dir().join(format!("ontrack-settings-nav-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join("settings.json");
@@ -2152,33 +2396,25 @@ mod tests {
         a.settings_path = Some(path.clone());
         press(&mut a, KeyCode::Char('s'));
         press(&mut a, KeyCode::Up);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 4, .. })));
         press(&mut a, KeyCode::Down);
-        assert_eq!(a.theme, Theme::Dark);
-        assert!(!path.exists());
-        press(&mut a, KeyCode::Tab);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 0, .. })));
+        press(&mut a, KeyCode::Down);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 1, .. })));
         press(&mut a, KeyCode::Enter);
-        assert!(a.modal.is_none());
-        assert!(!path.exists(), "Close must not save settings");
-        press(&mut a, KeyCode::Char('s'));
-        press(&mut a, KeyCode::Enter);
-        press(&mut a, KeyCode::Down);
-        assert!(matches!(
-            a.modal,
-            Some(Modal::Settings {
-                dropdown_open: false,
-                ..
-            })
-        ));
-        press(&mut a, KeyCode::Up);
         assert_eq!(a.theme, Theme::Dark);
-        assert!(!path.exists(), "row navigation must not write settings");
+        assert!(a.settings.auto_merge);
+        assert!(settings::load_from(&path).unwrap().auto_merge);
         press(&mut a, KeyCode::Esc);
         assert!(a.modal.is_none());
-        assert!(
-            !path.exists(),
-            "closing without a change must not write settings"
-        );
+        assert!(a.settings.auto_merge);
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Down);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 0, .. })));
+        assert_eq!(a.theme, Theme::Dark);
+        assert!(a.settings.auto_merge);
+        press(&mut a, KeyCode::Esc);
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
@@ -2240,7 +2476,7 @@ mod tests {
             "reopening reloads the committed theme"
         );
         press(&mut a, KeyCode::Char('s'));
-        assert!(matches!(a.modal, Some(Modal::Settings { draft, .. }) if draft == reloaded.theme));
+        assert!(matches!(a.modal, Some(Modal::Settings { draft, .. }) if draft == reloaded));
         press(&mut a, KeyCode::Esc);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3032,7 +3268,14 @@ mod tests {
         let path = root.join("settings.json");
         let mut a = app();
         a.settings_path = Some(path.clone());
-        settings::save_to(&path, &Settings { theme: Theme::Dark }).unwrap();
+        settings::save_to(
+            &path,
+            &Settings {
+                theme: Theme::Dark,
+                ..Settings::default()
+            },
+        )
+        .unwrap();
         press(&mut a, KeyCode::Char('s'));
         // A regular file where the parent directory should be makes saving fail.
         let blocker = root.join("blocked");
@@ -3052,7 +3295,10 @@ mod tests {
         assert!(matches!(
             a.modal,
             Some(Modal::Settings {
-                draft: Theme::Light,
+                draft: Settings {
+                    theme: Theme::Light,
+                    ..
+                },
                 error: Some(_),
                 ..
             })
@@ -3061,18 +3307,16 @@ mod tests {
         assert_eq!(fs::read_to_string(blocker).unwrap(), "preserve");
 
         press(&mut a, KeyCode::Enter);
-        press(&mut a, KeyCode::Up);
         assert!(matches!(
             a.modal,
             Some(Modal::Settings {
-                dropdown_open: false,
+                dropdown_open: true,
                 error: Some(_),
                 ..
             })
         ));
         assert_eq!(a.theme, Theme::Dark);
         assert_eq!(settings::load_from(&path).unwrap().theme, Theme::Dark);
-        press(&mut a, KeyCode::Enter);
         press(&mut a, KeyCode::Enter);
         assert!(
             matches!(a.modal, Some(Modal::Settings { error: Some(_), .. })),
@@ -3094,5 +3338,113 @@ mod tests {
             "closing retains the successful choice"
         );
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn worktree_merge_requires_confirmation_and_cancel_has_no_side_effect() {
+        let (mut a, rx, _) = connected_app();
+        a.worktrees_view = true;
+        a.worktrees.push(ManagedWorktree {
+            id: "wt-1".into(),
+            bead_id: "b1".into(),
+            branch: "ontrack/b1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws1".into(),
+            status: worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        });
+        press(&mut a, KeyCode::Char('m'));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::ConfirmWorktree { action: 0, .. })
+        ));
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Esc);
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::WorktreeAction(id, WorktreeAction::RequestMerge)) if id == "wt-1")
+        );
+    }
+    #[test]
+    fn worktree_worker_polls_without_queue_growth_and_surfaces_errors() {
+        let (mut a, rx, tx) = connected_app();
+        a.worktrees_view = true;
+        let now = Instant::now();
+        a.poll_worktrees(now);
+        assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
+        a.poll_worktrees(now + REFRESH_INTERVAL * 10);
+        assert!(rx.try_recv().is_err(), "one in-flight request is enough");
+        tx.send(Response::Worktrees(Err(std::io::Error::other(
+            "registry unavailable",
+        ))))
+        .unwrap();
+        a.receive_at(now);
+        assert_eq!(a.worktrees_error.as_deref(), Some("registry unavailable"));
+        assert!(!a.worktrees_loading);
+        a.poll_worktrees(now + REFRESH_INTERVAL);
+        assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
+    }
+    #[test]
+    fn worktree_policy_reconciles_outside_worktrees_view() {
+        let (mut a, rx, _) = connected_app();
+        a.settings.auto_merge = true;
+        a.poll_worktrees(Instant::now());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Request::ReconcileWorktrees(CleanupPolicy {
+                auto_merge: true,
+                ..
+            }))
+        ));
+        assert!(!a.worktrees_view);
+    }
+    #[test]
+    fn closed_bead_does_not_remove_its_managed_worktree() {
+        let (mut a, _, tx) = connected_app();
+        a.beads[0].status = "closed".into();
+        let item = ManagedWorktree {
+            id: "tracked-closed".into(),
+            bead_id: a.beads[0].id.clone(),
+            branch: "ontrack/b0".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        };
+        tx.send(Response::Worktrees(Ok(vec![item.clone()])))
+            .unwrap();
+        a.receive_at(Instant::now());
+        assert_eq!(a.worktrees.len(), 1);
+        assert_eq!(a.worktrees[0].id, item.id);
+        assert_eq!(a.beads[0].status, "closed");
+    }
+    #[test]
+    fn older_worktree_snapshot_cannot_overwrite_action_result() {
+        let (mut a, _, tx) = connected_app();
+        let before = ManagedWorktree {
+            id: "wt".into(),
+            bead_id: "b0".into(),
+            branch: "ontrack/b0".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        };
+        a.worktrees = vec![before.clone()];
+        a.worktrees_inflight = true;
+        a.worktree_action_pending = true;
+        let after = ManagedWorktree {
+            status: worktrees::WorktreeStatus::Integrated,
+            detail: None,
+            ..before
+        };
+        tx.send(Response::Worktrees(Ok(vec![a.worktrees[0].clone()])))
+            .unwrap();
+        tx.send(Response::WorktreeChanged(Ok(after.clone())))
+            .unwrap();
+        a.receive_at(Instant::now());
+        assert_eq!(a.worktrees.len(), 1);
+        assert_eq!(a.worktrees[0].status, worktrees::WorktreeStatus::Integrated);
     }
 }

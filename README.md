@@ -7,6 +7,7 @@ A terminal browser for Beads issues in the current workspace.
 - Automatic background refresh picks up external changes, with cached records and visible errors; no watcher setup required.
 - Persistent dark or light appearance with a live preview in settings.
 - Press `h` to hand a selected Bead to an installed Herdr agent in a new worktree, after explicit confirmation. See the [user guide](docs/user-guide.md) for setup and recovery limits.
+- Press `w` to inspect OnTrack-tracked outstanding worktrees independently of Bead status, request a merge, or confirm safe cleanup.
 
 ## Requirements
 
@@ -18,9 +19,9 @@ Rust 1.88 or newer, the `bd` command-line tool, and a Beads workspace. A termina
 cargo run
 ```
 
-Issues are grouped into coloured, collapsible status panes (open first, closed last). Each row colour-codes issue type, priority, and status while keeping its title readable. Use `↑` / `↓` to move through issues and group titles; `←` collapses and `→` expands the focused group. `Space` toggles a group, and clicking its pane title also toggles it. Press `Tab` to switch panes. Press `s` to choose from twelve built-in themes; `←` / `→` changes are saved immediately, while `↑` / `↓` navigates setting rows. Press `n` to create a bead, and `d` to permanently delete the selected issue (confirmation required). Changes refresh automatically; press `r` for a manual refresh. Press `q`, `Esc`, or `Ctrl+C` to quit outside a dialog. See the [user guide](docs/user-guide.md) for details.
+Issues are grouped into coloured, collapsible status panes (open first, closed last). Press `w` for outstanding tracked handoffs, `s` for appearance and cleanup preferences, `n` to create a bead, and `d` to permanently delete one (confirmation required). See the [user guide](docs/user-guide.md) for controls and the [development guide](docs/development.md) for the tracked-worktree model.
 
-See the [user guide](docs/user-guide.md) for setup and controls, the [settings guide](docs/settings.md) for theme storage, the [development guide](docs/development.md) for architecture and checks, and the [official Beads documentation](https://beads.gascity.com) for workspace setup.
+See the [user guide](docs/user-guide.md) for setup and controls, the [settings guide](docs/settings.md) for theme and worktree preferences, the [development guide](docs/development.md) for architecture and checks, and the [official Beads documentation](https://beads.gascity.com) for workspace setup.
 
 ## Checks
 
