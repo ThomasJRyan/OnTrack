@@ -663,18 +663,8 @@ impl App {
                             (*focus + 2) % 3
                         };
                     }
-                    Left | Right if *focus == 0 => {
-                        *draft = cycle_theme(*draft, key.code == Right);
-                        *error = None;
-                        self.theme = *draft;
-                    }
-                    Up if *focus == 0 => {
-                        *draft = Theme::Dark;
-                        *error = None;
-                        self.theme = *draft;
-                    }
-                    Down if *focus == 0 => {
-                        *draft = Theme::Light;
+                    Left | Right | Up | Down if *focus == 0 => {
+                        *draft = cycle_theme(*draft, matches!(key.code, Right | Down));
                         *error = None;
                         self.theme = *draft;
                     }
@@ -1692,6 +1682,56 @@ mod tests {
         assert_eq!(a.theme, Theme::Dark);
     }
     #[test]
+    fn settings_selector_cycles_all_catalog_entries_and_wraps_both_directions() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: true,
+                ..
+            })
+        ));
+        for theme in Theme::ALL
+            .into_iter()
+            .cycle()
+            .skip(1)
+            .take(Theme::ALL.len() - 1)
+        {
+            press(&mut a, KeyCode::Right);
+            assert_eq!(a.theme, theme);
+        }
+        assert_eq!(a.theme, *Theme::ALL.last().unwrap());
+        press(&mut a, KeyCode::Right);
+        assert_eq!(
+            a.theme,
+            Theme::Dark,
+            "forward wraps from the last catalog entry"
+        );
+        press(&mut a, KeyCode::Left);
+        assert_eq!(
+            a.theme,
+            *Theme::ALL.last().unwrap(),
+            "backward wraps from the first entry"
+        );
+        press(&mut a, KeyCode::Esc);
+        assert_eq!(
+            a.theme,
+            Theme::Dark,
+            "Esc restores the opened dropdown choice"
+        );
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: false,
+                ..
+            })
+        ));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+    }
+    #[test]
     fn mouse_targets_follow_scrolled_natural_lines_without_relocated_headers() {
         let mut a = app();
         a.list_rect = Rect::new(5, 7, 30, 20);
@@ -2408,18 +2448,19 @@ mod tests {
 
         let mut a = app();
         press(&mut a, KeyCode::Char('s'));
-        press(&mut a, KeyCode::Left); // Closed focused setting wraps Dark -> Light.
-        assert_eq!(a.theme, Theme::Light);
+        press(&mut a, KeyCode::Left); // Closed focused setting wraps Dark -> last theme.
+        let last_theme = *Theme::ALL.last().unwrap();
+        assert_eq!(a.theme, last_theme);
         press(&mut a, KeyCode::Enter);
-        press(&mut a, KeyCode::Right); // Open setting wraps Light -> Dark.
+        press(&mut a, KeyCode::Right); // Open setting wraps the last theme -> Dark.
         assert_eq!(a.theme, Theme::Dark);
         press(&mut a, KeyCode::Esc);
-        assert_eq!(a.theme, Theme::Light, "Esc restores the opening choice");
+        assert_eq!(a.theme, last_theme, "Esc restores the opening choice");
         press(&mut a, KeyCode::Enter);
         press(&mut a, KeyCode::Left);
-        assert_eq!(a.theme, Theme::Dark);
+        assert_eq!(a.theme, Theme::SolarizedLight);
         press(&mut a, KeyCode::Enter);
-        assert_eq!(a.theme, Theme::Dark, "Enter keeps the preview");
+        assert_eq!(a.theme, Theme::SolarizedLight, "Enter keeps the preview");
     }
 
     #[test]

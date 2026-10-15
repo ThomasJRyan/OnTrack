@@ -12,16 +12,44 @@ pub enum Theme {
     #[default]
     Dark,
     Light,
+    TokyoNight,
+    Nord,
+    Dracula,
+    GruvboxDark,
+    GruvboxLight,
+    CatppuccinMocha,
+    CatppuccinLatte,
+    SolarizedDark,
+    SolarizedLight,
+    RosePine,
 }
 
 impl Theme {
-    pub const ALL: [Self; 2] = [Self::Dark, Self::Light];
+    pub const ALL: [Self; 12] = [
+        Self::Dark,
+        Self::Light,
+        Self::TokyoNight,
+        Self::Nord,
+        Self::Dracula,
+        Self::GruvboxDark,
+        Self::GruvboxLight,
+        Self::CatppuccinMocha,
+        Self::CatppuccinLatte,
+        Self::SolarizedDark,
+        Self::SolarizedLight,
+        Self::RosePine,
+    ];
 
     pub fn label(self) -> &'static str {
-        match self {
-            Self::Dark => "Dark",
-            Self::Light => "Light",
-        }
+        crate::theme::definition(self).name
+    }
+
+    pub fn id(self) -> &'static str {
+        crate::theme::definition(self).id
+    }
+
+    pub fn is_light(self) -> bool {
+        crate::theme::definition(self).is_light
     }
 }
 
@@ -74,9 +102,9 @@ pub fn load_from(path: &Path) -> io::Result<Settings> {
         .ok_or_else(|| invalid("expected a JSON object"))?;
     let theme = match object.get("theme") {
         None => Theme::default(),
-        Some(serde_json::Value::String(theme)) if theme == "dark" => Theme::Dark,
-        Some(serde_json::Value::String(theme)) if theme == "light" => Theme::Light,
-        Some(_) => return Err(invalid("theme must be \"dark\" or \"light\"")),
+        Some(serde_json::Value::String(theme)) => crate::theme::find(theme)
+            .ok_or_else(|| invalid(&format!("unknown theme id '{theme}'")))?,
+        Some(_) => return Err(invalid("theme must be a supported string ID")),
     };
     Ok(Settings { theme })
 }
@@ -96,10 +124,7 @@ pub fn save_to(path: &Path, settings: &Settings) -> io::Result<()> {
     fs::create_dir_all(parent).map_err(|error| io_error("create directory", parent, error))?;
 
     let (temporary_path, mut file) = create_temporary_file(parent)?;
-    let theme = match settings.theme {
-        Theme::Dark => "dark",
-        Theme::Light => "light",
-    };
+    let theme = settings.theme.id();
     let result = (|| {
         writeln!(file, "{{\"theme\":\"{theme}\"}}")
             .and_then(|()| file.sync_all())
@@ -208,22 +233,15 @@ mod tests {
     }
 
     #[test]
-    fn both_themes_roundtrip_and_replace_existing_settings() {
+    fn every_theme_roundtrips_and_replaces_existing_settings() {
         let directory = TestDirectory::new();
-        for theme in [Theme::Dark, Theme::Light, Theme::Dark] {
+        for theme in Theme::ALL.into_iter().chain([Theme::Dark]) {
             let settings = Settings { theme };
             save_to(&directory.path(), &settings).unwrap();
             assert_eq!(load_from(&directory.path()).unwrap(), settings);
             let json: serde_json::Value =
                 serde_json::from_slice(&fs::read(directory.path()).unwrap()).unwrap();
-            assert_eq!(
-                json["theme"],
-                if theme == Theme::Dark {
-                    "dark"
-                } else {
-                    "light"
-                }
-            );
+            assert_eq!(json["theme"], theme.id());
             assert_eq!(
                 fs::read_dir(directory.path().parent().unwrap())
                     .unwrap()

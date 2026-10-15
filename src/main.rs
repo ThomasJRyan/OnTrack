@@ -4,6 +4,7 @@ mod detail;
 mod event;
 mod settings;
 mod terminal;
+mod theme;
 mod ui;
 
 use std::{error::Error, io};

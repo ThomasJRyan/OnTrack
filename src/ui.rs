@@ -8,45 +8,24 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
 };
 use std::time::Duration;
-const BG: Color = Color::Rgb(13, 23, 28);
-const INK: Color = Color::Rgb(220, 228, 229);
+#[cfg(test)]
 const MUTED: Color = Color::Rgb(123, 144, 148);
+#[cfg(test)]
 const TEAL: Color = Color::Rgb(73, 211, 182);
+#[cfg(test)]
 const GOLD: Color = Color::Rgb(239, 183, 99);
-const ASCII_LOGO: [&str; 8] = [
-    "    ███████               ███████████                              █████     ",
-    "  ███▒▒▒▒▒███            ▒█▒▒▒███▒▒▒█                             ▒▒███      ",
-    " ███     ▒▒███ ████████  ▒   ▒███  ▒  ████████   ██████    ██████  ▒███ █████",
-    "▒███      ▒███▒▒███▒▒███     ▒███    ▒▒███▒▒███ ▒▒▒▒▒███  ███▒▒███ ▒███▒▒███ ",
-    "▒███      ▒███ ▒███ ▒███     ▒███     ▒███ ▒▒▒   ███████ ▒███ ▒▒▒  ▒██████▒  ",
-    "▒▒███     ███  ▒███ ▒███     ▒███     ▒███      ███▒▒███ ▒███  ███ ▒███▒▒███ ",
-    " ▒▒▒███████▒   ████ █████    █████    █████    ▒▒████████▒▒██████  ████ █████",
-    "   ▒▒▒▒▒▒▒    ▒▒▒▒ ▒▒▒▒▒    ▒▒▒▒▒    ▒▒▒▒▒      ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒  ▒▒▒▒ ▒▒▒▒▒ ",
-];
+#[cfg(test)]
 fn status_color(status: &str) -> Color {
     match status {
         "open" => TEAL,
-        "closed" => Color::Rgb(255, 123, 123),
+        "closed" | "blocked" => Color::Rgb(255, 123, 123),
         "in_progress" => GOLD,
-        "blocked" => Color::Rgb(255, 123, 123),
         "deferred" => Color::Rgb(145, 170, 220),
         "unknown" | "" => MUTED,
         _ => Color::Rgb(125, 168, 235),
     }
 }
-fn row_issue_type(bead: &crate::beads::Bead) -> String {
-    ["issue_type", "type"]
-        .into_iter()
-        .find_map(|field| {
-            bead.data
-                .get(field)
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|kind| !kind.is_empty())
-        })
-        .map(str::to_owned)
-        .unwrap_or_else(|| "unknown".to_owned())
-}
+#[cfg(test)]
 fn row_type_color(kind: &str) -> Color {
     match kind.to_ascii_lowercase().as_str() {
         "task" => TEAL,
@@ -61,68 +40,69 @@ fn row_type_color(kind: &str) -> Color {
         _ => MUTED,
     }
 }
+#[cfg(test)]
 fn row_priority_color(priority: u64) -> Color {
     match priority {
         0 => Color::Rgb(255, 105, 105),
         1 => Color::Rgb(255, 159, 105),
         2 => GOLD,
         3 => Color::Rgb(138, 197, 169),
-        4 => MUTED,
         _ => MUTED,
     }
 }
-fn light_semantic(color: Color) -> Color {
-    match color {
-        Color::Reset | Color::White | Color::Black => Color::Rgb(32, 43, 45),
-        Color::DarkGray => Color::Rgb(83, 101, 104),
-        Color::Gray => Color::Rgb(76, 98, 101),
-        Color::Red | Color::LightRed => Color::Rgb(150, 45, 45),
-        Color::Green | Color::LightGreen => Color::Rgb(0, 112, 91),
-        Color::Yellow | Color::LightYellow => Color::Rgb(142, 83, 0),
-        Color::Blue | Color::LightBlue => Color::Rgb(55, 91, 142),
-        Color::Magenta | Color::LightMagenta => Color::Rgb(128, 57, 112),
-        Color::Cyan | Color::LightCyan => Color::Rgb(0, 100, 112),
-        Color::Rgb(73, 211, 182) => Color::Rgb(0, 112, 91),
-        Color::Rgb(239, 183, 99) => Color::Rgb(142, 83, 0),
-        Color::Rgb(123, 144, 148) => Color::Rgb(76, 98, 101),
-        Color::Indexed(index) => light_ansi(index),
-        Color::Rgb(r, g, b) => Color::Rgb(r / 2, g / 2, b / 2),
-    }
-}
-fn light_ansi(index: u8) -> Color {
-    match index {
-        0 | 7 | 15 => Color::Rgb(32, 43, 45),
-        1 | 9 => Color::Rgb(150, 45, 45),
-        2 | 10 => Color::Rgb(0, 112, 91),
-        3 | 11 => Color::Rgb(142, 83, 0),
-        4 | 12 => Color::Rgb(55, 91, 142),
-        5 | 13 => Color::Rgb(128, 57, 112),
-        6 | 14 => Color::Rgb(0, 100, 112),
-        _ => Color::Rgb(83, 101, 104),
-    }
+const ASCII_LOGO: [&str; 8] = [
+    "    ███████               ███████████                              █████     ",
+    "  ███▒▒▒▒▒███            ▒█▒▒▒███▒▒▒█                             ▒▒███      ",
+    " ███     ▒▒███ ████████  ▒   ▒███  ▒  ████████   ██████    ██████  ▒███ █████",
+    "▒███      ▒███▒▒███▒▒███     ▒███    ▒▒███▒▒███ ▒▒▒▒▒███  ███▒▒███ ▒███▒▒███ ",
+    "▒███      ▒███ ▒███ ▒███     ▒███     ▒███ ▒▒▒   ███████ ▒███ ▒▒▒  ▒██████▒  ",
+    "▒▒███     ███  ▒███ ▒███     ▒███     ▒███      ███▒▒███ ▒███  ███ ▒███▒▒███ ",
+    " ▒▒▒███████▒   ████ █████    █████    █████    ▒▒████████▒▒██████  ████ █████",
+    "   ▒▒▒▒▒▒▒    ▒▒▒▒ ▒▒▒▒▒    ▒▒▒▒▒    ▒▒▒▒▒      ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒  ▒▒▒▒ ▒▒▒▒▒ ",
+];
+fn row_issue_type(bead: &crate::beads::Bead) -> String {
+    ["issue_type", "type"]
+        .into_iter()
+        .find_map(|field| {
+            bead.data
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty())
+        })
+        .map(str::to_owned)
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 fn themed_status_color(status: &str, theme: Theme) -> Color {
-    let color = status_color(status);
-    if theme == Theme::Light {
-        light_semantic(color)
-    } else {
-        color
-    }
+    crate::theme::status_color(theme, status)
 }
 fn themed_type_color(kind: &str, theme: Theme) -> Color {
-    let color = row_type_color(kind);
-    if theme == Theme::Light {
-        light_semantic(color)
-    } else {
-        color
-    }
+    crate::theme::issue_type_color(theme, kind)
+}
+fn themed_priority_color(priority: u64, theme: Theme) -> Color {
+    crate::theme::priority_color(theme, priority)
 }
 fn settings_hint(dropdown_open: bool) -> &'static str {
     if dropdown_open {
-        "← / → cycle · ↑ / ↓ choose · Enter keep · Esc revert · Tab / Shift+Tab actions"
+        "← / → or ↑ / ↓ cycle · Enter keep · Esc revert · Tab actions"
     } else {
-        "Tab / Shift+Tab focus · ← / → cycle · Enter / Space open · Esc cancel"
+        "Tab / Shift+Tab focus · arrows cycle · Enter / Space open · Esc cancel"
     }
+}
+const MAX_VISIBLE_THEMES: usize = 6;
+fn visible_theme_window(theme: Theme, available_height: u16) -> (usize, usize) {
+    let total = crate::theme::CATALOG.len();
+    let visible = usize::from(available_height)
+        .saturating_sub(13)
+        .clamp(1, MAX_VISIBLE_THEMES.min(total));
+    let selected = Theme::ALL
+        .iter()
+        .position(|choice| *choice == theme)
+        .unwrap_or(0);
+    let start = selected
+        .saturating_sub(visible.saturating_sub(1))
+        .min(total.saturating_sub(visible));
+    (start, visible)
 }
 fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
     let type_width = beads
@@ -141,16 +121,16 @@ fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
 }
 pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     let a = f.area();
-    let (bg, ink, muted, teal, gold) = match app.theme {
-        Theme::Dark => (BG, INK, MUTED, TEAL, GOLD),
-        Theme::Light => (
-            Color::Rgb(246, 248, 247),
-            Color::Rgb(32, 43, 45),
-            Color::Rgb(83, 101, 104),
-            Color::Rgb(0, 113, 94),
-            Color::Rgb(139, 86, 0),
-        ),
-    };
+    let palette = crate::theme::definition(app.theme).palette;
+    debug_assert_eq!(
+        app.theme.is_light(),
+        crate::theme::definition(app.theme).is_light
+    );
+    let bg = palette.background;
+    let ink = palette.foreground;
+    let muted = palette.muted;
+    let teal = palette.accent;
+    let gold = palette.warning;
     f.render_widget(Block::default().style(Style::default().bg(bg)), a);
     app.list_rect = Rect::default();
     app.detail_rect = Rect::default();
@@ -224,8 +204,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             Span::styled(
                 " BEADS ",
                 Style::default()
-                    .fg(bg)
-                    .bg(teal)
+                    .fg(palette.selected_foreground)
+                    .bg(palette.selected_background)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  ONTRACK  /  WORKSPACE ISSUES"),
@@ -296,8 +276,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             let marker = if group.collapsed { "▸" } else { "▾" };
             let title_style = if focused {
                 Style::default()
-                    .fg(bg)
-                    .bg(color)
+                    .fg(palette.selected_foreground)
+                    .bg(palette.selected_background)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default().fg(color).add_modifier(Modifier::BOLD)
@@ -390,11 +370,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                                     )
                                 )
                             },
-                            Style::default().fg(if app.theme == Theme::Light {
-                                light_semantic(row_priority_color(bead.priority))
-                            } else {
-                                row_priority_color(bead.priority)
-                            }),
+                            Style::default().fg(themed_priority_color(bead.priority, app.theme)),
                         ),
                         Span::raw("  "),
                         Span::styled(
@@ -405,14 +381,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 } else {
                     Line::from(vec![
                         Span::raw("  "),
-                        Span::styled(
-                            bead.title.clone(),
-                            Style::default().fg(if app.theme == Theme::Dark {
-                                Color::White
-                            } else {
-                                ink
-                            }),
-                        ),
+                        Span::styled(bead.title.clone(), Style::default().fg(ink)),
                     ])
                 };
                 f.render_widget(
@@ -447,16 +416,19 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 "Select an issue to inspect its full record."
             })
         });
-    if app.theme == Theme::Light {
-        for line in &mut detail_text.lines {
-            for span in &mut line.spans {
-                let old = span.style;
-                let style = old.fg(old.fg.map(light_semantic).unwrap_or(ink));
-                span.style = old
-                    .bg
-                    .map(|background| style.bg(light_detail_background(background)))
-                    .unwrap_or(style);
-            }
+    for line in &mut detail_text.lines {
+        for span in &mut line.spans {
+            let old = span.style;
+            let style = old.fg(old
+                .fg
+                .map(|color| crate::theme::markdown_foreground(app.theme, color))
+                .unwrap_or(ink));
+            span.style = old
+                .bg
+                .map(|background| {
+                    style.bg(crate::theme::markdown_background(app.theme, background))
+                })
+                .unwrap_or(style);
         }
     }
     let lines = Paragraph::new(detail_text.clone())
@@ -474,7 +446,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(if app.focus_detail { teal } else { muted }));
+        .border_style(Style::default().fg(if app.focus_detail {
+            teal
+        } else {
+            palette.border
+        }))
+        .style(Style::default().bg(palette.panel));
     f.render_widget(
         Paragraph::new(detail_text)
             .block(block)
@@ -500,7 +477,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         Paragraph::new(format!(
             " {state}  ·  ↑↓ move  ← fold  → unfold  ·  Tab panes  ·  s settings  ·  n new  ·  d delete  ·  r refresh  ·  q quit"
         ))
-        .style(Style::default().fg(muted)),
+        .style(Style::default().fg(muted).bg(palette.panel_alt)),
         v[2],
     );
     if let Some(modal) = &app.modal {
@@ -524,6 +501,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             crate::app::Modal::Settings {
                 error,
                 dropdown_open,
+                draft,
                 ..
             } => {
                 let error_lines = error
@@ -535,7 +513,15 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     width.saturating_sub(4) as usize,
                 )
                 .len();
-                ((if *dropdown_open { 7 } else { 5 } + error_lines + hint_lines) + 2) as u16
+                let option_lines = if *dropdown_open {
+                    let (start, count) = visible_theme_window(*draft, a.height);
+                    count
+                        + usize::from(start > 0)
+                        + usize::from(start + count < crate::theme::CATALOG.len())
+                } else {
+                    0
+                };
+                (5 + option_lines + error_lines + hint_lines + 2) as u16
             }
             crate::app::Modal::Create(form) => {
                 if form.dropdown.is_some() {
@@ -551,7 +537,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         let min_width = if matches!(modal, crate::app::Modal::Create(_)) {
             70
         } else if matches!(modal, crate::app::Modal::Settings { .. }) {
-            54
+            38
         } else {
             50
         };
@@ -586,14 +572,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 _ => " DELETE BEAD? ",
             })
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(teal))
-            .style(
-                Style::default().bg(if app.theme == crate::settings::Theme::Light {
-                    Color::Rgb(232, 239, 237)
-                } else {
-                    Color::Rgb(20, 33, 38)
-                }),
-            );
+            .border_style(Style::default().fg(palette.border))
+            .style(Style::default().bg(palette.panel));
         f.render_widget(frame, area);
         let inner = Rect::new(
             area.x + 2,
@@ -616,8 +596,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         format!("Theme  [ {}  ▾ ]", draft.label()),
                         if *focus == 0 {
                             Style::default()
-                                .fg(bg)
-                                .bg(teal)
+                                .fg(palette.selected_foreground)
+                                .bg(palette.selected_background)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(teal).add_modifier(Modifier::BOLD)
@@ -625,19 +605,30 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     )),
                 ];
                 if *dropdown_open {
-                    for theme in Theme::ALL {
+                    let (start, count) = visible_theme_window(*draft, a.height);
+                    let end = start + count;
+                    if start > 0 {
+                        lines.push(
+                            Line::from("  ↑ earlier themes").style(Style::default().fg(muted)),
+                        );
+                    }
+                    for theme in Theme::ALL.iter().skip(start).take(count).copied() {
                         let selected = *draft == theme;
                         lines.push(Line::from(Span::styled(
                             format!("  {} {}", if selected { "›" } else { " " }, theme.label()),
                             if selected {
                                 Style::default()
-                                    .fg(bg)
-                                    .bg(teal)
+                                    .fg(palette.selected_foreground)
+                                    .bg(palette.selected_background)
                                     .add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default().fg(ink)
                             },
                         )));
+                    }
+                    if end < crate::theme::CATALOG.len() {
+                        lines
+                            .push(Line::from("  ↓ later themes").style(Style::default().fg(muted)));
                     }
                 }
                 lines.push(Line::from(""));
@@ -646,8 +637,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "[ Save ]",
                         if *focus == 1 {
                             Style::default()
-                                .fg(bg)
-                                .bg(teal)
+                                .fg(palette.selected_foreground)
+                                .bg(palette.selected_background)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(teal).add_modifier(Modifier::BOLD)
@@ -658,7 +649,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "[ Cancel ]",
                         if *focus == 2 {
                             Style::default()
-                                .fg(bg)
+                                .fg(palette.selected_foreground)
                                 .bg(gold)
                                 .add_modifier(Modifier::BOLD)
                         } else {
@@ -670,7 +661,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     lines.extend(
                         wrap_words(error, inner.width as usize)
                             .into_iter()
-                            .map(|line| Line::from(Span::styled(line, Style::default().fg(gold)))),
+                            .map(|line| {
+                                Line::from(Span::styled(line, Style::default().fg(palette.danger)))
+                            }),
                     );
                 }
                 lines.extend(
@@ -767,17 +760,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         )
                     };
                     let color = if which == 2 {
-                        if app.theme == Theme::Light {
-                            light_semantic(type_color(selected))
-                        } else {
-                            type_color(selected)
-                        }
+                        crate::theme::issue_type_color(
+                            app.theme,
+                            crate::beads::BEAD_TYPES[selected],
+                        )
                     } else {
-                        if app.theme == Theme::Light {
-                            light_semantic(priority_color(selected))
-                        } else {
-                            priority_color(selected)
-                        }
+                        crate::theme::priority_color(app.theme, selected as u64)
                     };
                     let border = if form.focus == which || dropdown == Some(which) {
                         teal
@@ -795,30 +783,20 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                                 .iter()
                                 .enumerate()
                                 .map(|(i, x)| {
-                                    let color = type_color(i);
                                     (
                                         i,
                                         x.to_string(),
-                                        if app.theme == Theme::Light {
-                                            light_semantic(color)
-                                        } else {
-                                            color
-                                        },
+                                        crate::theme::issue_type_color(app.theme, x),
                                     )
                                 })
                                 .collect::<Vec<_>>()
                         } else {
                             (0..=4)
                                 .map(|i| {
-                                    let color = priority_color(i);
                                     (
                                         i,
                                         format!("P{i}"),
-                                        if app.theme == Theme::Light {
-                                            light_semantic(color)
-                                        } else {
-                                            color
-                                        },
+                                        crate::theme::priority_color(app.theme, i as u64),
                                     )
                                 })
                                 .collect()
@@ -838,8 +816,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             let line = Rect::new(area.x + 1, y, area.width.saturating_sub(2), 1);
                             let style = if *idx == selected {
                                 Style::default()
-                                    .fg(bg)
-                                    .bg(*col)
+                                    .fg(palette.selected_foreground)
+                                    .bg(palette.selected_background)
                                     .add_modifier(Modifier::BOLD)
                             } else {
                                 Style::default().fg(*col)
@@ -862,7 +840,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             } else {
                                 format!("P{selected}")
                             })
-                            .style(Style::default().fg(bg).bg(color)),
+                            .style(Style::default().fg(color)),
                             line,
                         );
                     }
@@ -908,8 +886,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             Style::default().fg(muted)
                         } else if form.focus == 4 {
                             Style::default()
-                                .fg(bg)
-                                .bg(teal)
+                                .fg(palette.selected_foreground)
+                                .bg(palette.selected_background)
                                 .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(teal)
@@ -922,7 +900,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             Style::default().fg(muted)
                         } else if form.focus == 5 {
                             Style::default()
-                                .fg(bg)
+                                .fg(palette.selected_foreground)
                                 .bg(gold)
                                 .add_modifier(Modifier::BOLD)
                         } else {
@@ -972,13 +950,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         }
     }
 }
-fn light_detail_background(color: Color) -> Color {
-    match color {
-        Color::Reset | Color::Black | Color::DarkGray => Color::Rgb(232, 239, 237),
-        other => light_semantic(other),
-    }
-}
-
 fn bead_type_name(index: usize) -> &'static str {
     crate::beads::BEAD_TYPES
         .get(index)
@@ -1147,6 +1118,7 @@ fn delete_dialog_lines(
     lines.push("[y] Delete · [n / Enter] Cancel".into());
     lines
 }
+#[cfg(test)]
 fn type_color(index: usize) -> Color {
     [
         Color::Rgb(73, 211, 182),
@@ -1160,6 +1132,7 @@ fn type_color(index: usize) -> Color {
         Color::Rgb(168, 207, 125),
     ][index.min(8)]
 }
+#[cfg(test)]
 fn priority_color(index: usize) -> Color {
     [
         Color::Rgb(255, 105, 105),
@@ -1263,13 +1236,16 @@ mod tests {
         );
         assert_eq!(
             buffer[(a.list_rect.x + 12, bead_row)].fg,
-            row_priority_color(1)
+            crate::theme::priority_color(a.theme, 1)
         );
         assert_eq!(
             buffer[(a.list_rect.x + 16, bead_row)].fg,
             status_color("closed")
         );
-        assert_eq!(buffer[(a.list_rect.x + 3, bead_row + 1)].fg, Color::White);
+        assert_eq!(
+            buffer[(a.list_rect.x + 3, bead_row + 1)].fg,
+            crate::theme::definition(a.theme).palette.foreground
+        );
         let group = crate::app::list_layout(&a.beads, &a.collapsed)
             .groups
             .remove(0);
@@ -1308,7 +1284,7 @@ mod tests {
         let y = a.list_rect.y + 2;
         assert_eq!(
             terminal.backend().buffer()[(a.list_rect.x + 3, y)].fg,
-            Color::White
+            crate::theme::definition(a.theme).palette.foreground
         );
     }
     #[test]
@@ -1579,7 +1555,12 @@ mod tests {
         assert!(text.contains("Milestone"));
         assert!(text.contains("NEW BEAD"));
         assert!(a.modal_ready);
-        assert!(buf.content().iter().any(|cell| cell.bg == type_color(8)));
+        assert!(buf.content().iter().any(|cell| {
+            cell.bg
+                == crate::theme::definition(a.theme)
+                    .palette
+                    .selected_background
+        }));
         assert_eq!(buf[(17, 9)].fg, TEAL);
         a.notice = None;
         a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
@@ -1658,13 +1639,13 @@ mod tests {
             .collect::<String>();
         assert!(text.contains("SETTINGS"));
         assert!(text.contains("Light"));
-        assert!(text.contains("› Light"));
+        assert!(text.contains("› OnTrack Light"));
         assert!(text.contains("Save"));
         assert!(text.contains("Cancel"));
         assert!(text.contains("settings.json"));
         assert!(text.contains("Permission") && text.contains("denied"));
         assert!(text.contains("try again"));
-        assert!(text.contains("choose"));
+        assert!(text.contains("cycle"));
         assert!(text.contains("Dark"));
         assert!(text.contains("Enter keep"));
         assert!(text.contains("Esc revert"));
@@ -1693,7 +1674,7 @@ mod tests {
         assert!(!a.modal_ready);
     }
     #[test]
-    fn light_create_type_dropdown_uses_darkened_semantic_colors() {
+    fn light_create_type_dropdown_uses_catalog_selection_colors() {
         let mut a = app();
         a.theme = Theme::Light;
         a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
@@ -1707,12 +1688,12 @@ mod tests {
             .draw(|f| render(f, Duration::ZERO, &mut a))
             .unwrap();
         let buffer = terminal.backend().buffer();
-        assert!(
-            buffer
-                .content()
-                .iter()
-                .any(|cell| cell.bg == light_semantic(type_color(0)))
-        );
+        assert!(buffer.content().iter().any(|cell| {
+            cell.bg
+                == crate::theme::definition(Theme::Light)
+                    .palette
+                    .selected_background
+        }));
         assert!(!buffer.content().iter().any(|cell| cell.bg == type_color(0)));
         assert!(
             !buffer
@@ -1738,21 +1719,105 @@ mod tests {
         let light = draw_detail(&mut a);
         let dark_cells = dark.content();
         let light_cells = light.content();
+        let dark_palette = crate::theme::definition(Theme::Dark).palette;
+        let light_palette = crate::theme::definition(Theme::Light).palette;
         let dark_code = dark_cells
             .iter()
-            .find(|cell| cell.symbol() == "i" && cell.fg == GOLD)
+            .find(|cell| cell.symbol() == "i" && cell.fg == dark_palette.warning)
             .expect("markdown inline code should retain the dark accent");
         let light_code = light_cells
             .iter()
-            .find(|cell| cell.symbol() == "i" && cell.fg == light_semantic(GOLD))
-            .expect("markdown inline code should use a readable light accent");
+            .find(|cell| cell.symbol() == "i" && cell.fg == light_palette.warning)
+            .expect("markdown inline code should use the light palette accent");
         assert_ne!(dark_code.fg, light_code.fg);
-        assert_eq!(light_code.bg, Color::Rgb(246, 248, 247));
-        assert_eq!(light_semantic(Color::Indexed(1)), Color::Rgb(150, 45, 45));
+        assert_eq!(light_code.bg, light_palette.panel);
         assert_eq!(
-            light_detail_background(Color::DarkGray),
-            Color::Rgb(232, 239, 237)
+            crate::theme::markdown_foreground(Theme::SolarizedLight, Color::Indexed(1)),
+            crate::theme::definition(Theme::SolarizedLight)
+                .palette
+                .danger
         );
+    }
+    #[test]
+    fn every_theme_renders_splash_and_browser_at_normal_and_compact_sizes() {
+        for theme in Theme::ALL {
+            let palette = crate::theme::definition(theme).palette;
+            let mut app = app();
+            app.theme = theme;
+            for size in [(100, 30), (60, 18)] {
+                let rendered = draw(size, &mut app).0;
+                assert!(
+                    rendered.contains("Title is visible"),
+                    "{theme:?} at {size:?}"
+                );
+                assert!(rendered.contains("ONTRACK"), "{theme:?} at {size:?}");
+                app.modal = Some(crate::app::Modal::Settings {
+                    draft: theme,
+                    error: None,
+                    dropdown_open: true,
+                    dropdown_original: Some(Theme::Dark),
+                    focus: 0,
+                });
+                let settings = draw(size, &mut app).0;
+                assert!(settings.contains("SETTINGS"), "{theme:?} at {size:?}");
+                assert!(
+                    app.modal_ready,
+                    "settings modal should fit for {theme:?} at {size:?}"
+                );
+                app.modal = None;
+            }
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert!(
+                buffer
+                    .content()
+                    .iter()
+                    .any(|cell| cell.bg == palette.background)
+            );
+            assert!(
+                buffer
+                    .content()
+                    .iter()
+                    .any(|cell| cell.fg == palette.success)
+            );
+            assert_eq!(
+                crate::theme::markdown_foreground(theme, Color::Rgb(220, 228, 229)),
+                palette.foreground
+            );
+        }
+    }
+    #[test]
+    fn theme_dropdown_keeps_late_selection_visible_and_marks_more_options() {
+        let mut app = app();
+        app.modal = Some(crate::app::Modal::Settings {
+            draft: Theme::RosePine,
+            error: None,
+            dropdown_open: true,
+            dropdown_original: Some(Theme::Dark),
+            focus: 0,
+        });
+        let late = draw((80, 24), &mut app).0;
+        assert!(late.contains("Rosé Pine"));
+        assert!(late.contains("↑ earlier themes"));
+        assert!(!late.contains("OnTrack Dark"));
+        assert!(app.modal_ready);
+
+        app.modal = Some(crate::app::Modal::Settings {
+            draft: Theme::TokyoNight,
+            error: None,
+            dropdown_open: true,
+            dropdown_original: Some(Theme::Dark),
+            focus: 0,
+        });
+        let early = draw((80, 24), &mut app).0;
+        assert!(early.contains("Tokyo Night"));
+        assert!(early.contains("↓ later themes"));
+        assert!(early.contains("Save"));
+        assert!(early.contains("Cancel"));
+        assert!(app.modal_ready);
     }
     #[test]
     fn wide_title_horizontal_scroll_starts_at_character_boundary() {

@@ -8,6 +8,7 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | --- | --- |
 | `src/main.rs` | Defines the terminal type, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
 | `src/settings.rs` | Loads and saves the small JSON appearance configuration under the user's XDG config directory. |
+| `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
 | `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/app.rs` | Holds selection, focus, scrolling, modal form state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
@@ -21,7 +22,7 @@ Theme is explicit app state (`App::theme`) threaded into rendering; do not intro
 
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
-The `s` settings dialog previews Dark/Light appearance across the browser and splash. Saving is explicit; Esc discards the draft. Config read/write errors are presented in the UI and must not be reported as successful saves.
+The `s` settings dialog previews every bundled theme across the browser and splash. Its bounded dropdown scrolls to keep the selection visible. Saving is explicit; Esc closes an open dropdown before cancelling the dialog. Config read/write errors are presented in the UI and must not be reported as successful saves. See the [settings guide](settings.md) for stable theme IDs and instructions for extending the catalog.
 
 ## Beads CLI contract
 
