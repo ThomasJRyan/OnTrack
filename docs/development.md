@@ -172,6 +172,8 @@ cargo clippy --all-targets -- -D warnings
 cargo build
 ```
 
+GitHub Actions runs these gates on pull requests and pushes to `main`. See the [CI guide](ci.md) for workflow details, logs, and branch protection setup.
+
 The same commands can run from a linked Git worktree. Keep the default test concurrency for `cargo test` to exercise fixture and registry lock isolation.
 
 For focused iterations:
