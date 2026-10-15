@@ -1,4 +1,4 @@
-//! Read-only browsing and explicit create/delete operations through the Beads CLI.
+//! Read-only browsing and explicit create/update/delete operations through the Beads CLI.
 
 use std::io;
 use std::process::{Command, Output};
@@ -23,6 +23,12 @@ pub struct CreateBead {
     pub description: String,
     pub issue_type: String,
     pub priority: u8,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateBead {
+    pub id: String,
+    pub fields: CreateBead,
 }
 
 #[derive(Debug, Clone)]
@@ -61,6 +67,13 @@ pub fn create_bead(input: &CreateBead) -> io::Result<String> {
     parse_created_id(&run_bd(&args)?)
 }
 
+pub fn update_bead(input: &UpdateBead) -> io::Result<()> {
+    let args = update_args(input)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_bd(&args)?;
+    Ok(())
+}
+
 /// Permanently delete only this issue, never cascading to dependent issues.
 pub fn delete_bead(id: &str) -> io::Result<()> {
     run_bd(&delete_args(id)?)?;
@@ -68,6 +81,35 @@ pub fn delete_bead(id: &str) -> io::Result<()> {
 }
 
 fn create_args(input: &CreateBead) -> io::Result<Vec<String>> {
+    let title = validated_title(input)?;
+    Ok(vec![
+        "--no-color".to_owned(),
+        "create".to_owned(),
+        format!("--title={title}"),
+        format!("--description={}", input.description),
+        format!("--type={}", input.issue_type),
+        format!("--priority={}", input.priority),
+        "--json".to_owned(),
+    ])
+}
+
+fn update_args(input: &UpdateBead) -> io::Result<Vec<String>> {
+    validate_id(&input.id)?;
+    let title = validated_title(&input.fields)?;
+    Ok(vec![
+        "--no-color".to_owned(),
+        "update".to_owned(),
+        format!("--title={title}"),
+        format!("--description={}", input.fields.description),
+        format!("--type={}", input.fields.issue_type),
+        format!("--priority={}", input.fields.priority),
+        "--json".to_owned(),
+        "--".to_owned(),
+        input.id.clone(),
+    ])
+}
+
+fn validated_title(input: &CreateBead) -> io::Result<&str> {
     let title = input.title.trim();
     if title.is_empty()
         || input
@@ -91,15 +133,7 @@ fn create_args(input: &CreateBead) -> io::Result<Vec<String>> {
             "Unsupported Beads issue type",
         ));
     }
-    Ok(vec![
-        "--no-color".to_owned(),
-        "create".to_owned(),
-        format!("--title={title}"),
-        format!("--description={}", input.description),
-        format!("--type={}", input.issue_type),
-        format!("--priority={}", input.priority),
-        "--json".to_owned(),
-    ])
+    Ok(title)
 }
 
 fn delete_args(id: &str) -> io::Result<[&str; 6]> {
@@ -269,6 +303,49 @@ mod tests {
         assert_eq!(args[2], format!("--title={}", input.title));
         assert_eq!(args[3], format!("--description={}", input.description));
         assert!(!args.iter().any(|arg| arg == "--readonly"));
+    }
+
+    #[test]
+    fn update_targets_one_id_and_keeps_user_text_in_argument_values() {
+        let mut fields = create_input();
+        fields.title = "--force $(touch ignored); 'quoted'".into();
+        fields.description = "First line\n--status=closed; $(touch ignored)".into();
+        let input = UpdateBead {
+            id: "ontrack-70t".into(),
+            fields,
+        };
+        assert_eq!(
+            update_args(&input).unwrap(),
+            [
+                "--no-color",
+                "update",
+                "--title=--force $(touch ignored); 'quoted'",
+                "--description=First line\n--status=closed; $(touch ignored)",
+                "--type=task",
+                "--priority=2",
+                "--json",
+                "--",
+                "ontrack-70t",
+            ]
+        );
+    }
+
+    #[test]
+    fn update_rejects_invalid_id_and_title_before_running_bd() {
+        let mut input = UpdateBead {
+            id: "--force".into(),
+            fields: create_input(),
+        };
+        assert_eq!(
+            update_bead(&input).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        input.id = "ontrack-70t".into();
+        input.fields.title = "first\nsecond".into();
+        assert_eq!(
+            update_bead(&input).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]
