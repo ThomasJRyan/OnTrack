@@ -25,6 +25,7 @@ pub(super) enum Request {
     Show(String, u64),
     LoadEdit(String, u64),
     Create(CreateBead),
+    CreateEpic(CreateBead, Option<String>),
     CreateChild(CreateBead, String),
     Update(UpdateBead),
     Delete(String),
@@ -41,6 +42,8 @@ pub(super) enum Response {
     Show(String, u64, std::io::Result<serde_json::Value>),
     EditLoaded(String, u64, std::io::Result<serde_json::Value>),
     Created(std::io::Result<String>),
+    EpicLaunched(String, std::io::Result<crate::epic::Session>),
+    EpicFinished(String, std::io::Result<Vec<String>>),
     Updated(String, std::io::Result<()>),
     Deleted(std::io::Result<()>),
     Discovered(u64, std::io::Result<LaunchContext>),
@@ -172,6 +175,7 @@ pub struct CreateForm {
     pub description: String,
     pub issue_type: usize,
     pub priority: usize,
+    pub generate_children: bool,
     pub focus: usize,
     pub cursor: usize,
     pub description_cursor: usize,
@@ -187,6 +191,7 @@ impl Default for CreateForm {
             description: String::new(),
             issue_type: 0,
             priority: 2,
+            generate_children: false,
             focus: 0,
             cursor: 0,
             description_cursor: 0,
@@ -276,6 +281,36 @@ impl App {
                         Response::EditLoaded(id.clone(), seq, beads::show_bead(&id))
                     }
                     Request::Create(input) => Response::Created(beads::create_bead(&input)),
+                    Request::CreateEpic(input, parent) => match parent.as_deref().map_or_else(
+                        || beads::create_bead(&input),
+                        |id| beads::create_child(&input, id),
+                    ) {
+                        Ok(id) => {
+                            if out.send(Response::Created(Ok(id.clone()))).is_err() {
+                                break;
+                            }
+                            let replies = out.clone();
+                            thread::spawn(move || {
+                                let session = match crate::epic::launch(&id) {
+                                    Ok(session) => session,
+                                    Err(error) => {
+                                        let _ =
+                                            replies.send(Response::EpicLaunched(id, Err(error)));
+                                        return;
+                                    }
+                                };
+                                if replies
+                                    .send(Response::EpicLaunched(id.clone(), Ok(session.clone())))
+                                    .is_ok()
+                                {
+                                    let result = crate::epic::finish(&session, &id);
+                                    let _ = replies.send(Response::EpicFinished(id, result));
+                                }
+                            });
+                            continue;
+                        }
+                        Err(error) => Response::Created(Err(error)),
+                    },
                     Request::CreateChild(input, parent) => {
                         Response::Created(beads::create_child(&input, &parent))
                     }
@@ -729,6 +764,12 @@ impl App {
                     self.mutation_busy = false;
                     match result {
                         Ok(id) => {
+                            if matches!(&self.modal, Some(Modal::Create(form)) if form.generate_children && beads::BEAD_TYPES[form.issue_type] == "epic")
+                            {
+                                self.toast = Some(Toast::progress(format!(
+                                    "Created Epic {id}; starting sub-task agent…"
+                                )));
+                            }
                             self.notice = Some(format!("Created {id}"));
                             self.modal = None;
                             self.preferred_id = Some(id);
@@ -738,6 +779,38 @@ impl App {
                             self.notice = Some(format!("Create failed: {e}"));
                         }
                     }
+                }
+                Response::EpicLaunched(id, result) => match result {
+                    Ok(session) => {
+                        let message =
+                            format!("Planning {id} in Herdr workspace {}…", session.workspace_id);
+                        self.notice = Some(message.clone());
+                        self.toast = Some(Toast::progress(message));
+                    }
+                    Err(error) => {
+                        let message =
+                            format!("Epic {id} created; automatic planning failed: {error}");
+                        self.notice = Some(message.clone());
+                        self.toast = Some(Toast::result(message, true));
+                    }
+                },
+                Response::EpicFinished(id, result) => {
+                    let (message, error) = match result {
+                        Ok(children) => (
+                            format!(
+                                "Epic {id}: {} child Beads created; planning workspace closed",
+                                children.len()
+                            ),
+                            false,
+                        ),
+                        Err(error) => (
+                            format!("Epic {id}: planning needs attention: {error}"),
+                            true,
+                        ),
+                    };
+                    self.notice = Some(message.clone());
+                    self.toast = Some(Toast::result(message, error));
+                    self.refresh_at(now);
                 }
                 Response::Updated(id, result) => {
                     self.mutation_busy = false;
@@ -1392,20 +1465,26 @@ impl App {
         }
         match key.code {
             Tab => {
+                let epic = edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic";
                 form.focus = match form.focus {
                     0 => 2,
                     2 => 3,
                     3 => 1,
+                    1 if epic => 6,
                     1 => 4,
+                    6 => 4,
                     4 => 5,
                     _ => 0,
                 }
             }
             BackTab => {
+                let epic = edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic";
                 form.focus = match form.focus {
                     0 => 5,
                     5 => 4,
+                    4 if epic => 6,
                     4 => 1,
+                    6 => 1,
                     1 => 3,
                     3 => 2,
                     _ => 0,
@@ -1428,6 +1507,15 @@ impl App {
             }
             Enter if form.focus == 4 => {
                 if !form.title.trim().is_empty() {
+                    if edit_id.is_none()
+                        && form.generate_children
+                        && beads::BEAD_TYPES[form.issue_type] == "epic"
+                        && form.description.trim().is_empty()
+                    {
+                        self.notice =
+                            Some("Describe the Epic proposal before generating child tasks".into());
+                        return false;
+                    }
                     let input = CreateBead {
                         title: form.title.trim().into(),
                         description: form.description.clone(),
@@ -1437,6 +1525,8 @@ impl App {
                     self.mutation_busy = true;
                     let request = if let Some(id) = edit_id {
                         Request::Update(UpdateBead { id, fields: input })
+                    } else if form.generate_children && input.issue_type == "epic" {
+                        Request::CreateEpic(input, form.parent_id.clone())
                     } else if let Some(parent) = &form.parent_id {
                         Request::CreateChild(input, parent.clone())
                     } else {
@@ -1452,6 +1542,10 @@ impl App {
             }
             Enter if form.focus == 5 => {
                 self.modal = None;
+                return false;
+            }
+            Enter | Char(' ') if form.focus == 6 => {
+                form.generate_children = !form.generate_children;
             }
             Char(' ') if form.focus == 2 || form.focus == 3 => {
                 form.dropdown = Some(form.focus);
@@ -1470,7 +1564,13 @@ impl App {
                 form.description.insert(i, '\n');
                 form.description_cursor = i + 1;
             }
-            Enter if form.focus == 1 && key.modifiers.is_empty() => form.focus = 4,
+            Enter if form.focus == 1 && key.modifiers.is_empty() => {
+                form.focus = if edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic" {
+                    6
+                } else {
+                    4
+                };
+            }
             Up if form.focus == 1 => {
                 form.description_cursor = crate::ui::move_description_vertical(
                     &form.description,
@@ -1551,6 +1651,12 @@ impl App {
                 form.description_cursor = i + c.len_utf8();
             }
             _ => {}
+        }
+        if beads::BEAD_TYPES[form.issue_type] != "epic" {
+            form.generate_children = false;
+            if form.focus == 6 {
+                form.focus = 4;
+            }
         }
         false
     }
@@ -3457,6 +3563,76 @@ mod tests {
         assert!(!a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
         a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 1);
         assert_eq!(a.selected, Some(0));
+    }
+    #[test]
+    fn epic_toggle_only_dispatches_opted_in_epics() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        press(&mut a, KeyCode::Char('n'));
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "Plan launch".into();
+        form.description = "Large proposal".into();
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.focus = 6;
+        press(&mut a, KeyCode::Enter);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert!(form.generate_children);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::CreateEpic(input, None)) if input.issue_type == "epic" && input.description == "Large proposal")
+        );
+
+        let mut b = app();
+        let (tx, rx) = mpsc::channel();
+        b.requests = tx;
+        press(&mut b, KeyCode::Char('n'));
+        let Some(Modal::Create(form)) = b.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "Ordinary".into();
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.generate_children = true;
+        form.focus = 2;
+        press(&mut b, KeyCode::Left);
+        let Some(Modal::Create(form)) = b.modal.as_mut() else {
+            panic!()
+        };
+        assert!(!form.generate_children);
+        form.focus = 4;
+        press(&mut b, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Create(input)) if input.issue_type == "feature")
+        );
+
+        let mut empty = app();
+        let (tx, rx) = mpsc::channel();
+        empty.requests = tx;
+        press(&mut empty, KeyCode::Char('n'));
+        let Some(Modal::Create(form)) = empty.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "Needs proposal".into();
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.generate_children = true;
+        form.focus = 4;
+        press(&mut empty, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        assert!(empty.notice.as_deref().unwrap().contains("proposal"));
     }
     #[test]
     fn description_accepts_shortcut_letters_and_shift_enter_but_not_control_chars() {

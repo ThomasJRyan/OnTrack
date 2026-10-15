@@ -966,7 +966,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 (9 + option_lines + error_lines + hint_lines + 2) as u16
             }
             crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
-                if form.dropdown.is_some() { 19 } else { 15 }
+                let epic_toggle = matches!(modal, crate::app::Modal::Create(_))
+                    && crate::beads::BEAD_TYPES[form.issue_type] == "epic";
+                (if form.dropdown.is_some() { 19 } else { 15 }) + u16::from(epic_toggle)
             }
             crate::app::Modal::EditLoading { .. } => 8,
             crate::app::Modal::ConfirmDelete { .. } => delete_lines
@@ -1199,12 +1201,14 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             }
             crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
                 let editing = matches!(modal, crate::app::Modal::Edit { .. });
+                let epic_toggle = !editing && crate::beads::BEAD_TYPES[form.issue_type] == "epic";
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(3),
                         Constraint::Length(if form.dropdown.is_some() { 7 } else { 3 }),
                         Constraint::Min(3),
+                        Constraint::Length(u16::from(epic_toggle)),
                         Constraint::Length(1),
                         Constraint::Length(1),
                     ])
@@ -1409,6 +1413,22 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         ));
                     }
                 }
+                if epic_toggle {
+                    let label = format!(
+                        "[{}] Generate child tasks with a Herdr agent",
+                        if form.generate_children { "x" } else { " " }
+                    );
+                    f.render_widget(
+                        Paragraph::new(label).style(if form.focus == 6 {
+                            Style::default()
+                                .fg(palette.selected_foreground)
+                                .bg(palette.selected_background)
+                        } else {
+                            Style::default().fg(teal)
+                        }),
+                        rows[3],
+                    );
+                }
                 let actions = Paragraph::new(Line::from(vec![
                     Span::styled(
                         if editing { "[ Save ]" } else { "[ Create ]" },
@@ -1439,7 +1459,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     ),
                     Span::raw("  ·  Enter choose · Esc cancel"),
                 ]));
-                f.render_widget(actions, rows[3]);
+                f.render_widget(actions, rows[4]);
                 let feedback = if app.mutation_busy {
                     Some(if editing {
                         "Saving… · form locked until the command finishes"
@@ -1453,7 +1473,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     feedback.unwrap_or(
                         "Tab moves · ←/→ cycles focused choices · Enter opens · Esc cancels",
                     ),
-                    rows[4].width as usize,
+                    rows[5].width as usize,
                 );
                 f.render_widget(
                     Paragraph::new(feedback).style(Style::default().fg(
@@ -1463,7 +1483,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             muted
                         },
                     )),
-                    rows[4],
+                    rows[5],
                 );
             }
             crate::app::Modal::ConfirmDelete { id, title } => {
@@ -2626,6 +2646,34 @@ mod tests {
         assert!(error_delete.contains("Delete error"));
         assert!(error_delete.contains("permission denied"));
         assert!(error_delete.contains("[y] Delete"));
+    }
+    #[test]
+    fn epic_generation_toggle_is_visible_only_when_creating_epic() {
+        let mut app = app();
+        let mut form = crate::app::CreateForm {
+            issue_type: crate::beads::BEAD_TYPES
+                .iter()
+                .position(|kind| *kind == "epic")
+                .unwrap(),
+            generate_children: true,
+            focus: 6,
+            ..Default::default()
+        };
+        app.modal = Some(crate::app::Modal::Create(form.clone()));
+        let epic = draw((100, 30), &mut app).0;
+        assert!(epic.contains("[x] Generate child tasks"));
+        form.issue_type = 0;
+        app.modal = Some(crate::app::Modal::Create(form.clone()));
+        assert!(!draw((100, 30), &mut app).0.contains("Generate child tasks"));
+        form.issue_type = crate::beads::BEAD_TYPES
+            .iter()
+            .position(|kind| *kind == "epic")
+            .unwrap();
+        app.modal = Some(crate::app::Modal::Edit {
+            id: "e1".into(),
+            form,
+        });
+        assert!(!draw((100, 30), &mut app).0.contains("Generate child tasks"));
     }
 
     #[test]

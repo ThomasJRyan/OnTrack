@@ -539,7 +539,7 @@ fn main_checkout_required(checkout: &Path) -> io::Error {
     ))
 }
 
-fn supported_agents(bytes: &[u8]) -> io::Result<HashSet<String>> {
+pub(crate) fn supported_agents(bytes: &[u8]) -> io::Result<HashSet<String>> {
     let help = std::str::from_utf8(bytes).map_err(|_| invalid("Agent help is not UTF-8"))?;
     let kinds = help
         .split_once("[possible values:")
@@ -557,7 +557,10 @@ fn supported_agents(bytes: &[u8]) -> io::Result<HashSet<String>> {
     Ok(result)
 }
 
-fn available_agents(bytes: &[u8], supported: &HashSet<String>) -> io::Result<Vec<String>> {
+pub(crate) fn available_agents(
+    bytes: &[u8],
+    supported: &HashSet<String>,
+) -> io::Result<Vec<String>> {
     let status =
         std::str::from_utf8(bytes).map_err(|_| invalid("Herdr integration status is not UTF-8"))?;
     let mut seen = HashSet::new();
