@@ -69,6 +69,12 @@ Create returns a JSON object containing the created ID; update and delete are su
 
 Detail parsing selects the requested ID, rejects duplicate matching records, and reports a missing ID. It retains the returned JSON intact, including comments, relationships, metadata, and fields unknown to ontrack. The detail renderer omits only the top-level `revision` field from display, for both cached list records and full show records; nested revision fields and other metadata remain visible. Process-start errors, unsuccessful exit statuses with stderr, and invalid JSON/records are surfaced as errors rather than panics.
 
+## Epic planning workspace
+
+`src/epic.rs` handles opt-in Epic planning separately from the tracked worktree handoff. The create worker persists the Epic first, then a separate thread validates the live Epic and originating Herdr workspace, discovers a current agent integration, and calls `herdr workspace create --cwd CURRENT_CHECKOUT --label ... --no-focus`. Herdr workspaces have no parent parameter: the new labeled workspace shares the checkout and records its source workspace in the label. No `herdr worktree create` call is involved. The agent is started and prompted by exact pane ID; the proposal comes from the live Bead Description, and the prompt requires `bd create --parent=EPIC_ID` children.
+
+The planning thread waits for the recorded agent to finish, reads the live Beads list, and closes the new workspace only after finding a direct child. Failures report the Epic and workspace for inspection without an automatic retry. The thread runs within OnTrack's process, so closing OnTrack before generation finishes stops its automatic cleanup. Normal create and edit requests retain their previous path. The UI exposes the toggle only on Epic creation and clears it when the type changes away from Epic.
+
 ## Herdr launch adapter
 
 `src/herdr.rs` exposes `discover() -> io::Result<LaunchContext>` and `launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result<LaunchOutcome>` for background-worker use. `LaunchContext` contains a `Workspace` and available `Agent` records (each with string `id` and `label`); `LaunchOutcome.message` carries the handoff result and `LaunchOutcome.reserved` distinguishes a prepared parent from a started agent. These public records derive `Debug`, `Clone`, `PartialEq`, and `Eq`. The app queues the full selected Bead and typed context/agent; the backend still captures authoritative `bd show` JSON before mutation and revalidates workspace/agent availability.

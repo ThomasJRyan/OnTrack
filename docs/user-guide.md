@@ -71,6 +71,12 @@ The hotkey reference accepts terminal reports of `Ctrl+?`, `Ctrl+Shift+/`, and `
 
 The settings dialog captures input until it closes, so `q` cannot quit while it is open. Theme changes and each cleanup toggle save immediately. All automatic cleanup options default off. Automatic merge may defer when there is no trustworthy evidence that the agent is idle; a closed Bead alone never proves it is safe to merge. Removing a checkout also closes its Herdr workspace. Settings load/save errors remain visible; failed saves preserve the last successfully saved settings. See the [settings guide](settings.md) for recovery.
 
+## Generate tasks for an Epic
+
+In the create form, choose **Epic** to reveal **Generate child tasks with a Herdr agent** below Description. Tab moves from Agent harness through Description to this option, then Create. The option starts off. Enter the proposal in Description, turn on the option, and create the Epic. OnTrack saves the Epic first, then opens a separate Herdr workspace at the current checkout, starts an available agent, and asks it to create direct child Beads with descriptions and acceptance criteria. It does not create another Git worktree. The form hides and clears this option for other issue types; editing a Bead does not run generation.
+
+Keep OnTrack open while planning runs. The top-right message reports launch, completion, or a recovery error. After the agent finishes, OnTrack checks that at least one direct child exists and closes only the planning workspace. If creation, agent start, prompt delivery, or child verification fails, the Epic remains. An already created planning workspace stays open so you can inspect its agent and Beads. Check that workspace before retrying; a prompt failure may still have delivered the proposal, and another run can duplicate children. This workflow requires OnTrack to run inside Herdr with a current agent integration.
+
 ## Details, loading, and refresh
 
 Selecting an issue immediately displays its cached list record while a richer `bd show` request runs. The returned detail record replaces that snapshot. ontrack requests long details, comments, and dependents; descriptions, notes, design and acceptance text render as Markdown. Metadata, comments, relationships, and unknown nested values are shown whenever present in the returned JSON, except for the top-level revision field. It does not invent missing fields or fetch data outside those CLI responses. Scroll the details pane to see fields below the visible area.
