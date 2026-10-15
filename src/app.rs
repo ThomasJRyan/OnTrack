@@ -10,7 +10,7 @@ use crate::{
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::mpsc,
     thread,
@@ -24,6 +24,7 @@ pub(super) enum Request {
     Show(String, u64),
     LoadEdit(String, u64),
     Create(CreateBead),
+    CreateChild(CreateBead, String),
     Update(UpdateBead),
     Delete(String),
     Discover(u64),
@@ -164,6 +165,7 @@ pub(super) struct PendingHandoff {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateForm {
+    pub parent_id: Option<String>,
     pub title: String,
     pub description: String,
     pub issue_type: usize,
@@ -178,6 +180,7 @@ pub struct CreateForm {
 impl Default for CreateForm {
     fn default() -> Self {
         Self {
+            parent_id: None,
             title: String::new(),
             description: String::new(),
             issue_type: 0,
@@ -271,6 +274,9 @@ impl App {
                         Response::EditLoaded(id.clone(), seq, beads::show_bead(&id))
                     }
                     Request::Create(input) => Response::Created(beads::create_bead(&input)),
+                    Request::CreateChild(input, parent) => {
+                        Response::Created(beads::create_child(&input, &parent))
+                    }
                     Request::Update(input) => {
                         Response::Updated(input.id.clone(), beads::update_bead(&input))
                     }
@@ -837,7 +843,7 @@ impl App {
                     self.worktrees_discovered = true;
                     if !self.worktree_action_pending {
                         match result {
-                            Ok(items) => {
+                            Ok(mut items) => {
                                 let selected_id = self
                                     .worktrees
                                     .get(self.selected_worktree)
@@ -847,12 +853,11 @@ impl App {
                                     .filter(|item| item.handoff_accepted)
                                     .map(|item| item.bead_id.clone())
                                     .collect();
-                                self.worktrees = items
-                                    .into_iter()
-                                    .filter(|item| {
-                                        item.status != worktrees::WorktreeStatus::CheckoutRemoved
-                                    })
-                                    .collect();
+                                items.retain(|item| {
+                                    item.status != worktrees::WorktreeStatus::CheckoutRemoved
+                                });
+                                order_worktrees(&mut items);
+                                self.worktrees = items;
                                 self.selected_worktree = selected_id
                                     .as_deref()
                                     .and_then(|id| {
@@ -1017,8 +1022,29 @@ impl App {
                 self.modal_ready = false;
             }
             KeyCode::Char(' ') => self.toggle_selected_group(),
-            KeyCode::Char('n') => {
-                self.modal = Some(Modal::Create(CreateForm::default()));
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let child = k.code == KeyCode::Char('N')
+                    || (k.code == KeyCode::Char('n')
+                        && k.modifiers.contains(crossterm::event::KeyModifiers::SHIFT));
+                let parent_id = if child {
+                    match self.selected.and_then(|i| self.beads.get(i)) {
+                        Some(bead)
+                            if bead.data["issue_type"] == "task" && bead.status != "closed" =>
+                        {
+                            Some(bead.id.clone())
+                        }
+                        _ => {
+                            self.notice = Some("Select an open task to create a child".into());
+                            return false;
+                        }
+                    }
+                } else {
+                    None
+                };
+                self.modal = Some(Modal::Create(CreateForm {
+                    parent_id,
+                    ..CreateForm::default()
+                }));
                 self.modal_ready = false;
                 self.notice = None;
             }
@@ -1381,6 +1407,8 @@ impl App {
                     self.mutation_busy = true;
                     let request = if let Some(id) = edit_id {
                         Request::Update(UpdateBead { id, fields: input })
+                    } else if let Some(parent) = &form.parent_id {
+                        Request::CreateChild(input, parent.clone())
                     } else {
                         Request::Create(input)
                     };
@@ -1618,6 +1646,7 @@ fn status_order(status: &str) -> (u8, &str) {
 pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'static str {
     use worktrees::WorktreeStatus::*;
     match status {
+        Reserved => "PREPARED",
         Unmerged => "UNMERGED",
         MergeRequested => "MERGE PENDING",
         NeedsResolution => "NEEDS RESOLUTION",
@@ -1667,6 +1696,31 @@ pub fn group_statuses(beads: &[Bead]) -> Vec<String> {
     groups.dedup();
     groups
 }
+fn order_worktrees(items: &mut [ManagedWorktree]) {
+    let positions: HashMap<_, _> = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.bead_id.clone(), (index, item.parent_bead_id.clone())))
+        .collect();
+    items.sort_by_cached_key(|item| {
+        let mut path = Vec::new();
+        let mut parent = Some(item.bead_id.as_str());
+        let mut seen = HashSet::new();
+        while let Some(id) = parent {
+            if !seen.insert(id) {
+                break;
+            }
+            let Some((index, next)) = positions.get(id) else {
+                break;
+            };
+            path.push(*index);
+            parent = next.as_deref();
+        }
+        path.reverse();
+        path
+    });
+}
+
 pub fn list_layout(beads: &[Bead], collapsed: &HashSet<String>) -> ListLayout {
     let mut layout = ListLayout {
         groups: Vec::new(),
@@ -1744,6 +1798,62 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use serde_json::json;
+
+    #[test]
+    fn shift_n_creates_child_of_selected_task_and_n_stays_top_level() {
+        let mut app = app();
+        app.beads[0].data["issue_type"] = json!("task");
+        let (tx, rx) = mpsc::channel();
+        app.requests = tx;
+        app.key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+        assert!(
+            matches!(&app.modal, Some(Modal::Create(form)) if form.parent_id.as_deref() == Some("b0"))
+        );
+        app.modal_ready = true;
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        for _ in 0..4 {
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::CreateChild(input, parent)) if input.title == "x" && parent == "b0")
+        );
+        app.modal = None;
+        app.mutation_busy = false;
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(matches!(&app.modal, Some(Modal::Create(form)) if form.parent_id.is_none()));
+    }
+
+    #[test]
+    fn managed_children_sort_immediately_below_parent() {
+        let item = |id: &str, parent: Option<&str>| ManagedWorktree {
+            id: id.into(),
+            bead_id: id.into(),
+            parent_bead_id: parent.map(str::to_owned),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: id.into(),
+            target_branch: "trunk".into(),
+            workspace_id: id.into(),
+            status: worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        };
+        let mut items = vec![
+            item("parent", None),
+            item("other", None),
+            item("child", Some("parent")),
+            item("grandchild", Some("child")),
+        ];
+        order_worktrees(&mut items);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.bead_id.as_str())
+                .collect::<Vec<_>>(),
+            ["parent", "child", "grandchild", "other"]
+        );
+    }
     fn app() -> App {
         let (tx, _rx) = mpsc::channel();
         let (_out, responses) = mpsc::channel();
@@ -3956,6 +4066,7 @@ mod tests {
             .map(|id| ManagedWorktree {
                 id: id.into(),
                 bead_id: "b1".into(),
+                parent_bead_id: None,
                 handoff_accepted: true,
                 bead_title: None,
                 bead_description: None,
@@ -3992,6 +4103,7 @@ mod tests {
         a.worktrees.push(ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "b1".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: None,
             bead_description: None,
@@ -4037,6 +4149,7 @@ mod tests {
         a.worktrees.push(ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "b1".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: None,
             bead_description: None,
@@ -4067,6 +4180,7 @@ mod tests {
         app.worktrees.push(ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "b1".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: Some("Task".into()),
             bead_description: None,
@@ -4117,6 +4231,7 @@ mod tests {
             .map(|index| ManagedWorktree {
                 id: format!("wt-{index}"),
                 bead_id: format!("bead-{index}"),
+                parent_bead_id: None,
                 handoff_accepted: true,
                 bead_title: Some(format!("Title {index}")),
                 bead_description: Some("A long description".into()),
@@ -4149,12 +4264,40 @@ mod tests {
         assert!(!a.worktrees_view);
     }
     #[test]
+    fn tracked_worktree_reconciles_with_cleanup_preferences_disabled() {
+        let (mut app, rx, _) = connected_app();
+        app.worktrees_discovered = true;
+        app.worktrees.push(ManagedWorktree {
+            id: "tracked".into(),
+            bead_id: "bead".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/task".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        });
+        app.poll_worktrees(Instant::now());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Request::ReconcileWorktrees(CleanupPolicy {
+                auto_merge: false,
+                auto_close_workspace: false,
+                auto_remove_checkout: false,
+            }))
+        ));
+    }
+    #[test]
     fn closed_bead_does_not_remove_its_managed_worktree() {
         let (mut a, _, tx) = connected_app();
         a.beads[0].status = "closed".into();
         let item = ManagedWorktree {
             id: "tracked-closed".into(),
             bead_id: a.beads[0].id.clone(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: None,
             bead_description: None,
@@ -4177,6 +4320,7 @@ mod tests {
         let item = |id: &str, status| ManagedWorktree {
             id: id.into(),
             bead_id: format!("bead-{id}"),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: None,
             bead_description: None,
@@ -4231,6 +4375,7 @@ mod tests {
         let item = |id: &str| ManagedWorktree {
             id: id.into(),
             bead_id: format!("bead-{id}"),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: None,
             bead_description: None,
@@ -4264,6 +4409,7 @@ mod tests {
         let before = ManagedWorktree {
             id: "wt".into(),
             bead_id: "b0".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: None,
             bead_description: None,

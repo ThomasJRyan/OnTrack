@@ -44,11 +44,14 @@ The subprocess inherits the application's working directory. Commands are passed
 bd --readonly --no-color list --all --limit 0 --json
 bd --readonly --no-color show --id=ISSUE_ID --json --long --include-comments --include-dependents
 bd --no-color create --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json
+bd --no-color create --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json --parent=PARENT_ID
 bd --no-color update --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json -- ISSUE_ID
 bd --no-color delete --force --json -- ISSUE_ID
 ```
 
 Create returns a JSON object containing the created ID; update and delete are successful on a successful command exit. Mutations are not passed `--readonly`; update sends only the four form fields, and delete uses `--force` for the selected issue only and never requests cascading deletion. The worker processes queued requests sequentially, preserving mutation order. Edit opening fetches the current `bd show` record on that worker, validates the editable type and priority, and ignores stale load responses using a request sequence. A failed update leaves the draft open; success triggers an immediate refresh and reselects the same ID.
+
+`Shift+N` opens the create form with an immutable selected parent ID. Child creation passes `--parent=PARENT_ID` as its own argument, so Beads records the hierarchy and list/show JSON exposes the child's `parent` field. OnTrack reads the uncapped live list to find open descendants before a parent starts or merges. Beads rejects a `blocks` dependency from a parent to its descendant because blocked state would cascade back to that descendant; its `bd ready` output still includes the parent. The child-first gate is therefore enforced by OnTrack, not by a reverse Beads dependency.
 
 `--all` includes closed issues and `--limit 0` removes the default list cap. `--id=ISSUE_ID` is a single argument. The list and show responses must be JSON arrays. List parsing requires nonempty string `id`, `title`, and `status`; a missing or null priority defaults to 2, and supplied priority must be an unsigned integer. Each `Bead` retains the entire JSON object as well as its summary fields.
 
@@ -159,7 +162,7 @@ List results are sorted deterministically by status (open first, closed last, ot
 The list row's first line derives issue type from the retained `Bead.data` (`issue_type`, with `type` as a fallback); it does not replace the internal bead ID. Type, priority, and status spans each have a semantic colour helper in `src/ui.rs`; the display-width-aware metadata columns are shared across the list. Preserve white title text independently of selection emphasis and keep missing/custom types safe to display.
 ## Tracked worktree lifecycle
 
-OnTrack records only worktrees created by its own confirmed Herdr handoffs; it
+OnTrack records only worktrees created by its own explicit Herdr actions; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
 from Beads: a closed or missing Bead does not remove the managed-worktree record.
 The app filters verified `CheckoutRemoved` rows from the visible worktree list
@@ -168,6 +171,16 @@ retains those records, and `NeedsAttention` rows remain visible when inspection
 finds a problem after removal. Selection clamps to a remaining row or the empty
 state. Accepted handoff IDs are retained separately from visible rows so an Open
 Bead's `· sent` marker still reflects its confirmed handoff.
+The existing periodic reconciliation checks the recorded path of each active
+handoff before considering automatic actions. A confirmed missing path sets
+`checkout_removed` and `checkout_removed_externally` in the registry even when
+cleanup preferences are off; it does not call Herdr, remove a Git branch, or
+claim that branch was integrated. An invalid path or filesystem inspection
+error is retained as `NeedsAttention`. A pending restart remains visible for
+recovery; a pending cleanup operation still uses its existing read-only
+confirmation before this check. External-removal records
+remain removed across restarts while the path is absent; if it reappears, they
+surface as `NeedsAttention` for identity review.
 The launch journal stores the authoritative Bead title and description before
 Herdr creates a worktree. The right pane prefers current text from the already
 refreshed Beads list and falls back to this registry snapshot after Bead removal
@@ -175,6 +188,8 @@ or a list failure; it makes no extra `bd` request. Registry entries from older
 versions may omit these optional fields; the view then shows a fallback. The
 pane wraps multiline descriptions and keeps its own bounded scroll position,
 reset when the selected worktree changes.
+
+For a parent with open or unintegrated children, the first confirmed `h` action creates and verifies a managed parent checkout, then persists journal phase `reserved` without starting an agent. The parent stays in the tracked-worktrees view. A child launch requires one open managed parent checkout, records its parent Bead ID, target branch, and canonical target checkout path, and passes `--base PARENT_BRANCH` to Herdr worktree creation. If the child closes and integrates, a later `h` on the parent reuses the exact reserved workspace and root pane to start its agent; no second worktree is created. The registry rejects duplicate active handoffs for the same Bead. The merge path verifies the recorded source and target identities, cleanliness, branch names, and Git tips before sending a resolution prompt or fast-forwarding the target checkout. Parent merge requests and finalization recheck live open descendants and pending child integrations. Child entries are sorted below their parent for display and indented; selection remains keyed by the worktree ID. A parent checkout cannot be closed or removed while tracked child checkouts still exist.
 The verified repository target branch is shown to the user. A merge request is
 pending work, not a completed merge; Git ancestry/cleanliness checks decide
 integration. Conflicts and uncertain outcomes remain inspectable for manual

@@ -67,6 +67,47 @@ pub fn create_bead(input: &CreateBead) -> io::Result<String> {
     parse_created_id(&run_bd(&args)?)
 }
 
+pub fn create_child(input: &CreateBead, parent_id: &str) -> io::Result<String> {
+    let args = create_child_args(input, parent_id)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    parse_created_id(&run_bd(&args)?)
+}
+
+fn create_child_args(input: &CreateBead, parent_id: &str) -> io::Result<Vec<String>> {
+    validate_id(parent_id)?;
+    let mut args = create_args(input)?;
+    args.push(format!("--parent={parent_id}"));
+    Ok(args)
+}
+
+/// Beads cannot add a blocking edge from a parent to its descendant: that
+/// would cascade the blocked status back to the child. Check the hierarchy
+/// itself before handing a parent to an agent.
+pub fn open_descendants(parent_id: &str) -> io::Result<Vec<String>> {
+    validate_id(parent_id)?;
+    Ok(open_descendants_in(&list_beads()?, parent_id))
+}
+
+fn open_descendants_in(beads: &[Bead], parent_id: &str) -> Vec<String> {
+    let mut descendants = Vec::new();
+    let mut frontier = vec![parent_id];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(parent) = frontier.pop() {
+        if !visited.insert(parent) {
+            continue;
+        }
+        for bead in beads {
+            if bead.data["parent"].as_str() == Some(parent) {
+                frontier.push(&bead.id);
+                if bead.status != "closed" {
+                    descendants.push(bead.id.clone());
+                }
+            }
+        }
+    }
+    descendants
+}
+
 pub fn update_bead(input: &UpdateBead) -> io::Result<()> {
     let args = update_args(input)?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -267,6 +308,36 @@ fn parse_show(bytes: &[u8], id: &str) -> io::Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn child_creation_keeps_parent_and_user_text_in_separate_arguments() {
+        let args = create_child_args(
+            &CreateBead {
+                title: "$(touch /tmp/unwanted)".into(),
+                description: "--priority=0\nsecond line".into(),
+                issue_type: "task".into(),
+                priority: 2,
+            },
+            "ontrack-parent",
+        )
+        .unwrap();
+        assert!(args.contains(&"--parent=ontrack-parent".to_owned()));
+        assert!(args.contains(&"--title=$(touch /tmp/unwanted)".to_owned()));
+        assert!(args.contains(&"--description=--priority=0\nsecond line".to_owned()));
+        assert!(create_child_args(&create_input(), "--help").is_err());
+    }
+
+    #[test]
+    fn open_descendants_follow_beads_hierarchy_through_closed_intermediates() {
+        let rows = json!([
+            {"id":"parent","title":"Parent","status":"open"},
+            {"id":"child","title":"Child","status":"closed","parent":"parent"},
+            {"id":"grandchild","title":"Grandchild","status":"open","parent":"child"},
+            {"id":"unrelated","title":"Elsewhere","status":"open"}
+        ]);
+        let beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        assert_eq!(open_descendants_in(&beads, "parent"), vec!["grandchild"]);
+    }
 
     fn create_input() -> CreateBead {
         CreateBead {
