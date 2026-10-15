@@ -18,6 +18,7 @@ const GOLD: Color = Color::Rgb(239, 183, 99);
 fn status_color(status: &str) -> Color {
     match status {
         "open" => TEAL,
+        "ready" => Color::Rgb(130, 205, 135),
         "closed" | "blocked" => Color::Rgb(255, 123, 123),
         "in_progress" => GOLD,
         "deferred" => Color::Rgb(145, 170, 220),
@@ -755,12 +756,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "{kind}{}",
                         " ".repeat(type_width.saturating_sub(kind_width))
                     );
-                    let status = if bead.status.trim().is_empty() {
-                        "unknown"
-                    } else {
-                        bead.status.as_str()
-                    };
-                    let handed_off = status == "open"
+                    let status = crate::app::display_status(bead);
+                    let handed_off = bead.status == "open"
                         && (app.accepted_handoffs.contains(&bead.id)
                             || app.worktrees.iter().any(|worktree| {
                                 worktree.bead_id == bead.id && worktree.handoff_accepted
@@ -966,7 +963,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 (9 + option_lines + error_lines + hint_lines + 2) as u16
             }
             crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
-                if form.dropdown.is_some() { 19 } else { 15 }
+                if form.dropdown.is_some() { 22 } else { 18 }
             }
             crate::app::Modal::EditLoading { .. } => 8,
             crate::app::Modal::ConfirmDelete { .. } => delete_lines
@@ -1203,7 +1200,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(3),
-                        Constraint::Length(if form.dropdown.is_some() { 7 } else { 3 }),
+                        Constraint::Length(if matches!(form.dropdown, Some(2 | 3)) {
+                            7
+                        } else {
+                            3
+                        }),
+                        Constraint::Length(if form.dropdown == Some(6) { 7 } else { 3 }),
                         Constraint::Min(3),
                         Constraint::Length(1),
                         Constraint::Length(1),
@@ -1367,7 +1369,64 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         );
                     }
                 }
-                let desc_area = rows[2];
+                let harness_area = rows[2];
+                let harness_name = if form.harness == 0 {
+                    "Unassigned"
+                } else {
+                    crate::beads::HARNESSES[form.harness - 1]
+                };
+                let harness_border = if form.focus == 6 || form.dropdown == Some(6) {
+                    teal
+                } else {
+                    muted
+                };
+                f.render_widget(
+                    Block::default()
+                        .title(format!("Agent harness (tasks): {harness_name}  ▾"))
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(harness_border)),
+                    harness_area,
+                );
+                if form.dropdown == Some(6) {
+                    let options = std::iter::once("Unassigned")
+                        .chain(crate::beads::HARNESSES.iter().copied())
+                        .collect::<Vec<_>>();
+                    let count = harness_area.height.saturating_sub(2) as usize;
+                    let start = form.harness.saturating_sub(count.saturating_sub(1));
+                    for (offset, label) in options.iter().enumerate().skip(start).take(count) {
+                        let style = if offset == form.harness {
+                            Style::default()
+                                .fg(palette.selected_foreground)
+                                .bg(palette.selected_background)
+                        } else {
+                            Style::default().fg(ink)
+                        };
+                        f.render_widget(
+                            Paragraph::new(format!(
+                                "{} {label}",
+                                if offset == form.harness { "›" } else { " " }
+                            ))
+                            .style(style),
+                            Rect::new(
+                                harness_area.x + 1,
+                                harness_area.y + 1 + (offset - start) as u16,
+                                harness_area.width.saturating_sub(2),
+                                1,
+                            ),
+                        );
+                    }
+                } else {
+                    f.render_widget(
+                        Paragraph::new(harness_name).style(Style::default().fg(ink)),
+                        Rect::new(
+                            harness_area.x + 1,
+                            harness_area.y + 1,
+                            harness_area.width.saturating_sub(2),
+                            1,
+                        ),
+                    );
+                }
+                let desc_area = rows[3];
                 debug_assert_eq!(
                     desc_area.width.saturating_sub(2) as usize,
                     FORM_DESCRIPTION_WIDTH
@@ -1439,7 +1498,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     ),
                     Span::raw("  ·  Enter choose · Esc cancel"),
                 ]));
-                f.render_widget(actions, rows[3]);
+                f.render_widget(actions, rows[4]);
                 let feedback = if app.mutation_busy {
                     Some(if editing {
                         "Saving… · form locked until the command finishes"
@@ -1453,7 +1512,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     feedback.unwrap_or(
                         "Tab moves · ←/→ cycles focused choices · Enter opens · Esc cancels",
                     ),
-                    rows[4].width as usize,
+                    rows[5].width as usize,
                 );
                 f.render_widget(
                     Paragraph::new(feedback).style(Style::default().fg(
@@ -1463,7 +1522,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             muted
                         },
                     )),
-                    rows[4],
+                    rows[5],
                 );
             }
             crate::app::Modal::ConfirmDelete { id, title } => {
@@ -2022,6 +2081,8 @@ mod tests {
             settings_load_error: None,
             worktrees: Vec::new(),
             accepted_handoffs: std::collections::HashSet::new(),
+            known_handoffs: std::collections::HashSet::new(),
+            scheduler_attempted: std::collections::HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,

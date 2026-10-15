@@ -71,6 +71,10 @@ impl Context {
                 ("e", "Edit selected bead"),
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
+                (
+                    "Shift+R",
+                    "Mark selected open task Ready or return it to Open",
+                ),
                 ("w", "Open outstanding worktrees"),
                 ("Esc", "Stay in the issue browser"),
             ],

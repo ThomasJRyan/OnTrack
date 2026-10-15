@@ -16,6 +16,34 @@ pub const BEAD_TYPES: &[&str] = &[
     "story",
     "milestone",
 ];
+pub const READY_LABEL: &str = "ontrack:ready";
+pub const HARNESS_PREFIX: &str = "ontrack:agent:";
+pub const HARNESSES: &[&str] = &[
+    "pi",
+    "claude",
+    "codex",
+    "gemini",
+    "cursor",
+    "devin",
+    "agy",
+    "cline",
+    "omp",
+    "mastracode",
+    "opencode",
+    "copilot",
+    "kimi",
+    "kiro",
+    "droid",
+    "amp",
+    "grok",
+    "hermes",
+    "kilo",
+    "qodercli",
+    "qwen",
+    "letta",
+    "maki",
+    "muse",
+];
 
 #[derive(Debug, Clone)]
 pub struct CreateBead {
@@ -23,12 +51,14 @@ pub struct CreateBead {
     pub description: String,
     pub issue_type: String,
     pub priority: u8,
+    pub harness: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct UpdateBead {
     pub id: String,
     pub fields: CreateBead,
+    pub previous_harness: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,15 +98,35 @@ pub fn create_bead(input: &CreateBead) -> io::Result<String> {
 }
 
 pub fn create_child(input: &CreateBead, parent_id: &str) -> io::Result<String> {
-    let args = create_child_args(input, parent_id)?;
+    validate_id(parent_id)?;
+    let parent = show_bead(parent_id)?;
+    let inherited = labels(&parent)
+        .filter(|label| *label != READY_LABEL && !label.starts_with(HARNESS_PREFIX))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let args = create_child_args(input, parent_id, &inherited)?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     parse_created_id(&run_bd(&args)?)
 }
 
-fn create_child_args(input: &CreateBead, parent_id: &str) -> io::Result<Vec<String>> {
+fn create_child_args(
+    input: &CreateBead,
+    parent_id: &str,
+    inherited: &[String],
+) -> io::Result<Vec<String>> {
     validate_id(parent_id)?;
     let mut args = create_args(input)?;
     args.push(format!("--parent={parent_id}"));
+    args.push("--no-inherit-labels".into());
+    for label in inherited {
+        if label == READY_LABEL || label.starts_with(HARNESS_PREFIX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "OnTrack parent state cannot be inherited by child",
+            ));
+        }
+        args.push(format!("--labels={label}"));
+    }
     Ok(args)
 }
 
@@ -88,7 +138,7 @@ pub fn open_descendants(parent_id: &str) -> io::Result<Vec<String>> {
     Ok(open_descendants_in(&list_beads()?, parent_id))
 }
 
-fn open_descendants_in(beads: &[Bead], parent_id: &str) -> Vec<String> {
+pub(crate) fn open_descendants_in(beads: &[Bead], parent_id: &str) -> Vec<String> {
     let mut descendants = Vec::new();
     let mut frontier = vec![parent_id];
     let mut visited = std::collections::HashSet::new();
@@ -115,6 +165,48 @@ pub fn update_bead(input: &UpdateBead) -> io::Result<()> {
     Ok(())
 }
 
+pub fn set_ready(id: &str, ready: bool) -> io::Result<()> {
+    validate_id(id)?;
+    let flag = if ready {
+        "--add-label"
+    } else {
+        "--remove-label"
+    };
+    let mut args = vec!["--no-color", "update", flag, READY_LABEL];
+    if ready {
+        args.extend(["--if-status", "open", "--status", "open"]);
+    }
+    args.extend(["--", id]);
+    run_bd(&args)?;
+    Ok(())
+}
+
+pub fn is_ready(bead: &Bead) -> bool {
+    bead.status == "open"
+        && bead.data["issue_type"] == "task"
+        && labels(&bead.data).any(|label| label == READY_LABEL)
+}
+
+pub fn ready_record(data: &Value) -> bool {
+    data["status"] == "open"
+        && data["issue_type"] == "task"
+        && labels(data).any(|label| label == READY_LABEL)
+}
+
+pub fn harness(data: &Value) -> Option<&str> {
+    labels(data)
+        .filter_map(|label| label.strip_prefix(HARNESS_PREFIX))
+        .find(|kind| HARNESSES.contains(kind))
+}
+
+fn labels(data: &Value) -> impl Iterator<Item = &str> {
+    data.get("labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
 /// Permanently delete only this issue, never cascading to dependent issues.
 pub fn delete_bead(id: &str) -> io::Result<()> {
     run_bd(&delete_args(id)?)?;
@@ -123,7 +215,7 @@ pub fn delete_bead(id: &str) -> io::Result<()> {
 
 fn create_args(input: &CreateBead) -> io::Result<Vec<String>> {
     let title = validated_title(input)?;
-    Ok(vec![
+    let mut args = vec![
         "--no-color".to_owned(),
         "create".to_owned(),
         format!("--title={title}"),
@@ -131,13 +223,17 @@ fn create_args(input: &CreateBead) -> io::Result<Vec<String>> {
         format!("--type={}", input.issue_type),
         format!("--priority={}", input.priority),
         "--json".to_owned(),
-    ])
+    ];
+    if let Some(harness) = &input.harness {
+        args.push(format!("--labels={HARNESS_PREFIX}{harness}"));
+    }
+    Ok(args)
 }
 
 fn update_args(input: &UpdateBead) -> io::Result<Vec<String>> {
     validate_id(&input.id)?;
     let title = validated_title(&input.fields)?;
-    Ok(vec![
+    let mut args = vec![
         "--no-color".to_owned(),
         "update".to_owned(),
         format!("--title={title}"),
@@ -145,9 +241,17 @@ fn update_args(input: &UpdateBead) -> io::Result<Vec<String>> {
         format!("--type={}", input.fields.issue_type),
         format!("--priority={}", input.fields.priority),
         "--json".to_owned(),
-        "--".to_owned(),
-        input.id.clone(),
-    ])
+    ];
+    if input.fields.harness != input.previous_harness {
+        if let Some(old) = &input.previous_harness {
+            args.push(format!("--remove-label={HARNESS_PREFIX}{old}"));
+        }
+        if let Some(new) = &input.fields.harness {
+            args.push(format!("--add-label={HARNESS_PREFIX}{new}"));
+        }
+    }
+    args.extend(["--".to_owned(), input.id.clone()]);
+    Ok(args)
 }
 
 fn validated_title(input: &CreateBead) -> io::Result<&str> {
@@ -172,6 +276,16 @@ fn validated_title(input: &CreateBead) -> io::Result<&str> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "Unsupported Beads issue type",
+        ));
+    }
+    if input
+        .harness
+        .as_deref()
+        .is_some_and(|h| !HARNESSES.contains(&h))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unsupported agent harness",
         ));
     }
     Ok(title)
@@ -317,14 +431,23 @@ mod tests {
                 description: "--priority=0\nsecond line".into(),
                 issue_type: "task".into(),
                 priority: 2,
+                harness: None,
             },
             "ontrack-parent",
+            &[],
         )
         .unwrap();
         assert!(args.contains(&"--parent=ontrack-parent".to_owned()));
+        assert!(args.contains(&"--no-inherit-labels".to_owned()));
         assert!(args.contains(&"--title=$(touch /tmp/unwanted)".to_owned()));
         assert!(args.contains(&"--description=--priority=0\nsecond line".to_owned()));
-        assert!(create_child_args(&create_input(), "--help").is_err());
+        assert!(create_child_args(&create_input(), "--help", &[]).is_err());
+        let inherited = vec!["team:core".to_owned()];
+        let args = create_child_args(&create_input(), "ontrack-parent", &inherited).unwrap();
+        assert!(args.contains(&"--labels=team:core".to_owned()));
+        assert!(
+            create_child_args(&create_input(), "ontrack-parent", &[READY_LABEL.into()]).is_err()
+        );
     }
 
     #[test]
@@ -345,7 +468,47 @@ mod tests {
             description: "First line\n\nSecond line\r\n  indented  \n".to_owned(),
             issue_type: "task".to_owned(),
             priority: 2,
+            harness: None,
         }
+    }
+
+    #[test]
+    fn ready_and_harness_labels_are_app_state_without_changing_beads_status() {
+        let data = json!({"issue_type":"task", "labels":["team:core", READY_LABEL, "ontrack:agent:opencode"]});
+        let bead = Bead {
+            id: "b1".into(),
+            title: "Task".into(),
+            status: "open".into(),
+            priority: 2,
+            data: data.clone(),
+        };
+        assert!(is_ready(&bead));
+        assert_eq!(harness(&data), Some("opencode"));
+        assert!(!is_ready(&Bead {
+            status: "closed".into(),
+            ..bead.clone()
+        }));
+        assert!(!is_ready(&Bead {
+            data: json!({"issue_type":"feature", "labels":[READY_LABEL]}),
+            ..bead
+        }));
+    }
+
+    #[test]
+    fn creation_and_edit_persist_harness_as_a_safe_label_argument() {
+        let mut fields = create_input();
+        fields.harness = Some("opencode".into());
+        let args = create_args(&fields).unwrap();
+        assert!(args.contains(&"--labels=ontrack:agent:opencode".into()));
+        let update = UpdateBead {
+            id: "b1".into(),
+            fields,
+            previous_harness: Some("codex".into()),
+        };
+        let args = update_args(&update).unwrap();
+        assert!(args.contains(&"--remove-label=ontrack:agent:codex".into()));
+        assert!(args.contains(&"--add-label=ontrack:agent:opencode".into()));
+        assert_eq!(&args[args.len() - 2..], ["--", "b1"]);
     }
 
     #[test]
@@ -384,6 +547,7 @@ mod tests {
         let input = UpdateBead {
             id: "ontrack-70t".into(),
             fields,
+            previous_harness: None,
         };
         assert_eq!(
             update_args(&input).unwrap(),
@@ -406,6 +570,7 @@ mod tests {
         let mut input = UpdateBead {
             id: "--force".into(),
             fields: create_input(),
+            previous_harness: None,
         };
         assert_eq!(
             update_bead(&input).unwrap_err().kind(),
