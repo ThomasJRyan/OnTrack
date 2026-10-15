@@ -117,9 +117,47 @@ impl DefaultAgent {
 pub struct Settings {
     pub theme: Theme,
     pub default_agent: DefaultAgent,
+    pub agent_limit: AgentLimit,
     pub auto_merge: bool,
     pub auto_close_workspace: bool,
     pub auto_remove_checkout: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentLimit {
+    Unlimited,
+    Limited(u32),
+}
+
+impl Default for AgentLimit {
+    fn default() -> Self {
+        Self::Limited(5)
+    }
+}
+
+impl AgentLimit {
+    pub fn label(self) -> String {
+        match self {
+            Self::Unlimited => "Unlimited".to_owned(),
+            Self::Limited(count) => count.to_string(),
+        }
+    }
+
+    pub fn step(self, forward: bool) -> Self {
+        match (self, forward) {
+            (Self::Unlimited, true) => Self::Limited(1),
+            (Self::Unlimited, false) | (Self::Limited(1), false) => Self::Unlimited,
+            (Self::Limited(count), true) => Self::Limited(count.saturating_add(1)),
+            (Self::Limited(count), false) => Self::Limited(count - 1),
+        }
+    }
+
+    pub fn allows(self, active: usize) -> bool {
+        match self {
+            Self::Unlimited => true,
+            Self::Limited(count) => active < count as usize,
+        }
+    }
 }
 
 /// Resolve the user configuration location without using the current workspace.
@@ -183,9 +221,25 @@ pub fn load_from(path: &Path) -> io::Result<Settings> {
             Some(_) => Err(invalid(&format!("{key} must be a boolean"))),
         }
     };
+    let agent_limit = match object.get("agent_limit") {
+        None => AgentLimit::default(),
+        Some(serde_json::Value::String(value)) if value == "unlimited" => AgentLimit::Unlimited,
+        Some(serde_json::Value::Number(value)) => value
+            .as_u64()
+            .and_then(|count| u32::try_from(count).ok())
+            .filter(|count| *count > 0)
+            .map(AgentLimit::Limited)
+            .ok_or_else(|| invalid("agent_limit must be a positive integer or 'unlimited'"))?,
+        Some(_) => {
+            return Err(invalid(
+                "agent_limit must be a positive integer or 'unlimited'",
+            ));
+        }
+    };
     Ok(Settings {
         theme,
         default_agent,
+        agent_limit,
         auto_merge: boolean("auto_merge")?,
         auto_close_workspace: boolean("auto_close_workspace")?,
         auto_remove_checkout: boolean("auto_remove_checkout")?,
@@ -209,8 +263,12 @@ pub fn save_to(path: &Path, settings: &Settings) -> io::Result<()> {
     let (temporary_path, mut file) = create_temporary_file(parent)?;
     let theme = settings.theme.id();
     let default_agent = settings.default_agent.id();
+    let agent_limit = match settings.agent_limit {
+        AgentLimit::Unlimited => "\"unlimited\"".to_owned(),
+        AgentLimit::Limited(count) => count.to_string(),
+    };
     let result = (|| {
-        writeln!(file, "{{\"theme\":\"{theme}\",\"default_agent\":\"{default_agent}\",\"auto_merge\":{},\"auto_close_workspace\":{},\"auto_remove_checkout\":{}}}", settings.auto_merge, settings.auto_close_workspace, settings.auto_remove_checkout)
+        writeln!(file, "{{\"theme\":\"{theme}\",\"default_agent\":\"{default_agent}\",\"agent_limit\":{agent_limit},\"auto_merge\":{},\"auto_close_workspace\":{},\"auto_remove_checkout\":{}}}", settings.auto_merge, settings.auto_close_workspace, settings.auto_remove_checkout)
             .and_then(|()| file.sync_all())
             .map_err(|error| io_error("write", &temporary_path, error))?;
         drop(file);
@@ -363,6 +421,7 @@ mod tests {
         let settings = Settings {
             theme: Theme::Nord,
             default_agent: DefaultAgent::Kind("codex"),
+            agent_limit: AgentLimit::Unlimited,
             auto_merge: true,
             auto_close_workspace: true,
             auto_remove_checkout: true,
@@ -401,6 +460,45 @@ mod tests {
             load_from(&directory.path()).unwrap().default_agent,
             DefaultAgent::Automatic
         );
+    }
+
+    #[test]
+    fn agent_limit_orders_choices_and_roundtrips() {
+        let directory = TestDirectory::new();
+        assert_eq!(Settings::default().agent_limit, AgentLimit::Limited(5));
+        let mut choice = AgentLimit::Unlimited;
+        for count in 1..=12 {
+            choice = choice.step(true);
+            assert_eq!(choice, AgentLimit::Limited(count));
+            let settings = Settings {
+                agent_limit: choice,
+                ..Settings::default()
+            };
+            save_to(&directory.path(), &settings).unwrap();
+            assert_eq!(load_from(&directory.path()).unwrap(), settings);
+        }
+        assert_eq!(choice.step(false), AgentLimit::Limited(11));
+        assert_eq!(AgentLimit::Limited(1).step(false), AgentLimit::Unlimited);
+        let settings = Settings {
+            agent_limit: AgentLimit::Unlimited,
+            ..Settings::default()
+        };
+        save_to(&directory.path(), &settings).unwrap();
+        assert_eq!(load_from(&directory.path()).unwrap(), settings);
+        assert!(AgentLimit::Unlimited.allows(usize::MAX));
+        assert!(AgentLimit::Limited(5).allows(4));
+        assert!(!AgentLimit::Limited(5).allows(5));
+    }
+
+    #[test]
+    fn invalid_agent_limits_report_settings_error() {
+        let directory = TestDirectory::new();
+        for value in ["0", "-1", "1.5", "null", "true", "\"5\"", "4294967296"] {
+            directory.write(&format!("{{\"agent_limit\":{value}}}"));
+            let error = load_from(&directory.path()).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(error.to_string().contains("agent_limit"));
+        }
     }
 
     #[test]

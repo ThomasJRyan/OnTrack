@@ -132,7 +132,7 @@ impl Context {
             Self::Settings => vec![
                 ("↑ / ↓", "Move between setting rows"),
                 ("Tab / Shift+Tab", "Move between setting rows"),
-                ("← / →", "Cycle focused theme or agent"),
+                ("← / →", "Cycle focused theme, agent, or limit"),
                 ("Enter / Space", "Open choices, toggle preference, or close"),
                 ("Esc", "Close settings"),
             ],

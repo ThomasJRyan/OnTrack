@@ -195,9 +195,9 @@ fn worktree_status_style(theme: Theme, status: crate::worktrees::WorktreeStatus)
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
         "↑ / ↓ move · ← / → choice · Enter / Space select · Tab moves · Esc close"
-    } else if focus == 5 {
+    } else if focus == 6 {
         "↑ / ↓ move · Enter / Space close · Tab moves · Esc close"
-    } else if focus >= 2 {
+    } else if focus >= 3 {
         "↑ / ↓ move · Enter / Space toggle · Tab moves · Esc close"
     } else {
         "↑ / ↓ move · ← / → choice · Enter / Space open · Tab moves"
@@ -237,7 +237,7 @@ const MAX_VISIBLE_THEMES: usize = 6;
 fn visible_theme_window(theme: Theme, available_height: u16) -> (usize, usize) {
     let total = crate::theme::CATALOG.len();
     let visible = usize::from(available_height)
-        .saturating_sub(20)
+        .saturating_sub(21)
         .clamp(1, MAX_VISIBLE_THEMES.min(total));
     let selected = Theme::ALL
         .iter()
@@ -253,12 +253,22 @@ fn visible_agent_window(
     available_height: u16,
 ) -> (usize, usize) {
     let total = crate::beads::HARNESSES.len() + 2;
-    let visible = usize::from(available_height).saturating_sub(21).clamp(1, 6);
+    let visible = usize::from(available_height).saturating_sub(22).clamp(1, 6);
     let start = agent
         .index()
         .saturating_sub(visible.saturating_sub(1))
         .min(total - visible);
     (start, visible)
+}
+fn visible_limit_window(limit: crate::settings::AgentLimit, available_height: u16) -> (u64, usize) {
+    let visible = usize::from(available_height)
+        .saturating_sub(22)
+        .clamp(1, MAX_VISIBLE_THEMES);
+    let selected = match limit {
+        crate::settings::AgentLimit::Unlimited => 0,
+        crate::settings::AgentLimit::Limited(count) => u64::from(count),
+    };
+    (selected.saturating_sub((visible - 1) as u64), visible)
 }
 fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
     let type_width = beads
@@ -986,16 +996,23 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         count
                             + usize::from(start > 0)
                             + usize::from(start + count < crate::theme::CATALOG.len())
-                    } else {
+                    } else if *focus == 1 {
                         let (start, count) = visible_agent_window(draft.default_agent, a.height);
                         count
                             + usize::from(start > 0)
                             + usize::from(start + count < crate::beads::HARNESSES.len() + 2)
+                    } else if *focus == 2 {
+                        let (start, count) = visible_limit_window(draft.agent_limit, a.height);
+                        count
+                            + usize::from(start > 0)
+                            + usize::from(start + count as u64 <= u32::MAX as u64)
+                    } else {
+                        0
                     }
                 } else {
                     0
                 };
-                (10 + option_lines + error_lines + hint_lines + 2) as u16
+                (11 + option_lines + error_lines + hint_lines + 2) as u16
             }
             crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
                 let epic_toggle = matches!(modal, crate::app::Modal::Create(_))
@@ -1206,6 +1223,61 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         ));
                     }
                 }
+                lines.push(settings_row(
+                    "Agent limit",
+                    &format!("{} ▾", draft.agent_limit.label()),
+                    row_width,
+                    if *focus == 2 {
+                        value_style
+                    } else {
+                        Style::default().fg(ink)
+                    },
+                    if *focus == 2 {
+                        selected_style
+                    } else {
+                        value_style
+                    },
+                ));
+                if *dropdown_open && *focus == 2 {
+                    let (start, count) = visible_limit_window(draft.agent_limit, a.height);
+                    if start > 0 {
+                        lines.push(settings_row(
+                            "",
+                            "↑ earlier limits",
+                            row_width,
+                            Style::default(),
+                            Style::default().fg(muted),
+                        ));
+                    }
+                    for index in start..start + count as u64 {
+                        let choice = if index == 0 {
+                            crate::settings::AgentLimit::Unlimited
+                        } else {
+                            crate::settings::AgentLimit::Limited(index as u32)
+                        };
+                        let selected = draft.agent_limit == choice;
+                        lines.push(settings_row(
+                            "",
+                            &format!("{} {}", if selected { "›" } else { " " }, choice.label()),
+                            row_width,
+                            Style::default(),
+                            if selected {
+                                selected_style
+                            } else {
+                                Style::default().fg(ink)
+                            },
+                        ));
+                    }
+                    if start + count as u64 <= u32::MAX as u64 {
+                        lines.push(settings_row(
+                            "",
+                            "↓ later limits",
+                            row_width,
+                            Style::default(),
+                            Style::default().fg(muted),
+                        ));
+                    }
+                }
                 for (index, (label, enabled)) in [
                     ("Auto-request merge", draft.auto_merge),
                     (
@@ -1220,7 +1292,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .into_iter()
                 .enumerate()
                 {
-                    let focused = *focus == index + 2;
+                    let focused = *focus == index + 3;
                     lines.push(settings_row(
                         label,
                         if enabled { "[x]" } else { "[ ]" },
@@ -1248,7 +1320,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 lines.push(
                     Line::from(Span::styled(
                         "[ Close ]",
-                        if *focus == 5 {
+                        if *focus == 6 {
                             selected_style
                         } else {
                             value_style
@@ -2426,6 +2498,8 @@ mod tests {
     fn open_issue_shows_confirmed_agent_handoff_only() {
         let mut a = app();
         a.beads[0].status = "open".into();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([crate::beads::READY_LABEL]);
         a.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "demo-1".into(),
@@ -2441,11 +2515,12 @@ mod tests {
         });
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));
         a.worktrees[0].handoff_accepted = true;
-        assert!(draw((80, 24), &mut a).0.contains("open · sent"));
+        assert!(draw((80, 24), &mut a).0.contains("ready · sent"));
         a.worktrees.clear();
         a.accepted_handoffs.insert("demo-1".into());
-        assert!(draw((80, 24), &mut a).0.contains("open · sent"));
+        assert!(draw((80, 24), &mut a).0.contains("ready · sent"));
         a.beads[0].status = "in_progress".into();
+        assert!(draw((80, 24), &mut a).0.contains("in_progress"));
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));
     }
     #[test]
@@ -2980,6 +3055,7 @@ mod tests {
             WorktreeStatus::Reserved,
             WorktreeStatus::InProgress,
             WorktreeStatus::Unmerged,
+            WorktreeStatus::MergeQueued,
             WorktreeStatus::MergeRequested,
             WorktreeStatus::NeedsResolution,
             WorktreeStatus::Integrated,
@@ -3364,6 +3440,7 @@ mod tests {
         assert_eq!(settings_columns(60), (40, 20));
         let title_x = locate(buffer, "Theme").0;
         for label in [
+            "Agent limit",
             "Auto-request merge",
             "Close Herdr workspace after integration",
             "Remove checkout + close Herdr workspace",
@@ -3575,6 +3652,37 @@ mod tests {
         assert!(!early.contains("Save"));
         assert!(!early.contains("Cancel"));
         assert!(app.modal_ready);
+    }
+    #[test]
+    fn agent_limit_dropdown_shows_unlimited_then_increasing_counts() {
+        let mut app = app();
+        app.modal = Some(crate::app::Modal::Settings {
+            draft: crate::settings::Settings::default(),
+            error: None,
+            dropdown_open: true,
+            focus: 2,
+        });
+        let screen = draw((80, 30), &mut app).0;
+        let labels = ["› 5", "  Unlimited", "  1", "  2", "  3", "  4"];
+        for label in labels {
+            assert!(screen.contains(label), "missing {label:?}");
+        }
+        assert!(screen.find("Unlimited").unwrap() < screen.find("› 5").unwrap());
+        assert!(screen.contains("↓ later limits"));
+
+        app.modal = Some(crate::app::Modal::Settings {
+            draft: crate::settings::Settings {
+                agent_limit: crate::settings::AgentLimit::Limited(12),
+                ..Default::default()
+            },
+            error: None,
+            dropdown_open: true,
+            focus: 2,
+        });
+        let later = draw((80, 24), &mut app).0;
+        assert!(later.contains("› 12"));
+        assert!(later.contains("↑ earlier limits"));
+        assert!(later.contains("↓ later limits"));
     }
     #[test]
     fn wide_title_horizontal_scroll_starts_at_character_boundary() {
