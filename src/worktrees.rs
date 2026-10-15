@@ -12,7 +12,7 @@ use std::{
 
 use serde_json::{Value, json};
 
-use crate::herdr::{Executor, RepositoryIdentity, SystemExecutor, envelope};
+use crate::herdr::{self, Executor, RepositoryIdentity, SystemExecutor, envelope};
 
 #[derive(Debug, Clone)]
 pub struct ManagedWorktree {
@@ -533,6 +533,29 @@ fn view(entry: &Value, status: WorktreeStatus, detail: Option<String>) -> Manage
 
 fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
     use WorktreeStatus::*;
+    if entry["restart_pending"] == true {
+        return view(entry, NeedsAttention, Some(entry["detail"].as_str().unwrap_or(
+            "Restart removal may have succeeded; inspect Git and Herdr before recovery."
+        ).to_owned()));
+    }
+    if entry["restarted"] == true {
+        if entry["restart_launch_pending"] == true || entry["restart_launch_error"].is_string() {
+            return view(entry, NeedsAttention, Some(entry["restart_launch_error"].as_str().unwrap_or(
+                "Old checkout removed; fresh launch may not have completed. Inspect tracked handoffs before recovery."
+            ).to_owned()));
+        }
+        if entry["path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).exists())
+        {
+            return view(
+                entry,
+                NeedsAttention,
+                Some("Restarted checkout path exists again; inspect identity".into()),
+            );
+        }
+        return view(entry, CheckoutRemoved, None);
+    }
     if entry["phase"] != "active" {
         return view(
             entry,
@@ -640,6 +663,120 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
         return view(entry, MergeRequested, Some(entry["detail"].as_str().unwrap_or("Merge prompt possibly sent; waiting for verified current Git ancestry. Native idle/sequence changes are not proof that this particular prompt completed. Never blindly resend.").to_owned()));
     }
     view(entry, Unmerged, entry["detail"].as_str().map(str::to_owned))
+}
+
+/// A confirmed restart abandons the old checkout and launches the live Bead
+/// from the current main HEAD. The old branch is deliberately retained.
+pub fn restart(id: &str) -> io::Result<String> {
+    restart_with(&std::env::current_dir()?, id, &mut SystemExecutor)
+}
+
+fn restart_with(cwd: &Path, id: &str, executor: &mut impl Executor) -> io::Result<String> {
+    let mut registry = Registry::open(cwd)?;
+    let index = registry.index(id)?;
+    let entry = &registry.entries[index];
+    if entry["phase"] != "active"
+        || entry["checkout_removed"] == true
+        || entry["restart_pending"] == true
+        || entry["restarted"] == true
+        || entry["cleanup_pending"].is_string()
+    {
+        return Err(error(
+            "This handoff cannot be restarted or may already have been removed",
+        ));
+    }
+    let main = registry.repo.main_root.clone();
+    if SystemExecutor.git_identity(&main)? != registry.repo
+        || default_branch(&registry.repo)? != field(entry, "target_branch")?
+        || branch(&main)? != field(entry, "target_branch")?
+    {
+        return Err(error(
+            "Main checkout identity or branch changed; restart cancelled",
+        ));
+    }
+    clean(&main)?;
+    let path = Path::new(field(entry, "path")?).canonicalize()?;
+    if path == main
+        || path.to_str() != entry["path"].as_str()
+        || SystemExecutor.git_identity(&path)? != registry.repo
+        || branch(&path)? != field(entry, "branch")?
+    {
+        return Err(error(
+            "Recorded checkout identity or branch changed; restart cancelled",
+        ));
+    }
+    verify_open_workspace(&registry.repo, entry, executor)?;
+    let workspace = field(entry, "workspace_id")?.to_owned();
+    let recorded_path = field(entry, "path")?.to_owned();
+    let source_workspace = field(entry, "source_workspace")?.to_owned();
+    let agent = field(entry, "agent")?.to_owned();
+    let bead_id = field(entry, "bead_id")?.to_owned();
+    let bead = executor.show_bead(&bead_id)?;
+    let title = if bead["id"] == bead_id {
+        field(&bead, "title")?.to_owned()
+    } else {
+        return Err(error("Live Bead identity changed; restart cancelled"));
+    };
+    herdr::validate_restart_source(executor, &main, &source_workspace, &agent)?;
+    // Recheck ownership immediately before the destructive command.
+    verify_open_workspace(&registry.repo, entry, executor)?;
+    if Path::new(field(entry, "path")?).canonicalize()? != path
+        || branch(&path)? != field(entry, "branch")?
+    {
+        return Err(error("Checkout changed during restart validation"));
+    }
+    registry.entries[index]["restart_pending"] = json!(true);
+    registry.entries[index]["detail"] = json!(
+        "Restart removal may have been sent. Inspect Herdr and Git before recovery; never retry blindly."
+    );
+    registry.save()?;
+    let bytes = executor.run(&["worktree", "remove", "--workspace", &workspace, "--force"])?;
+    registry.entries[index]["restart_remove_response"] = json!(String::from_utf8_lossy(&bytes));
+    registry.save()?;
+    envelope(&bytes)?;
+    let inventory = worktree_inventory(&registry.repo, &registry.entries[index], executor)?;
+    let rows = inventory["worktrees"]
+        .as_array()
+        .ok_or_else(|| error("Missing worktree rows"))?;
+    if path.exists()
+        || rows
+            .iter()
+            .any(|row| row["open_workspace_id"] == workspace || row["path"] == recorded_path)
+        || git(&main, &["worktree", "list", "--porcelain", "-z"])?
+            .split('\0')
+            .any(|line| line.strip_prefix("worktree ") == path.to_str())
+    {
+        return Err(error(
+            "Restart removal is unconfirmed; inspect Herdr and Git",
+        ));
+    }
+    registry.entries[index]["restart_pending"] = Value::Null;
+    registry.entries[index]["restarted"] = json!(true);
+    registry.entries[index]["checkout_removed"] = json!(true);
+    registry.entries[index]["workspace_closed"] = json!(true);
+    registry.entries[index]["restart_launch_pending"] = json!(true);
+    registry.entries[index]["detail"] = Value::Null;
+    registry.save()?;
+    drop(registry);
+    match herdr::relaunch_from(executor, &main, &source_workspace, &agent, &bead_id, &title) {
+        Ok(outcome) => {
+            let mut registry = Registry::open(&main)?;
+            let index = registry.index(id)?;
+            registry.entries[index]["restart_launch_pending"] = Value::Null;
+            registry.save()?;
+            Ok(outcome.message)
+        }
+        Err(cause) => {
+            let mut registry = Registry::open(&main)?;
+            let index = registry.index(id)?;
+            registry.entries[index]["restart_launch_pending"] = Value::Null;
+            registry.entries[index]["restart_launch_error"] = json!(format!(
+                "Old checkout removed; fresh launch failed: {cause}. Inspect any new handoff before recovery."
+            ));
+            registry.save()?;
+            Err(cause)
+        }
+    }
 }
 
 /// Read-only with respect to Git/Herdr; only this repository's durable handoffs.
@@ -1812,6 +1949,102 @@ mod tests {
         assert_eq!(executor.calls[1], ["workspace", "close", "wTask"]);
         assert!(fixture.source.exists());
         assert!(tip(&fixture.main, &format!("refs/heads/{BRANCH}")).is_ok());
+    }
+
+    #[test]
+    fn restart_checks_ownership_before_any_mutation() {
+        let fixture = Fixture::managed();
+        let mut wrong = fixture.inventory(true, true);
+        wrong["result"]["worktrees"][1]["branch"] = json!("other-branch");
+        let mut executor = Fake::default();
+        executor.json(wrong);
+        assert!(restart_with(&fixture.main, ID, &mut executor).is_err());
+        assert_eq!(executor.calls.len(), 1);
+        assert_eq!(executor.calls[0][..2], ["worktree", "list"]);
+        assert!(fixture.source.exists());
+        assert!(Registry::open(&fixture.main).unwrap().entries[0]["restart_pending"].is_null());
+    }
+
+    #[test]
+    fn restart_force_removal_is_journaled_and_never_blindly_retried() {
+        let fixture = Fixture::managed();
+        fs::write(
+            fixture.source.join("uncommitted"),
+            "discard on confirmed restart",
+        )
+        .unwrap();
+        let mut executor = Fake {
+            bead: Some(test_bead()),
+            ..Default::default()
+        };
+        executor.json(fixture.inventory(true, true));
+        executor.json(fixture.inventory(true, true));
+        executor
+            .outputs
+            .push_back(Ok(b"--kind <KIND> [possible values: opencode]".to_vec()));
+        executor
+            .outputs
+            .push_back(Ok(b"opencode: current (v1) (/tmp/opencode)".to_vec()));
+        executor.json(fixture.inventory(true, true));
+        executor
+            .outputs
+            .push_back(Err(error("Herdr timed out after removal may have started")));
+        assert!(restart_with(&fixture.main, ID, &mut executor).is_err());
+        assert_eq!(
+            executor.calls.last().unwrap(),
+            &["worktree", "remove", "--workspace", "wTask", "--force"]
+        );
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["restart_pending"], true);
+        drop(registry);
+        let mut retry = Fake::default();
+        assert!(restart_with(&fixture.main, ID, &mut retry).is_err());
+        assert!(retry.calls.is_empty());
+    }
+
+    #[test]
+    fn restart_verifies_forced_removal_and_exposes_failed_relaunch() {
+        let fixture = Fixture::managed();
+        fs::write(fixture.source.join("uncommitted"), "discard me").unwrap();
+        let main = fixture.main.clone();
+        let source = fixture.source.clone();
+        let mut executor = Fake {
+            bead: Some(test_bead()),
+            hook: Some(Box::new(move |args| {
+                if args.starts_with(&["worktree", "remove"]) {
+                    git(
+                        &main,
+                        &["worktree", "remove", "--force", source.to_str().unwrap()],
+                    )
+                    .unwrap();
+                }
+            })),
+            ..Default::default()
+        };
+        executor.json(fixture.inventory(true, true));
+        executor.json(fixture.inventory(true, true));
+        executor
+            .outputs
+            .push_back(Ok(b"[possible values: opencode]".to_vec()));
+        executor
+            .outputs
+            .push_back(Ok(b"opencode: current (v1) (/tmp/opencode)".to_vec()));
+        executor.json(fixture.inventory(true, true));
+        executor.json(json!({"result":{"type":"worktree_removed"}}));
+        executor.json(fixture.inventory(false, false));
+        executor
+            .outputs
+            .push_back(Err(error("discovery unavailable")));
+        assert!(restart_with(&fixture.main, ID, &mut executor).is_err());
+        assert!(!fixture.source.exists());
+        assert!(tip(&fixture.main, &format!("refs/heads/{BRANCH}")).is_ok());
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["checkout_removed"], true);
+        assert_eq!(registry.entries[0]["restarted"], true);
+        assert!(registry.entries[0]["restart_launch_error"].is_string());
+        assert!(registry.entries[0]["restart_launch_pending"].is_null());
     }
 
     #[test]

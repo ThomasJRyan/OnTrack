@@ -417,7 +417,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             let operation = match action {
                 0 => "MERGE REQUEST · dispatch only; not integrated",
                 1 => "CLOSE WORKSPACE · integrated only",
-                _ => "REMOVE CHECKOUT AND CLOSE HERDR WORKSPACE · integrated only; branch kept",
+                2 => "REMOVE CHECKOUT AND CLOSE HERDR WORKSPACE · integrated only; branch kept",
+                _ => "RESTART TASK · discard checkout changes; old branch kept",
             };
             format!("y confirm / Esc cancel · {operation} · {id}")
         } else if let Some(feedback) = &app.worktrees_focus_feedback {
@@ -429,12 +430,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             format!("ERROR · {error} · Esc / w back")
         } else if let Some(item) = selected.filter(|item| item.detail.is_some()) {
             format!(
-                "{} · {} · Enter switch workspace · PgUp/PgDn details · r refresh",
+                "Shift+R restart · {} · {} · Enter switch workspace · PgUp/PgDn details · r refresh",
                 crate::app::worktree_status_label(item.status),
                 item.detail.as_deref().unwrap_or_default()
             )
         } else {
-            "↑/↓ select · Enter switch workspace · PgUp/PgDn details · m request merge · c close · x remove · r refresh · Esc / w back".to_owned()
+            "↑/↓ select · Shift+R restart · Enter switch workspace · PgUp/PgDn details · m merge · c close · x remove · r refresh · Esc / w back".to_owned()
         };
         let footer_lines = wrap_words(&footer, areas[2].width as usize)
             .into_iter()
@@ -460,6 +461,47 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             ),
             areas[2],
         );
+        if let Some(crate::app::Modal::ConfirmWorktree { id, action: 3 }) = &app.modal {
+            let height = 12;
+            if a.width < 50 || a.height < height {
+                app.modal_ready = false;
+                f.render_widget(Clear, a);
+                f.render_widget(
+                    Paragraph::new("Resize terminal to confirm · Esc cancels")
+                        .style(Style::default().fg(gold))
+                        .alignment(Alignment::Center),
+                    a,
+                );
+            } else {
+                app.modal_ready = true;
+                let width = 62.min(a.width.saturating_sub(2));
+                let area = Rect::new(
+                    a.x + a.width.saturating_sub(width) / 2,
+                    a.y + a.height.saturating_sub(height) / 2,
+                    width,
+                    height,
+                );
+                f.render_widget(Clear, area);
+                f.render_widget(
+                    Block::default()
+                        .title(" RESTART TASK? ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(palette.border))
+                        .style(Style::default().bg(palette.panel)),
+                    area,
+                );
+                let prompt = "Restart this task from scratch?\n\nDiscard all uncommitted checkout changes.\nThe current Herdr workspace will close.\nThe old branch is kept. A fresh worktree\nand agent will start for this Bead.";
+                let inner = Rect::new(area.x + 2, area.y + 1, area.width - 4, area.height - 2);
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "{prompt}\n\nWorktree: {id}\n\ny confirm · n / Esc cancel"
+                    ))
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
+        }
         render_toast(f, app);
         return;
     }
@@ -824,6 +866,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             crate::app::Modal::ConfirmDelete { .. } => delete_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
+            crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
         };
         let min_width = if matches!(
@@ -876,6 +919,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     " EDIT BEAD "
                 }
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
+                crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
+                crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
                 _ => " DELETE BEAD? ",
             })
             .borders(Borders::ALL)
@@ -1327,8 +1372,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "Request merge resolution from the recorded agent? This is pending, not merged."
                     }
                     1 => "Close the integrated Herdr workspace?",
-                    _ => {
+                    2 => {
                         "Remove integrated checkout and close its Herdr workspace? Branch is preserved."
+                    }
+                    _ => {
+                        "Restart this task from scratch?\n\nDiscard all uncommitted checkout changes.\nThe current Herdr workspace will close.\nThe old branch is kept. A fresh worktree\nand agent will start for this Bead."
                     }
                 };
                 f.render_widget(
@@ -2212,6 +2260,21 @@ mod tests {
         assert!(error_delete.contains("Delete error"));
         assert!(error_delete.contains("permission denied"));
         assert!(error_delete.contains("[y] Delete"));
+    }
+
+    #[test]
+    fn restart_dialog_shows_destructive_warning_and_handoff_id() {
+        let mut app = app();
+        app.worktrees_view = true;
+        app.modal = Some(crate::app::Modal::ConfirmWorktree {
+            id: "ot-selected".into(),
+            action: 3,
+        });
+        let rendered = draw((100, 30), &mut app).0;
+        assert!(rendered.contains("RESTART TASK?"));
+        assert!(rendered.contains("Discard all uncommitted checkout changes."));
+        assert!(rendered.contains("Worktree: ot-selected"));
+        assert!(rendered.contains("y confirm"));
     }
     #[test]
     fn footer_keeps_mutation_and_handoff_shortcuts_ahead_of_optional_navigation() {

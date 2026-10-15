@@ -31,6 +31,7 @@ pub(super) enum Request {
     ListWorktrees,
     FocusWorkspace(String),
     WorktreeAction(String, WorktreeAction),
+    RestartWorktree(String),
     ReconcileWorktrees(CleanupPolicy),
 }
 pub(super) enum Response {
@@ -45,6 +46,7 @@ pub(super) enum Response {
     Worktrees(std::io::Result<Vec<ManagedWorktree>>),
     WorkspaceFocused(String, std::io::Result<()>),
     WorktreeChanged(std::io::Result<ManagedWorktree>),
+    WorktreeRestarted(std::io::Result<String>),
 }
 pub(super) enum WorktreeFocusFeedback {
     Success(String),
@@ -303,6 +305,9 @@ impl App {
                     }
                     Request::WorktreeAction(id, action) => {
                         Response::WorktreeChanged(worktrees::act(&id, action))
+                    }
+                    Request::RestartWorktree(id) => {
+                        Response::WorktreeRestarted(worktrees::restart(&id))
                     }
                     Request::ReconcileWorktrees(policy) => {
                         Response::Worktrees(worktrees::reconcile(policy))
@@ -943,6 +948,23 @@ impl App {
                         }
                     }
                 }
+                Response::WorktreeRestarted(result) => {
+                    self.mutation_busy = false;
+                    self.modal = None;
+                    self.worktree_action_pending = false;
+                    self.worktrees_focus_feedback = Some(match result {
+                        Ok(message) => WorktreeFocusFeedback::Success(message),
+                        Err(error) => {
+                            WorktreeFocusFeedback::Error(format!("Restart failed: {error}"))
+                        }
+                    });
+                    if self.worktrees_inflight {
+                        self.worktrees_refresh_pending = true;
+                    } else {
+                        self.worktrees_discovered = false;
+                        self.worktrees_next_refresh = now;
+                    }
+                }
             }
         }
     }
@@ -988,6 +1010,7 @@ impl App {
                 KeyCode::Char('m') => self.confirm_worktree_action(0),
                 KeyCode::Char('c') => self.confirm_worktree_action(1),
                 KeyCode::Char('x') => self.confirm_worktree_action(2),
+                KeyCode::Char('R') => self.confirm_worktree_action(3),
                 _ => {}
             }
             return false;
@@ -1142,6 +1165,16 @@ impl App {
             self.worktrees_error = Some("This worktree is not ready for a merge request".into());
             return;
         }
+        if action == 3
+            && matches!(
+                item.status,
+                worktrees::WorktreeStatus::CheckoutRemoved
+                    | worktrees::WorktreeStatus::WorkspaceClosed
+            )
+        {
+            self.worktrees_error = Some("Select an active checkout to restart".into());
+            return;
+        }
         self.modal = Some(Modal::ConfirmWorktree {
             id: item.id.clone(),
             action,
@@ -1182,17 +1215,14 @@ impl App {
         if let Some(Modal::ConfirmWorktree { id, action }) = self.modal.as_ref() {
             if matches!(key.code, Char('y') | Char('Y')) {
                 let id = id.clone();
-                let action = match action {
-                    0 => WorktreeAction::RequestMerge,
-                    1 => WorktreeAction::CloseWorkspace,
-                    _ => WorktreeAction::RemoveCheckout,
+                let request = match action {
+                    0 => Request::WorktreeAction(id, WorktreeAction::RequestMerge),
+                    1 => Request::WorktreeAction(id, WorktreeAction::CloseWorkspace),
+                    2 => Request::WorktreeAction(id, WorktreeAction::RemoveCheckout),
+                    _ => Request::RestartWorktree(id),
                 };
                 self.mutation_busy = true;
-                if self
-                    .requests
-                    .send(Request::WorktreeAction(id, action))
-                    .is_err()
-                {
+                if self.requests.send(request).is_err() {
                     self.mutation_busy = false;
                     self.worktrees_error = Some("Action could not be queued".into());
                 } else {
@@ -3968,6 +3998,35 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(Request::WorktreeAction(id, WorktreeAction::RequestMerge)) if id == "wt-1")
         );
+    }
+    #[test]
+    fn restart_requires_explicit_confirmation_and_queues_selected_handoff() {
+        let (mut app, requests, _) = connected_app();
+        app.worktrees_view = true;
+        app.worktrees.push(ManagedWorktree {
+            id: "wt-1".into(),
+            bead_id: "b1".into(),
+            handoff_accepted: true,
+            bead_title: Some("Task".into()),
+            bead_description: None,
+            branch: "ontrack/b1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws1".into(),
+            status: worktrees::WorktreeStatus::NeedsAttention,
+            detail: None,
+        });
+        press(&mut app, KeyCode::Char('R'));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConfirmWorktree { action: 3, .. })
+        ));
+        assert!(requests.try_recv().is_err());
+        press(&mut app, KeyCode::Esc);
+        assert!(requests.try_recv().is_err());
+        press(&mut app, KeyCode::Char('R'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(requests.try_recv(), Ok(Request::RestartWorktree(id)) if id == "wt-1"));
+        assert!(app.mutation_busy);
     }
     #[test]
     fn worktree_worker_polls_without_queue_growth_and_surfaces_errors() {
