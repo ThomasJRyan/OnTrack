@@ -249,10 +249,11 @@ pub fn set_epic_ready(
     epic_id: &str,
     ready: bool,
     known_handoffs: &std::collections::HashSet<String>,
+    protected_handoffs: &std::collections::HashSet<String>,
 ) -> io::Result<Vec<String>> {
     validate_id(epic_id)?;
     let beads = list_beads()?;
-    let ids = epic_ready_targets_in(&beads, epic_id, ready, known_handoffs)?;
+    let ids = epic_ready_targets_in(&beads, epic_id, ready, known_handoffs, protected_handoffs)?;
     set_ready_many(&ids, ready)?;
     Ok(ids)
 }
@@ -262,6 +263,7 @@ fn epic_ready_targets_in(
     epic_id: &str,
     ready: bool,
     known_handoffs: &std::collections::HashSet<String>,
+    protected_handoffs: &std::collections::HashSet<String>,
 ) -> io::Result<Vec<String>> {
     let epic = beads
         .iter()
@@ -286,6 +288,7 @@ fn epic_ready_targets_in(
                     && bead.status == "open"
                     && bead.data["issue_type"] == "task"
                     && (!ready || !known_handoffs.contains(&bead.id))
+                    && (ready || !protected_handoffs.contains(&bead.id))
                     && (ready != is_ready(bead))
             })
             .map(|bead| bead.id.clone()),
@@ -770,23 +773,25 @@ mod tests {
             {"id":"epic","title":"Epic","status":"open","issue_type":"epic"},
             {"id":"direct","title":"Direct","status":"open","issue_type":"task","parent":"epic"},
             {"id":"ready","title":"Ready","status":"open","issue_type":"task","parent":"epic","labels":[READY_LABEL]},
+            {"id":"reserved","title":"Reserved","status":"open","issue_type":"task","parent":"epic","labels":[READY_LABEL]},
             {"id":"closed","title":"Closed","status":"closed","issue_type":"task","parent":"epic"},
             {"id":"group","title":"Group","status":"closed","issue_type":"feature","parent":"epic"},
             {"id":"nested","title":"Nested","status":"open","issue_type":"task","parent":"group"},
-            {"id":"sent","title":"Sent","status":"open","issue_type":"task","parent":"epic"},
+            {"id":"sent","title":"Sent","status":"open","issue_type":"task","parent":"epic","labels":[READY_LABEL]},
             {"id":"other","title":"Other","status":"open","issue_type":"task"}
         ]);
         let beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
-        let handoffs = std::collections::HashSet::from(["sent".to_owned()]);
+        let handoffs = std::collections::HashSet::from(["sent".to_owned(), "reserved".to_owned()]);
+        let accepted = std::collections::HashSet::from(["sent".to_owned()]);
         assert_eq!(
-            epic_ready_targets_in(&beads, "epic", true, &handoffs).unwrap(),
+            epic_ready_targets_in(&beads, "epic", true, &handoffs, &accepted).unwrap(),
             ["epic", "direct", "nested"]
         );
         assert_eq!(
-            epic_ready_targets_in(&beads, "epic", false, &handoffs).unwrap(),
-            ["epic", "ready"]
+            epic_ready_targets_in(&beads, "epic", false, &handoffs, &accepted).unwrap(),
+            ["epic", "ready", "reserved"]
         );
-        assert!(epic_ready_targets_in(&beads, "other", true, &handoffs).is_err());
+        assert!(epic_ready_targets_in(&beads, "other", true, &handoffs, &accepted).is_err());
     }
 
     #[test]

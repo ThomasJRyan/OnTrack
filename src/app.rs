@@ -30,7 +30,7 @@ pub(super) enum Request {
     CreateChild(CreateBead, String),
     Update(UpdateBead),
     SetReady(String, bool),
-    SetEpicReady(String, bool, HashSet<String>),
+    SetEpicReady(String, bool, HashSet<String>, HashSet<String>),
     Delete(String),
     DiscoverHarnesses(u64),
     Discover(u64),
@@ -399,11 +399,13 @@ impl App {
                         ready,
                         beads::set_ready(&id, ready).map(|()| vec![id]),
                     ),
-                    Request::SetEpicReady(id, ready, known_handoffs) => Response::ReadySet(
-                        id.clone(),
-                        ready,
-                        beads::set_epic_ready(&id, ready, &known_handoffs),
-                    ),
+                    Request::SetEpicReady(id, ready, known_handoffs, protected_handoffs) => {
+                        Response::ReadySet(
+                            id.clone(),
+                            ready,
+                            beads::set_epic_ready(&id, ready, &known_handoffs, &protected_handoffs),
+                        )
+                    }
                     Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
                     Request::DiscoverHarnesses(seq) => {
                         Response::HarnessesDiscovered(seq, crate::herdr::installed_harnesses())
@@ -1235,6 +1237,8 @@ impl App {
                                     self.known_handoffs.insert(id.clone());
                                     if outcome.reserved {
                                         self.scheduler_attempted.remove(&id);
+                                    } else {
+                                        self.accepted_handoffs.insert(id);
                                     }
                                 }
                                 self.toast = Some(Toast::result(outcome.message.clone(), false));
@@ -1268,11 +1272,17 @@ impl App {
                                     .worktrees
                                     .get(self.selected_worktree)
                                     .map(|item| item.id.clone());
-                                self.accepted_handoffs = items
+                                let accepted_handoffs: HashSet<_> = items
                                     .iter()
                                     .filter(|item| item.handoff_accepted)
                                     .map(|item| item.bead_id.clone())
                                     .collect();
+                                if self.worktrees_refresh_pending {
+                                    // This scan started before the successful handoff.
+                                    self.accepted_handoffs.extend(accepted_handoffs);
+                                } else {
+                                    self.accepted_handoffs = accepted_handoffs;
+                                }
                                 self.known_handoffs
                                     .extend(items.iter().map(|item| item.bead_id.clone()));
                                 items.retain(|item| {
@@ -2140,13 +2150,27 @@ impl App {
         }
         let id = bead.id.clone();
         let ready = !beads::is_ready(bead);
+        if !ready && !self.worktrees_discovered {
+            self.notice = Some("Wait for tracked handoffs to load before removing Ready".into());
+            return;
+        }
         if self.known_handoffs.contains(&id) && ready {
             self.notice = Some("This task already has a tracked handoff".into());
             return;
         }
+        let mut protected_handoffs = self.accepted_handoffs.clone();
+        if let Some(pending) = &self.handoff {
+            protected_handoffs.insert(pending.bead.id.clone());
+        }
+        if !ready && !epic && protected_handoffs.contains(&id) {
+            self.notice = Some(
+                "This task has been sent or is being handed off; Ready cannot be removed".into(),
+            );
+            return;
+        }
         self.mutation_busy = true;
         let request = if epic {
-            Request::SetEpicReady(id, ready, self.known_handoffs.clone())
+            Request::SetEpicReady(id, ready, self.known_handoffs.clone(), protected_handoffs)
         } else {
             Request::SetReady(id, ready)
         };
@@ -2691,6 +2715,7 @@ mod tests {
         assert!(rx.try_recv().is_err(), "handoff must not clear Ready");
         assert_eq!(display_status(&a.beads[0]), "ready");
         assert!(a.known_handoffs.contains("b0"));
+        assert!(a.accepted_handoffs.contains("b0"));
         a.poll_scheduler();
         assert!(rx.try_recv().is_err());
         a.beads[0].status = "in_progress".into();
@@ -2986,6 +3011,58 @@ mod tests {
     }
 
     #[test]
+    fn sent_ready_task_cannot_be_unreadied_but_unsent_handoff_can() {
+        let (mut a, rx, _) = connected_app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.known_handoffs.insert("b0".into());
+        a.accepted_handoffs.insert("b0".into());
+        for focus_detail in [false, true] {
+            a.focus_detail = focus_detail;
+            press(&mut a, KeyCode::Char('r'));
+            assert!(rx.try_recv().is_err());
+            assert!(
+                a.notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Ready cannot be removed")
+            );
+            assert!(beads::is_ready(&a.beads[0]));
+        }
+
+        a.accepted_handoffs.clear();
+        a.worktrees_discovered = false;
+        press(&mut a, KeyCode::Char('r'));
+        assert!(rx.try_recv().is_err());
+        assert!(
+            a.notice
+                .as_deref()
+                .unwrap()
+                .contains("tracked handoffs to load")
+        );
+        a.worktrees_discovered = true;
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+    }
+
+    #[test]
+    fn ready_task_cannot_be_unreadied_during_handoff() {
+        let (mut a, rx, _) = connected_app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        press(&mut a, KeyCode::Char('h'));
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+        press(&mut a, KeyCode::Char('r'));
+        assert!(rx.try_recv().is_err());
+        assert!(
+            a.notice
+                .as_deref()
+                .unwrap()
+                .contains("Ready cannot be removed")
+        );
+    }
+
+    #[test]
     fn epic_ready_toggle_queues_cascade_and_only_tasks_are_scheduled() {
         let mut a = app();
         a.beads[0].data["issue_type"] = json!("epic");
@@ -3003,8 +3080,8 @@ mod tests {
         press(&mut a, KeyCode::Char('r'));
         assert!(matches!(
             rx.try_recv(),
-            Ok(Request::SetEpicReady(id, true, handoffs))
-                if id == "b0" && handoffs.contains("b2")
+            Ok(Request::SetEpicReady(id, true, handoffs, protected))
+                if id == "b0" && handoffs.contains("b2") && protected.is_empty()
         ));
         assert_eq!(a.beads[0].status, "open");
     }
@@ -3292,6 +3369,10 @@ mod tests {
             "manual handoff must not clear Ready"
         );
         assert!(a.worktrees_refresh_pending);
+        assert!(a.accepted_handoffs.contains("b0"));
+        tx.send(Response::Worktrees(Ok(Vec::new()))).unwrap();
+        a.receive();
+        assert!(a.accepted_handoffs.contains("b0"));
         assert!(a.modal.is_none());
         assert!(
             a.toast
