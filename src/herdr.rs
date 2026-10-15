@@ -172,6 +172,28 @@ pub fn launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result
     )
 }
 
+pub fn focus_workspace(workspace_id: &str) -> io::Result<()> {
+    focus_workspace_with(&mut SystemExecutor, workspace_id)
+}
+
+fn focus_workspace_with(executor: &mut impl Executor, workspace_id: &str) -> io::Result<()> {
+    if workspace_id.is_empty()
+        || workspace_id.starts_with('-')
+        || !workspace_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte))
+    {
+        return Err(invalid("Invalid recorded Herdr workspace ID"));
+    }
+    let result = envelope(&executor.run(&["workspace", "focus", workspace_id])?)?;
+    if result["type"] != "workspace_focused" || result["workspace_id"] != workspace_id {
+        return Err(invalid(
+            "Herdr did not confirm focus of the selected workspace",
+        ));
+    }
+    Ok(())
+}
+
 impl From<Discovery> for LaunchContext {
     fn from(discovery: Discovery) -> Self {
         Self {
@@ -1040,6 +1062,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn focus_workspace_targets_recorded_id_and_requires_confirmation() {
+        let mut executor = FakeExecutor::default();
+        executor.outputs.push_back(Ok(
+            br#"{"result":{"type":"workspace_focused","workspace_id":"w7"}}"#.to_vec(),
+        ));
+        focus_workspace_with(&mut executor, "w7").unwrap();
+        assert_eq!(executor.calls, vec![vec!["workspace", "focus", "w7"]]);
+
+        executor.outputs.push_back(Ok(
+            br#"{"result":{"type":"workspace_focused","workspace_id":"w8"}}"#.to_vec(),
+        ));
+        assert!(focus_workspace_with(&mut executor, "w7").is_err());
+        assert_eq!(executor.calls.len(), 2);
+        assert!(focus_workspace_with(&mut executor, "--help").is_err());
+        assert_eq!(executor.calls.len(), 2);
+    }
+
     impl FakeExecutor {
         fn output(&mut self, value: impl AsRef<[u8]>) {
             self.outputs.push_back(Ok(value.as_ref().to_vec()));
@@ -1627,10 +1667,7 @@ mod tests {
         }
         // Filesystem-only .git markers, not real Git worktrees or config. Cover
         // both a sibling checkout and a nested linked checkout inside main.
-        for base in [
-            std::env::temp_dir(),
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
-        ] {
+        for base in [std::env::temp_dir(), cwd().join("target")] {
             let linked = Fixture(base.join(unique_name("linked-fixture")));
             std::fs::create_dir(&linked.0).unwrap();
             std::fs::write(
