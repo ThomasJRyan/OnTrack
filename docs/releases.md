@@ -38,15 +38,16 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The [CI workflow](../.github/workflows/ci.yml) runs on pull requests and pushes to `main`. Its reported result is distinct from branch protection, which maintainers must configure separately if they want CI to block merges. The tagged release workflow repeats the Rust checks and packaging tests, so a passing tag is required even if the branch's earlier CI run passed.
+The [CI workflow](../.github/workflows/ci.yml) runs on pull requests and pushes to `main`. Its reported result is distinct from branch protection, which maintainers must configure separately if they want CI to block merges. The tagged release workflow repeats the Rust checks, packaging tests, and installer tests, so a passing tag is required even if the branch's earlier CI run passed.
 
-The release workflow first verifies the tag and runs formatting, tests, Clippy, a normal build, and release packaging tests. Four native GitHub-hosted runners then build the listed targets and upload archives with their checksums. The publish job downloads all four sets, requires the exact expected filenames, recalculates every SHA-256 digest, and creates a GitHub Release with all eight assets. A failed check, build, upload, or verification prevents the publish job from running. GitHub CLI creates a draft while uploading assets and publishes it only after uploads succeed.
+The release workflow first verifies the tag and runs formatting, tests, Clippy, a normal build, release packaging tests, and the offline installer tests. Four native GitHub-hosted runners then build the listed targets and upload archives with their checksums. The publish job downloads all four sets, requires the exact expected filenames, recalculates every SHA-256 digest, and creates a GitHub Release with all eight assets. A failed check, build, upload, or verification prevents the publish job from running. GitHub CLI creates a draft while uploading assets and publishes it only after uploads succeed.
 
-For a local packaging check, run:
+For local release checks, run:
 
 ```sh
 python3 -m unittest discover -s scripts -p 'test_release_asset.py'
 python3 scripts/release_asset.py validate-tag v0.1.0
+bash tests/installer.sh
 ```
 
 Use the current package version for the second command. GitHub Actions is the authority for actual native platform builds and publishing; local checks cannot validate those remote steps. After pushing, inspect the workflow run and the [release page](https://github.com/ThomasJRyan/OnTrack/releases) for all eight files. If a check or build fails, fix the cause in a new commit, rerun checks, and use a new version tag. Do not move a published tag: users and checksums may already refer to its original contents. A missing or mismatched checksum is a release defect; users should never bypass verification to install it.

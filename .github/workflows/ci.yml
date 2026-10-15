@@ -21,6 +21,8 @@ jobs:
         run: cargo fmt --check
       - name: Run tests
         run: cargo test
+      - name: Test release installer
+        run: bash tests/installer.sh
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
       - name: Build

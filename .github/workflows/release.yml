@@ -21,6 +21,8 @@ jobs:
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
       - name: Check release packaging
         run: python3 -m unittest discover -s scripts -p 'test_release_asset.py'
+      - name: Check release installer
+        run: bash tests/installer.sh
       - name: Check formatting
         run: cargo +stable fmt --check
       - name: Run tests

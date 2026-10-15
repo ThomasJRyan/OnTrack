@@ -1,6 +1,6 @@
 # Continuous integration
 
-GitHub Actions runs the [CI workflow](../.github/workflows/ci.yml) for every pull request and every push to `main`. The **Rust checks** job uses Ubuntu and stable Rust, which satisfies the project's Rust 1.88 minimum, with the `rustfmt` and `clippy` components installed. It runs the same formatting, test, lint, and build commands listed in the [development guide](development.md). A failed command fails the job and its GitHub check; successful runs appear in the repository's Actions tab and on pull requests.
+GitHub Actions runs the [CI workflow](../.github/workflows/ci.yml) for every pull request and every push to `main`. The **Rust checks** job uses Ubuntu and stable Rust, which satisfies the project's Rust 1.88 minimum, with the `rustfmt` and `clippy` components installed. It runs the formatting, test, lint, and build commands listed in the [development guide](development.md), plus the offline installer tests. A failed command fails the job and its GitHub check; successful runs appear in the repository's Actions tab and on pull requests.
 
 ## For contributors
 
@@ -11,6 +11,7 @@ cargo fmt --check
 cargo test
 cargo clippy --all-targets -- -D warnings
 cargo build
+bash tests/installer.sh
 ```
 
 Open the pull request's **Checks** tab or the repository's **Actions** tab to inspect results and logs. Fix any failed command, then push the change to rerun CI.
