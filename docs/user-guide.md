@@ -8,6 +8,7 @@ ontrack browses Beads issues in a two-pane terminal view and can create, edit, o
 - `bd` available on `PATH`, with support for the JSON commands shown in the [development guide](development.md#beads-cli-contract).
 - OnTrack initializes Beads in the launch directory if no workspace is accessible there. An existing workspace, including one inherited from a parent directory, is reused.
 - An interactive terminal supporting raw mode and the alternate screen; mouse support is needed for clicking and wheel input.
+- For in-app updates, `curl` must be on `PATH`; `tar` is also needed for `.tar.gz` release assets. The executable's directory must be writable for replacement.
 
 See the [official Beads documentation](https://beads.gascity.com) for installing `bd` and setting up a workspace.
 
@@ -66,6 +67,7 @@ An Open or Ready issue shows `· sent` beside its status after Herdr confirms th
 | `e` | Load the selected bead's current details and open the edit form. Edit Title, Type, Priority, Agent harness, and Description with the same controls as the new-bead form; Save updates that bead, while Esc or Cancel discards the draft. The loading dialog offers `e` to retry a failed detail load. |
 | `d` | Ask to permanently delete the selected bead. `y` confirms; `n` or Enter cancels. Deletion does not cascade; dependency links are removed and dependents may be orphaned. |
 | `h` | Immediately hand the selected bead to Herdr in the background. The top-right toast shows discovery, launch, and the result. No dialog or second confirmation appears. Repeated `h` during a pending handoff is ignored. |
+| `u` | Check the official GitHub release for a newer version, then review a confirmation before downloading and installing it. |
 | `Shift+R` in the issue browser | Same Ready toggle as `r`. |
 | `w` | Open outstanding tracked worktrees. This list is independent of Beads statuses, so closing or deleting a Bead does not hide unfinished work. A checkout disappears after removal is verified, including when it was removed outside OnTrack; uncertain cleanup stays visible for recovery. Select an item and press Enter to focus its recorded Herdr workspace. A merge is a request, not proof of integration; inspect conflict/error states and recover in Git before retrying. Cleanup is separately confirmed and available only after verified integration. In this view, `Shift+R` opens a restart confirmation for the selected active handoff. |
 | `Esc` | Go back one level: close a dialog (or its open choice list first), return from outstanding worktrees to the main browser, or stay on the main browser if already there. A dialog stays locked while a mutation is running. |
@@ -90,6 +92,12 @@ Selecting an issue immediately displays its cached list record while a richer `b
 ontrack automatically polls the issue list and selected issue's details in the background, starting another refresh roughly one second after the previous refresh completes. Changes made by another terminal or agent appear without manual input or configuring events, a watcher, or extra dependencies. Slow `bd` commands increase the delay; updates are not instantaneous or event-driven. Successful create/edit/delete actions in ontrack still trigger an immediate refresh. In the separate `w` view, `r` still refreshes tracked worktrees.
 
 The footer reports refreshing, detail loading, ready, or an error. Refresh retains the existing list while loading and keeps the selected ID if it still exists in the new list; otherwise it selects the first issue. Automatic updates preserve group collapse state, pane focus, scroll position within available content, and active form input. A failed list or detail refresh keeps the last loaded data (or the available list snapshot) visible alongside the error and retries automatically after the cause is resolved. An empty successful list displays “No issues found in this workspace.”
+
+## Update OnTrack
+
+Press `u` in the issue browser to check [OnTrack releases](https://github.com/ThomasJRyan/OnTrack/releases). A newer semantic version opens a confirmation with its version and release link. Press `y` to install, or `n` or `Esc` to cancel. While downloading, `Esc` or `c` requests cancellation before the executable is replaced. Keep OnTrack open until the result appears. A successful update replaces the installed executable; quit and restart OnTrack to run the new version. The current session continues running its original code.
+
+The updater selects a release asset for the current operating system and architecture, downloads its published `.sha256` checksum, verifies the asset, and stages the replacement beside the running executable. A missing compatible asset, checksum mismatch, network error, missing `curl`/`tar`, or unwritable installation directory produces a message; the existing executable remains usable, and `u` can retry after the cause is fixed. The updater does not install Beads or Herdr. If a check finishes while another dialog or the worktree view is open, it reports the available version without replacing that view; return to the issue browser and press `u` again to review it.
 
 ## Launch an agent with Herdr
 

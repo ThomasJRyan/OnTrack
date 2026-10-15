@@ -1025,6 +1025,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
             crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
+            crate::app::Modal::ConfirmUpdate(_) => 10,
+            crate::app::Modal::InstallingUpdate(_) => 8,
         };
         let min_width = if matches!(
             modal,
@@ -1080,6 +1082,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
                 crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
+                crate::app::Modal::ConfirmUpdate(_) => " UPDATE ONTRACK? ",
+                crate::app::Modal::InstallingUpdate(_) => " INSTALLING ONTRACK ",
                 _ => " DELETE BEAD? ",
             })
             .borders(Borders::ALL)
@@ -1752,6 +1756,22 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     inner,
                 );
             }
+            crate::app::Modal::ConfirmUpdate(release) => {
+                f.render_widget(
+                    Paragraph::new(format!("OnTrack {} is available.\n\n{}\n\nInstall the verified release?\ny confirm · n / Esc cancel", release.version, release.page))
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
+            crate::app::Modal::InstallingUpdate(version) => {
+                f.render_widget(
+                    Paragraph::new(format!("Downloading and verifying OnTrack {version}…\n\nEsc or c cancels before replacement.\nKeep this session open until the result appears."))
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
         }
     }
     render_toast(f, app);
@@ -2306,6 +2326,8 @@ mod tests {
             launch_seq: 0,
             handoff: None,
             toast: None,
+            release_checking: false,
+            release_cancel: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -3006,6 +3028,25 @@ mod tests {
         assert!(rendered.contains("Discard all uncommitted checkout changes."));
         assert!(rendered.contains("Worktree: ot-selected"));
         assert!(rendered.contains("y confirm"));
+    }
+    #[test]
+    fn update_dialog_shows_release_and_cancellation() {
+        let mut app = app();
+        app.modal = Some(crate::app::Modal::ConfirmUpdate(crate::update::Available {
+            version: "1.2.0".into(),
+            page: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+            asset_name: "ontrack-v1.2.0-x86_64-unknown-linux-gnu.tar.gz".into(),
+            asset_url: String::new(),
+            checksum_url: String::new(),
+            digest: None,
+        }));
+        let confirm = draw((100, 24), &mut app).0;
+        assert!(confirm.contains("UPDATE ONTRACK?"));
+        assert!(confirm.contains("OnTrack 1.2.0"));
+        assert!(confirm.contains("y confirm"));
+        app.modal = Some(crate::app::Modal::InstallingUpdate("1.2.0".into()));
+        let installing = draw((100, 24), &mut app).0;
+        assert!(installing.contains("Esc or c cancels"));
     }
     #[test]
     fn footer_keeps_mutation_and_handoff_shortcuts_ahead_of_optional_navigation() {

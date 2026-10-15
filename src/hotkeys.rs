@@ -13,6 +13,8 @@ pub enum Context {
     EditLoading,
     Delete,
     WorktreeConfirm,
+    UpdateConfirm,
+    UpdateInstalling,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +38,8 @@ impl Context {
             Some(Modal::EditLoading { .. }) => Self::EditLoading,
             Some(Modal::ConfirmDelete { .. }) => Self::Delete,
             Some(Modal::ConfirmWorktree { .. }) => Self::WorktreeConfirm,
+            Some(Modal::ConfirmUpdate(_)) => Self::UpdateConfirm,
+            Some(Modal::InstallingUpdate(_)) => Self::UpdateInstalling,
             None if app.worktrees_view => Self::Worktrees,
             None if app.focus_detail => Self::Details,
             None => Self::Issues,
@@ -54,6 +58,8 @@ impl Context {
             Self::EditLoading => "Loading edit",
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
+            Self::UpdateConfirm => "Update confirmation",
+            Self::UpdateInstalling => "Installing update",
         }
     }
 
@@ -66,6 +72,7 @@ impl Context {
                 ("Tab", "Focus issue details"),
                 ("r", "Toggle Ready for an open Task or Epic and its tasks"),
                 ("s", "Open settings"),
+                ("u", "Check for and install a new OnTrack release"),
                 ("n", "Create a bead"),
                 ("Shift+N", "Create child of selected open task"),
                 ("e", "Edit selected bead"),
@@ -83,6 +90,7 @@ impl Context {
                 ("PgUp / PgDn", "Scroll issue details one page"),
                 ("Tab", "Focus issue list"),
                 ("r", "Toggle Ready for an open Task or Epic and its tasks"),
+                ("u", "Check for and install a new OnTrack release"),
                 (
                     "Shift+R",
                     "Toggle Ready for an open Task or Epic and its tasks",
@@ -150,11 +158,12 @@ impl Context {
                 ("e", "Retry a failed edit load"),
                 ("Esc", "Cancel edit loading"),
             ],
-            Self::Delete | Self::WorktreeConfirm => vec![
+            Self::Delete | Self::WorktreeConfirm | Self::UpdateConfirm => vec![
                 ("y / Y", "Confirm action"),
                 ("n / N / Enter", "Cancel action"),
                 ("Esc", "Cancel action"),
             ],
+            Self::UpdateInstalling => vec![("Esc / c", "Cancel download before replacement")],
         };
         rows.extend([
             ("Ctrl+?", "Open or close this hotkey reference"),
