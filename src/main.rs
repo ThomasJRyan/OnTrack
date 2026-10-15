@@ -10,6 +10,7 @@ mod settings;
 mod terminal;
 mod theme;
 mod ui;
+mod updates;
 mod worktrees;
 
 use std::{error::Error, io};
