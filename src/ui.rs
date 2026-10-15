@@ -344,7 +344,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             };
             format!("y confirm / Esc cancel · {operation} · {id}")
         } else if let Some(error) = &app.worktrees_error {
-            format!("ERROR · {error} · w back")
+            format!("ERROR · {error} · Esc / w back")
         } else if let Some(item) = selected.filter(|item| item.detail.is_some()) {
             format!(
                 "{} · {} · r refresh",
@@ -352,7 +352,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 item.detail.as_deref().unwrap_or_default()
             )
         } else {
-            "↑/↓ select · m request merge · c close · x remove · r refresh · w back".to_owned()
+            "↑/↓ select · m request merge · c close · x remove · r refresh · Esc / w back"
+                .to_owned()
         };
         let footer_lines = wrap_words(&footer, areas[2].width as usize)
             .into_iter()
