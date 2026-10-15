@@ -178,6 +178,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .alignment(Alignment::Center),
             a,
         );
+        render_toast(f, app);
         return;
     }
     if app.modal.is_none() && elapsed < Duration::from_millis(1200) {
@@ -221,6 +222,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 height,
             ),
         );
+        render_toast(f, app);
         return;
     }
     if app.worktrees_view {
@@ -452,6 +454,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             ),
             areas[2],
         );
+        render_toast(f, app);
         return;
     }
     let v = Layout::default()
@@ -768,7 +771,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         let width = match modal {
             crate::app::Modal::Create(_) => 70,
             crate::app::Modal::Settings { .. } => 64,
-            crate::app::Modal::Launch(_) => 58,
             _ => 62,
         }
         .min(a.width.saturating_sub(2));
@@ -818,25 +820,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             crate::app::Modal::ConfirmDelete { .. } => delete_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
-            crate::app::Modal::Launch(launch) => launch_dialog_lines(
-                launch,
-                app.notice.as_deref(),
-                app.mutation_busy,
-                palette,
-                width.saturating_sub(4) as usize,
-            )
-            .len()
-            .saturating_add(3)
-            .min(usize::from(a.height.saturating_sub(2)))
-            .max(7) as u16,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
         };
         let min_width = if matches!(modal, crate::app::Modal::Create(_)) {
             70
-        } else if matches!(
-            modal,
-            crate::app::Modal::Settings { .. } | crate::app::Modal::Launch(_)
-        ) {
+        } else if matches!(modal, crate::app::Modal::Settings { .. }) {
             38
         } else {
             50
@@ -849,11 +837,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             } else {
                 "Esc cancels"
             };
-            let prompt = if matches!(modal, crate::app::Modal::Launch(_)) && a.width < min_width {
-                format!("Widen to {min_width} · Esc cancels")
-            } else if matches!(modal, crate::app::Modal::Launch(_)) {
-                format!("Need {height} rows · Esc cancels")
-            } else if a.width < min_width {
+            let prompt = if a.width < min_width {
                 format!("Expand terminal width to {min_width} columns · {escape_hint}")
             } else {
                 format!("Expand terminal height to {height} rows · {escape_hint}")
@@ -864,6 +848,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     .alignment(Alignment::Center),
                 a,
             );
+            render_toast(f, app);
             return;
         }
         app.modal_ready = true;
@@ -878,7 +863,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .title(match modal {
                 crate::app::Modal::Create(_) => " NEW BEAD ",
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
-                crate::app::Modal::Launch(_) => " HAND OFF BEAD ",
                 _ => " DELETE BEAD? ",
             })
             .borders(Borders::ALL)
@@ -1303,67 +1287,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     inner,
                 );
             }
-            crate::app::Modal::Launch(launch) => {
-                let lines = launch_dialog_lines(
-                    launch,
-                    app.notice.as_deref(),
-                    app.mutation_busy,
-                    palette,
-                    inner.width as usize,
-                );
-                let viewport = inner.height.saturating_sub(1);
-                let max_scroll = lines.len().saturating_sub(usize::from(viewport));
-                let mut offset = usize::from(launch.scroll).min(max_scroll);
-                if !launch.finished
-                    && !app.mutation_busy
-                    && let Some(selected_line) = launch_selected_line(launch, inner.width as usize)
-                {
-                    if selected_line < offset {
-                        offset = selected_line;
-                    } else if selected_line >= offset + usize::from(viewport) {
-                        offset = selected_line + 1 - usize::from(viewport);
-                    }
-                    offset = offset.min(max_scroll);
-                }
-                let hint = if inner.width < 46 && launch.finished {
-                    "PgUp/Dn · Esc close"
-                } else if inner.width < 46 && launch.error.is_some() {
-                    "PgUp/Dn · h retry · Esc"
-                } else if inner.width < 46 {
-                    "PgUp/Dn · ↑/↓ · Enter · Esc"
-                } else if launch.finished {
-                    "PgUp/PgDn scroll · Esc close"
-                } else if launch.error.is_some() {
-                    "PgUp/PgDn scroll · h rediscover · Esc close"
-                } else if inner.width < 64 {
-                    "PgUp/Dn scroll · ↑/↓ agents · Enter · Esc"
-                } else {
-                    "PgUp/PgDn scroll · ↑/↓ agents · Enter launch · Esc cancel"
-                };
-                let above = offset > 0;
-                let below = offset + usize::from(viewport) < lines.len();
-                let scroll_mark = match (above, below) {
-                    (true, true) if inner.width < 64 => "↕ ",
-                    (true, false) if inner.width < 64 => "↑ ",
-                    (false, true) if inner.width < 64 => "↓ ",
-                    (true, true) => "↑↓ more · ",
-                    (true, false) => "↑ more · ",
-                    (false, true) => "↓ more · ",
-                    (false, false) => "",
-                };
-                let content = Rect::new(inner.x, inner.y, inner.width, viewport);
-                f.render_widget(
-                    Paragraph::new(lines)
-                        .scroll((offset.min(u16::MAX as usize) as u16, 0))
-                        .style(Style::default().fg(ink)),
-                    content,
-                );
-                f.render_widget(
-                    Paragraph::new(format!("{scroll_mark}{hint}"))
-                        .style(Style::default().fg(muted)),
-                    Rect::new(inner.x, inner.y + viewport, inner.width, 1),
-                );
-            }
             crate::app::Modal::ConfirmWorktree { id, action } => {
                 let action = match action {
                     0 => {
@@ -1384,6 +1307,48 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             }
         }
     }
+    render_toast(f, app);
+}
+fn render_toast(f: &mut Frame, app: &App) {
+    let Some(toast) = app
+        .toast
+        .as_ref()
+        .filter(|toast| toast.visible(std::time::Instant::now()))
+    else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(2).min(56);
+    if width < 4 || area.height < 3 {
+        return;
+    }
+    let text_width = usize::from(width.saturating_sub(4)).max(1);
+    let mut lines = wrap_words(&toast.message, text_width);
+    let height = (lines.len() as u16 + 2).min(area.height.saturating_sub(1));
+    let visible_lines = usize::from(height.saturating_sub(2));
+    if lines.len() > visible_lines && visible_lines > 0 {
+        lines.truncate(visible_lines);
+        lines[visible_lines - 1] = truncate_display("… see footer / w for handoffs", text_width);
+    }
+    let colors = crate::theme::definition(app.theme).palette;
+    let border = if toast.error {
+        colors.danger
+    } else {
+        colors.accent
+    };
+    let box_area = Rect::new(area.x + area.width - width, area.y, width, height);
+    f.render_widget(Clear, box_area);
+    f.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" HERDR ")
+                    .border_style(Style::default().fg(border)),
+            )
+            .style(Style::default().fg(colors.foreground).bg(colors.panel)),
+        box_area,
+    );
 }
 fn footer_text(state: &str, width: usize) -> String {
     // Keep the actions people need most before optional navigation hints so a
@@ -1404,104 +1369,6 @@ fn footer_text(state: &str, width: usize) -> String {
     } else {
         core
     }
-}
-fn launch_dialog_lines(
-    launch: &crate::app::LaunchModal,
-    notice: Option<&str>,
-    busy: bool,
-    palette: crate::theme::Palette,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    push_wrapped(
-        &mut lines,
-        &format!("Bead: {} · {}", launch.bead.id, launch.bead.title),
-        width,
-    );
-    if let Some(context) = &launch.context {
-        push_wrapped(
-            &mut lines,
-            &format!("Target workspace: {}", context.workspace.id),
-            width,
-        );
-    } else {
-        push_wrapped(&mut lines, "Target workspace: Discovering…", width);
-    }
-    lines.push(Line::from(""));
-    if launch.finished {
-        push_wrapped(&mut lines, "Launch finished.", width);
-        push_wrapped(&mut lines, "Use Esc to close this result.", width);
-    } else if let Some(error) = &launch.error {
-        push_wrapped(&mut lines, &format!("Discovery failed: {error}"), width);
-        push_wrapped(&mut lines, "Esc closes · h to try discovery again", width);
-    } else if busy {
-        push_wrapped(&mut lines, "Creating worktree and starting agent…", width);
-    } else if let Some(context) = &launch.context {
-        if context.agents.is_empty() {
-            push_wrapped(
-                &mut lines,
-                "No agents are available in this workspace.",
-                width,
-            );
-        } else {
-            for (index, agent) in context.agents.iter().enumerate() {
-                let prefix = if index == launch.selected_agent {
-                    "› "
-                } else {
-                    "  "
-                };
-                for (part, text) in wrap_words(&agent.label, width.saturating_sub(2))
-                    .into_iter()
-                    .enumerate()
-                {
-                    let style = if index == launch.selected_agent {
-                        Style::default()
-                            .fg(palette.selected_foreground)
-                            .bg(palette.selected_background)
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default()
-                    };
-                    lines.push(Line::from(Span::styled(
-                        format!("{}{}", if part == 0 { prefix } else { "  " }, text),
-                        style,
-                    )));
-                }
-            }
-        }
-        push_wrapped(&mut lines, "↑/↓ choose · Enter launch · Esc cancel", width);
-    } else {
-        push_wrapped(&mut lines, "Finding available agents… · Esc cancels", width);
-    }
-    if let Some(notice) = notice {
-        push_wrapped(&mut lines, notice, width);
-    }
-    lines
-}
-fn launch_selected_line(launch: &crate::app::LaunchModal, width: usize) -> Option<usize> {
-    let context = launch.context.as_ref()?;
-    if context.agents.is_empty() || launch.selected_agent >= context.agents.len() {
-        return None;
-    }
-    let width = width.max(1);
-    let mut line = wrap_words(
-        &format!("Bead: {} · {}", launch.bead.id, launch.bead.title),
-        width,
-    )
-    .len();
-    line += wrap_words(
-        &format!("Target workspace: {}", context.workspace.id),
-        width,
-    )
-    .len()
-        + 1;
-    for agent in context.agents.iter().take(launch.selected_agent) {
-        line += wrap_words(&agent.label, width.saturating_sub(2)).len();
-    }
-    Some(line)
-}
-fn push_wrapped(lines: &mut Vec<Line<'static>>, text: &str, width: usize) {
-    lines.extend(wrap_words(text, width).into_iter().map(Line::from));
 }
 fn bead_type_name(index: usize) -> &'static str {
     crate::beads::BEAD_TYPES
@@ -1762,6 +1629,8 @@ mod tests {
             detail_error: None,
             detail_seq: 0,
             launch_seq: 0,
+            handoff: None,
+            toast: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -2826,206 +2695,54 @@ mod tests {
         let (_, start) = display_window("a界b", 2, 3);
         assert_eq!(start, 3);
     }
-    fn launch_modal() -> crate::app::Modal {
-        crate::app::Modal::Launch(crate::app::LaunchModal {
-            bead: Bead {
-                id: "task-42".into(),
-                title: "Investigate the launch flow".into(),
-                status: "open".into(),
-                priority: 2,
-                data: json!({}),
-            },
-            seq: 7,
-            context: Some(crate::herdr::LaunchContext {
-                workspace: crate::herdr::Workspace {
-                    id: "workspace-abc-123".into(),
-                    label: "workspace-abc-123".into(),
-                },
-                agents: vec![crate::herdr::Agent {
-                    id: "codex".into(),
-                    label: "Review agent".into(),
-                }],
-            }),
-            selected_agent: 0,
-            error: None,
-            scroll: 0,
-            finished: false,
-        })
-    }
     #[test]
-    fn launch_dialog_renders_target_identity_and_confirmation_at_normal_size() {
-        let mut app = app();
-        app.modal = Some(launch_modal());
-        let text = draw((100, 30), &mut app).0;
-        assert!(app.modal_ready);
-        for value in [
-            "HAND OFF BEAD",
-            "task-42",
-            "workspace-abc-123",
-            "Review agent",
-            "Enter launch",
-        ] {
-            assert!(text.contains(value), "missing {value}");
-        }
-        assert!(
-            text.contains("h hand off"),
-            "handoff shortcut belongs in the browser footer"
-        );
-    }
-    #[test]
-    fn every_discovered_agent_is_rendered_and_selected_choice_scrolls_into_view() {
-        let crate::app::Modal::Launch(mut launch) = launch_modal() else {
-            unreachable!()
-        };
-        launch.context.as_mut().unwrap().agents = (0..14)
-            .map(|i| crate::herdr::Agent {
-                id: format!("agent-{i:02}"),
-                label: format!("agent-{i:02}"),
-            })
-            .collect();
-        launch.selected_agent = 12;
-        let mut app = app();
-        app.modal = Some(crate::app::Modal::Launch(launch));
-        let rendered = draw((100, 16), &mut app).0;
-        assert!(app.modal_ready);
-        assert!(
-            rendered.contains("agent-12"),
-            "selected agent must remain visible"
-        );
-        assert!(rendered.contains("agent-13") || rendered.contains("agent-11"));
-        let crate::app::Modal::Launch(mut launch) = launch_modal() else {
-            unreachable!()
-        };
-        launch.context.as_mut().unwrap().agents = (0..14)
-            .map(|i| crate::herdr::Agent {
-                id: format!("agent-{i:02}"),
-                label: format!("agent-{i:02}"),
-            })
-            .collect();
-        assert!(
-            launch_dialog_lines(
-                &launch,
-                None,
-                false,
-                crate::theme::definition(Theme::Dark).palette,
-                46
-            )
-            .iter()
-            .any(|line| line.to_string().contains("agent-13"))
-        );
-    }
-    #[test]
-    fn launch_dialog_has_actionable_compact_fallback_and_wraps_errors_and_busy_notice() {
-        let mut app = app();
-        app.modal = Some(launch_modal());
-        let compact = draw((30, 14), &mut app).0;
-        assert!(!app.modal_ready);
-        assert!(compact.contains("Widen to 38"));
-        assert!(compact.contains("Esc cancels"));
-
-        app.modal = Some(crate::app::Modal::Launch(crate::app::LaunchModal {
-            context: None,
-            error: Some("Workspace discovery failed: the configured workspace could not be found; check the selected project directory and retry discovery with h.".into()),
-            ..match launch_modal() { crate::app::Modal::Launch(m) => m, _ => unreachable!() }
-        }));
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal
-            .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
-            .unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(app.modal_ready);
-        for value in [
-            "Workspace discovery failed",
-            "project",
-            "retry",
-            "Esc closes",
-        ] {
-            assert!(
-                text.contains(value),
-                "missing readable recovery text: {value}"
-            );
-        }
-
-        app.modal = Some(launch_modal());
-        app.mutation_busy = true;
-        app.notice = Some("Agent started in the target worktree, but prompt dispatch failed after partial setup; inspect the worktree and retry only after confirming its state.".into());
-        terminal
-            .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
-            .unwrap();
-        let text = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect::<String>();
-        assert!(app.modal_ready);
-        for value in ["Creating worktree", "partial setup", "confirming its state"] {
-            assert!(
-                text.contains(value),
-                "missing busy/recovery message: {value}"
-            );
-        }
-    }
-    #[test]
-    fn long_finished_launch_recovery_can_be_scrolled_to_its_tail_at_normal_and_narrow_sizes() {
-        for size in [(80, 24), (40, 12)] {
+    fn handoff_toast_is_top_right_and_does_not_open_a_dialog() {
+        for size in [(80, 24), (30, 9)] {
             let mut app = app();
-            let crate::app::Modal::Launch(mut launch) = launch_modal() else {
-                unreachable!()
-            };
-            launch.finished = true;
-            app.modal = Some(crate::app::Modal::Launch(launch));
-            app.notice = Some(format!(
-                "{}TAIL_RECOVERY_SENTINEL",
-                "The worktree is only partly ready; inspect setup before retrying. ".repeat(45)
-            ));
+            app.toast = Some(crate::app::Toast {
+                message: "Finding Herdr agent…".into(),
+                error: false,
+                expires_at: None,
+            });
             let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
             terminal
                 .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
                 .unwrap();
+            let buffer = terminal.backend().buffer();
+            let top = (0..size.0)
+                .map(|x| buffer[(x, 0)].symbol())
+                .collect::<String>();
             assert!(
-                app.modal_ready,
-                "launch result should fit a scrollable dialog at {size:?}"
+                top.contains("HERDR"),
+                "toast must touch the top edge at {size:?}"
             );
-            let initial = terminal
-                .backend()
-                .buffer()
+            assert!(
+                top.find("HERDR").unwrap() > 0,
+                "toast must be on the right at {size:?}"
+            );
+            assert!(app.modal.is_none());
+            let screen = buffer
                 .content()
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(
-                initial.contains("PgUp"),
-                "scroll control missing at {size:?}"
-            );
-            assert!(
-                !initial.contains("TAIL_RECOVERY_SENTINEL"),
-                "fixture should require scrolling"
-            );
-            if let Some(crate::app::Modal::Launch(modal)) = app.modal.as_mut() {
-                modal.scroll = u16::MAX;
-            }
-            terminal
-                .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
-                .unwrap();
-            let scrolled = terminal
-                .backend()
-                .buffer()
-                .content()
-                .iter()
-                .map(|cell| cell.symbol())
-                .collect::<String>();
-            assert!(
-                scrolled.contains("TAIL_RECOVERY_SENTINEL"),
-                "recovery tail must be reachable at {size:?}"
-            );
+            assert!(screen.contains("Finding"));
         }
+    }
+    #[test]
+    fn expired_handoff_toast_disappears_and_compact_error_stays_readable() {
+        let mut app = app();
+        app.toast = Some(crate::app::Toast {
+            message: "Handoff failed: inspect recorded worktree before retrying".into(),
+            error: true,
+            expires_at: Some(std::time::Instant::now() + Duration::from_secs(5)),
+        });
+        let visible = draw((40, 12), &mut app).0;
+        assert!(visible.contains("Handoff"));
+        assert!(visible.contains("failed"));
+        app.toast.as_mut().unwrap().expires_at =
+            Some(std::time::Instant::now() - Duration::from_secs(1));
+        let expired = draw((40, 12), &mut app).0;
+        assert!(!expired.contains("Handoff failed"));
     }
 }
