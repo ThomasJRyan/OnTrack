@@ -72,6 +72,7 @@ pub struct App {
     pub worktrees: Vec<ManagedWorktree>,
     pub selected_worktree: usize,
     pub worktree_offset: usize,
+    pub worktree_detail_offset: u16,
     pub worktrees_view: bool,
     pub worktrees_loading: bool,
     pub worktrees_error: Option<String>,
@@ -79,6 +80,7 @@ pub struct App {
     pub(super) worktrees_focus_pending: bool,
     pub worktrees_inflight: bool,
     pub worktrees_discovered: bool,
+    pub worktrees_refresh_pending: bool,
     pub worktree_action_pending: bool,
     pub worktrees_next_refresh: Instant,
     pub notice: Option<String>,
@@ -289,6 +291,7 @@ impl App {
             worktrees: Vec::new(),
             selected_worktree: 0,
             worktree_offset: 0,
+            worktree_detail_offset: 0,
             worktrees_view: false,
             worktrees_loading: false,
             worktrees_error: None,
@@ -296,6 +299,7 @@ impl App {
             worktrees_focus_pending: false,
             worktrees_inflight: false,
             worktrees_discovered: false,
+            worktrees_refresh_pending: false,
             worktree_action_pending: false,
             worktrees_next_refresh: Instant::now(),
             notice: settings_error,
@@ -686,6 +690,14 @@ impl App {
                         match result {
                             Ok(outcome) => {
                                 self.notice = Some(outcome.message);
+                                // The launch journal is now active. Reload it even if the
+                                // initial worktree scan found no managed handoffs.
+                                if self.worktrees_inflight {
+                                    self.worktrees_refresh_pending = true;
+                                } else {
+                                    self.worktrees_discovered = false;
+                                    self.worktrees_next_refresh = now;
+                                }
                                 if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
                                     modal.finished = true;
                                     modal.scroll = 0;
@@ -724,6 +736,10 @@ impl App {
                             }
                             Err(error) => self.worktrees_error = Some(error.to_string()),
                         }
+                    }
+                    if std::mem::take(&mut self.worktrees_refresh_pending) {
+                        self.worktrees_discovered = false;
+                        self.worktrees_next_refresh = now;
                     }
                 }
                 Response::WorkspaceFocused(id, result) => {
@@ -782,11 +798,23 @@ impl App {
                     self.worktrees_view = false
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.selected_worktree = self.selected_worktree.saturating_sub(1)
+                    self.selected_worktree = self.selected_worktree.saturating_sub(1);
+                    self.worktree_detail_offset = 0;
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.selected_worktree =
-                        (self.selected_worktree + 1).min(self.worktrees.len().saturating_sub(1))
+                        (self.selected_worktree + 1).min(self.worktrees.len().saturating_sub(1));
+                    self.worktree_detail_offset = 0;
+                }
+                KeyCode::PageUp => {
+                    self.worktree_detail_offset = self
+                        .worktree_detail_offset
+                        .saturating_sub(self.detail_rect.height.saturating_sub(2));
+                }
+                KeyCode::PageDown => {
+                    self.worktree_detail_offset = self
+                        .worktree_detail_offset
+                        .saturating_add(self.detail_rect.height.saturating_sub(2));
                 }
                 KeyCode::Char('r') => {
                     self.worktrees_next_refresh = Instant::now();
@@ -1358,6 +1386,27 @@ impl App {
         if self.modal.is_some() {
             return;
         }
+        if self.worktrees_view {
+            match k {
+                MouseEventKind::Down(MouseButton::Left)
+                    if self.list_rect.contains((x, y).into()) && y > self.list_rect.y =>
+                {
+                    let row = usize::from(y - self.list_rect.y - 1) / 2 + self.worktree_offset;
+                    if row < self.worktrees.len() {
+                        self.selected_worktree = row;
+                        self.worktree_detail_offset = 0;
+                    }
+                }
+                MouseEventKind::ScrollUp if self.detail_rect.contains((x, y).into()) => {
+                    self.worktree_detail_offset = self.worktree_detail_offset.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown if self.detail_rect.contains((x, y).into()) => {
+                    self.worktree_detail_offset = self.worktree_detail_offset.saturating_add(3);
+                }
+                _ => {}
+            }
+            return;
+        }
         match k {
             MouseEventKind::Down(MouseButton::Left)
                 if self.list_rect.contains((x, y).into())
@@ -1562,6 +1611,7 @@ mod tests {
             worktrees: Vec::new(),
             selected_worktree: 0,
             worktree_offset: 0,
+            worktree_detail_offset: 0,
             worktrees_view: false,
             worktrees_loading: false,
             worktrees_error: None,
@@ -1569,6 +1619,7 @@ mod tests {
             worktrees_focus_pending: false,
             worktrees_inflight: false,
             worktrees_discovered: true,
+            worktrees_refresh_pending: false,
             worktree_action_pending: false,
             worktrees_next_refresh: Instant::now(),
             notice: None,
@@ -1797,6 +1848,8 @@ mod tests {
         a.receive();
         press(&mut a, KeyCode::Enter);
         assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
+        // A snapshot that began before launch must not hide the new handoff.
+        a.worktrees_inflight = true;
         tx.send(Response::Launched(
             seq,
             Ok(LaunchOutcome {
@@ -1806,6 +1859,11 @@ mod tests {
         .unwrap();
         a.receive();
         assert!(!a.mutation_busy);
+        assert!(a.worktrees_refresh_pending);
+        tx.send(Response::Worktrees(Ok(vec![]))).unwrap();
+        a.receive();
+        a.poll_worktrees(Instant::now());
+        assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
         assert_eq!(
             a.notice.as_deref(),
             Some("Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0")
@@ -3566,6 +3624,9 @@ mod tests {
             .map(|id| ManagedWorktree {
                 id: id.into(),
                 bead_id: "b1".into(),
+                handoff_accepted: true,
+                bead_title: None,
+                bead_description: None,
                 branch: "ontrack/b1".into(),
                 target_branch: "main".into(),
                 workspace_id: id.into(),
@@ -3599,6 +3660,9 @@ mod tests {
         a.worktrees.push(ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "b1".into(),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
             branch: "ontrack/b1".into(),
             target_branch: "main".into(),
             workspace_id: "w1".into(),
@@ -3641,6 +3705,9 @@ mod tests {
         a.worktrees.push(ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "b1".into(),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
             branch: "ontrack/b1".into(),
             target_branch: "main".into(),
             workspace_id: "ws1".into(),
@@ -3681,6 +3748,32 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
     }
     #[test]
+    fn worktree_detail_scroll_is_separate_and_resets_on_selection() {
+        let (mut app, _, _) = connected_app();
+        app.worktrees_view = true;
+        app.detail_rect = Rect::new(40, 2, 40, 12);
+        app.worktrees = (0..2)
+            .map(|index| ManagedWorktree {
+                id: format!("wt-{index}"),
+                bead_id: format!("bead-{index}"),
+                handoff_accepted: true,
+                bead_title: Some(format!("Title {index}")),
+                bead_description: Some("A long description".into()),
+                branch: format!("ontrack/bead-{index}"),
+                target_branch: "main".into(),
+                workspace_id: format!("ws-{index}"),
+                status: worktrees::WorktreeStatus::Unmerged,
+                detail: None,
+            })
+            .collect();
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.worktree_detail_offset, 10);
+        assert_eq!(app.detail_offset, 0);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_worktree, 1);
+        assert_eq!(app.worktree_detail_offset, 0);
+    }
+    #[test]
     fn worktree_policy_reconciles_outside_worktrees_view() {
         let (mut a, rx, _) = connected_app();
         a.settings.auto_merge = true;
@@ -3701,6 +3794,9 @@ mod tests {
         let item = ManagedWorktree {
             id: "tracked-closed".into(),
             bead_id: a.beads[0].id.clone(),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
             branch: "ontrack/b0".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),
@@ -3720,6 +3816,9 @@ mod tests {
         let before = ManagedWorktree {
             id: "wt".into(),
             bead_id: "b0".into(),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
             branch: "ontrack/b0".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),

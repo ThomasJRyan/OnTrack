@@ -252,6 +252,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(areas[1]);
+        app.list_rect = panes[0];
+        app.detail_rect = panes[1];
         let item_height = 2usize;
         let visible = (usize::from(panes[0].height.saturating_sub(2)) / item_height).max(1);
         if app.selected_worktree < app.worktree_offset {
@@ -321,6 +323,17 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         );
         let selected = app.worktrees.get(app.selected_worktree);
         let detail = if let Some(item) = selected {
+            let live_bead = app.beads.iter().find(|bead| bead.id == item.bead_id);
+            let title = live_bead
+                .map(|bead| bead.title.as_str())
+                .filter(|title| !title.trim().is_empty())
+                .or(item.bead_title.as_deref())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or("(not recorded at handoff)");
+            let description = live_bead
+                .and_then(|bead| bead.data.get("description"))
+                .and_then(serde_json::Value::as_str)
+                .or(item.bead_description.as_deref());
             let mut lines = vec![
                 Line::from(Span::styled(
                     format!(
@@ -350,10 +363,35 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     ),
                 )));
             }
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled("Title: ", Style::default().fg(muted)),
+                Span::raw(title),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "Description:",
+                Style::default().fg(muted),
+            )));
+            match description {
+                Some(description) if !description.trim().is_empty() => {
+                    lines.extend(description.split('\n').map(Line::from));
+                }
+                _ => lines.push(Line::from("(none recorded at handoff)")),
+            }
             lines
         } else {
             vec![Line::from("Select a tracked handoff to inspect its state.")]
         };
+        let detail_width = panes[1].width.saturating_sub(2);
+        let detail_height = panes[1].height.saturating_sub(2);
+        let line_count = Paragraph::new(detail.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(detail_width);
+        app.worktree_detail_offset = app.worktree_detail_offset.min(
+            line_count
+                .saturating_sub(detail_height as usize)
+                .min(u16::MAX as usize) as u16,
+        );
         f.render_widget(
             Paragraph::new(detail)
                 .block(
@@ -362,7 +400,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         .title(" HANDOFF DETAILS ")
                         .border_style(Style::default().fg(palette.border)),
                 )
-                .wrap(Wrap { trim: true })
+                .wrap(Wrap { trim: false })
+                .scroll((app.worktree_detail_offset, 0))
                 .style(Style::default().fg(ink).bg(bg)),
             panes[1],
         );
@@ -382,13 +421,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             format!("ERROR · {error} · Esc / w back")
         } else if let Some(item) = selected.filter(|item| item.detail.is_some()) {
             format!(
-                "{} · {} · r refresh",
+                "{} · {} · Enter switch workspace · PgUp/PgDn details · r refresh",
                 crate::app::worktree_status_label(item.status),
                 item.detail.as_deref().unwrap_or_default()
             )
         } else {
-            "↑/↓ select · Enter switch workspace · m merge · c close · x remove · r refresh · Esc / w back"
-                .to_owned()
+            "↑/↓ select · Enter switch workspace · PgUp/PgDn details · m request merge · c close · x remove · r refresh · Esc / w back".to_owned()
         };
         let footer_lines = wrap_words(&footer, areas[2].width as usize)
             .into_iter()
@@ -567,7 +605,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     } else {
                         bead.status.as_str()
                     };
-                    Line::from(vec![
+                    let handed_off = status == "open"
+                        && app.worktrees.iter().any(|worktree| {
+                            worktree.bead_id == bead.id && worktree.handoff_accepted
+                        });
+                    let mut spans = vec![
                         Span::styled(
                             if selected { "› " } else { "  " },
                             Style::default()
@@ -602,7 +644,14 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             status,
                             Style::default().fg(themed_status_color(status, app.theme)),
                         ),
-                    ])
+                    ];
+                    if handed_off {
+                        spans.push(Span::styled(
+                            " · sent",
+                            Style::default().fg(gold).add_modifier(Modifier::BOLD),
+                        ));
+                    }
+                    Line::from(spans)
                 } else {
                     Line::from(vec![
                         Span::raw("  "),
@@ -1723,6 +1772,7 @@ mod tests {
             worktrees: Vec::new(),
             selected_worktree: 0,
             worktree_offset: 0,
+            worktree_detail_offset: 0,
             worktrees_view: false,
             worktrees_loading: false,
             worktrees_error: None,
@@ -1730,6 +1780,7 @@ mod tests {
             worktrees_focus_pending: false,
             worktrees_inflight: false,
             worktrees_discovered: true,
+            worktrees_refresh_pending: false,
             worktree_action_pending: false,
             worktrees_next_refresh: std::time::Instant::now(),
             notice: None,
@@ -1826,6 +1877,29 @@ mod tests {
         for x in ["unknown", "comments", "hello comment", "界", "5"] {
             assert!(s.contains(x), "{x}")
         }
+    }
+
+    #[test]
+    fn open_issue_shows_confirmed_agent_handoff_only() {
+        let mut a = app();
+        a.beads[0].status = "open".into();
+        a.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "wt-1".into(),
+            bead_id: "demo-1".into(),
+            handoff_accepted: false,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/demo-1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: crate::worktrees::WorktreeStatus::NeedsAttention,
+            detail: None,
+        });
+        assert!(!draw((80, 24), &mut a).0.contains("· sent"));
+        a.worktrees[0].handoff_accepted = true;
+        assert!(draw((80, 24), &mut a).0.contains("open · sent"));
+        a.beads[0].status = "in_progress".into();
+        assert!(!draw((80, 24), &mut a).0.contains("· sent"));
     }
     #[test]
     fn list_and_detail_backgrounds_match_across_themes() {
@@ -2229,6 +2303,9 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "handoff-1".into(),
             bead_id: "closed-1".into(),
+            handoff_accepted: true,
+            bead_title: Some("Review handoff".into()),
+            bead_description: Some("First line\nSecond line".into()),
             branch: "ontrack/closed-1".into(),
             target_branch: "main".into(),
             workspace_id: "ws-7".into(),
@@ -2244,6 +2321,103 @@ mod tests {
         assert!(screen.contains("Git integration"));
     }
     #[test]
+    fn selected_worktree_shows_its_captured_title_and_multiline_description() {
+        let mut app = app();
+        app.worktrees_view = true;
+        let first = crate::worktrees::ManagedWorktree {
+            id: "handoff-1".into(),
+            bead_id: "bead-1".into(),
+            handoff_accepted: true,
+            bead_title: Some("First task".into()),
+            bead_description: Some("Line one\nLine two".into()),
+            branch: "ontrack/bead-1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws-1".into(),
+            status: crate::worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        };
+        app.worktrees.push(first.clone());
+        app.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "handoff-2".into(),
+            bead_id: "bead-2".into(),
+            bead_title: Some("Second task".into()),
+            bead_description: Some("Another description".into()),
+            ..first
+        });
+        let first_screen = draw((100, 23), &mut app).0;
+        for value in [
+            "First task",
+            "Line one",
+            "Line two",
+            "Branch: ontrack/bead-1",
+        ] {
+            assert!(first_screen.contains(value), "{value} missing");
+        }
+        app.selected_worktree = 1;
+        let second_screen = draw((100, 23), &mut app).0;
+        for value in ["Second task", "Another description"] {
+            assert!(second_screen.contains(value), "{value} missing");
+        }
+        assert!(!second_screen.contains("Line one"));
+    }
+    #[test]
+    fn worktree_description_scrolls_and_missing_context_has_fallback() {
+        let mut app = app();
+        app.worktrees_view = true;
+        app.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "legacy".into(),
+            bead_id: "old-bead".into(),
+            handoff_accepted: false,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/old-bead".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: crate::worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        });
+        let legacy = draw((100, 20), &mut app).0;
+        assert!(legacy.contains("old-bead"));
+        assert!(legacy.contains("not recorded at handoff"));
+        app.worktrees[0].bead_description = Some(
+            (0..30)
+                .map(|index| format!("Detail line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        app.worktree_detail_offset = u16::MAX;
+        let scrolled = draw((100, 20), &mut app).0;
+        assert!(app.worktree_detail_offset > 0);
+        assert!(scrolled.contains("Detail line 29"));
+    }
+    #[test]
+    fn current_bead_text_updates_worktree_details_and_snapshot_survives_bead_removal() {
+        let mut app = app();
+        app.worktrees_view = true;
+        app.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "handoff".into(),
+            bead_id: "demo-1".into(),
+            handoff_accepted: true,
+            bead_title: Some("Original title".into()),
+            bead_description: Some("Original description".into()),
+            branch: "ontrack/demo-1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: crate::worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        });
+        app.beads[0].title = "Updated title".into();
+        app.beads[0].data["description"] = json!("Updated description");
+        let current = draw((100, 23), &mut app).0;
+        assert!(current.contains("Updated title"));
+        assert!(current.contains("Updated description"));
+        assert!(!current.contains("Original description"));
+        app.beads.clear();
+        let fallback = draw((100, 23), &mut app).0;
+        assert!(fallback.contains("Original title"));
+        assert!(fallback.contains("Original description"));
+    }
+    #[test]
     fn selected_worktree_and_confirmation_stay_visible_with_long_lists() {
         let mut app = app();
         app.worktrees_view = true;
@@ -2251,6 +2425,9 @@ mod tests {
             app.worktrees.push(crate::worktrees::ManagedWorktree {
                 id: format!("wt-{index}"),
                 bead_id: format!("bead-{index}"),
+                handoff_accepted: true,
+                bead_title: None,
+                bead_description: None,
                 branch: format!("ontrack/bead-{index}"),
                 target_branch: "main".into(),
                 workspace_id: format!("ws-{index}"),
@@ -2276,6 +2453,9 @@ mod tests {
         state.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "wt-remove".into(),
             bead_id: "b-closed".into(),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
             branch: "ontrack/b".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),

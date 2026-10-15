@@ -49,7 +49,32 @@ struct Launch {
     pub branch: String,
 }
 
-// Keep both external boundaries injectable: tests never execute Herdr or bd.
+// Keep external commands and launch journaling injectable in Herdr unit tests.
+pub(crate) trait LaunchRecord {
+    fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()>;
+    fn created(&mut self, result: &Value) -> io::Result<()>;
+    fn phase(&mut self, phase: &str) -> io::Result<()>;
+    fn failed(&mut self, message: &str) -> io::Result<()>;
+}
+
+impl LaunchRecord for crate::worktrees::LaunchJournal {
+    fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()> {
+        Self::capture(self, kind, bytes)
+    }
+
+    fn created(&mut self, result: &Value) -> io::Result<()> {
+        Self::created(self, result)
+    }
+
+    fn phase(&mut self, phase: &str) -> io::Result<()> {
+        Self::phase(self, phase)
+    }
+
+    fn failed(&mut self, message: &str) -> io::Result<()> {
+        Self::failed(self, message)
+    }
+}
+
 pub(crate) trait Executor {
     fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>>;
     fn show_bead(&mut self, id: &str) -> io::Result<Value>;
@@ -57,12 +82,12 @@ pub(crate) trait Executor {
     fn launch_intent(
         &mut self,
         _checkout: &Path,
-        _bead: &str,
+        _bead: &Value,
         _branch: &str,
         _agent: &str,
         _name: &str,
         _workspace: &str,
-    ) -> io::Result<Option<crate::worktrees::LaunchJournal>> {
+    ) -> io::Result<Option<Box<dyn LaunchRecord>>> {
         Ok(None)
     }
 }
@@ -73,14 +98,14 @@ impl Executor for SystemExecutor {
     fn launch_intent(
         &mut self,
         checkout: &Path,
-        bead: &str,
+        bead: &Value,
         branch: &str,
         agent: &str,
         name: &str,
         workspace: &str,
-    ) -> io::Result<Option<crate::worktrees::LaunchJournal>> {
+    ) -> io::Result<Option<Box<dyn LaunchRecord>>> {
         crate::worktrees::LaunchJournal::begin(checkout, bead, branch, agent, name, workspace)
-            .map(Some)
+            .map(|journal| Some(Box::new(journal) as Box<dyn LaunchRecord>))
     }
 
     fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
@@ -501,7 +526,7 @@ fn launch_with(
             "Bead capture: expected the requested full issue object; nothing created",
         ));
     }
-    let prompt = prompt(request, bead)?;
+    let prompt = prompt(request, &bead)?;
     let source = discover_with(executor, cwd)?;
     if source.discovery.workspace_id != request.workspace_id {
         return Err(io::Error::other(
@@ -542,7 +567,7 @@ fn launch_with(
         };
     let mut journal = executor.launch_intent(
         &source.checkout,
-        request.id,
+        &bead,
         &branch,
         request.agent,
         request.name,
@@ -570,7 +595,7 @@ fn create_and_prompt(
     branch: &str,
     prompt: &str,
     expected_repository: Option<RepositoryIdentity>,
-    journal: &mut Option<crate::worktrees::LaunchJournal>,
+    journal: &mut Option<Box<dyn LaunchRecord>>,
 ) -> io::Result<Launch> {
     let bytes = executor
         .run(&[
@@ -744,7 +769,7 @@ fn agent_response(bytes: &[u8], kind: &str, target: &Launch) -> io::Result<()> {
     Ok(())
 }
 
-fn prompt(request: &Request<'_>, bead: Value) -> io::Result<String> {
+fn prompt(request: &Request<'_>, bead: &Value) -> io::Result<String> {
     let captured = serde_json::to_string_pretty(&json!({
         "requested_issue": {"id": request.id, "title": request.title},
         "bead": bead,
@@ -863,11 +888,105 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    struct MainCheckout(PathBuf);
+
+    impl MainCheckout {
+        fn new() -> Self {
+            let root = loop {
+                let path = std::env::temp_dir().join(unique_name("herdr-main-test"));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => break path,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("Cannot create Herdr test fixture: {error}"),
+                }
+            };
+            let fixture = Self(root);
+            let output = Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .arg(&fixture.0)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::create_dir(fixture.0.join("src")).unwrap();
+            std::fs::create_dir(fixture.0.join("target")).unwrap();
+            fixture
+        }
+    }
+
+    impl Drop for MainCheckout {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    thread_local! {
+        static MAIN_CHECKOUT: MainCheckout = MainCheckout::new();
+    }
+
     const NAME: &str = "ot-ontrackz2y-123-abcdef-0";
     const BRANCH: &str = "ontrack/ot-ontrackz2y-123-abcdef-0";
     const HELP: &str =
         "--kind <KIND>\n[possible values: pi, claude, codex,\n opencode, hermes, letta]";
     const STATUS: &str = "codex: current (v8) (/hooks/codex)\nopencode: current (v12) (/plugins/opencode)\nhermes: current (v5) (/plugins/hermes)\nclaude: not installed (/hook)\npi: outdated (v1) (/hook)\nfuture: current (v1) (/hook)";
+
+    struct FakeJournal {
+        path: PathBuf,
+        entry: Value,
+    }
+
+    impl FakeJournal {
+        fn new(root: &Path, bead: &Value) -> io::Result<Self> {
+            let path = root.join("main/.git/ontrack-worktrees/registry.json");
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let journal = Self {
+                path,
+                entry: json!({
+                    "phase": "create_possibly_sent", "responses": {},
+                    "bead_id": bead["id"],
+                    "bead_title": bead["title"].as_str(),
+                    "bead_description": bead["description"].as_str()
+                }),
+            };
+            journal.save()?;
+            Ok(journal)
+        }
+
+        fn save(&self) -> io::Result<()> {
+            std::fs::write(&self.path, json!({"entries": [self.entry]}).to_string())
+        }
+    }
+
+    impl LaunchRecord for FakeJournal {
+        fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()> {
+            self.entry["responses"][kind] = json!(String::from_utf8_lossy(bytes));
+            if kind == "ready" {
+                let result = envelope(bytes)?;
+                self.entry["initial_lifecycle_seq"] = result["agent"]["state_change_seq"].clone();
+            }
+            self.save()
+        }
+
+        fn created(&mut self, result: &Value) -> io::Result<()> {
+            self.entry["workspace_id"] = result["workspace"]["workspace_id"].clone();
+            self.entry["pane_id"] = result["root_pane"]["pane_id"].clone();
+            self.entry["path"] = result["worktree"]["path"].clone();
+            self.phase("created_verified")
+        }
+
+        fn phase(&mut self, phase: &str) -> io::Result<()> {
+            self.entry["phase"] = json!(phase);
+            self.save()
+        }
+
+        fn failed(&mut self, message: &str) -> io::Result<()> {
+            self.entry["detail"] = json!(message);
+            self.save()
+        }
+    }
 
     #[derive(Default)]
     struct FakeExecutor {
@@ -891,18 +1010,6 @@ mod tests {
                 match args {
                     ["worktree", "create", ..] => {
                         assert_eq!(registry["entries"][0]["phase"], "create_possibly_sent");
-                        let output = Command::new("git")
-                            .arg("-C")
-                            .arg(root.join("main"))
-                            .args(["worktree", "add", "-b", BRANCH])
-                            .arg(root.join("checkout"))
-                            .output()
-                            .unwrap();
-                        assert!(
-                            output.status.success(),
-                            "{}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
                     }
                     ["agent", "start", ..] if !args.contains(&"--help") => {
                         assert!(registry["entries"][0]["responses"]["create"].is_string());
@@ -924,18 +1031,16 @@ mod tests {
 
         fn launch_intent(
             &mut self,
-            checkout: &Path,
-            bead: &str,
-            branch: &str,
-            agent: &str,
-            name: &str,
-            workspace: &str,
-        ) -> io::Result<Option<crate::worktrees::LaunchJournal>> {
-            if self.tracked_root.is_some() {
-                crate::worktrees::LaunchJournal::begin(
-                    checkout, bead, branch, agent, name, workspace,
-                )
-                .map(Some)
+            _checkout: &Path,
+            bead: &Value,
+            _branch: &str,
+            _agent: &str,
+            _name: &str,
+            _workspace: &str,
+        ) -> io::Result<Option<Box<dyn LaunchRecord>>> {
+            if let Some(root) = self.tracked_root.as_ref() {
+                FakeJournal::new(root, bead)
+                    .map(|journal| Some(Box::new(journal) as Box<dyn LaunchRecord>))
             } else {
                 Ok(None)
             }
@@ -1017,28 +1122,7 @@ mod tests {
     }
 
     fn cwd() -> PathBuf {
-        let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .unwrap();
-        if checkout.join(".git").is_dir() {
-            return checkout;
-        }
-        // Launch discovery deliberately uses a primary checkout. When tests
-        // run from a linked worktree, use its real primary checkout as the
-        // read-only source fixture instead of treating the .git file as a dir.
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&checkout)
-            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
-            .output()
-            .unwrap();
-        assert!(output.status.success());
-        PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
-            .canonicalize()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .to_path_buf()
+        MAIN_CHECKOUT.with(|fixture| fixture.0.clone())
     }
 
     fn identity() -> RepositoryIdentity {
@@ -1372,29 +1456,9 @@ mod tests {
             }
         }
         for fail_prompt in [false, true] {
-            let fixture = Fixture(Path::new("/tmp/opencode").join(unique_name("tracked-launch")));
+            let fixture = Fixture(std::env::temp_dir().join(unique_name("tracked-launch")));
             let main = fixture.0.join("main");
-            std::fs::create_dir_all(&main).unwrap();
-            for args in [
-                vec!["init", "--initial-branch=trunk"],
-                vec!["config", "--local", "user.name", "OnTrack Test"],
-                vec!["config", "--local", "user.email", "test@example.invalid"],
-                vec!["config", "--local", "commit.gpgsign", "false"],
-                vec!["config", "--local", "core.hooksPath", "/dev/null"],
-                vec!["commit", "--allow-empty", "-m", "base"],
-            ] {
-                let output = Command::new("git")
-                    .arg("-C")
-                    .arg(&main)
-                    .args(args)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            std::fs::create_dir_all(main.join(".git")).unwrap();
             let mut executor = FakeExecutor {
                 tracked_root: Some(fixture.0.clone()),
                 bead: Some(Ok(bead())),
@@ -1435,6 +1499,12 @@ mod tests {
             );
             assert_eq!(registry["entries"][0]["workspace_id"], "wNew");
             assert_eq!(registry["entries"][0]["pane_id"], "wNew:p1");
+            assert_eq!(registry["entries"][0]["bead_id"], bead()["id"]);
+            assert_eq!(registry["entries"][0]["bead_title"], bead()["title"]);
+            assert_eq!(
+                registry["entries"][0]["bead_description"],
+                bead()["description"]
+            );
             assert_eq!(registry["entries"][0]["initial_lifecycle_seq"], 10);
             if fail_prompt {
                 assert!(
@@ -1597,10 +1667,7 @@ mod tests {
         }
         // Filesystem-only .git markers, not real Git worktrees or config. Cover
         // both a sibling checkout and a nested linked checkout inside main.
-        for base in [
-            std::env::temp_dir(),
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
-        ] {
+        for base in [std::env::temp_dir(), cwd().join("target")] {
             let linked = Fixture(base.join(unique_name("linked-fixture")));
             std::fs::create_dir(&linked.0).unwrap();
             std::fs::write(
