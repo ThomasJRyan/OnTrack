@@ -143,6 +143,13 @@ The list row's first line derives issue type from the retained `Bead.data` (`iss
 OnTrack records only worktrees created by its own confirmed Herdr handoffs; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
 from Beads: a closed or missing Bead does not remove the managed-worktree record.
+The launch journal stores the authoritative Bead title and description before
+Herdr creates a worktree. The right pane prefers current text from the already
+refreshed Beads list and falls back to this registry snapshot after Bead removal
+or a list failure; it makes no extra `bd` request. Registry entries from older
+versions may omit these optional fields; the view then shows a fallback. The
+pane wraps multiline descriptions and keeps its own bounded scroll position,
+reset when the selected worktree changes.
 The verified repository target branch is shown to the user. A merge request is
 pending work, not a completed merge; Git ancestry/cleanliness checks decide
 integration. Conflicts and uncertain outcomes remain inspectable for manual

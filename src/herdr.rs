@@ -57,7 +57,7 @@ pub(crate) trait Executor {
     fn launch_intent(
         &mut self,
         _checkout: &Path,
-        _bead: &str,
+        _bead: &Value,
         _branch: &str,
         _agent: &str,
         _name: &str,
@@ -73,7 +73,7 @@ impl Executor for SystemExecutor {
     fn launch_intent(
         &mut self,
         checkout: &Path,
-        bead: &str,
+        bead: &Value,
         branch: &str,
         agent: &str,
         name: &str,
@@ -479,7 +479,7 @@ fn launch_with(
             "Bead capture: expected the requested full issue object; nothing created",
         ));
     }
-    let prompt = prompt(request, bead)?;
+    let prompt = prompt(request, &bead)?;
     let source = discover_with(executor, cwd)?;
     if source.discovery.workspace_id != request.workspace_id {
         return Err(io::Error::other(
@@ -520,7 +520,7 @@ fn launch_with(
         };
     let mut journal = executor.launch_intent(
         &source.checkout,
-        request.id,
+        &bead,
         &branch,
         request.agent,
         request.name,
@@ -722,7 +722,7 @@ fn agent_response(bytes: &[u8], kind: &str, target: &Launch) -> io::Result<()> {
     Ok(())
 }
 
-fn prompt(request: &Request<'_>, bead: Value) -> io::Result<String> {
+fn prompt(request: &Request<'_>, bead: &Value) -> io::Result<String> {
     let captured = serde_json::to_string_pretty(&json!({
         "requested_issue": {"id": request.id, "title": request.title},
         "bead": bead,
@@ -903,7 +903,7 @@ mod tests {
         fn launch_intent(
             &mut self,
             checkout: &Path,
-            bead: &str,
+            bead: &Value,
             branch: &str,
             agent: &str,
             name: &str,
@@ -977,7 +977,19 @@ mod tests {
     }
 
     fn cwd() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
+        // These fixtures model launch from the main checkout even when the
+        // test binary itself was built in a linked worktree.
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(env!("CARGO_MANIFEST_DIR"))
+            .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let common = String::from_utf8(output.stdout).unwrap();
+        Path::new(common.trim_end())
+            .parent()
+            .unwrap()
             .canonicalize()
             .unwrap()
     }
