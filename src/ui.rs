@@ -373,6 +373,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 _ => "REMOVE CHECKOUT AND CLOSE HERDR WORKSPACE · integrated only; branch kept",
             };
             format!("y confirm / Esc cancel · {operation} · {id}")
+        } else if let Some(feedback) = &app.worktrees_focus_feedback {
+            match feedback {
+                crate::app::WorktreeFocusFeedback::Success(message) => message.clone(),
+                crate::app::WorktreeFocusFeedback::Error(message) => format!("ERROR · {message}"),
+            }
         } else if let Some(error) = &app.worktrees_error {
             format!("ERROR · {error} · Esc / w back")
         } else if let Some(item) = selected.filter(|item| item.detail.is_some()) {
@@ -382,7 +387,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 item.detail.as_deref().unwrap_or_default()
             )
         } else {
-            "↑/↓ select · m request merge · c close · x remove · r refresh · Esc / w back"
+            "↑/↓ select · Enter switch workspace · m merge · c close · x remove · r refresh · Esc / w back"
                 .to_owned()
         };
         let footer_lines = wrap_words(&footer, areas[2].width as usize)
@@ -392,11 +397,19 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         f.render_widget(
             Paragraph::new(footer_lines.join("\n")).style(
                 Style::default()
-                    .fg(if app.worktrees_error.is_some() || app.modal.is_some() {
-                        gold
-                    } else {
-                        muted
-                    })
+                    .fg(
+                        if app.worktrees_error.is_some()
+                            || matches!(
+                                app.worktrees_focus_feedback,
+                                Some(crate::app::WorktreeFocusFeedback::Error(_))
+                            )
+                            || app.modal.is_some()
+                        {
+                            gold
+                        } else {
+                            muted
+                        },
+                    )
                     .bg(palette.panel_alt),
             ),
             areas[2],
@@ -1713,6 +1726,8 @@ mod tests {
             worktrees_view: false,
             worktrees_loading: false,
             worktrees_error: None,
+            worktrees_focus_feedback: None,
+            worktrees_focus_pending: false,
             worktrees_inflight: false,
             worktrees_discovered: true,
             worktree_action_pending: false,

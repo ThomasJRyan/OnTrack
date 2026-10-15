@@ -27,6 +27,7 @@ pub(super) enum Request {
     Discover(u64),
     Launch(u64, LaunchContext, Agent, Bead),
     ListWorktrees,
+    FocusWorkspace(String),
     WorktreeAction(String, WorktreeAction),
     ReconcileWorktrees(CleanupPolicy),
 }
@@ -38,7 +39,12 @@ pub(super) enum Response {
     Discovered(u64, std::io::Result<LaunchContext>),
     Launched(u64, std::io::Result<LaunchOutcome>),
     Worktrees(std::io::Result<Vec<ManagedWorktree>>),
+    WorkspaceFocused(String, std::io::Result<()>),
     WorktreeChanged(std::io::Result<ManagedWorktree>),
+}
+pub(super) enum WorktreeFocusFeedback {
+    Success(String),
+    Error(String),
 }
 pub struct App {
     pub beads: Vec<Bead>,
@@ -69,6 +75,8 @@ pub struct App {
     pub worktrees_view: bool,
     pub worktrees_loading: bool,
     pub worktrees_error: Option<String>,
+    pub(super) worktrees_focus_feedback: Option<WorktreeFocusFeedback>,
+    pub(super) worktrees_focus_pending: bool,
     pub worktrees_inflight: bool,
     pub worktrees_discovered: bool,
     pub worktree_action_pending: bool,
@@ -224,6 +232,9 @@ impl App {
                         Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
                     }
                     Request::ListWorktrees => Response::Worktrees(worktrees::list()),
+                    Request::FocusWorkspace(id) => {
+                        Response::WorkspaceFocused(id.clone(), crate::herdr::focus_workspace(&id))
+                    }
                     Request::WorktreeAction(id, action) => {
                         Response::WorktreeChanged(worktrees::act(&id, action))
                     }
@@ -281,6 +292,8 @@ impl App {
             worktrees_view: false,
             worktrees_loading: false,
             worktrees_error: None,
+            worktrees_focus_feedback: None,
+            worktrees_focus_pending: false,
             worktrees_inflight: false,
             worktrees_discovered: false,
             worktree_action_pending: false,
@@ -713,6 +726,17 @@ impl App {
                         }
                     }
                 }
+                Response::WorkspaceFocused(id, result) => {
+                    self.worktrees_focus_pending = false;
+                    self.worktrees_focus_feedback = Some(match result {
+                        Ok(()) => WorktreeFocusFeedback::Success(format!(
+                            "Switched to Herdr workspace {id}"
+                        )),
+                        Err(error) => WorktreeFocusFeedback::Error(format!(
+                            "Could not switch to Herdr workspace {id}: {error}"
+                        )),
+                    });
+                }
                 Response::WorktreeChanged(result) => {
                     self.mutation_busy = false;
                     self.modal = None;
@@ -768,6 +792,7 @@ impl App {
                     self.worktrees_next_refresh = Instant::now();
                     self.poll_worktrees(Instant::now());
                 }
+                KeyCode::Enter => self.focus_selected_worktree(),
                 KeyCode::Char('m') => self.confirm_worktree_action(0),
                 KeyCode::Char('c') => self.confirm_worktree_action(1),
                 KeyCode::Char('x') => self.confirm_worktree_action(2),
@@ -778,6 +803,7 @@ impl App {
         match k.code {
             KeyCode::Char('w') => {
                 self.worktrees_view = true;
+                self.worktrees_focus_feedback = None;
                 self.worktrees_next_refresh = Instant::now();
                 self.poll_worktrees(Instant::now());
             }
@@ -844,6 +870,38 @@ impl App {
             _ => {}
         }
         false
+    }
+    fn focus_selected_worktree(&mut self) {
+        if self.worktrees_focus_pending {
+            return;
+        }
+        let Some(item) = self.worktrees.get(self.selected_worktree) else {
+            self.worktrees_focus_feedback = Some(WorktreeFocusFeedback::Error(
+                "Select a managed worktree first".into(),
+            ));
+            return;
+        };
+        if matches!(
+            item.status,
+            worktrees::WorktreeStatus::WorkspaceClosed | worktrees::WorktreeStatus::CheckoutRemoved
+        ) {
+            self.worktrees_focus_feedback = Some(WorktreeFocusFeedback::Error(
+                "This worktree's Herdr workspace is closed".into(),
+            ));
+            return;
+        }
+        self.worktrees_focus_feedback = None;
+        self.worktrees_focus_pending = true;
+        if self
+            .requests
+            .send(Request::FocusWorkspace(item.workspace_id.clone()))
+            .is_err()
+        {
+            self.worktrees_focus_pending = false;
+            self.worktrees_focus_feedback = Some(WorktreeFocusFeedback::Error(
+                "Workspace switch could not be queued".into(),
+            ));
+        }
     }
     fn confirm_worktree_action(&mut self, action: u8) {
         let Some(item) = self.worktrees.get(self.selected_worktree) else {
@@ -1507,6 +1565,8 @@ mod tests {
             worktrees_view: false,
             worktrees_loading: false,
             worktrees_error: None,
+            worktrees_focus_feedback: None,
+            worktrees_focus_pending: false,
             worktrees_inflight: false,
             worktrees_discovered: true,
             worktree_action_pending: false,
@@ -3496,6 +3556,83 @@ mod tests {
             "closing retains the successful choice"
         );
         let _ = fs::remove_dir_all(root);
+    }
+    #[test]
+    fn enter_focuses_selected_worktree_without_repeating_pending_request() {
+        let (mut a, rx, tx) = connected_app();
+        a.worktrees_view = true;
+        a.worktrees = ["w1", "w2"]
+            .into_iter()
+            .map(|id| ManagedWorktree {
+                id: id.into(),
+                bead_id: "b1".into(),
+                branch: "ontrack/b1".into(),
+                target_branch: "main".into(),
+                workspace_id: id.into(),
+                status: worktrees::WorktreeStatus::Unmerged,
+                detail: None,
+            })
+            .collect();
+        a.selected_worktree = 1;
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(Request::FocusWorkspace(id)) if id == "w2"));
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::WorkspaceFocused("w2".into(), Ok(())))
+            .unwrap();
+        a.receive_at(Instant::now());
+        assert!(matches!(
+            a.worktrees_focus_feedback,
+            Some(WorktreeFocusFeedback::Success(ref message)) if message.contains("w2")
+        ));
+        assert!(!a.worktrees_focus_pending);
+    }
+    #[test]
+    fn enter_without_open_workspace_reports_error_without_request() {
+        let (mut a, rx, tx) = connected_app();
+        a.worktrees_view = true;
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.worktrees_focus_feedback,
+            Some(WorktreeFocusFeedback::Error(ref message)) if message.contains("Select")
+        ));
+        a.worktrees.push(ManagedWorktree {
+            id: "wt-1".into(),
+            bead_id: "b1".into(),
+            branch: "ontrack/b1".into(),
+            target_branch: "main".into(),
+            workspace_id: "w1".into(),
+            status: worktrees::WorktreeStatus::WorkspaceClosed,
+            detail: None,
+        });
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.worktrees_focus_feedback,
+            Some(WorktreeFocusFeedback::Error(ref message)) if message.contains("closed")
+        ));
+        assert!(rx.try_recv().is_err());
+
+        a.worktrees[0].status = worktrees::WorktreeStatus::CheckoutRemoved;
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.worktrees_focus_feedback,
+            Some(WorktreeFocusFeedback::Error(ref message)) if message.contains("closed")
+        ));
+        assert!(rx.try_recv().is_err());
+
+        a.worktrees[0].status = worktrees::WorktreeStatus::Integrated;
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(Request::FocusWorkspace(id)) if id == "w1"));
+        tx.send(Response::WorkspaceFocused(
+            "w1".into(),
+            Err(std::io::Error::other("workspace missing")),
+        ))
+        .unwrap();
+        a.receive_at(Instant::now());
+        assert!(matches!(
+            a.worktrees_focus_feedback,
+            Some(WorktreeFocusFeedback::Error(ref message)) if message.contains("workspace missing")
+        ));
     }
     #[test]
     fn worktree_merge_requires_confirmation_and_cancel_has_no_side_effect() {
