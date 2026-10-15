@@ -556,15 +556,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 crate::app::WorktreeFocusFeedback::Error(message) => format!("ERROR · {message}"),
             }
         } else if let Some(error) = &app.worktrees_error {
-            format!("ERROR · {error} · Esc / w back")
-        } else if let Some(item) = selected.filter(|item| item.detail.is_some()) {
-            format!(
-                "Shift+R restart · {} · {} · Enter switch workspace · PgUp/PgDn details · r refresh",
-                crate::app::worktree_status_label(item.status),
-                item.detail.as_deref().unwrap_or_default()
-            )
+            format!("ERROR · {error}")
         } else {
-            "↑/↓ select · Shift+R restart · Enter switch workspace · PgUp/PgDn details · m merge · c close · x remove · r refresh · Esc / w back · Ctrl+? keys".to_owned()
+            "Enter switch workspace · Ctrl+? keys".to_owned()
         };
         let footer_lines = wrap_words(&footer, areas[2].width as usize)
             .into_iter()
@@ -937,21 +931,15 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .scroll((app.detail_offset, 0)),
         split[1],
     );
-    let state = if let Some(e) = &app.list_error {
-        format!("LIST ERROR · {e}")
+    let message = if let Some(e) = &app.list_error {
+        Some(format!("LIST ERROR · {e}"))
     } else if let Some(e) = &app.detail_error {
-        format!("DETAIL ERROR · {e}")
-    } else if app.list_loading {
-        "REFRESHING ISSUES…".into()
-    } else if app.detail_loading {
-        "LOADING DETAILS…".into()
-    } else if let Some(notice) = &app.notice {
-        notice.clone()
+        Some(format!("DETAIL ERROR · {e}"))
     } else {
-        "READY".into()
+        app.notice.clone()
     };
     f.render_widget(
-        Paragraph::new(footer_text(&state, v[2].width as usize))
+        Paragraph::new(footer_text(message.as_deref(), v[2].width as usize))
             .style(Style::default().fg(muted).bg(palette.panel_alt)),
         v[2],
     );
@@ -1891,38 +1879,25 @@ fn render_toast(f: &mut Frame, app: &App) {
         box_area,
     );
 }
-fn footer_text(state: &str, width: usize) -> String {
-    // Keep the actions people need most before optional navigation hints so a
-    // long status/error cannot push create, delete, or handoff offscreen. At
-    // narrow widths, spend the remaining cells on the start of the status and
-    // mark its truncation rather than letting Ratatui clip the actions.
-    let actions = " · n new · e edit · d delete · h hand off · r ready · q quit";
-    let state_width = width.saturating_sub(1 + Span::raw(actions).width());
-    let state = truncate_display(state, state_width);
-    let core = if state.is_empty() {
-        actions.trim_start().to_owned()
-    } else {
-        format!(" {state}{actions}")
-    };
-    let navigation = " · ↑↓ · ←/→ · Tab panes · s settings · w worktrees";
-    let help_hint = " · Ctrl+? keys";
-    let child_hint = " · N child";
-    if Span::raw(core.as_str()).width()
-        + Span::raw(navigation).width()
-        + Span::raw(child_hint).width()
-        <= width
-    {
-        let full = format!("{core}{child_hint}{navigation}");
-        if Span::raw(full.as_str()).width() + Span::raw(help_hint).width() <= width {
-            format!("{full}{help_hint}")
-        } else {
-            full
-        }
-    } else if Span::raw(core.as_str()).width() + Span::raw(navigation).width() <= width {
-        format!("{core}{navigation}")
-    } else {
-        core
+fn footer_text(message: Option<&str>, width: usize) -> String {
+    if let Some(message) = message {
+        return truncate_display(&format!(" {message}"), width);
     }
+    let mut footer = truncate_display(
+        " n new · e edit · d delete · h hand off · r ready · q quit",
+        width,
+    );
+    for hint in [
+        " · N child",
+        " · s settings",
+        " · w worktrees",
+        " · Ctrl+? keys",
+    ] {
+        if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
+            footer.push_str(hint);
+        }
+    }
+    footer
 }
 fn bead_type_name(index: usize) -> &'static str {
     crate::beads::BEAD_TYPES
@@ -2790,7 +2765,7 @@ mod tests {
         assert_eq!(a.list_rect, Rect::default());
         a.list_loading = true;
         let (s, _) = draw((80, 24), &mut a);
-        assert!(s.contains("REFRESHING"));
+        assert!(!s.contains("REFRESHING"));
         a.list_loading = false;
         a.detail_error = Some("broken".into());
         let (s, _) = draw((80, 24), &mut a);
@@ -2826,11 +2801,13 @@ mod tests {
         a.list_error = Some("current failure".into());
         let status = draw((120, 40), &mut a).0;
         assert!(status.contains("LIST ERROR"));
+        a.list_error = None;
+        a.notice = None;
+        let status = draw((120, 40), &mut a).0;
         assert!(status.contains("n new"));
         assert!(status.contains("e edit"));
         assert!(status.contains("d delete"));
         assert!(status.contains("h hand off"));
-        a.list_error = None;
         a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm::default()));
         let normal = draw((100, 30), &mut a).0;
         assert!(normal.contains("NEW BEAD"));
@@ -3011,9 +2988,9 @@ mod tests {
         assert!(rendered.contains("y confirm"));
     }
     #[test]
-    fn footer_keeps_mutation_and_handoff_shortcuts_ahead_of_optional_navigation() {
+    fn browser_footer_keeps_action_hints_without_routine_state_or_arrow_tips() {
         for width in [64, 90, 120] {
-            let footer = footer_text("LIST ERROR · current failure", width);
+            let footer = footer_text(None, width);
             for action in ["n new", "d delete", "h hand off", "r ready", "q quit"] {
                 assert!(
                     footer.contains(action),
@@ -3021,9 +2998,15 @@ mod tests {
                 );
             }
             assert!(Span::raw(footer.as_str()).width() <= width);
+            assert!(!footer.contains("↑"));
+            assert!(!footer.contains("←"));
+            assert!(!footer.contains("READY"));
         }
-        assert!(footer_text("READY", 120).contains("Tab panes"));
-        assert!(footer_text("READY", 160).contains("N child"));
+        assert!(footer_text(None, 120).contains("N child"));
+        assert!(footer_text(None, 120).contains("Ctrl+? keys"));
+        let error = footer_text(Some("LIST ERROR · current failure"), 24);
+        assert!(error.starts_with(" LIST ERROR"));
+        assert!(Span::raw(error.as_str()).width() <= 24);
     }
     #[test]
     fn outstanding_worktrees_render_target_state_and_pending_dispatch_on_compact_terminal() {
@@ -3049,6 +3032,18 @@ mod tests {
         assert!(screen.contains("main"));
         assert!(screen.contains("waiting for verified ancestry"));
         assert!(screen.contains("Git integration"));
+        let footer = screen.chars().skip(80 * 13).collect::<String>();
+        assert!(footer.contains("Enter switch workspace · Ctrl+? keys"));
+        assert!(!footer.contains("MERGE PENDING"));
+        assert!(!footer.contains("waiting for verified ancestry"));
+        assert!(!footer.contains("PgUp"));
+        app.worktrees_error = Some("scan failed".into());
+        let error_footer = draw((80, 16), &mut app)
+            .0
+            .chars()
+            .skip(80 * 13)
+            .collect::<String>();
+        assert!(error_footer.contains("ERROR · scan failed"));
     }
     #[test]
     fn worktree_status_text_uses_theme_colours_in_list_and_detail() {
