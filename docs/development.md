@@ -2,6 +2,9 @@
 
 ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only. Create, edit, delete, and Ready toggles are user actions; the scheduler automatically hands off Ready tasks through the existing tracked Herdr path. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
+Release binary names, checksum expectations, supported targets, and offline
+installer checks are documented in the [installation guide](installation.md#release-asset-contract-for-maintainers).
+
 ## Modules
 
 | File | Responsibility |
