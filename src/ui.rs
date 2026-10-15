@@ -184,9 +184,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             a,
         );
         render_toast(f, app);
+        render_help(f, app);
         return;
     }
-    if app.modal.is_none() && elapsed < Duration::from_millis(1200) {
+    if app.modal.is_none() && app.help.is_none() && elapsed < Duration::from_millis(1200) {
         let logo_width = ASCII_LOGO
             .iter()
             .map(|line| Span::raw(*line).width())
@@ -461,7 +462,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 item.detail.as_deref().unwrap_or_default()
             )
         } else {
-            "↑/↓ select · Shift+R restart · Enter switch workspace · PgUp/PgDn details · m merge · c close · x remove · r refresh · Esc / w back".to_owned()
+            "↑/↓ select · Shift+R restart · Enter switch workspace · PgUp/PgDn details · m merge · c close · x remove · r refresh · Esc / w back · Ctrl+? keys".to_owned()
         };
         let footer_lines = wrap_words(&footer, areas[2].width as usize)
             .into_iter()
@@ -529,6 +530,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             }
         }
         render_toast(f, app);
+        render_help(f, app);
         return;
     }
     let v = Layout::default()
@@ -844,7 +846,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     );
     if let Some(modal) = &app.modal {
         let width = match modal {
-            crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. } => 70,
+            crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. } => {
+                FORM_DESCRIPTION_WIDTH as u16 + 6
+            }
             crate::app::Modal::Settings { .. } => 64,
             _ => 62,
         }
@@ -928,6 +932,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 a,
             );
             render_toast(f, app);
+            render_help(f, app);
             return;
         }
         app.modal_ready = true;
@@ -1287,6 +1292,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     }
                 }
                 let desc_area = rows[2];
+                debug_assert_eq!(
+                    desc_area.width.saturating_sub(2) as usize,
+                    FORM_DESCRIPTION_WIDTH
+                );
                 let (wrapped_description, cx, cy) = wrapped_description(
                     &form.description,
                     form.description_cursor,
@@ -1420,6 +1429,100 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         }
     }
     render_toast(f, app);
+    render_help(f, app);
+}
+fn render_help(f: &mut Frame, app: &mut App) {
+    let Some(help) = app.help.as_mut() else {
+        return;
+    };
+    let screen = f.area();
+    if screen.width < 18 || screen.height < 5 {
+        f.render_widget(Clear, screen);
+        f.render_widget(
+            Paragraph::new("Expand terminal to view hotkeys · Esc closes")
+                .alignment(Alignment::Center),
+            screen,
+        );
+        return;
+    }
+    let palette = crate::theme::definition(app.theme).palette;
+    let width = screen.width.saturating_sub(2).min(82);
+    let height = screen.height.saturating_sub(2).min(30);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    let inner = Rect::new(
+        area.x + 2,
+        area.y + 2,
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(5),
+    );
+    let key_width = help
+        .context
+        .entries()
+        .iter()
+        .map(|(key, _)| Span::raw(*key).width())
+        .max()
+        .unwrap_or(12)
+        .min(20)
+        .min((inner.width as usize).saturating_sub(6).max(1));
+    let action_width = (inner.width as usize).saturating_sub(key_width + 2).max(1);
+    let mut lines = Vec::new();
+    for (key, action) in help.context.entries() {
+        let keys = wrap_words(key, key_width);
+        let actions = wrap_words(action, action_width);
+        for row in 0..keys.len().max(actions.len()) {
+            let label = keys.get(row).map(String::as_str).unwrap_or("");
+            let padding = key_width.saturating_sub(Span::raw(label).width());
+            let description = actions.get(row).map(String::as_str).unwrap_or("");
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{label}{}  ", " ".repeat(padding)),
+                    Style::default().fg(palette.accent),
+                ),
+                Span::styled(
+                    description.to_owned(),
+                    Style::default().fg(palette.foreground),
+                ),
+            ]));
+        }
+    }
+    let viewport = usize::from(inner.height).max(1);
+    help.offset = help.offset.min(lines.len().saturating_sub(viewport));
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default()
+            .title(format!(" HOTKEYS · {} ", help.context.title()))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(palette.accent))
+            .style(Style::default().bg(palette.panel)),
+        area,
+    );
+    f.render_widget(
+        Paragraph::new(lines).scroll((help.offset.min(u16::MAX as usize) as u16, 0)),
+        inner,
+    );
+    let footer = if area.width < 45 {
+        "Esc close · ↑↓ scroll"
+    } else {
+        "Esc / Ctrl+? close · ↑↓ / PgUp PgDn scroll"
+    };
+    f.render_widget(
+        Paragraph::new(truncate_display(
+            footer,
+            area.width.saturating_sub(4) as usize,
+        ))
+        .style(Style::default().fg(palette.muted)),
+        Rect::new(
+            area.x + 2,
+            area.y + area.height - 2,
+            area.width.saturating_sub(4),
+            1,
+        ),
+    );
 }
 fn render_toast(f: &mut Frame, app: &App) {
     let Some(toast) = app
@@ -1476,13 +1579,19 @@ fn footer_text(state: &str, width: usize) -> String {
         format!(" {state}{actions}")
     };
     let navigation = " · ↑↓ · ←/→ · Tab panes · s settings · w worktrees";
+    let help_hint = " · Ctrl+? keys";
     let child_hint = " · N child";
     if Span::raw(core.as_str()).width()
         + Span::raw(navigation).width()
         + Span::raw(child_hint).width()
         <= width
     {
-        format!("{core}{child_hint}{navigation}")
+        let full = format!("{core}{child_hint}{navigation}");
+        if Span::raw(full.as_str()).width() + Span::raw(help_hint).width() <= width {
+            format!("{full}{help_hint}")
+        } else {
+            full
+        }
     } else if Span::raw(core.as_str()).width() + Span::raw(navigation).width() <= width {
         format!("{core}{navigation}")
     } else {
@@ -1525,21 +1634,30 @@ fn display_window(s: &str, desired_start: usize, width: usize) -> (String, usize
     }
     (out, actual_start)
 }
-fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, usize) {
+pub(crate) const FORM_DESCRIPTION_WIDTH: usize = 64;
+
+fn description_layout(
+    s: &str,
+    cursor: usize,
+    width: usize,
+) -> (String, usize, usize, Vec<(usize, usize, usize)>) {
     let width = width.max(1);
     let cursor = cursor.min(s.len());
     let mut caret = None;
+    let mut positions = Vec::with_capacity(s.chars().count() + 1);
     let mut out = String::new();
     let mut row = 0;
     let mut col = 0;
     for (byte, ch) in s.char_indices() {
         if ch == '\n' {
+            let position = if col == width {
+                (0, row + 1)
+            } else {
+                (col, row)
+            };
+            positions.push((byte, position.0, position.1));
             if byte == cursor {
-                caret = Some(if col == width {
-                    (0, row + 1)
-                } else {
-                    (col, row)
-                });
+                caret = Some(position);
             }
             out.push('\n');
             row += 1;
@@ -1572,6 +1690,7 @@ fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, 
             out.push('\n');
             row += 1;
             col = 0;
+            positions.push((byte, col, row));
             if byte == cursor {
                 caret = Some((col, row));
             }
@@ -1583,21 +1702,48 @@ fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, 
             row += 1;
             col = 0;
         }
+        positions.push((byte, col, row));
         if byte == cursor {
             caret = Some((col, row));
         }
         out.push(ch);
         col += cw;
     }
+    let end = if col == width {
+        (0, row + 1)
+    } else {
+        (col, row)
+    };
+    positions.push((s.len(), end.0, end.1));
     if cursor == s.len() {
-        caret = Some(if col == width {
-            (0, row + 1)
-        } else {
-            (col, row)
-        });
+        caret = Some(end);
     }
     let (x, y) = caret.unwrap_or((col, row));
-    (out, x, y)
+    (out, x, y, positions)
+}
+
+fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, usize) {
+    let (text, x, y, _) = description_layout(s, cursor, width);
+    (text, x, y)
+}
+
+pub(crate) fn move_description_vertical(
+    s: &str,
+    cursor: usize,
+    down: bool,
+    preferred_column: &mut Option<usize>,
+) -> usize {
+    let (_, x, y, positions) = description_layout(s, cursor, FORM_DESCRIPTION_WIDTH);
+    let column = *preferred_column.get_or_insert(x);
+    let target_row = if down { y + 1 } else { y.saturating_sub(1) };
+    if target_row == y {
+        return cursor;
+    }
+    positions
+        .into_iter()
+        .filter(|(_, _, row)| *row == target_row)
+        .min_by_key(|(byte, x, _)| (x.abs_diff(column), std::cmp::Reverse(*byte)))
+        .map_or(cursor, |(byte, _, _)| byte)
 }
 fn wrapped_lines(s: &str, width: usize) -> Vec<String> {
     wrapped_description(s, 0, width)
@@ -1793,6 +1939,7 @@ mod tests {
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
+            help: None,
             settings: crate::settings::Settings::default(),
             theme: crate::settings::Theme::Dark,
             settings_path: None,
@@ -1835,6 +1982,23 @@ mod tests {
                 .collect(),
             a.list_rect,
         )
+    }
+    #[test]
+    fn hotkey_reference_has_columns_and_scrolls_in_compact_terminals() {
+        let mut a = app();
+        a.help = Some(crate::hotkeys::Help {
+            context: crate::hotkeys::Context::Form,
+            offset: 0,
+        });
+        let (wide, _) = draw((80, 15), &mut a);
+        assert!(wide.contains("HOTKEYS · Create / edit form"));
+        assert!(wide.contains("Text / Space"));
+        assert!(wide.contains("Type in title or description"));
+        a.help.as_mut().unwrap().offset = usize::MAX;
+        let (compact, _) = draw((30, 10), &mut a);
+        assert!(a.help.unwrap().offset > 0);
+        assert!(compact.contains("HOTKEYS"));
+        assert!(compact.contains("Esc"));
     }
     #[test]
     fn renders_exact_two_line_issue_with_status_and_full_nested_data() {

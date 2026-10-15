@@ -4,6 +4,7 @@ use crate::{
     Tui,
     beads::{self, Bead, CreateBead, UpdateBead},
     event,
+    hotkeys::{self, Help},
     settings::{self, Settings, Theme},
     ui,
 };
@@ -75,6 +76,7 @@ pub struct App {
     pub list_rect: Rect,
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
+    pub help: Option<Help>,
     pub settings: Settings,
     pub theme: Theme,
     pub settings_path: Option<PathBuf>,
@@ -173,6 +175,7 @@ pub struct CreateForm {
     pub focus: usize,
     pub cursor: usize,
     pub description_cursor: usize,
+    pub description_preferred_col: Option<usize>,
     pub dropdown: Option<usize>,
     pub dropdown_original: Option<usize>,
 }
@@ -187,6 +190,7 @@ impl Default for CreateForm {
             focus: 0,
             cursor: 0,
             description_cursor: 0,
+            description_preferred_col: None,
             dropdown: None,
             dropdown_original: None,
         }
@@ -237,28 +241,6 @@ fn next_boundary(s: &str, cursor: usize) -> usize {
         .nth(1)
         .map_or(s.len(), |(i, _)| cursor + i)
 }
-fn move_vertical(s: &str, cursor: usize, down: bool) -> usize {
-    let cursor = cursor.min(s.len());
-    let line_start = s[..cursor].rfind('\n').map_or(0, |i| i + 1);
-    let column = s[line_start..cursor].chars().count();
-    let target_start = if down {
-        s[cursor..].find('\n').map(|i| cursor + i + 1)
-    } else if line_start > 0 {
-        Some(s[..line_start - 1].rfind('\n').map_or(0, |i| i + 1))
-    } else {
-        None
-    };
-    let Some(start) = target_start else {
-        return cursor;
-    };
-    let end = s[start..].find('\n').map_or(s.len(), |i| start + i);
-    start
-        + s[start..end]
-            .char_indices()
-            .nth(column)
-            .map_or(end - start, |(i, _)| i)
-}
-
 /// Return the next choice index, wrapping in either direction.
 fn cycle_choice(index: usize, choices: usize, forward: bool) -> usize {
     assert!(
@@ -362,6 +344,7 @@ impl App {
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
+            help: None,
             settings,
             theme,
             settings_path,
@@ -977,6 +960,31 @@ impl App {
         if self.mutation_busy {
             return false;
         }
+        if let Some(help) = self.help.as_mut() {
+            if hotkeys::is_help_key(k) || k.code == KeyCode::Esc {
+                self.help = None;
+            } else {
+                match k.code {
+                    KeyCode::Up | KeyCode::Char('k') => help.offset = help.offset.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        help.offset = help.offset.saturating_add(1)
+                    }
+                    KeyCode::PageUp => help.offset = help.offset.saturating_sub(10),
+                    KeyCode::PageDown => help.offset = help.offset.saturating_add(10),
+                    KeyCode::Home => help.offset = 0,
+                    KeyCode::End => help.offset = usize::MAX,
+                    _ => {}
+                }
+            }
+            return false;
+        }
+        if hotkeys::is_help_key(k) {
+            self.help = Some(Help {
+                context: hotkeys::Context::current(self),
+                offset: 0,
+            });
+            return false;
+        }
         if self.modal.is_some() {
             return self.modal_key(k);
         }
@@ -1379,6 +1387,9 @@ impl App {
             }
             return false;
         }
+        if form.focus == 1 && !matches!(key.code, Up | Down) {
+            form.description_preferred_col = None;
+        }
         match key.code {
             Tab => {
                 form.focus = match form.focus {
@@ -1461,12 +1472,20 @@ impl App {
             }
             Enter if form.focus == 1 && key.modifiers.is_empty() => form.focus = 4,
             Up if form.focus == 1 => {
-                form.description_cursor =
-                    move_vertical(&form.description, form.description_cursor, false)
+                form.description_cursor = crate::ui::move_description_vertical(
+                    &form.description,
+                    form.description_cursor,
+                    false,
+                    &mut form.description_preferred_col,
+                )
             }
             Down if form.focus == 1 => {
-                form.description_cursor =
-                    move_vertical(&form.description, form.description_cursor, true)
+                form.description_cursor = crate::ui::move_description_vertical(
+                    &form.description,
+                    form.description_cursor,
+                    true,
+                    &mut form.description_preferred_col,
+                )
             }
             Left if form.focus == 0 => form.cursor = previous_boundary(&form.title, form.cursor),
             Right if form.focus == 0 => form.cursor = next_boundary(&form.title, form.cursor),
@@ -1592,7 +1611,7 @@ impl App {
         }
     }
     fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
-        if self.modal.is_some() {
+        if self.modal.is_some() || self.help.is_some() {
             return;
         }
         if self.worktrees_view {
@@ -1899,6 +1918,7 @@ mod tests {
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,
+            help: None,
             settings: Settings::default(),
             theme: Theme::Dark,
             settings_path: None,
@@ -3545,6 +3565,43 @@ mod tests {
         }
     }
     #[test]
+    fn help_tracks_active_view_and_preserves_underlying_form() {
+        let mut a = app();
+        let help_key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
+        a.key(help_key);
+        assert_eq!(a.help.unwrap().context, hotkeys::Context::Issues);
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.selected, Some(0));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.help.is_none());
+
+        press(&mut a, KeyCode::Tab);
+        a.key(help_key);
+        assert_eq!(a.help.unwrap().context, hotkeys::Context::Details);
+        a.key(help_key);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Char('?'));
+        a.key(help_key);
+        assert_eq!(a.help.unwrap().context, hotkeys::Context::Form);
+        press(&mut a, KeyCode::Esc);
+        assert!(matches!(a.modal, Some(Modal::Create(ref form)) if form.title == "?"));
+        a.mutation_busy = true;
+        a.key(help_key);
+        assert!(a.help.is_none());
+    }
+
+    #[test]
+    fn help_lists_view_specific_commands() {
+        let mut a = app();
+        a.worktrees_view = true;
+        a.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        let context = a.help.unwrap().context;
+        assert_eq!(context, hotkeys::Context::Worktrees);
+        assert!(context.entries().iter().any(|(key, _)| *key == "Shift+R"));
+        assert!(!context.entries().iter().any(|(key, _)| *key == "n"));
+    }
+    #[test]
     fn escape_navigates_back_without_quitting() {
         let mut a = app();
         assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
@@ -3677,13 +3734,13 @@ mod tests {
     }
     #[test]
     fn unicode_cursor_and_multiline_vertical_movement_stay_on_boundaries() {
-        let s = "界a\nxy".to_string();
+        let s = "界a\nxyz".to_string();
         let mut cursor = "界".len();
         assert_eq!(previous_boundary(&s, cursor), 0);
         cursor = next_boundary(&s, 0);
         assert_eq!(cursor, 3);
-        let down = move_vertical(&s, 3, true);
-        assert_eq!(&s[down..down + 1], "y");
+        let down = crate::ui::move_description_vertical(&s, 3, true, &mut None);
+        assert_eq!(&s[down..down + 1], "z");
         let mut a = app();
         a.modal = Some(Modal::Create(CreateForm {
             title: s.clone(),
@@ -3695,7 +3752,77 @@ mod tests {
         let Some(Modal::Create(form)) = a.modal else {
             panic!()
         };
-        assert_eq!(form.title, "a\nxy");
+        assert_eq!(form.title, "a\nxyz");
+    }
+    #[test]
+    fn description_arrows_follow_soft_wrap_in_create_and_edit_forms() {
+        let description = format!("{} {}", "a".repeat(60), "b".repeat(20));
+        let first_line_cursor = 50;
+        for editing in [false, true] {
+            let mut a = app();
+            let form = CreateForm {
+                description: description.clone(),
+                description_cursor: first_line_cursor,
+                focus: 1,
+                ..Default::default()
+            };
+            a.modal = Some(if editing {
+                Modal::Edit {
+                    id: "b0".into(),
+                    form,
+                }
+            } else {
+                Modal::Create(form)
+            });
+            press(&mut a, KeyCode::Up);
+            let Some(Modal::Create(form) | Modal::Edit { form, .. }) = a.modal.as_ref() else {
+                panic!("form closed")
+            };
+            assert_eq!(form.description_cursor, first_line_cursor);
+            press(&mut a, KeyCode::Down);
+            let Some(Modal::Create(form) | Modal::Edit { form, .. }) = a.modal.as_ref() else {
+                panic!("form closed")
+            };
+            assert_eq!(form.description_cursor, description.len());
+            assert_eq!(form.description, description);
+            press(&mut a, KeyCode::Down);
+            press(&mut a, KeyCode::Up);
+            let Some(Modal::Create(form) | Modal::Edit { form, .. }) = a.modal.as_ref() else {
+                panic!("form closed")
+            };
+            assert_eq!(form.description_cursor, first_line_cursor);
+            assert_eq!(form.description, description);
+        }
+    }
+    #[test]
+    fn description_arrows_restore_column_across_short_explicit_line() {
+        let description = format!("{}\nhi\n{}", "a".repeat(55), "界".repeat(28));
+        let mut a = app();
+        a.modal = Some(Modal::Create(CreateForm {
+            description: description.clone(),
+            description_cursor: 50,
+            focus: 1,
+            ..Default::default()
+        }));
+        press(&mut a, KeyCode::Down);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.description_cursor, 58);
+        press(&mut a, KeyCode::Down);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.description_cursor, 59 + 25 * "界".len());
+        assert!(form.description.is_char_boundary(form.description_cursor));
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Up);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.description_cursor, 50);
+        assert_eq!(form.description, description);
     }
     #[test]
     fn create_success_refreshes_and_selects_created_id() {
