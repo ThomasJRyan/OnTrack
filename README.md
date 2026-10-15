@@ -15,7 +15,7 @@ A terminal browser for Beads issues in the current workspace.
 
 ## Requirements
 
-Rust 1.88 or newer, the `bd` command-line tool, and a Beads workspace. A terminal with alternate-screen and mouse support is recommended.
+Rust 1.88 or newer and the `bd` command-line tool. OnTrack initializes Beads in the launch directory when no workspace is available. A terminal with alternate-screen and mouse support is recommended.
 
 ## Run
 

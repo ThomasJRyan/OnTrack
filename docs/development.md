@@ -6,10 +6,10 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Defines the terminal type, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
+| `src/main.rs` | Defines the terminal type, ensures Beads is initialized, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
 | `src/settings.rs` | Loads and atomically saves theme and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
-| `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
+| `src/beads.rs` | Initializes missing workspaces, builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/herdr.rs` | Discovers usable agent integrations, maps the current checkout to a Herdr workspace, focuses a selected managed workspace, and explicitly creates a worktree and starts/prompts an agent. |
 | `src/worktrees.rs` | Journals OnTrack-created handoffs separately from Beads and verifies Git/Herdr evidence before merge finalization or cleanup. |
 | `src/app.rs` | Holds selection, focus, scrolling, modal form and handoff toast state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
@@ -40,6 +40,8 @@ by terminal cell width; keep dropdown entries on the same value boundary and
 retain the existing compact-terminal fallback when changing this layout.
 
 ## Beads CLI contract
+
+Before terminal initialization, `beads::ensure_workspace` runs `bd --no-color init --init-if-missing --non-interactive --skip-agents --skip-hooks --quiet` in the launch directory. Beads creates a local workspace only when none is discoverable, including from an ancestor directory. A failed command stops startup before raw mode and alternate-screen setup; its error includes the launch directory and the CLI failure. The skip flags preserve tracked agent instructions and avoid installing hooks on application launch. Tests exercise first startup, repeated startup, inherited workspaces, and command failure.
 
 ### Ready and agent harness labels
 

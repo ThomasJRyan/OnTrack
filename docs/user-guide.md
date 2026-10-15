@@ -6,7 +6,7 @@ ontrack browses Beads issues in a two-pane terminal view and can create, edit, o
 
 - Rust 1.88 or newer to build this Rust 2024 project.
 - `bd` available on `PATH`, with support for the JSON commands shown in the [development guide](development.md#beads-cli-contract).
-- An existing Beads workspace accessible from the directory where you launch ontrack.
+- OnTrack initializes Beads in the launch directory if no workspace is accessible there. An existing workspace, including one inherited from a parent directory, is reused.
 - An interactive terminal supporting raw mode and the alternate screen; mouse support is needed for clicking and wheel input.
 
 See the [official Beads documentation](https://beads.gascity.com) for installing `bd` and setting up a workspace.
@@ -18,6 +18,8 @@ cargo run
 ```
 
 To browse another workspace, build with `cargo build`, change to that workspace, and launch the built binary using its absolute path. The launch directory, not the binary's location, determines which workspace `bd` uses. Do not launch the interactive application in a runner without a terminal.
+
+Before opening the terminal interface, OnTrack runs non-interactive `bd init --init-if-missing`. If `bd` is missing or initialization fails, OnTrack exits with an error naming the launch directory; install or repair `bd`, then retry. This startup step does not replace project agent instructions or install Beads hooks.
 
 A brief splash precedes the browser. A terminal-drawn anime girl blinks and waves beneath the ONTRACK wordmark; narrower terminals use a compact title, and very small terminals show text only. The animation lasts about 1.2 seconds and uses the selected theme. Issue loading starts in the background; quit keys work during startup too.
 

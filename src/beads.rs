@@ -1,7 +1,7 @@
-//! Read-only browsing and explicit create/update/delete operations through the Beads CLI.
+//! Workspace initialization, read-only browsing, and explicit mutations through the Beads CLI.
 
-use std::io;
 use std::process::{Command, Output};
+use std::{io, path::Path};
 
 use serde_json::Value;
 
@@ -79,6 +79,46 @@ const LIST_ARGS: &[&str] = &[
     "0",
     "--json",
 ];
+
+const INIT_ARGS: &[&str] = &[
+    "--no-color",
+    "init",
+    "--init-if-missing",
+    "--non-interactive",
+    "--skip-agents",
+    "--skip-hooks",
+    "--quiet",
+];
+
+/// Ensure the launch directory can use Beads before the terminal enters raw mode.
+pub fn ensure_workspace() -> io::Result<()> {
+    ensure_workspace_in(&std::env::current_dir()?)
+}
+
+fn ensure_workspace_in(directory: &Path) -> io::Result<()> {
+    ensure_workspace_in_with(directory, |directory, args| {
+        Command::new("bd")
+            .args(args)
+            .current_dir(directory)
+            .output()
+    })
+}
+
+fn ensure_workspace_in_with(
+    directory: &Path,
+    execute: impl FnOnce(&Path, &[&str]) -> io::Result<Output>,
+) -> io::Result<()> {
+    run_bd_with(INIT_ARGS, |args| execute(directory, args)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Could not initialize Beads for {}: {error}. Install or check bd, then retry",
+                directory.display()
+            ),
+        )
+    })?;
+    Ok(())
+}
 
 pub fn list_beads() -> io::Result<Vec<Bead>> {
     parse_list(&run_bd(LIST_ARGS)?)
@@ -479,6 +519,55 @@ fn parse_show(bytes: &[u8], id: &str) -> io::Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn startup_initializes_missing_workspace_and_preserves_existing_one() {
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "ontrack-beads-init-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let _fixture = Fixture(directory.clone());
+
+        ensure_workspace_in(&directory).unwrap();
+        assert!(directory.join(".beads").is_dir());
+        assert!(!directory.join("AGENTS.md").exists());
+
+        let marker = directory.join(".beads/ontrack-marker");
+        std::fs::write(&marker, b"keep").unwrap();
+        ensure_workspace_in(&directory).unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep");
+
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        ensure_workspace_in(&nested).unwrap();
+        assert!(!nested.join(".beads").exists());
+    }
+
+    #[test]
+    fn startup_failure_is_reported_before_terminal_setup() {
+        let directory = Path::new("/missing-workspace");
+        let error = ensure_workspace_in_with(directory, |actual_directory, args| {
+            assert_eq!(actual_directory, directory);
+            assert_eq!(args, INIT_ARGS);
+            Err(io::Error::new(io::ErrorKind::NotFound, "bd not installed"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("/missing-workspace"));
+        assert!(error.to_string().contains("Install or check bd"));
+    }
 
     #[test]
     fn child_creation_keeps_parent_and_user_text_in_separate_arguments() {
