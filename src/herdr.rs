@@ -841,6 +841,45 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    struct MainCheckout(PathBuf);
+
+    impl MainCheckout {
+        fn new() -> Self {
+            let root = loop {
+                let path = std::env::temp_dir().join(unique_name("herdr-main-test"));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => break path,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("Cannot create Herdr test fixture: {error}"),
+                }
+            };
+            let fixture = Self(root);
+            let output = Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .arg(&fixture.0)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::create_dir(fixture.0.join("src")).unwrap();
+            std::fs::create_dir(fixture.0.join("target")).unwrap();
+            fixture
+        }
+    }
+
+    impl Drop for MainCheckout {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    thread_local! {
+        static MAIN_CHECKOUT: MainCheckout = MainCheckout::new();
+    }
+
     const NAME: &str = "ot-ontrackz2y-123-abcdef-0";
     const BRANCH: &str = "ontrack/ot-ontrackz2y-123-abcdef-0";
     const HELP: &str =
@@ -977,9 +1016,7 @@ mod tests {
     }
 
     fn cwd() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .unwrap()
+        MAIN_CHECKOUT.with(|fixture| fixture.0.clone())
     }
 
     fn identity() -> RepositoryIdentity {

@@ -1199,6 +1199,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     const ID: &str = "ot-test";
@@ -1219,13 +1220,24 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let directory = PathBuf::from("/tmp/opencode").join(format!(
-                "ontrack-worktrees-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let directory = loop {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let path = std::env::temp_dir().join(format!(
+                    "ontrack-worktrees-{}-{nanos}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => break path,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("Cannot create worktree test fixture: {error}"),
+                }
+            };
             let main = directory.join("main");
-            fs::create_dir_all(&main).unwrap();
+            fs::create_dir(&main).unwrap();
             git(&main, &["init", "--initial-branch=trunk"]).unwrap();
             for (key, value) in [
                 ("user.name", "OnTrack Test"),
