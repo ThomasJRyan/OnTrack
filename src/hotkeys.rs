@@ -50,7 +50,7 @@ impl Context {
             Self::Form => "Create / edit form",
             Self::FormChoices => "Form choice list",
             Self::Settings => "Settings",
-            Self::SettingsChoices => "Theme choices",
+            Self::SettingsChoices => "Setting choices",
             Self::EditLoading => "Loading edit",
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
@@ -132,11 +132,8 @@ impl Context {
             Self::Settings => vec![
                 ("↑ / ↓", "Move between setting rows"),
                 ("Tab / Shift+Tab", "Move between setting rows"),
-                ("← / →", "Cycle themes when Theme is focused"),
-                (
-                    "Enter / Space",
-                    "Open theme choices, toggle preference, or close",
-                ),
+                ("← / →", "Cycle focused theme, agent, or limit"),
+                ("Enter / Space", "Open choices, toggle preference, or close"),
                 ("Esc", "Close settings"),
             ],
             Self::SettingsChoices => vec![
@@ -145,9 +142,9 @@ impl Context {
                     "Tab / Shift+Tab",
                     "Move to another setting and close choices",
                 ),
-                ("← / →", "Cycle themes and save immediately"),
-                ("Enter / Space", "Close choices and save theme"),
-                ("Esc", "Close theme choices"),
+                ("← / →", "Cycle choices and save immediately"),
+                ("Enter / Space", "Close choices and save selection"),
+                ("Esc", "Close choices"),
             ],
             Self::EditLoading => vec![
                 ("e", "Retry a failed edit load"),

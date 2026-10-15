@@ -1,8 +1,8 @@
 # Settings
 
-OnTrack stores the selected theme globally for your Linux user, not in the
-workspace or Beads database. OnTrack Dark is the default. Twelve built-in themes
-are available:
+OnTrack stores theme, default-agent, agent-limit, and cleanup preferences
+globally for your Linux user, not in the workspace or Beads database. OnTrack
+Dark is the default theme. Twelve built-in themes are available:
 
 | Stable ID | Display name | Style |
 | --- | --- | --- |
@@ -55,36 +55,58 @@ The OnTrack-specific role mapping and contrast choices are maintained in
 The file is a JSON object:
 
 ```json
-{"theme":"dark","auto_merge":false,"auto_close_workspace":false,"auto_remove_checkout":false}
+{"theme":"dark","default_agent":"automatic","agent_limit":5,"auto_merge":false,"auto_close_workspace":false,"auto_remove_checkout":false}
 ```
 
 `theme` accepts one of the stable IDs above; existing `"dark"` and `"light"`
 files remain valid. Missing worktree preference fields default to false; old theme-only
-files therefore remain backward compatible. All automatic cleanup switches are
+files therefore remain backward compatible. A missing `agent_limit` defaults to 5.
+It accepts a positive integer or `"unlimited"`; zero, negative, fractional, and
+other values are invalid. All automatic cleanup switches are
 off by default. Unknown additional keys
 are accepted for future expansion. Invalid JSON,
 non-object JSON, unknown themes, and non-string theme values are errors.
 
-## Changing the theme
+`default_agent` accepts `automatic`, `unassigned`, or a supported agent kind such
+as `codex` or `hermes`. Existing files without this field use `automatic`.
+Settings lists the supported kinds; the new-task form checks current Herdr
+integrations when it opens. `automatic` selects Codex when available, otherwise
+the first available integration. A saved kind that is not currently available
+uses that same fallback in the form while retaining the saved preference.
+`unassigned` starts new Tasks without a selected agent. New child Tasks use the
+same preference. The form choice can always be changed; editing an existing
+Bead keeps its stored agent choice.
 
-Press `s` to open Settings. `Up` / `Down` moves among Theme, automatic merge,
-workspace close, checkout removal, and Close.
+## Changing settings
+
+Press `s` to open Settings. `Up` / `Down` moves among Theme, Default agent for
+new tasks, Agent limit, automatic merge, workspace close, checkout removal, and Close.
 The dialog places setting titles in a wider, left-aligned column and centers
-theme and cleanup controls in the right column. The theme list opens beneath
+theme, agent, limit, and cleanup controls in the right column. The choice lists open beneath
 its value; on narrow supported terminals, long titles and values may be
 shortened with an ellipsis.
 
-`Left` / `Right` cycles themes
-with wraparound and immediately saves the new choice, whether the list is open
-or closed. The bounded list scrolls to keep the current choice visible. `Enter`
-or `Space` opens the list; while it is open, either key saves the selected theme
-again and closes the list, which also lets you retry a failed save. `Esc` closes
+`Left` / `Right` cycles theme or default-agent choices with wraparound and
+immediately saves the new choice, whether the list is open
+or closed. The bounded lists scroll to keep the current choice visible. `Enter`
+or `Space` opens the focused list; while it is open, either key saves the selected
+choice again and closes the list, which also lets you retry a failed save. `Esc` closes
 an open list without reverting a successful change; `Esc` again closes Settings.
 `Enter` / `Space` toggles a cleanup preference. Every change saves all settings
 together. The removal preference is labeled “Remove checkout + close Herdr workspace”;
 removing the checkout also closes its Herdr workspace. Cleanup remains
 subject to backend integration checks and cannot force-remove a checkout.
 Use `Tab` / `Shift+Tab` to move focus; Close exits the dialog.
+
+Agent limit starts at 5. `Left` / `Right` moves through Unlimited, 1, 2, 3,
+and increasing positive counts, saving each change immediately. `Enter` or
+`Space` opens the list and closes it with a save, including a retry after a
+failed save. The list scrolls around the selected count. The limit applies to
+automatic Ready-task scheduling. Active OnTrack-managed handoffs started with
+`h` occupy slots, but `h` itself is not blocked by the limit. Reserved parent
+worktrees and handoffs ready for merge or cleanup do not occupy slots. Ready
+tasks remain queued when full and resume after a managed-worktree refresh
+finds an available slot. Unlimited disables this capacity check.
 
 When both cleanup switches are enabled, removal runs first and also closes the
 workspace. Closing first and enabling removal later is unsupported by the
@@ -98,7 +120,7 @@ still match and the agent has finished. This also works for earlier handoffs
 whose launch response retained those fields. Missing or changed evidence keeps
 the worktree visible with a recovery reason instead of triggering cleanup.
 
-Each theme change is saved immediately. On success, the active appearance and
+Each setting change is saved immediately. On success, the active appearance and
 the saved settings update together, and any startup or save error clears. On
 failure, the active theme and saved file stay at their last successful values;
 the dialog keeps the attempted choice and shows an error so you can retry it by
@@ -126,7 +148,8 @@ the containing directory is not explicitly synchronized.
 
 ## Developer interface
 
-`src/settings.rs` exposes `Theme`, `Settings` (theme and three false-by-default
+`src/settings.rs` exposes `Theme`, `DefaultAgent`, `AgentLimit`, `Settings`
+(theme, default agent, five-agent default limit, and three false-by-default
 worktree cleanup preferences), `config_path()`, `load_from(path)`,
 and `save_to(path, settings)`. The filesystem functions return `io::Result`;
 invalid settings contents use `io::ErrorKind::InvalidData` with the file path and
