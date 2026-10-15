@@ -1,6 +1,6 @@
 # Development guide
 
-ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only, while create, edit, and delete are explicit user actions. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
+ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only, while create, edit, delete, and Herdr handoff are explicit user actions. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
 ## Modules
 
@@ -12,15 +12,17 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/herdr.rs` | Discovers usable agent integrations, maps the current checkout to a Herdr workspace, focuses a selected managed workspace, and explicitly creates a worktree and starts/prompts an agent. |
 | `src/worktrees.rs` | Journals OnTrack-created handoffs separately from Beads and verifies Git/Herdr evidence before merge finalization or cleanup. |
-| `src/app.rs` | Holds selection, focus, scrolling, modal form state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
+| `src/app.rs` | Holds selection, focus, scrolling, modal form and handoff toast state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
-| `src/ui.rs` | Renders splash, issue list, wrapped Markdown details, and status; maintains list visibility and scroll bounds. |
+| `src/ui.rs` | Renders splash, issue list, wrapped Markdown details, status, and top-right handoff toasts; maintains list visibility and scroll bounds. |
 | `src/detail.rs` | Presents complete issue records with Markdown rendering for narrative fields and readable structured fallbacks for metadata. |
 | `src/terminal.rs` | Manages raw mode, alternate screen, mouse capture, and cleanup, including initialization failures and panic handling. |
 
 `src/ui.rs` renders a centered ASCII ONTRACK wordmark during startup, with a short subtitle and a compact text fallback for narrower terminals. Keep the splash readable across terminal sizes and ensure it yields to the normal browser view after startup.
 
 In the managed-worktree view, Enter queues `herdr workspace focus WORKSPACE_ID` on the existing background worker. The ID comes from the selected OnTrack handoff, never global focus. The adapter passes arguments separately, rejects unsafe IDs, and requires Herdr's `workspace_focused` result to repeat the selected ID. Closed workspaces and removed checkouts are rejected before dispatch. Focus success and errors are shown in the view without changing Git, Beads, or the handoff registry.
+
+`theme::worktree_status_color` maps every `WorktreeStatus` to a semantic palette role. `ui::worktree_status_style` applies that colour to the label's foreground characters and leaves the pane background intact; the surrounding selected-row highlight remains separate. Keep list and detail labels in sync when adding a worktree state. Theme tests enforce that pending and attention colours differ from integrated in every bundled theme, and UI buffer tests check all list labels and selected details across bundled themes.
 
 Theme is explicit app state (`App::theme`) threaded into rendering; do not introduce global or thread-local palette state. Keep Dark as the existing default look. New colors need readable Light equivalents for surfaces, text, semantic metadata, startup splash, details, and dialogs. Settings changes immediately attempt persistence; update `App::settings` and the active theme only after `settings::save_to` succeeds. Failed writes retain the candidate for retry without changing the active theme. Tests should use isolated settings paths rather than changing process-wide environment variables.
 
@@ -59,7 +61,11 @@ Detail parsing selects the requested ID, rejects duplicate matching records, and
 
 `src/herdr.rs` exposes `discover() -> io::Result<LaunchContext>` and `launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result<LaunchOutcome>` for background-worker use. `LaunchContext` contains a `Workspace` and available `Agent` records (each with string `id` and `label`); `LaunchOutcome.message` carries the handoff result. These public records derive `Debug`, `Clone`, `PartialEq`, and `Eq`. The app queues the full selected Bead and typed context/agent; the backend still captures authoritative `bd show` JSON before mutation and revalidates workspace/agent availability.
 
-Discovery is read-only. Supported kinds are parsed from the installed CLI's `herdr agent start --help` list and intersected with **text** `herdr integration status` entries in the observed `current (vN) (path)` format. Availability is not hardcoded: any supported current integration, including Hermes, can be offered. Outdated/not-installed entries and unsupported kinds are excluded; malformed/duplicate current entries and incompatible help/status output fail closed. No integration is installed or repaired automatically. A current integration establishes integration configuration, not a guarantee its agent executable can start.
+Restart is a separate confirmed worker request for a selected tracked handoff. The backend requires an active journal entry, verifies the main checkout identity and clean current target branch, checks the recorded checkout path/branch and Herdr ownership, and fetches the live Bead before mutation. It also checks that the recorded agent integration and source workspace are available. It saves a `restart_pending` marker before invoking `herdr worktree remove --workspace ID --force`, captures the response, and verifies both Herdr and Git inventories plus path absence. Only then does it mark the old handoff restarted and use the ordinary launch path with a new unique name and the live Bead. The old Git branch is retained. An uncertain removal is never retried automatically. A failed relaunch records an attention state; any partial new launch has its own normal launch journal for recovery. Normal cleanup still requires verified integration and never uses force.
+
+Pressing `h` records the selected Bead and queues discovery once. While that handoff is pending, another `h` is ignored and normal browsing remains available. The discovery response selects Codex if present, otherwise the first agent in the sorted discovery list, and immediately queues launch. Missing selection, discovery errors, and empty agent lists stop before launch. Stale or duplicate discovery responses cannot dispatch another launch. The top-right toast reports progress and a timed result; the outcome or error is also stored for the footer, where it may be truncated by terminal width. The existing tracked-worktree refresh runs after confirmed success. Rendering tests cover normal and compact toasts, and app tests cover automatic dispatch, selection capture, duplicate prevention, errors, and stale responses.
+
+Discovery is read-only. Supported kinds are parsed from the installed CLI's `herdr agent start --help` list and intersected with **text** `herdr integration status` entries in the observed `current (vN) (path)` format. Availability is not hardcoded: any supported current integration, including Hermes, can be selected when Codex is unavailable. Outdated/not-installed entries and unsupported kinds are excluded; malformed/duplicate current entries and incompatible help/status output fail closed. No integration is installed or repaired automatically. A current integration establishes integration configuration, not a guarantee its agent executable can start.
 
 Workspace selection uses `herdr worktree list --cwd CURRENT_DIRECTORY` and its JSON envelope's `result.source.source_workspace_id`, never global focus, labels, a live agent list, or inherited workspace variables. An absent/null/unsafe workspace ID fails with guidance to open the checkout in Herdr. **Launch discovery from linked checkouts is unsupported:** observed Herdr 0.9.1 responses report the main `source_checkout_path` even when `--cwd` names a linked checkout, so that field does not independently identify the linked workspace. Launch from the main checkout instead. The absolute, accessible, canonical source path must contain the current directory and have a normal `.git` directory. Any intervening `.git` boundary (including a nested linked checkout/submodule) fails before creation, without guessing another workspace. Ordinary main-checkout subdirectories remain supported. Read-only output for the main checkout returned `source_workspace_id=wY` and `source_checkout_path=/home/thomasr/Documents/dev/OnTrack`.
 
@@ -159,6 +165,12 @@ The list row's first line derives issue type from the retained `Bead.data` (`iss
 OnTrack records only worktrees created by its own explicit Herdr actions; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
 from Beads: a closed or missing Bead does not remove the managed-worktree record.
+The app filters verified `CheckoutRemoved` rows from the visible worktree list
+on refresh and immediately after a successful removal action. The registry still
+retains those records, and `NeedsAttention` rows remain visible when inspection
+finds a problem after removal. Selection clamps to a remaining row or the empty
+state. Accepted handoff IDs are retained separately from visible rows so an Open
+Bead's `· sent` marker still reflects its confirmed handoff.
 The launch journal stores the authoritative Bead title and description before
 Herdr creates a worktree. The right pane prefers current text from the already
 refreshed Beads list and falls back to this registry snapshot after Bead removal
@@ -178,6 +190,15 @@ separate close. It never force-removes a checkout or deletes a branch. Bead
 closure is an eligibility signal only, not evidence
 that an agent is idle or its changes safe to merge. Automatic merge may therefore
 defer; manual merge remains the user-controlled path.
+
+`inspect` in `src/worktrees.rs` remains the Git-based safety classification.
+`inspect_for_display` only changes a `NeedsResolution` merge-request row to
+`MergeRequested` when a read-only Herdr `agent get` response reports `working`
+for the recorded pane, workspace, and agent kind, with the recorded session
+matching when available. The original Git concern stays in the detail text.
+Idle, done, blocked, mismatched, malformed, and unavailable observations retain
+`NeedsResolution`. Both listing and reconciliation use this display mapping;
+finalization, action gates, and cleanup continue to use the Git classification.
 
 Manual merge provenance is persisted separately from automatic requests: optional
 agent-session metadata is not required for an explicitly confirmed manual merge,

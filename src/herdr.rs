@@ -214,6 +214,54 @@ pub fn launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result
     )
 }
 
+pub(crate) fn validate_restart_source(
+    executor: &mut impl Executor,
+    checkout: &Path,
+    workspace_id: &str,
+    agent_id: &str,
+) -> io::Result<()> {
+    let source = discover_with(executor, checkout)?;
+    if source.discovery.workspace_id != workspace_id
+        || !source
+            .discovery
+            .agents
+            .iter()
+            .any(|agent| agent == agent_id)
+    {
+        return Err(invalid(
+            "Recorded source workspace or agent integration is unavailable; restart cancelled",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn relaunch_from(
+    executor: &mut impl Executor,
+    checkout: &Path,
+    workspace_id: &str,
+    agent_id: &str,
+    bead_id: &str,
+    title: &str,
+) -> io::Result<LaunchOutcome> {
+    let result = launch_with(
+        executor,
+        checkout,
+        &Request {
+            workspace_id,
+            agent: agent_id,
+            id: bead_id,
+            title,
+            name: &unique_name(bead_id),
+        },
+    )?;
+    Ok(LaunchOutcome {
+        message: format!(
+            "Task restarted · new workspace {} · pane {} · branch {}",
+            result.workspace_id, result.pane_id, result.branch
+        ),
+    })
+}
+
 pub fn focus_workspace(workspace_id: &str) -> io::Result<()> {
     focus_workspace_with(&mut SystemExecutor, workspace_id)
 }
