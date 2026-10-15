@@ -1,6 +1,6 @@
 # Development guide
 
-ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only, while create, edit, and delete are explicit user actions. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
+ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only, while create, edit, delete, and Herdr handoff are explicit user actions. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
 ## Modules
 
@@ -12,9 +12,9 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/herdr.rs` | Discovers usable agent integrations, maps the current checkout to a Herdr workspace, focuses a selected managed workspace, and explicitly creates a worktree and starts/prompts an agent. |
 | `src/worktrees.rs` | Journals OnTrack-created handoffs separately from Beads and verifies Git/Herdr evidence before merge finalization or cleanup. |
-| `src/app.rs` | Holds selection, focus, scrolling, modal form state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
+| `src/app.rs` | Holds selection, focus, scrolling, modal form and handoff toast state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
-| `src/ui.rs` | Renders splash, issue list, wrapped Markdown details, and status; maintains list visibility and scroll bounds. |
+| `src/ui.rs` | Renders splash, issue list, wrapped Markdown details, status, and top-right handoff toasts; maintains list visibility and scroll bounds. |
 | `src/detail.rs` | Presents complete issue records with Markdown rendering for narrative fields and readable structured fallbacks for metadata. |
 | `src/terminal.rs` | Manages raw mode, alternate screen, mouse capture, and cleanup, including initialization failures and panic handling. |
 
@@ -58,7 +58,9 @@ Detail parsing selects the requested ID, rejects duplicate matching records, and
 
 `src/herdr.rs` exposes `discover() -> io::Result<LaunchContext>` and `launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result<LaunchOutcome>` for background-worker use. `LaunchContext` contains a `Workspace` and available `Agent` records (each with string `id` and `label`); `LaunchOutcome.message` carries the handoff result. These public records derive `Debug`, `Clone`, `PartialEq`, and `Eq`. The app queues the full selected Bead and typed context/agent; the backend still captures authoritative `bd show` JSON before mutation and revalidates workspace/agent availability.
 
-Discovery is read-only. Supported kinds are parsed from the installed CLI's `herdr agent start --help` list and intersected with **text** `herdr integration status` entries in the observed `current (vN) (path)` format. Availability is not hardcoded: any supported current integration, including Hermes, can be offered. Outdated/not-installed entries and unsupported kinds are excluded; malformed/duplicate current entries and incompatible help/status output fail closed. No integration is installed or repaired automatically. A current integration establishes integration configuration, not a guarantee its agent executable can start.
+Pressing `h` records the selected Bead and queues discovery once. While that handoff is pending, another `h` is ignored and normal browsing remains available. The discovery response selects Codex if present, otherwise the first agent in the sorted discovery list, and immediately queues launch. Missing selection, discovery errors, and empty agent lists stop before launch. Stale or duplicate discovery responses cannot dispatch another launch. The top-right toast reports progress and a timed result; the outcome or error is also stored for the footer, where it may be truncated by terminal width. The existing tracked-worktree refresh runs after confirmed success. Rendering tests cover normal and compact toasts, and app tests cover automatic dispatch, selection capture, duplicate prevention, errors, and stale responses.
+
+Discovery is read-only. Supported kinds are parsed from the installed CLI's `herdr agent start --help` list and intersected with **text** `herdr integration status` entries in the observed `current (vN) (path)` format. Availability is not hardcoded: any supported current integration, including Hermes, can be selected when Codex is unavailable. Outdated/not-installed entries and unsupported kinds are excluded; malformed/duplicate current entries and incompatible help/status output fail closed. No integration is installed or repaired automatically. A current integration establishes integration configuration, not a guarantee its agent executable can start.
 
 Workspace selection uses `herdr worktree list --cwd CURRENT_DIRECTORY` and its JSON envelope's `result.source.source_workspace_id`, never global focus, labels, a live agent list, or inherited workspace variables. An absent/null/unsafe workspace ID fails with guidance to open the checkout in Herdr. **Launch discovery from linked checkouts is unsupported:** observed Herdr 0.9.1 responses report the main `source_checkout_path` even when `--cwd` names a linked checkout, so that field does not independently identify the linked workspace. Launch from the main checkout instead. The absolute, accessible, canonical source path must contain the current directory and have a normal `.git` directory. Any intervening `.git` boundary (including a nested linked checkout/submodule) fails before creation, without guessing another workspace. Ordinary main-checkout subdirectories remain supported. Read-only output for the main checkout returned `source_workspace_id=wY` and `source_checkout_path=/home/thomasr/Documents/dev/OnTrack`.
 
@@ -158,6 +160,12 @@ The list row's first line derives issue type from the retained `Bead.data` (`iss
 OnTrack records only worktrees created by its own confirmed Herdr handoffs; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
 from Beads: a closed or missing Bead does not remove the managed-worktree record.
+The app filters verified `CheckoutRemoved` rows from the visible worktree list
+on refresh and immediately after a successful removal action. The registry still
+retains those records, and `NeedsAttention` rows remain visible when inspection
+finds a problem after removal. Selection clamps to a remaining row or the empty
+state. Accepted handoff IDs are retained separately from visible rows so an Open
+Bead's `· sent` marker still reflects its confirmed handoff.
 The launch journal stores the authoritative Bead title and description before
 Herdr creates a worktree. The right pane prefers current text from the already
 refreshed Beads list and falls back to this registry snapshot after Bead removal

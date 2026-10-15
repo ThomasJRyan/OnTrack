@@ -67,6 +67,8 @@ pub struct App {
     pub(super) detail_seq: u64,
     pub(super) edit_seq: u64,
     pub(super) launch_seq: u64,
+    pub(super) handoff: Option<PendingHandoff>,
+    pub toast: Option<Toast>,
     pub list_rect: Rect,
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
@@ -75,6 +77,8 @@ pub struct App {
     pub settings_path: Option<PathBuf>,
     pub settings_load_error: Option<String>,
     pub worktrees: Vec<ManagedWorktree>,
+    /// Accepted handoffs include removed checkouts, which are hidden from `worktrees`.
+    pub accepted_handoffs: HashSet<String>,
     pub selected_worktree: usize,
     pub worktree_offset: usize,
     pub worktree_detail_offset: u16,
@@ -120,34 +124,42 @@ pub enum Modal {
         dropdown_open: bool,
         focus: usize,
     },
-    Launch(LaunchModal),
     ConfirmWorktree {
         id: String,
         action: u8,
     },
 }
 #[derive(Debug, Clone)]
-pub struct LaunchModal {
-    pub bead: Bead,
-    pub seq: u64,
-    pub context: Option<LaunchContext>,
-    pub selected_agent: usize,
-    pub error: Option<String>,
-    pub scroll: u16,
-    pub finished: bool,
+pub struct Toast {
+    pub message: String,
+    pub error: bool,
+    pub expires_at: Option<Instant>,
 }
-impl PartialEq for LaunchModal {
-    fn eq(&self, other: &Self) -> bool {
-        self.bead.id == other.bead.id
-            && self.seq == other.seq
-            && self.context == other.context
-            && self.selected_agent == other.selected_agent
-            && self.error == other.error
-            && self.scroll == other.scroll
-            && self.finished == other.finished
+impl Toast {
+    fn progress(message: String) -> Self {
+        Self {
+            message,
+            error: false,
+            expires_at: None,
+        }
+    }
+    fn result(message: String, error: bool) -> Self {
+        Self {
+            message,
+            error,
+            expires_at: Some(Instant::now() + Duration::from_secs(if error { 15 } else { 7 })),
+        }
+    }
+    pub fn visible(&self, now: Instant) -> bool {
+        self.expires_at.is_none_or(|expires| now < expires)
     }
 }
-impl Eq for LaunchModal {}
+#[derive(Debug, Clone)]
+pub(super) struct PendingHandoff {
+    seq: u64,
+    bead: Bead,
+    launch_queued: bool,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateForm {
     pub title: String,
@@ -334,6 +346,8 @@ impl App {
             detail_seq: 0,
             edit_seq: 0,
             launch_seq: 0,
+            handoff: None,
+            toast: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -342,6 +356,7 @@ impl App {
             settings_path,
             settings_load_error: settings_error.clone(),
             worktrees: Vec::new(),
+            accepted_handoffs: HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,
@@ -754,24 +769,64 @@ impl App {
                     }
                 }
                 Response::Discovered(seq, result) => {
-                    if let Some(Modal::Launch(modal)) = self.modal.as_mut()
-                        && modal.seq == seq
+                    if let Some(pending) = self
+                        .handoff
+                        .as_ref()
+                        .filter(|item| item.seq == seq && !item.launch_queued)
                     {
                         match result {
                             Ok(context) => {
-                                modal.selected_agent = 0;
-                                modal.error = None;
-                                modal.context = Some(context);
+                                let agent = context
+                                    .agents
+                                    .iter()
+                                    .find(|agent| agent.id == "codex")
+                                    .or_else(|| context.agents.first())
+                                    .cloned();
+                                if let Some(agent) = agent {
+                                    let bead = pending.bead.clone();
+                                    self.handoff.as_mut().unwrap().launch_queued = true;
+                                    self.toast = Some(Toast::progress(format!(
+                                        "Handing {} to {} in Herdr…",
+                                        bead.id, agent.label
+                                    )));
+                                    if self
+                                        .requests
+                                        .send(Request::Launch(seq, context, agent, bead))
+                                        .is_err()
+                                    {
+                                        self.handoff = None;
+                                        let message =
+                                            "Handoff could not be queued; try again".to_owned();
+                                        self.notice = Some(message.clone());
+                                        self.toast = Some(Toast::result(message, true));
+                                    }
+                                } else {
+                                    self.handoff = None;
+                                    let message = "No Herdr agents are available in this workspace"
+                                        .to_owned();
+                                    self.notice = Some(message.clone());
+                                    self.toast = Some(Toast::result(message, true));
+                                }
                             }
-                            Err(error) => modal.error = Some(error.to_string()),
+                            Err(error) => {
+                                self.handoff = None;
+                                let message = format!("Handoff discovery failed: {error}");
+                                self.notice = Some(message.clone());
+                                self.toast = Some(Toast::result(message, true));
+                            }
                         }
                     }
                 }
                 Response::Launched(seq, result) => {
-                    self.mutation_busy = false;
-                    if seq == self.launch_seq {
+                    if self
+                        .handoff
+                        .as_ref()
+                        .is_some_and(|item| item.seq == seq && item.launch_queued)
+                    {
+                        self.handoff = None;
                         match result {
                             Ok(outcome) => {
+                                self.toast = Some(Toast::result(outcome.message.clone(), false));
                                 self.notice = Some(outcome.message);
                                 // The launch journal is now active. Reload it even if the
                                 // initial worktree scan found no managed handoffs.
@@ -781,17 +836,11 @@ impl App {
                                     self.worktrees_discovered = false;
                                     self.worktrees_next_refresh = now;
                                 }
-                                if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
-                                    modal.finished = true;
-                                    modal.scroll = 0;
-                                }
                             }
                             Err(error) => {
-                                self.notice = Some(format!("Launch failed: {error}"));
-                                if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
-                                    modal.finished = true;
-                                    modal.scroll = 0;
-                                }
+                                let message = format!("Handoff failed: {error}");
+                                self.toast = Some(Toast::result(message.clone(), true));
+                                self.notice = Some(message);
                             }
                         }
                     }
@@ -808,13 +857,32 @@ impl App {
                                     .worktrees
                                     .get(self.selected_worktree)
                                     .map(|item| item.id.clone());
-                                self.worktrees = items;
+                                self.accepted_handoffs = items
+                                    .iter()
+                                    .filter(|item| item.handoff_accepted)
+                                    .map(|item| item.bead_id.clone())
+                                    .collect();
+                                self.worktrees = items
+                                    .into_iter()
+                                    .filter(|item| {
+                                        item.status != worktrees::WorktreeStatus::CheckoutRemoved
+                                    })
+                                    .collect();
                                 self.selected_worktree = selected_id
+                                    .as_deref()
                                     .and_then(|id| {
                                         self.worktrees.iter().position(|item| item.id == id)
                                     })
                                     .unwrap_or(self.selected_worktree)
                                     .min(self.worktrees.len().saturating_sub(1));
+                                if selected_id.as_deref()
+                                    != self
+                                        .worktrees
+                                        .get(self.selected_worktree)
+                                        .map(|item| item.id.as_str())
+                                {
+                                    self.worktree_detail_offset = 0;
+                                }
                                 self.worktrees_error = None;
                             }
                             Err(error) => self.worktrees_error = Some(error.to_string()),
@@ -842,12 +910,25 @@ impl App {
                     self.worktree_action_pending = false;
                     match result {
                         Ok(item) => {
+                            if item.handoff_accepted {
+                                self.accepted_handoffs.insert(item.bead_id.clone());
+                            }
                             if let Some(index) = self
                                 .worktrees
                                 .iter()
                                 .position(|existing| existing.id == item.id)
                             {
-                                self.worktrees[index] = item.clone();
+                                if item.status == worktrees::WorktreeStatus::CheckoutRemoved {
+                                    self.worktrees.remove(index);
+                                    self.selected_worktree = self
+                                        .selected_worktree
+                                        .min(self.worktrees.len().saturating_sub(1));
+                                    if self.selected_worktree >= index {
+                                        self.worktree_detail_offset = 0;
+                                    }
+                                } else {
+                                    self.worktrees[index] = item.clone();
+                                }
                             }
                             self.notice = Some(format!(
                                 "{} · {}",
@@ -1076,11 +1157,6 @@ impl App {
             return false;
         }
         if key.code == Esc {
-            if matches!(self.modal, Some(Modal::Launch(_))) {
-                self.launch_seq = self.launch_seq.wrapping_add(1);
-                self.modal = None;
-                return false;
-            }
             if let Some(Modal::Settings { dropdown_open, .. }) = self.modal.as_mut() {
                 if *dropdown_open {
                     *dropdown_open = false;
@@ -1172,64 +1248,6 @@ impl App {
             }
             if let Some(settings) = save_settings {
                 self.save_settings(settings);
-            }
-            return false;
-        }
-        if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
-            match key.code {
-                PageUp => modal.scroll = modal.scroll.saturating_sub(6),
-                PageDown => modal.scroll = modal.scroll.saturating_add(6),
-                Enter if modal.finished => {}
-                Up | Char('k') if modal.context.as_ref().is_some_and(|c| !c.agents.is_empty()) => {
-                    modal.selected_agent = modal.selected_agent.saturating_sub(1);
-                }
-                Down | Char('j')
-                    if modal.context.as_ref().is_some_and(|c| !c.agents.is_empty()) =>
-                {
-                    let len = modal.context.as_ref().unwrap().agents.len();
-                    modal.selected_agent = (modal.selected_agent + 1).min(len - 1);
-                }
-                Enter => {
-                    let Some(context) = modal.context.clone() else {
-                        return false;
-                    };
-                    let Some(agent) = context.agents.get(modal.selected_agent).cloned() else {
-                        self.notice = Some("No agents are available in this workspace".into());
-                        return false;
-                    };
-                    let seq = modal.seq;
-                    let bead = modal.bead.clone();
-                    self.mutation_busy = true;
-                    if self
-                        .requests
-                        .send(Request::Launch(seq, context, agent, bead))
-                        .is_err()
-                    {
-                        self.mutation_busy = false;
-                        self.notice = Some("Launch could not be queued; try again".into());
-                    }
-                }
-                Char('h') if modal.error.is_some() => {
-                    let bead = modal.bead.clone();
-                    self.launch_seq = self.launch_seq.wrapping_add(1);
-                    let seq = self.launch_seq;
-                    self.modal = Some(Modal::Launch(LaunchModal {
-                        bead,
-                        seq,
-                        context: None,
-                        selected_agent: 0,
-                        error: None,
-                        scroll: 0,
-                        finished: false,
-                    }));
-                    if self.requests.send(Request::Discover(seq)).is_err()
-                        && let Some(Modal::Launch(modal)) = self.modal.as_mut()
-                    {
-                        modal.error =
-                            Some("Workspace discovery could not be queued; try again".into());
-                    }
-                }
-                _ => {}
             }
             return false;
         }
@@ -1481,30 +1499,36 @@ impl App {
         }
     }
     fn open_launch(&mut self) {
+        if self.handoff.is_some() {
+            return;
+        }
         let Some(bead) = self
             .selected
             .and_then(|index| self.beads.get(index))
             .cloned()
         else {
-            self.notice = Some("Select a bead before handing it to an agent".into());
+            let message = "Select a bead before handing it to an agent".to_owned();
+            self.notice = Some(message.clone());
+            self.toast = Some(Toast::result(message, true));
             return;
         };
         self.launch_seq = self.launch_seq.wrapping_add(1);
         let seq = self.launch_seq;
-        self.modal = Some(Modal::Launch(LaunchModal {
-            bead,
-            seq,
-            context: None,
-            selected_agent: 0,
-            error: None,
-            scroll: 0,
-            finished: false,
-        }));
         self.notice = None;
-        if self.requests.send(Request::Discover(seq)).is_err()
-            && let Some(Modal::Launch(modal)) = self.modal.as_mut()
-        {
-            modal.error = Some("Workspace discovery could not be queued; try again".into());
+        self.toast = Some(Toast::progress(format!(
+            "Finding a Herdr agent for {}…",
+            bead.id
+        )));
+        self.handoff = Some(PendingHandoff {
+            seq,
+            bead,
+            launch_queued: false,
+        });
+        if self.requests.send(Request::Discover(seq)).is_err() {
+            self.handoff = None;
+            let message = "Workspace discovery could not be queued; try again".to_owned();
+            self.notice = Some(message.clone());
+            self.toast = Some(Toast::result(message, true));
         }
     }
     fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
@@ -1727,6 +1751,8 @@ mod tests {
             detail_seq: 0,
             edit_seq: 0,
             launch_seq: 0,
+            handoff: None,
+            toast: None,
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,
@@ -1735,6 +1761,7 @@ mod tests {
             settings_path: None,
             settings_load_error: None,
             worktrees: Vec::new(),
+            accepted_handoffs: HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,
@@ -1796,98 +1823,128 @@ mod tests {
         }
     }
     #[test]
-    fn launch_discovery_is_queued_without_launch_until_explicit_confirmation() {
+    fn handoff_discovers_and_launches_once_without_dialog_or_confirmation() {
         let (mut a, rx, tx) = connected_app();
-        a.beads[0].data["description"] = json!("Preserve full bead context for the worker");
+        a.beads[0].data["description"] = json!("Full context");
         press(&mut a, KeyCode::Char('h'));
         let seq = match rx.try_recv().unwrap() {
             Request::Discover(seq) => seq,
             _ => panic!("expected discovery"),
         };
+        assert!(a.modal.is_none());
+        assert!(a.handoff.is_some());
+        assert!(
+            a.toast
+                .as_ref()
+                .is_some_and(|toast| toast.expires_at.is_none())
+        );
+        press(&mut a, KeyCode::Char('h'));
         assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.selected, Some(1), "browsing remains available");
+        assert!(matches!(rx.try_recv(), Ok(Request::Show(..))));
         tx.send(Response::Discovered(seq, Ok(launch_context())))
             .unwrap();
         a.receive();
-        press(&mut a, KeyCode::Down);
-        assert!(rx.try_recv().is_err());
-        press(&mut a, KeyCode::Enter);
         assert!(
-            matches!(rx.try_recv(), Ok(Request::Launch(_, context, agent, bead)) if context.workspace.id == "ws" && agent.id == "opencode" && bead.id == "b0" && bead.title == "issue 0" && bead.data["description"] == "Preserve full bead context for the worker")
+            matches!(rx.try_recv(), Ok(Request::Launch(id, context, agent, bead))
+            if id == seq && context.workspace.id == "ws" && agent.id == "codex"
+                && bead.id == "b0" && bead.data["description"] == "Full context")
         );
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate discovery cannot relaunch"
+        );
+        press(&mut a, KeyCode::Char('h'));
+        assert!(rx.try_recv().is_err());
     }
     #[test]
-    fn handoff_gates_selection_and_captures_selected_bead_across_discovery() {
+    fn handoff_requires_selection_and_ignores_stale_discovery() {
         let (mut a, rx, tx) = connected_app();
         a.clear_selection();
         press(&mut a, KeyCode::Char('h'));
         assert!(rx.try_recv().is_err());
-        a.collapsed.insert("open".into());
-        a.focus_collapsed_group("open".into());
-        press(&mut a, KeyCode::Char('h'));
-        assert!(rx.try_recv().is_err());
-        assert!(a.modal.is_none());
-
-        a.collapsed.clear();
+        assert!(a.toast.as_ref().is_some_and(|toast| toast.error));
         a.select(0);
-        let _ = rx.try_recv(); // selection detail request
+        let _ = rx.try_recv();
         press(&mut a, KeyCode::Char('h'));
         let seq = match rx.try_recv().unwrap() {
             Request::Discover(seq) => seq,
             _ => unreachable!(),
         };
-        a.select(1);
-        let _ = rx.try_recv(); // changed selection detail request
+        tx.send(Response::Discovered(seq + 1, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(rx.try_recv().is_err());
+        assert!(a.handoff.is_some());
         tx.send(Response::Discovered(seq, Ok(launch_context())))
             .unwrap();
         a.receive();
-        press(&mut a, KeyCode::Enter);
-        assert!(
-            matches!(rx.try_recv(), Ok(Request::Launch(_, _, _, bead)) if bead.id == "b0" && bead.title == "issue 0")
-        );
+        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
     }
     #[test]
-    fn empty_agents_prevent_launch_and_duplicate_confirmation_is_ignored() {
+    fn handoff_uses_first_available_agent_if_codex_is_absent() {
         let (mut a, rx, tx) = connected_app();
         press(&mut a, KeyCode::Char('h'));
         let seq = match rx.try_recv().unwrap() {
             Request::Discover(seq) => seq,
             _ => unreachable!(),
         };
+        let mut context = launch_context();
+        context.agents.remove(0);
+        tx.send(Response::Discovered(seq, Ok(context))).unwrap();
+        a.receive();
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Launch(_, _, agent, _)) if agent.id == "opencode")
+        );
+    }
+    #[test]
+    fn unavailable_agents_and_discovery_failure_do_not_launch() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        let mut context = launch_context();
+        context.agents.clear();
+        tx.send(Response::Discovered(seq, Ok(context))).unwrap();
+        a.receive();
+        assert!(a.handoff.is_none());
+        assert!(a.toast.as_ref().is_some_and(|toast| toast.error));
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Char('h'));
+        let next = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
         tx.send(Response::Discovered(
-            seq,
-            Ok(LaunchContext {
-                workspace: crate::herdr::Workspace {
-                    id: "ws".into(),
-                    label: "ws".into(),
-                },
-                agents: vec![],
-            }),
+            next,
+            Err(std::io::Error::other("workspace unavailable")),
         ))
         .unwrap();
         a.receive();
-        press(&mut a, KeyCode::Enter);
-        assert!(!a.mutation_busy);
-        assert!(rx.try_recv().is_err());
-
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        press(&mut a, KeyCode::Enter);
-        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
-        press(&mut a, KeyCode::Enter);
+        assert!(a.handoff.is_none());
+        assert!(
+            a.toast
+                .as_ref()
+                .is_some_and(|toast| toast.message.contains("workspace unavailable"))
+        );
         assert!(rx.try_recv().is_err());
     }
     #[test]
-    fn disconnected_discovery_and_launch_queues_do_not_lock_the_ui() {
+    fn disconnected_handoff_queues_show_toast_and_leave_ui_available() {
         let mut a = app();
         let (requests, rx) = mpsc::channel();
         drop(rx);
         a.requests = requests;
         press(&mut a, KeyCode::Char('h'));
-        assert!(!a.mutation_busy);
-        assert!(
-            matches!(&a.modal, Some(Modal::Launch(m)) if m.error.as_deref().is_some_and(|e| e.contains("could not be queued")))
-        );
+        assert!(a.handoff.is_none());
+        assert!(a.modal.is_none());
+        assert!(a.toast.as_ref().is_some_and(|toast| toast.error));
 
         let (mut a, rx, tx) = connected_app();
         press(&mut a, KeyCode::Char('h'));
@@ -1895,74 +1952,21 @@ mod tests {
             Request::Discover(seq) => seq,
             _ => unreachable!(),
         };
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
         let (requests, receiver) = mpsc::channel();
         drop(receiver);
         a.requests = requests;
-        press(&mut a, KeyCode::Enter);
-        assert!(!a.mutation_busy);
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(a.handoff.is_none());
         assert!(
-            a.notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("Launch could not be queued"))
+            a.toast
+                .as_ref()
+                .is_some_and(|toast| toast.message.contains("could not be queued"))
         );
     }
     #[test]
-    fn launch_cancel_ignores_stale_discovery_and_busy_guard_blocks_input() {
-        let (mut a, rx, tx) = connected_app();
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        press(&mut a, KeyCode::Esc);
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        assert!(a.modal.is_none());
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        a.mutation_busy = true;
-        press(&mut a, KeyCode::Down);
-        assert!(matches!(
-            a.modal,
-            Some(Modal::Launch(LaunchModal {
-                selected_agent: 0,
-                ..
-            }))
-        ));
-        assert!(rx.try_recv().is_err());
-    }
-    #[test]
-    fn discovery_failure_is_reported_and_retryable() {
-        let (mut a, rx, tx) = connected_app();
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        tx.send(Response::Discovered(
-            seq,
-            Err(std::io::Error::other("workspace unavailable")),
-        ))
-        .unwrap();
-        a.receive();
-        assert!(
-            matches!(&a.modal, Some(Modal::Launch(m)) if m.error.as_deref() == Some("workspace unavailable"))
-        );
-        press(&mut a, KeyCode::Char('h'));
-        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
-    }
-    #[test]
-    fn completed_launch_result_scrolls_without_relaunch_and_can_be_dismissed() {
+    fn handoff_result_sets_toast_and_refreshes_tracked_worktrees() {
         let (mut a, rx, tx) = connected_app();
         press(&mut a, KeyCode::Char('h'));
         let seq = match rx.try_recv().unwrap() {
@@ -1972,43 +1976,35 @@ mod tests {
         tx.send(Response::Discovered(seq, Ok(launch_context())))
             .unwrap();
         a.receive();
-        press(&mut a, KeyCode::Enter);
         assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
-        // A snapshot that began before launch must not hide the new handoff.
         a.worktrees_inflight = true;
         tx.send(Response::Launched(
             seq,
             Ok(LaunchOutcome {
-                message: "Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0".into(),
+                message: "Prompt sent · workspace ws-new".into(),
             }),
         ))
         .unwrap();
         a.receive();
-        assert!(!a.mutation_busy);
+        assert!(a.handoff.is_none());
         assert!(a.worktrees_refresh_pending);
-        tx.send(Response::Worktrees(Ok(vec![]))).unwrap();
-        a.receive();
-        a.poll_worktrees(Instant::now());
-        assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
-        assert_eq!(
-            a.notice.as_deref(),
-            Some("Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0")
-        );
-        assert!(matches!(&a.modal, Some(Modal::Launch(m)) if m.finished));
-        press(&mut a, KeyCode::Enter);
-        assert!(
-            rx.try_recv().is_err(),
-            "Enter cannot repeat a completed launch"
-        );
-        press(&mut a, KeyCode::PageDown);
-        assert!(matches!(&a.modal, Some(Modal::Launch(m)) if m.scroll == 6));
-        press(&mut a, KeyCode::PageUp);
-        assert!(matches!(&a.modal, Some(Modal::Launch(m)) if m.scroll == 0));
-        press(&mut a, KeyCode::Esc);
         assert!(a.modal.is_none());
+        assert!(
+            a.toast
+                .as_ref()
+                .is_some_and(|toast| !toast.error && toast.expires_at.is_some())
+        );
+        assert_eq!(a.notice.as_deref(), Some("Prompt sent · workspace ws-new"));
+        tx.send(Response::Launched(seq, Err(std::io::Error::other("stale"))))
+            .unwrap();
+        a.receive();
+        assert!(
+            !a.toast.as_ref().unwrap().error,
+            "stale result cannot replace success"
+        );
     }
     #[test]
-    fn failed_launch_clears_busy_and_keeps_actionable_result_open() {
+    fn failed_handoff_shows_recovery_error_without_modal() {
         let (mut a, rx, tx) = connected_app();
         press(&mut a, KeyCode::Char('h'));
         let seq = match rx.try_recv().unwrap() {
@@ -2018,10 +2014,7 @@ mod tests {
         tx.send(Response::Discovered(seq, Ok(launch_context())))
             .unwrap();
         a.receive();
-        press(&mut a, KeyCode::Enter);
         assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
-        press(&mut a, KeyCode::Enter);
-        assert!(rx.try_recv().is_err());
         tx.send(Response::Launched(
             seq,
             Err(std::io::Error::other(
@@ -2030,12 +2023,12 @@ mod tests {
         ))
         .unwrap();
         a.receive();
-        assert!(!a.mutation_busy);
-        assert!(matches!(&a.modal, Some(Modal::Launch(modal)) if modal.finished));
+        assert!(a.handoff.is_none());
+        assert!(a.modal.is_none());
         assert!(
-            a.notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("inspect before retrying"))
+            a.toast.as_ref().is_some_and(
+                |toast| toast.error && toast.message.contains("inspect before retrying")
+            )
         );
     }
     fn respond(a: &mut App, response: Response) {
@@ -4057,6 +4050,93 @@ mod tests {
         assert_eq!(a.worktrees.len(), 1);
         assert_eq!(a.worktrees[0].id, item.id);
         assert_eq!(a.beads[0].status, "closed");
+    }
+    #[test]
+    fn removed_checkout_is_hidden_on_refresh_without_hiding_attention_or_closed_workspace() {
+        let (mut app, _, tx) = connected_app();
+        let item = |id: &str, status| ManagedWorktree {
+            id: id.into(),
+            bead_id: format!("bead-{id}"),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: format!("ontrack/{id}"),
+            target_branch: "main".into(),
+            workspace_id: format!("ws-{id}"),
+            status,
+            detail: None,
+        };
+        let removed = item("removed", worktrees::WorktreeStatus::CheckoutRemoved);
+        let closed = item("closed", worktrees::WorktreeStatus::WorkspaceClosed);
+        let attention = item("attention", worktrees::WorktreeStatus::NeedsAttention);
+        app.worktrees = vec![removed.clone(), closed.clone()];
+        app.selected_worktree = 1;
+        app.worktree_detail_offset = 7;
+        tx.send(Response::Worktrees(Ok(vec![
+            removed.clone(),
+            closed.clone(),
+            attention.clone(),
+        ])))
+        .unwrap();
+        app.receive();
+        assert_eq!(
+            app.worktrees
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["closed", "attention"]
+        );
+        assert_eq!(app.selected_worktree, 0);
+        assert_eq!(app.worktree_detail_offset, 7);
+        assert!(app.accepted_handoffs.contains(&removed.bead_id));
+
+        tx.send(Response::Worktrees(Ok(vec![
+            removed.clone(),
+            attention.clone(),
+        ])))
+        .unwrap();
+        app.receive();
+        assert_eq!(app.worktrees[0].id, attention.id);
+        assert_eq!(app.selected_worktree, 0);
+        assert_eq!(app.worktree_detail_offset, 0);
+
+        tx.send(Response::Worktrees(Ok(vec![removed]))).unwrap();
+        app.receive();
+        assert!(app.worktrees.is_empty());
+        assert_eq!(app.selected_worktree, 0);
+    }
+    #[test]
+    fn successful_checkout_removal_hides_selected_row_immediately() {
+        let (mut app, _, tx) = connected_app();
+        let item = |id: &str| ManagedWorktree {
+            id: id.into(),
+            bead_id: format!("bead-{id}"),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: format!("ontrack/{id}"),
+            target_branch: "main".into(),
+            workspace_id: format!("ws-{id}"),
+            status: worktrees::WorktreeStatus::Integrated,
+            detail: None,
+        };
+        let first = item("first");
+        let selected = item("selected");
+        let last = item("last");
+        app.worktrees = vec![first, selected.clone(), last.clone()];
+        app.selected_worktree = 1;
+        app.worktree_detail_offset = 9;
+        tx.send(Response::WorktreeChanged(Ok(ManagedWorktree {
+            status: worktrees::WorktreeStatus::CheckoutRemoved,
+            ..selected
+        })))
+        .unwrap();
+        app.receive();
+        assert_eq!(app.worktrees.len(), 2);
+        assert_eq!(app.worktrees[app.selected_worktree].id, last.id);
+        assert_eq!(app.worktree_detail_offset, 0);
+        assert!(app.accepted_handoffs.contains("bead-selected"));
+        assert!(app.notice.as_deref().unwrap().contains("CHECKOUT REMOVED"));
     }
     #[test]
     fn older_worktree_snapshot_cannot_overwrite_action_result() {
