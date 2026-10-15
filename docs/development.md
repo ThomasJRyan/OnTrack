@@ -128,7 +128,7 @@ Automatic refresh uses the same public read-only list/show commands above. Sched
 
 The background worker executes each request in channel order. It does not coalesce or reorder requests, so mutation commands cannot be lost. Responses for a show ID other than the current selection are ignored.
 
-Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Automatic updates also retain group collapse state, focus, scroll positions within current bounds, and active form input. Failed list/detail refreshes retain the last loaded data or available snapshot, display errors in the footer, and retry automatically. The presentation layer renders narrative Markdown via `tui-markdown`; all remaining fields except the top-level revision, including unknown nested values, remain represented. Rendered text drives both wrapping and scroll bounds.
+Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Automatic updates also retain group collapse state, focus, scroll positions within current bounds, and active form input. Failed list/detail refreshes retain the last loaded data or available snapshot, display errors in the footer, and retry automatically. The presentation layer renders narrative Markdown via `tui-markdown`. The selected issue's ID, status, and priority appear in the details pane border title and are omitted from its body; other fields except the top-level revision, including unknown nested values, remain represented. Rendered text drives both wrapping and scroll bounds.
 
 Keep CLI calls off the input/render loop and preserve stale-response filtering when changing the worker. The worker is not joined on quit, so terminal cleanup does not wait for a slow CLI call; in-flight commands are not cancelled on quit.
 
@@ -232,11 +232,20 @@ status renders as `READY TO MERGE` in both worktree panes. New handoff prompts
 ask agents to close the Bead only after checked and committed work; unfinished
 work must keep its Bead open or in progress.
 The display check makes read-only Beads and Herdr calls during worktree refresh;
-it does not change merge, finalization, or cleanup gates. In particular, a
-legacy launch without a recorded session cannot trigger automatic merge, even
-when the display says `READY TO MERGE`. Explicit manual merge
-confirmation remains available for `InProgress` rows and is still subject to
-the existing Git and agent checks.
+it does not change merge, finalization, or cleanup gates. A legacy launch without
+a recorded session can show `READY TO MERGE` from weaker display evidence.
+Automatic reconciliation separately requires a later native session on the same
+recorded terminal and persists it before acting. Without that evidence, automatic
+merge remains deferred. Explicit manual merge confirmation remains available
+for `InProgress` rows and is still subject to the existing Git and agent checks.
+The launch journal records `state_change_seq` and `terminal_id` from the
+pre-prompt `agent get` response even when `agent_session` has not appeared yet.
+Reconciliation can recover those observations from the retained `ready`
+response in older entries. A later native session is bound and persisted only
+after the same pane, workspace, agent kind, terminal, checkout, and post-prompt
+activity pass the settled-agent check. Subsequent merge and cleanup passes
+require that exact session. Missing or changed evidence leaves the worktree
+visible; no automatic action is dispatched.
 `inspect_for_display` only changes a `NeedsResolution` merge-request row to
 `MergeRequested` when a read-only Herdr `agent get` response reports `working`
 for the recorded pane, workspace, and agent kind, with the recorded session

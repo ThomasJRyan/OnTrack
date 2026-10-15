@@ -91,6 +91,12 @@ workspace. Closing first and enabling removal later is unsupported by the
 verified Herdr interface; OnTrack reports manual recovery guidance instead.
 Automatic operations defer when native agent evidence is missing, and untouched
 branches without task commits are never automatically cleaned up.
+Herdr may attach an agent's native session after OnTrack sends the first prompt.
+OnTrack records the initial lifecycle sequence and terminal at launch, then
+binds the later session during reconciliation when the terminal and checkout
+still match and the agent has finished. This also works for earlier handoffs
+whose launch response retained those fields. Missing or changed evidence keeps
+the worktree visible with a recovery reason instead of triggering cleanup.
 
 Each theme change is saved immediately. On success, the active appearance and
 the saved settings update together, and any startup or save error clears. On
