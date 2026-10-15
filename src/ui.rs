@@ -290,11 +290,28 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             } else {
                 Style::default().fg(ink)
             };
+            let mut depth = 0usize;
+            let mut parent = item.parent_bead_id.as_deref();
+            while let Some(id) = parent {
+                let Some(ancestor) = app
+                    .worktrees
+                    .iter()
+                    .find(|candidate| candidate.bead_id == id)
+                else {
+                    break;
+                };
+                depth += 1;
+                if depth >= 4 {
+                    break;
+                }
+                parent = ancestor.parent_bead_id.as_deref();
+            }
             rows.push(Line::from(Span::styled(
                 truncate_display(
                     &format!(
-                        "{} {} · {}",
+                        "{} {}{} · {}",
                         if selected { "›" } else { " " },
+                        "  ".repeat(depth),
                         item.bead_id,
                         crate::app::worktree_status_label(item.status)
                     ),
@@ -304,7 +321,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             )));
             rows.push(Line::from(Span::styled(
                 truncate_display(
-                    &format!("  {} → {}", item.branch, item.target_branch),
+                    &format!(
+                        "  {}{} → {}",
+                        "  ".repeat(depth),
+                        item.branch,
+                        item.target_branch
+                    ),
                     panes[0].width.saturating_sub(2) as usize,
                 ),
                 Style::default().fg(muted),
@@ -878,6 +900,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         f.render_widget(Clear, area);
         let frame = Block::default()
             .title(match modal {
+                crate::app::Modal::Create(form) if form.parent_id.is_some() => " NEW CHILD TASK ",
                 crate::app::Modal::Create(_) => " NEW BEAD ",
                 crate::app::Modal::EditLoading { .. } | crate::app::Modal::Edit { .. } => {
                     " EDIT BEAD "
@@ -1069,7 +1092,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Paragraph::new("")
                         .block(
                             Block::default()
-                                .title(" Title ")
+                                .title(match &form.parent_id {
+                                    Some(parent) => format!(" Title · child of {parent} "),
+                                    None => " Title ".to_owned(),
+                                })
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(if form.focus == 0 {
                                     teal
@@ -1425,7 +1451,14 @@ fn footer_text(state: &str, width: usize) -> String {
         format!(" {state}{actions}")
     };
     let navigation = " · ↑↓ · ←/→ · Tab panes · s settings · w worktrees";
-    if Span::raw(core.as_str()).width() + Span::raw(navigation).width() <= width {
+    let child_hint = " · N child";
+    if Span::raw(core.as_str()).width()
+        + Span::raw(navigation).width()
+        + Span::raw(child_hint).width()
+        <= width
+    {
+        format!("{core}{child_hint}{navigation}")
+    } else if Span::raw(core.as_str()).width() + Span::raw(navigation).width() <= width {
         format!("{core}{navigation}")
     } else {
         core
@@ -1763,6 +1796,45 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
     use std::sync::mpsc;
+    #[test]
+    fn tracked_child_row_is_indented_under_parent() {
+        let mut app = app();
+        app.worktrees_view = true;
+        let parent = crate::worktrees::ManagedWorktree {
+            id: "parent".into(),
+            bead_id: "parent".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/parent".into(),
+            target_branch: "trunk".into(),
+            workspace_id: "wParent".into(),
+            status: crate::worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        };
+        let child = crate::worktrees::ManagedWorktree {
+            id: "child".into(),
+            bead_id: "child".into(),
+            parent_bead_id: Some("parent".into()),
+            branch: "ontrack/child".into(),
+            target_branch: "ontrack/parent".into(),
+            ..parent.clone()
+        };
+        app.worktrees = vec![parent, child];
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..app.list_rect.width)
+                .map(|x| buffer[(app.list_rect.x + x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(app.list_rect.y + 1).contains("› parent"));
+        assert!(row(app.list_rect.y + 3).contains("    child"));
+    }
     fn app() -> App {
         let (tx, _) = mpsc::channel();
         let (_, responses) = mpsc::channel();
@@ -1913,6 +1985,7 @@ mod tests {
         a.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "demo-1".into(),
+            parent_bead_id: None,
             handoff_accepted: false,
             bead_title: None,
             bead_description: None,
@@ -2345,6 +2418,7 @@ mod tests {
             assert!(Span::raw(footer.as_str()).width() <= width);
         }
         assert!(footer_text("READY", 120).contains("Tab panes"));
+        assert!(footer_text("READY", 160).contains("N child"));
     }
     #[test]
     fn outstanding_worktrees_render_target_state_and_pending_dispatch_on_compact_terminal() {
@@ -2353,6 +2427,7 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "handoff-1".into(),
             bead_id: "closed-1".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: Some("Review handoff".into()),
             bead_description: Some("First line\nSecond line".into()),
@@ -2377,6 +2452,7 @@ mod tests {
         let first = crate::worktrees::ManagedWorktree {
             id: "handoff-1".into(),
             bead_id: "bead-1".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: Some("First task".into()),
             bead_description: Some("Line one\nLine two".into()),
@@ -2390,6 +2466,7 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "handoff-2".into(),
             bead_id: "bead-2".into(),
+            parent_bead_id: None,
             bead_title: Some("Second task".into()),
             bead_description: Some("Another description".into()),
             ..first
@@ -2417,6 +2494,7 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "legacy".into(),
             bead_id: "old-bead".into(),
+            parent_bead_id: None,
             handoff_accepted: false,
             bead_title: None,
             bead_description: None,
@@ -2447,6 +2525,7 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "handoff".into(),
             bead_id: "demo-1".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: Some("Original title".into()),
             bead_description: Some("Original description".into()),
@@ -2475,6 +2554,7 @@ mod tests {
             app.worktrees.push(crate::worktrees::ManagedWorktree {
                 id: format!("wt-{index}"),
                 bead_id: format!("bead-{index}"),
+                parent_bead_id: None,
                 handoff_accepted: true,
                 bead_title: None,
                 bead_description: None,
@@ -2503,6 +2583,7 @@ mod tests {
         state.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "wt-remove".into(),
             bead_id: "b-closed".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: None,
             bead_description: None,
