@@ -4,7 +4,7 @@ A terminal browser for Beads issues in the current workspace.
 
 - Browse open and closed Beads, with explicit create, edit, and permanent-delete actions.
 - Mark open tasks Ready in a separate OnTrack group, choose from current Herdr agent integrations when creating them, and let the in-app scheduler hand Ready tasks to available Herdr agents.
-- Press `Shift+N` on an open task to create a child task. Parent handoff waits for children, and child work integrates into the managed parent worktree.
+- Press `Shift+N` on an open task to create a child task. Child issues appear indented beneath their parent within a status pane. Parent handoff waits for children, and child work integrates into the managed parent worktree.
 - When creating an Epic, optionally generate child tasks from its Description with a Herdr agent in a separate workspace using the same checkout.
 - Two-pane browsing with scrollable, Markdown-rendered descriptions, notes, comments, relationships, and Beads details.
 - Automatic background refresh picks up external changes, with cached records and visible errors; no watcher setup required.
