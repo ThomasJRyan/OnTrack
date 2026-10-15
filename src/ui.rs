@@ -831,7 +831,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         .map(|v| crate::detail::render(v, selected_title, inner_width))
         .unwrap_or_else(|| {
             ratatui::text::Text::from(if app.beads.is_empty() {
-                "No issues found in this workspace.\n\nPress r to refresh."
+                "No issues found in this workspace.\n\nThe issue list refreshes automatically."
             } else {
                 "Select an issue to inspect its full record."
             })
@@ -1728,7 +1728,7 @@ fn footer_text(state: &str, width: usize) -> String {
     // long status/error cannot push create, delete, or handoff offscreen. At
     // narrow widths, spend the remaining cells on the start of the status and
     // mark its truncation rather than letting Ratatui clip the actions.
-    let actions = " · n new · e edit · d delete · h hand off · r refresh · q quit";
+    let actions = " · n new · e edit · d delete · h hand off · r ready · q quit";
     let state_width = width.saturating_sub(1 + Span::raw(actions).width());
     let state = truncate_display(state, state_width);
     let core = if state.is_empty() {
@@ -2797,7 +2797,7 @@ mod tests {
     fn footer_keeps_mutation_and_handoff_shortcuts_ahead_of_optional_navigation() {
         for width in [64, 90, 120] {
             let footer = footer_text("LIST ERROR · current failure", width);
-            for action in ["n new", "d delete", "h hand off", "r refresh", "q quit"] {
+            for action in ["n new", "d delete", "h hand off", "r ready", "q quit"] {
                 assert!(
                     footer.contains(action),
                     "{action} missing at width {width}: {footer}"

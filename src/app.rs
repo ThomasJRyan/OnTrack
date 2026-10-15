@@ -1317,10 +1317,7 @@ impl App {
                 self.worktrees_next_refresh = Instant::now();
                 self.poll_worktrees(Instant::now());
             }
-            KeyCode::Char('r') if k.modifiers.contains(crossterm::event::KeyModifiers::SHIFT) => {
-                self.toggle_ready()
-            }
-            KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('r' | 'R') => self.toggle_ready(),
             KeyCode::Char('s') => {
                 let load_error = self
                     .settings_load_error
@@ -1402,7 +1399,6 @@ impl App {
                 }
             }
             KeyCode::Char('h') => self.open_launch(),
-            KeyCode::Char('R') => self.toggle_ready(),
             KeyCode::Tab => self.focus_detail = !self.focus_detail,
             KeyCode::Left if !self.focus_detail => {
                 if let Some(status) = self.focused_status() {
@@ -2449,18 +2445,47 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
     #[test]
-    fn ready_toggle_uses_label_mutation_and_does_not_change_beads_status() {
+    fn ready_toggle_uses_r_in_both_panes_and_does_not_change_beads_status() {
         let mut a = app();
         a.beads[0].data["issue_type"] = json!("task");
         let (tx, rx) = mpsc::channel();
         a.requests = tx;
-        press(&mut a, KeyCode::Char('R'));
+        press(&mut a, KeyCode::Char('r'));
         assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, true)) if id == "b0"));
+        assert!(rx.try_recv().is_err());
+        assert!(!a.refresh_pending);
         assert_eq!(a.beads[0].status, "open");
         a.mutation_busy = false;
         a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.focus_detail = true;
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+        assert!(rx.try_recv().is_err());
+        assert!(!a.refresh_pending);
+        a.mutation_busy = false;
         press(&mut a, KeyCode::Char('R'));
         assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+    }
+
+    #[test]
+    fn ready_key_respects_task_and_handoff_guards() {
+        let (mut a, rx, _) = connected_app();
+        a.beads[0].data["issue_type"] = json!("epic");
+        press(&mut a, KeyCode::Char('r'));
+        assert_eq!(
+            a.notice.as_deref(),
+            Some("Only open tasks can be marked Ready")
+        );
+        assert!(rx.try_recv().is_err());
+
+        a.beads[0].data["issue_type"] = json!("task");
+        a.known_handoffs.insert("b0".into());
+        press(&mut a, KeyCode::Char('r'));
+        assert_eq!(
+            a.notice.as_deref(),
+            Some("This task already has a tracked handoff")
+        );
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]
@@ -2900,13 +2925,13 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
     #[test]
-    fn repeated_manual_refreshes_coalesce_into_one_trailing_snapshot() {
+    fn repeated_refresh_requests_coalesce_into_one_trailing_snapshot() {
         let (mut a, rx, tx) = connected_app();
         let now = Instant::now();
         a.refresh_at(now);
         assert!(matches!(rx.try_recv(), Ok(Request::List)));
         for _ in 0..20 {
-            press(&mut a, KeyCode::Char('r'));
+            a.refresh();
         }
         assert!(rx.try_recv().is_err());
         assert!(a.refresh_pending);
@@ -5065,6 +5090,15 @@ mod tests {
         assert!(!a.worktrees_loading);
         a.poll_worktrees(now + REFRESH_INTERVAL);
         assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
+    }
+
+    #[test]
+    fn worktree_view_r_still_refreshes_worktrees() {
+        let (mut a, rx, _) = connected_app();
+        a.worktrees_view = true;
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
+        assert!(rx.try_recv().is_err());
     }
     #[test]
     fn worktree_detail_scroll_is_separate_and_resets_on_selection() {
