@@ -155,6 +155,12 @@ The list row's first line derives issue type from the retained `Bead.data` (`iss
 OnTrack records only worktrees created by its own confirmed Herdr handoffs; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
 from Beads: a closed or missing Bead does not remove the managed-worktree record.
+The app filters verified `CheckoutRemoved` rows from the visible worktree list
+on refresh and immediately after a successful removal action. The registry still
+retains those records, and `NeedsAttention` rows remain visible when inspection
+finds a problem after removal. Selection clamps to a remaining row or the empty
+state. Accepted handoff IDs are retained separately from visible rows so an Open
+Bead's `· sent` marker still reflects its confirmed handoff.
 The launch journal stores the authoritative Bead title and description before
 Herdr creates a worktree. The right pane prefers current text from the already
 refreshed Beads list and falls back to this registry snapshot after Bead removal

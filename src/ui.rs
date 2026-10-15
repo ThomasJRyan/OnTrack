@@ -270,7 +270,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             rows.push(Line::from(if app.worktrees_loading {
                 "Checking tracked handoffs…"
             } else {
-                "No OnTrack-tracked handoffs."
+                "No outstanding OnTrack-tracked handoffs."
             }));
             rows.push(Line::from("Existing worktrees are not adopted."));
         }
@@ -606,9 +606,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         bead.status.as_str()
                     };
                     let handed_off = status == "open"
-                        && app.worktrees.iter().any(|worktree| {
-                            worktree.bead_id == bead.id && worktree.handoff_accepted
-                        });
+                        && (app.accepted_handoffs.contains(&bead.id)
+                            || app.worktrees.iter().any(|worktree| {
+                                worktree.bead_id == bead.id && worktree.handoff_accepted
+                            }));
                     let mut spans = vec![
                         Span::styled(
                             if selected { "› " } else { "  " },
@@ -1770,6 +1771,7 @@ mod tests {
             settings_path: None,
             settings_load_error: None,
             worktrees: Vec::new(),
+            accepted_handoffs: std::collections::HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,
@@ -1897,6 +1899,9 @@ mod tests {
         });
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));
         a.worktrees[0].handoff_accepted = true;
+        assert!(draw((80, 24), &mut a).0.contains("open · sent"));
+        a.worktrees.clear();
+        a.accepted_handoffs.insert("demo-1".into());
         assert!(draw((80, 24), &mut a).0.contains("open · sent"));
         a.beads[0].status = "in_progress".into();
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));

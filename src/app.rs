@@ -70,6 +70,8 @@ pub struct App {
     pub settings_path: Option<PathBuf>,
     pub settings_load_error: Option<String>,
     pub worktrees: Vec<ManagedWorktree>,
+    /// Accepted handoffs include removed checkouts, which are hidden from `worktrees`.
+    pub accepted_handoffs: HashSet<String>,
     pub selected_worktree: usize,
     pub worktree_offset: usize,
     pub worktree_detail_offset: u16,
@@ -289,6 +291,7 @@ impl App {
             settings_path,
             settings_load_error: settings_error.clone(),
             worktrees: Vec::new(),
+            accepted_handoffs: HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,
@@ -725,13 +728,32 @@ impl App {
                                     .worktrees
                                     .get(self.selected_worktree)
                                     .map(|item| item.id.clone());
-                                self.worktrees = items;
+                                self.accepted_handoffs = items
+                                    .iter()
+                                    .filter(|item| item.handoff_accepted)
+                                    .map(|item| item.bead_id.clone())
+                                    .collect();
+                                self.worktrees = items
+                                    .into_iter()
+                                    .filter(|item| {
+                                        item.status != worktrees::WorktreeStatus::CheckoutRemoved
+                                    })
+                                    .collect();
                                 self.selected_worktree = selected_id
+                                    .as_deref()
                                     .and_then(|id| {
                                         self.worktrees.iter().position(|item| item.id == id)
                                     })
                                     .unwrap_or(self.selected_worktree)
                                     .min(self.worktrees.len().saturating_sub(1));
+                                if selected_id.as_deref()
+                                    != self
+                                        .worktrees
+                                        .get(self.selected_worktree)
+                                        .map(|item| item.id.as_str())
+                                {
+                                    self.worktree_detail_offset = 0;
+                                }
                                 self.worktrees_error = None;
                             }
                             Err(error) => self.worktrees_error = Some(error.to_string()),
@@ -759,12 +781,25 @@ impl App {
                     self.worktree_action_pending = false;
                     match result {
                         Ok(item) => {
+                            if item.handoff_accepted {
+                                self.accepted_handoffs.insert(item.bead_id.clone());
+                            }
                             if let Some(index) = self
                                 .worktrees
                                 .iter()
                                 .position(|existing| existing.id == item.id)
                             {
-                                self.worktrees[index] = item.clone();
+                                if item.status == worktrees::WorktreeStatus::CheckoutRemoved {
+                                    self.worktrees.remove(index);
+                                    self.selected_worktree = self
+                                        .selected_worktree
+                                        .min(self.worktrees.len().saturating_sub(1));
+                                    if self.selected_worktree >= index {
+                                        self.worktree_detail_offset = 0;
+                                    }
+                                } else {
+                                    self.worktrees[index] = item.clone();
+                                }
                             }
                             self.notice = Some(format!(
                                 "{} · {}",
@@ -1609,6 +1644,7 @@ mod tests {
             settings_path: None,
             settings_load_error: None,
             worktrees: Vec::new(),
+            accepted_handoffs: HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
             worktree_detail_offset: 0,
@@ -3809,6 +3845,93 @@ mod tests {
         assert_eq!(a.worktrees.len(), 1);
         assert_eq!(a.worktrees[0].id, item.id);
         assert_eq!(a.beads[0].status, "closed");
+    }
+    #[test]
+    fn removed_checkout_is_hidden_on_refresh_without_hiding_attention_or_closed_workspace() {
+        let (mut app, _, tx) = connected_app();
+        let item = |id: &str, status| ManagedWorktree {
+            id: id.into(),
+            bead_id: format!("bead-{id}"),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: format!("ontrack/{id}"),
+            target_branch: "main".into(),
+            workspace_id: format!("ws-{id}"),
+            status,
+            detail: None,
+        };
+        let removed = item("removed", worktrees::WorktreeStatus::CheckoutRemoved);
+        let closed = item("closed", worktrees::WorktreeStatus::WorkspaceClosed);
+        let attention = item("attention", worktrees::WorktreeStatus::NeedsAttention);
+        app.worktrees = vec![removed.clone(), closed.clone()];
+        app.selected_worktree = 1;
+        app.worktree_detail_offset = 7;
+        tx.send(Response::Worktrees(Ok(vec![
+            removed.clone(),
+            closed.clone(),
+            attention.clone(),
+        ])))
+        .unwrap();
+        app.receive();
+        assert_eq!(
+            app.worktrees
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["closed", "attention"]
+        );
+        assert_eq!(app.selected_worktree, 0);
+        assert_eq!(app.worktree_detail_offset, 7);
+        assert!(app.accepted_handoffs.contains(&removed.bead_id));
+
+        tx.send(Response::Worktrees(Ok(vec![
+            removed.clone(),
+            attention.clone(),
+        ])))
+        .unwrap();
+        app.receive();
+        assert_eq!(app.worktrees[0].id, attention.id);
+        assert_eq!(app.selected_worktree, 0);
+        assert_eq!(app.worktree_detail_offset, 0);
+
+        tx.send(Response::Worktrees(Ok(vec![removed]))).unwrap();
+        app.receive();
+        assert!(app.worktrees.is_empty());
+        assert_eq!(app.selected_worktree, 0);
+    }
+    #[test]
+    fn successful_checkout_removal_hides_selected_row_immediately() {
+        let (mut app, _, tx) = connected_app();
+        let item = |id: &str| ManagedWorktree {
+            id: id.into(),
+            bead_id: format!("bead-{id}"),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: format!("ontrack/{id}"),
+            target_branch: "main".into(),
+            workspace_id: format!("ws-{id}"),
+            status: worktrees::WorktreeStatus::Integrated,
+            detail: None,
+        };
+        let first = item("first");
+        let selected = item("selected");
+        let last = item("last");
+        app.worktrees = vec![first, selected.clone(), last.clone()];
+        app.selected_worktree = 1;
+        app.worktree_detail_offset = 9;
+        tx.send(Response::WorktreeChanged(Ok(ManagedWorktree {
+            status: worktrees::WorktreeStatus::CheckoutRemoved,
+            ..selected
+        })))
+        .unwrap();
+        app.receive();
+        assert_eq!(app.worktrees.len(), 2);
+        assert_eq!(app.worktrees[app.selected_worktree].id, last.id);
+        assert_eq!(app.worktree_detail_offset, 0);
+        assert!(app.accepted_handoffs.contains("bead-selected"));
+        assert!(app.notice.as_deref().unwrap().contains("CHECKOUT REMOVED"));
     }
     #[test]
     fn older_worktree_snapshot_cannot_overwrite_action_result() {
