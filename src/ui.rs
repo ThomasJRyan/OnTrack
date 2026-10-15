@@ -826,16 +826,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     let selected = app.selected.and_then(|i| app.beads.get(i));
     let detail = app.detail.as_ref().or_else(|| selected.map(|b| &b.data));
     let inner_width = split[1].width.saturating_sub(2).max(1);
-    let selected_metadata = selected.map(|b| {
-        (
-            b.id.as_str(),
-            b.title.as_str(),
-            b.status.as_str(),
-            b.priority as i64,
-        )
-    });
+    let selected_title = selected.map(|b| b.title.as_str());
     let mut detail_text = detail
-        .map(|v| crate::detail::render(v, selected_metadata, inner_width))
+        .map(|v| crate::detail::render(v, selected_title, inner_width))
         .unwrap_or_else(|| {
             ratatui::text::Text::from(if app.beads.is_empty() {
                 "No issues found in this workspace.\n\nPress r to refresh."
@@ -879,7 +872,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .min(u16::MAX as usize) as u16,
     );
     let title = selected
-        .map(|b| format!(" {} · {} ", b.id, b.status))
+        .map(|b| format!(" {} · {} · P{} ", b.id, b.status, b.priority))
         .unwrap_or_else(|| " ISSUE DETAILS ".into());
     let block = Block::default()
         .title(title)
@@ -2212,6 +2205,10 @@ mod tests {
         let (s, _) = draw((120, 40), &mut a);
         assert!(s.contains("task     P1  closed"));
         assert!(!s.contains("demo-1  P1"));
+        assert!(s.contains(" demo-1 · closed · P1 "));
+        assert!(!s.contains("id: demo-1"));
+        assert!(!s.contains("status: closed"));
+        assert!(!s.contains("priority: P1"));
         assert!(s.contains("Title is visible"));
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal
@@ -2797,6 +2794,10 @@ mod tests {
     #[test]
     fn worktree_status_text_uses_theme_colours_in_list_and_detail() {
         use crate::worktrees::{ManagedWorktree, WorktreeStatus};
+        assert_eq!(
+            crate::app::worktree_status_label(WorktreeStatus::Unmerged),
+            "READY TO MERGE"
+        );
         let statuses = [
             WorktreeStatus::Reserved,
             WorktreeStatus::InProgress,
