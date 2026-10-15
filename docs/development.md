@@ -186,6 +186,15 @@ closure is an eligibility signal only, not evidence
 that an agent is idle or its changes safe to merge. Automatic merge may therefore
 defer; manual merge remains the user-controlled path.
 
+`inspect` in `src/worktrees.rs` remains the Git-based safety classification.
+`inspect_for_display` only changes a `NeedsResolution` merge-request row to
+`MergeRequested` when a read-only Herdr `agent get` response reports `working`
+for the recorded pane, workspace, and agent kind, with the recorded session
+matching when available. The original Git concern stays in the detail text.
+Idle, done, blocked, mismatched, malformed, and unavailable observations retain
+`NeedsResolution`. Both listing and reconciliation use this display mapping;
+finalization, action gates, and cleanup continue to use the Git classification.
+
 Manual merge provenance is persisted separately from automatic requests: optional
 agent-session metadata is not required for an explicitly confirmed manual merge,
 but current Git identity, cleanliness and ancestry checks still apply. Native
