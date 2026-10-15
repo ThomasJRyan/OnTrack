@@ -53,9 +53,70 @@ impl Theme {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DefaultAgent {
+    #[default]
+    Automatic,
+    Unassigned,
+    Kind(&'static str),
+}
+
+impl DefaultAgent {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Automatic => "automatic",
+            Self::Unassigned => "unassigned",
+            Self::Kind(kind) => kind,
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        match id {
+            "automatic" => Some(Self::Automatic),
+            "unassigned" => Some(Self::Unassigned),
+            kind => crate::beads::HARNESSES
+                .iter()
+                .find(|known| **known == kind)
+                .copied()
+                .map(Self::Kind),
+        }
+    }
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Automatic => 0,
+            Self::Unassigned => 1,
+            Self::Kind(kind) => crate::beads::HARNESSES
+                .iter()
+                .position(|known| *known == kind)
+                .map_or(0, |index| index + 2),
+        }
+    }
+
+    pub fn at(index: usize) -> Self {
+        match index {
+            0 => Self::Automatic,
+            1 => Self::Unassigned,
+            _ => crate::beads::HARNESSES
+                .get(index - 2)
+                .copied()
+                .map_or(Self::Automatic, Self::Kind),
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "Automatic",
+            Self::Unassigned => "Unassigned",
+            Self::Kind(kind) => kind,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Settings {
     pub theme: Theme,
+    pub default_agent: DefaultAgent,
     pub agent_limit: AgentLimit,
     pub auto_merge: bool,
     pub auto_merge_children: bool,
@@ -67,6 +128,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: Theme::default(),
+            default_agent: DefaultAgent::default(),
             agent_limit: AgentLimit::default(),
             auto_merge: false,
             auto_merge_children: true,
@@ -161,6 +223,12 @@ pub fn load_from(path: &Path) -> io::Result<Settings> {
             .ok_or_else(|| invalid(&format!("unknown theme id '{theme}'")))?,
         Some(_) => return Err(invalid("theme must be a supported string ID")),
     };
+    let default_agent = match object.get("default_agent") {
+        None => DefaultAgent::default(),
+        Some(serde_json::Value::String(id)) => DefaultAgent::from_id(id)
+            .ok_or_else(|| invalid(&format!("unknown default agent id '{id}'")))?,
+        Some(_) => return Err(invalid("default_agent must be a supported string ID")),
+    };
     let boolean = |key: &str, default: bool| -> io::Result<bool> {
         match object.get(key) {
             None => Ok(default),
@@ -185,6 +253,7 @@ pub fn load_from(path: &Path) -> io::Result<Settings> {
     };
     Ok(Settings {
         theme,
+        default_agent,
         agent_limit,
         auto_merge: boolean("auto_merge", false)?,
         auto_merge_children: boolean("auto_merge_children", true)?,
@@ -209,12 +278,13 @@ pub fn save_to(path: &Path, settings: &Settings) -> io::Result<()> {
 
     let (temporary_path, mut file) = create_temporary_file(parent)?;
     let theme = settings.theme.id();
+    let default_agent = settings.default_agent.id();
     let agent_limit = match settings.agent_limit {
         AgentLimit::Unlimited => "\"unlimited\"".to_owned(),
         AgentLimit::Limited(count) => count.to_string(),
     };
     let result = (|| {
-        writeln!(file, "{{\"theme\":\"{theme}\",\"agent_limit\":{agent_limit},\"auto_merge\":{},\"auto_merge_children\":{},\"auto_close_workspace\":{},\"auto_remove_checkout\":{}}}", settings.auto_merge, settings.auto_merge_children, settings.auto_close_workspace, settings.auto_remove_checkout)
+        writeln!(file, "{{\"theme\":\"{theme}\",\"default_agent\":\"{default_agent}\",\"agent_limit\":{agent_limit},\"auto_merge\":{},\"auto_merge_children\":{},\"auto_close_workspace\":{},\"auto_remove_checkout\":{}}}", settings.auto_merge, settings.auto_merge_children, settings.auto_close_workspace, settings.auto_remove_checkout)
             .and_then(|()| file.sync_all())
             .map_err(|error| io_error("write", &temporary_path, error))?;
         drop(file);
@@ -367,6 +437,7 @@ mod tests {
         assert!(load_from(&directory.path()).unwrap().auto_merge_children);
         let settings = Settings {
             theme: Theme::Nord,
+            default_agent: DefaultAgent::Kind("codex"),
             agent_limit: AgentLimit::Unlimited,
             auto_merge: true,
             auto_merge_children: false,
@@ -375,6 +446,38 @@ mod tests {
         };
         save_to(&directory.path(), &settings).unwrap();
         assert_eq!(load_from(&directory.path()).unwrap(), settings);
+    }
+
+    #[test]
+    fn default_agent_roundtrips_and_rejects_unknown_ids() {
+        let directory = TestDirectory::new();
+        for agent in [
+            DefaultAgent::Automatic,
+            DefaultAgent::Unassigned,
+            DefaultAgent::Kind("hermes"),
+        ] {
+            let settings = Settings {
+                default_agent: agent,
+                ..Settings::default()
+            };
+            save_to(&directory.path(), &settings).unwrap();
+            assert_eq!(load_from(&directory.path()).unwrap(), settings);
+        }
+        for contents in [
+            r#"{"default_agent":"unknown"}"#,
+            r#"{"default_agent":null}"#,
+        ] {
+            directory.write(contents);
+            assert_eq!(
+                load_from(&directory.path()).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
+        directory.write(r#"{"theme":"light"}"#);
+        assert_eq!(
+            load_from(&directory.path()).unwrap().default_agent,
+            DefaultAgent::Automatic
+        );
     }
 
     #[test]

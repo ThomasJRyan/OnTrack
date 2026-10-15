@@ -35,6 +35,7 @@ pub enum WorktreeStatus {
     Reserved,
     InProgress,
     Unmerged,
+    MergeQueued,
     MergeRequested,
     NeedsResolution,
     Integrated,
@@ -884,6 +885,18 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
     if checkout_dirty {
         return view(entry, DirtyCheckout, Some(DIRTY_CHECKOUT_DETAIL.into()));
     }
+    if entry["merge_queue"].is_object() {
+        return view(
+            entry,
+            MergeQueued,
+            Some(
+                entry["detail"]
+                    .as_str()
+                    .unwrap_or("Merge queued; waiting for the active integration to finish.")
+                    .to_owned(),
+            ),
+        );
+    }
     view(entry, Unmerged, entry["detail"].as_str().map(str::to_owned))
 }
 
@@ -1333,6 +1346,169 @@ fn request_merge(
     registry.save()
 }
 
+/// Queue order is stored with each handoff under the repository-wide registry lock.
+/// Retaining order on dispatched requests keeps later enqueues monotonic.
+fn queue_merge(
+    registry: &mut Registry,
+    index: usize,
+    executor: &mut impl Executor,
+    automatic: bool,
+) -> io::Result<()> {
+    if registry.entries[index]["merge_queue"].is_object() {
+        return Ok(());
+    }
+    if registry.entries[index]["merge_request"].is_object() {
+        return Err(error(
+            "Merge already requested; inspect the active agent before retrying",
+        ));
+    }
+    children_ready(registry, index, executor)?;
+    let entry = &registry.entries[index];
+    if entry["phase"] != "active"
+        || entry["workspace_closed"] == true
+        || entry["checkout_removed"] == true
+    {
+        return Err(error("Cannot queue an incomplete/closed handoff"));
+    }
+    let verified = verify(&registry.repo, entry)?;
+    task_commits(&registry.repo, entry, &verified.source_tip)?;
+    let order = registry
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            entry["merge_queue"]["order"]
+                .as_u64()
+                .or_else(|| entry["merge_request"]["queue_order"].as_u64())
+        })
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| error("Merge queue order exhausted"))?;
+    registry.entries[index]["merge_queue"] = json!({
+        "order": order,
+        "provenance": if automatic { "automatic" } else { "manual" },
+    });
+    registry.entries[index]["detail"] = Value::Null;
+    registry.save()
+}
+
+fn active_merge(registry: &mut Registry, executor: &mut impl Executor) -> io::Result<bool> {
+    for index in 0..registry.entries.len() {
+        let entry = &registry.entries[index];
+        if !entry["merge_request"].is_object() || entry["merge_request"]["queue_released"] == true {
+            continue;
+        }
+        match inspect(&registry.repo, entry).status {
+            WorktreeStatus::WorkspaceClosed | WorktreeStatus::CheckoutRemoved => {}
+            WorktreeStatus::Integrated => {
+                // Git may have been integrated externally while the prompted
+                // agent is still working, or after an uncertain prompt. Keep
+                // its slot until prompt acceptance and agent settlement are
+                // both known.
+                if !merge_prompt_confirmed(entry) {
+                    return Ok(true);
+                }
+                if settled(
+                    executor,
+                    entry,
+                    entry["merge_request"]["provenance"] != "manual",
+                )
+                .is_err()
+                {
+                    return Ok(true);
+                }
+            }
+            _ => return Ok(true),
+        }
+        // Once released, a later agent exit cannot hold unrelated requests.
+        registry.entries[index]["merge_request"]["queue_released"] = json!(true);
+        registry.save()?;
+    }
+    Ok(false)
+}
+
+fn merge_prompt_confirmed(entry: &Value) -> bool {
+    entry["merge_response"]
+        .as_str()
+        .and_then(|raw| envelope(raw.as_bytes()).ok())
+        .is_some_and(|result| {
+            result["type"] == "agent_prompted"
+                && result["agent"]["pane_id"] == entry["pane_id"]
+                && result["agent"]["workspace_id"] == entry["workspace_id"]
+        })
+}
+
+fn dispatch_next_merge(registry: &mut Registry, executor: &mut impl Executor) -> io::Result<()> {
+    if !registry
+        .entries
+        .iter()
+        .any(|entry| entry["merge_queue"].is_object())
+    {
+        return Ok(());
+    }
+    if active_merge(registry, executor)? {
+        return Ok(());
+    }
+    loop {
+        let Some((index, _)) = registry
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                entry["merge_queue"]["order"]
+                    .as_u64()
+                    .map(|order| (index, order))
+            })
+            .min_by_key(|(_, order)| *order)
+        else {
+            return Ok(());
+        };
+        if registry.entries[index]["merge_queue"]["blocked"] == true {
+            return Ok(());
+        }
+        if matches!(
+            inspect(&registry.repo, &registry.entries[index]).status,
+            WorktreeStatus::Integrated
+                | WorktreeStatus::WorkspaceClosed
+                | WorktreeStatus::CheckoutRemoved
+        ) {
+            registry.entries[index]["merge_queue"] = Value::Null;
+            registry.entries[index]["detail"] = Value::Null;
+            registry.save()?;
+            continue;
+        }
+        let automatic = registry.entries[index]["merge_queue"]["provenance"] == "automatic";
+        let order = registry.entries[index]["merge_queue"]["order"].clone();
+        let result = (|| {
+            if automatic {
+                let entry = &registry.entries[index];
+                let bead = executor.show_bead(field(entry, "bead_id")?)?;
+                if bead["id"] != entry["bead_id"] || bead["status"] != "closed" {
+                    return Err(error("Queued automatic merge deferred: Bead is not closed"));
+                }
+            }
+            request_merge(registry, index, executor, automatic)
+        })();
+        if registry.entries[index]["merge_request"].is_object() {
+            registry.entries[index]["merge_request"]["queue_order"] = order;
+            registry.entries[index]["merge_queue"] = Value::Null;
+            registry.save()?;
+        } else if result.is_ok() {
+            // Git may have integrated the branch between queue inspection and
+            // dispatch; no prompt is needed for that completed request.
+            registry.entries[index]["merge_queue"] = Value::Null;
+            registry.entries[index]["detail"] = Value::Null;
+            registry.save()?;
+        } else if let Err(error) = &result {
+            registry.entries[index]["merge_queue"]["blocked"] = json!(true);
+            registry.entries[index]["detail"] =
+                json!(format!("Queued merge needs review before retry: {error}"));
+            registry.save()?;
+        }
+        return result;
+    }
+}
+
 fn finalize(registry: &mut Registry, index: usize, executor: &mut impl Executor) -> io::Result<()> {
     children_ready(registry, index, executor)?;
     let entry = &registry.entries[index];
@@ -1684,7 +1860,23 @@ fn act_with(
     let mut registry = Registry::open(cwd)?;
     let index = registry.index(id)?;
     let result = match action {
-        Action::RequestMerge => request_merge(&mut registry, index, executor, false),
+        Action::RequestMerge => {
+            if registry.entries[index]["merge_request"].is_object() {
+                // An explicit retry of the active request may be needed after
+                // the target advances. It retains the active queue slot.
+                request_merge(&mut registry, index, executor, false)
+            } else {
+                if registry.entries[index]["merge_queue"].is_object() {
+                    registry.entries[index]["merge_queue"]["blocked"] = Value::Null;
+                    registry.entries[index]["merge_queue"]["provenance"] = json!("manual");
+                    registry.entries[index]["detail"] = Value::Null;
+                    registry.save()?;
+                } else {
+                    queue_merge(&mut registry, index, executor, false)?;
+                }
+                dispatch_next_merge(&mut registry, executor)
+            }
+        }
         _ => cleanup(&mut registry, index, action, executor),
     };
     if let Err(e) = result {
@@ -1769,8 +1961,11 @@ fn reconcile_with(
             let agent = settled(executor, entry, true)?;
             bind_late_session(&mut registry, index, &agent)?;
             if status == WorktreeStatus::Unmerged {
-                if auto_merge && registry.entries[index]["merge_request"].is_null() {
-                    request_merge(&mut registry, index, executor, true)?;
+                if auto_merge
+                    && registry.entries[index]["merge_request"].is_null()
+                    && registry.entries[index]["merge_queue"].is_null()
+                {
+                    queue_merge(&mut registry, index, executor, true)?;
                 }
             } else if policy.auto_remove_checkout {
                 // Removal closes the workspace too. Never close first when both enabled.
@@ -1784,6 +1979,11 @@ fn reconcile_with(
             registry.entries[index]["detail"] = json!(e.to_string());
             registry.save()?;
         }
+    }
+    if let Err(e) = dispatch_next_merge(&mut registry, executor) {
+        // The queued entry carries the recovery detail. A later explicit
+        // request can unblock it after the underlying condition is fixed.
+        let _ = e;
     }
     Ok(registry
         .entries
@@ -1803,6 +2003,170 @@ mod tests {
 
     const ID: &str = "ot-test";
     const BRANCH: &str = "ontrack/ot-test";
+
+    #[test]
+    fn manual_merges_wait_in_durable_order_and_dispatch_after_integration() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        fixture.request();
+
+        let mut no_prompt = Fake::default();
+        let queued = act_with(
+            &fixture.main,
+            "ot-second",
+            Action::RequestMerge,
+            &mut no_prompt,
+        )
+        .unwrap();
+        assert_eq!(queued.status, WorktreeStatus::MergeQueued);
+        assert!(no_prompt.calls.is_empty());
+        // Reopening the registry models an OnTrack restart.
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[1]["merge_queue"]["order"], 2);
+        assert_eq!(registry.entries[0]["merge_request"]["queue_order"], 1);
+        drop(registry);
+
+        let mut next = Fake::default();
+        next.json(fixture.agent(14, "done"));
+        next.json(fixture.agent(14, "done"));
+        next.json(fixture.second_agent(&second, 12, "done"));
+        next.json(json!({"result":{"type":"agent_prompted", "agent":{
+            "pane_id":"wSecond:p1", "workspace_id":"wSecond"}}}));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut next).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::Integrated);
+        assert_eq!(rows[1].status, WorktreeStatus::MergeRequested);
+        let prompts: Vec<_> = next
+            .calls
+            .iter()
+            .filter(|args| args.get(1).is_some_and(|s| s == "prompt"))
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0][2], "wSecond:p1");
+        let current_target = tip(&fixture.main, "HEAD").unwrap();
+        assert!(prompts[0][3].contains(&current_target));
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["merge_request"]["queue_released"], true);
+    }
+
+    #[test]
+    fn automatic_reconciliation_queues_multiple_ready_merges_but_prompts_one() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        let mut executor = Fake::default();
+        executor.json(fixture.agent(12, "done"));
+        executor.json(fixture.second_agent(&second, 12, "done"));
+        executor.json(fixture.agent(12, "done"));
+        executor.json(fixture.prompt_result());
+        let rows = reconcile_with(
+            &fixture.main,
+            CleanupPolicy {
+                auto_merge: true,
+                ..CleanupPolicy::default()
+            },
+            &mut executor,
+        )
+        .unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
+        assert_eq!(rows[1].status, WorktreeStatus::MergeQueued);
+        assert_eq!(
+            executor
+                .calls
+                .iter()
+                .filter(|args| args.get(1).is_some_and(|s| s == "prompt"))
+                .count(),
+            1
+        );
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            registry.entries[1]["merge_queue"]["provenance"],
+            "automatic"
+        );
+    }
+
+    #[test]
+    fn unresolved_active_merge_holds_later_queue_without_reprompting() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        fixture.request();
+        act_with(
+            &fixture.main,
+            "ot-second",
+            Action::RequestMerge,
+            &mut Fake::default(),
+        )
+        .unwrap();
+        Fixture::commit_at(&fixture.main, "target-change", "advanced\n");
+        let mut executor = Fake::default();
+        executor.json(fixture.agent(13, "working"));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
+        assert_eq!(rows[1].status, WorktreeStatus::MergeQueued);
+        assert!(
+            !executor
+                .calls
+                .iter()
+                .any(|args| args.get(1).is_some_and(|s| s == "prompt"))
+        );
+    }
+
+    #[test]
+    fn externally_integrated_branch_waits_for_prompted_agent_to_settle() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        fixture.request();
+        act_with(
+            &fixture.main,
+            "ot-second",
+            Action::RequestMerge,
+            &mut Fake::default(),
+        )
+        .unwrap();
+        git(&fixture.main, &["merge", "--ff-only", BRANCH]).unwrap();
+        let mut working = Fake::default();
+        working.json(fixture.agent(13, "working"));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut working).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::Integrated);
+        assert_eq!(rows[1].status, WorktreeStatus::MergeQueued);
+        assert!(
+            !working
+                .calls
+                .iter()
+                .any(|args| args.get(1).is_some_and(|s| s == "prompt"))
+        );
+    }
+
+    #[test]
+    fn uncertain_prompt_holds_queue_even_if_git_was_integrated_externally() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        let mut uncertain = Fake::default();
+        uncertain.json(fixture.agent(12, "idle"));
+        uncertain.outputs.push_back(Err(error("prompt timed out")));
+        assert!(act_with(&fixture.main, ID, Action::RequestMerge, &mut uncertain).is_err());
+        git(&fixture.main, &["merge", "--ff-only", BRANCH]).unwrap();
+        let queued = act_with(
+            &fixture.main,
+            "ot-second",
+            Action::RequestMerge,
+            &mut Fake::default(),
+        )
+        .unwrap();
+        assert_eq!(queued.status, WorktreeStatus::MergeQueued);
+        let mut no_prompt = Fake::default();
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut no_prompt).unwrap();
+        assert_eq!(rows[1].status, WorktreeStatus::MergeQueued);
+        assert!(no_prompt.calls.is_empty());
+    }
 
     #[test]
     fn child_handoff_targets_parent_checkout_and_never_default_branch() {
@@ -2059,6 +2423,51 @@ mod tests {
             journal.phase("active").unwrap();
             drop(journal);
             fixture
+        }
+
+        fn second_managed(&self) -> PathBuf {
+            let source = self.directory.join("second");
+            let mut journal = LaunchJournal::begin(
+                &self.main,
+                &json!({"id":"Bead-2", "title":"Second task"}),
+                "ontrack/ot-second",
+                "opencode",
+                "ot-second",
+                "wMain",
+            )
+            .unwrap();
+            git(
+                &self.main,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "ontrack/ot-second",
+                    source.to_str().unwrap(),
+                ],
+            )
+            .unwrap();
+            let created = json!({"workspace":{"workspace_id":"wSecond"}, "root_pane":{"pane_id":"wSecond:p1"}, "worktree":{"path":source,"branch":"ontrack/ot-second"}});
+            journal.created(&created).unwrap();
+            journal
+                .capture(
+                    "ready",
+                    self.second_agent(&source, 10, "idle")
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+            journal.phase("active").unwrap();
+            source
+        }
+
+        fn second_agent(&self, source: &Path, seq: u64, state: &str) -> Value {
+            json!({"result":{"type":"agent_info", "agent":{
+                "pane_id":"wSecond:p1", "workspace_id":"wSecond", "agent":"opencode",
+                "agent_status":state, "cwd":source, "foreground_cwd":source,
+                "agent_session":{"agent":"opencode", "kind":"id", "source":"herdr:opencode", "value":"session-2"},
+                "state_change_seq":seq
+            }}})
         }
 
         fn agent(&self, seq: u64, state: &str) -> Value {

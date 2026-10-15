@@ -194,11 +194,13 @@ fn worktree_status_style(theme: Theme, status: crate::worktrees::WorktreeStatus)
 }
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
-        "↑ / ↓ move · ← / → change choice · Enter / Space save · Tab moves · Esc close"
-    } else if (2..=5).contains(&focus) {
+        "↑ / ↓ move · ← / → choice · Enter / Space select · Tab moves · Esc close"
+    } else if focus == 7 {
+        "↑ / ↓ move · Enter / Space close · Tab moves · Esc close"
+    } else if focus >= 3 {
         "↑ / ↓ move · Enter / Space toggle · Tab moves · Esc close"
     } else {
-        "↑ / ↓ move · ← / → change choice · Enter / Space open · Tab moves"
+        "↑ / ↓ move · ← / → choice · Enter / Space open · Tab moves"
     }
 }
 fn settings_columns(width: usize) -> (usize, usize) {
@@ -235,7 +237,7 @@ const MAX_VISIBLE_THEMES: usize = 6;
 fn visible_theme_window(theme: Theme, available_height: u16) -> (usize, usize) {
     let total = crate::theme::CATALOG.len();
     let visible = usize::from(available_height)
-        .saturating_sub(21)
+        .saturating_sub(22)
         .clamp(1, MAX_VISIBLE_THEMES.min(total));
     let selected = Theme::ALL
         .iter()
@@ -246,9 +248,21 @@ fn visible_theme_window(theme: Theme, available_height: u16) -> (usize, usize) {
         .min(total.saturating_sub(visible));
     (start, visible)
 }
+fn visible_agent_window(
+    agent: crate::settings::DefaultAgent,
+    available_height: u16,
+) -> (usize, usize) {
+    let total = crate::beads::HARNESSES.len() + 2;
+    let visible = usize::from(available_height).saturating_sub(23).clamp(1, 6);
+    let start = agent
+        .index()
+        .saturating_sub(visible.saturating_sub(1))
+        .min(total - visible);
+    (start, visible)
+}
 fn visible_limit_window(limit: crate::settings::AgentLimit, available_height: u16) -> (u64, usize) {
     let visible = usize::from(available_height)
-        .saturating_sub(22)
+        .saturating_sub(23)
         .clamp(1, MAX_VISIBLE_THEMES);
     let selected = match limit {
         crate::settings::AgentLimit::Unlimited => 0,
@@ -976,16 +990,25 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     width.saturating_sub(4) as usize,
                 )
                 .len();
-                let option_lines = if *dropdown_open && *focus == 0 {
-                    let (start, count) = visible_theme_window(draft.theme, a.height);
-                    count
-                        + usize::from(start > 0)
-                        + usize::from(start + count < crate::theme::CATALOG.len())
-                } else if *dropdown_open && *focus == 1 {
-                    let (start, count) = visible_limit_window(draft.agent_limit, a.height);
-                    count
-                        + usize::from(start > 0)
-                        + usize::from(start + count as u64 <= u32::MAX as u64)
+                let option_lines = if *dropdown_open {
+                    if *focus == 0 {
+                        let (start, count) = visible_theme_window(draft.theme, a.height);
+                        count
+                            + usize::from(start > 0)
+                            + usize::from(start + count < crate::theme::CATALOG.len())
+                    } else if *focus == 1 {
+                        let (start, count) = visible_agent_window(draft.default_agent, a.height);
+                        count
+                            + usize::from(start > 0)
+                            + usize::from(start + count < crate::beads::HARNESSES.len() + 2)
+                    } else if *focus == 2 {
+                        let (start, count) = visible_limit_window(draft.agent_limit, a.height);
+                        count
+                            + usize::from(start > 0)
+                            + usize::from(start + count as u64 <= u32::MAX as u64)
+                    } else {
+                        0
+                    }
                 } else {
                     0
                 };
@@ -1095,8 +1118,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 let value_style = Style::default().fg(teal).add_modifier(Modifier::BOLD);
                 let row_width = inner.width as usize;
                 let mut lines = vec![
-                    Line::from("Tracked worktree cleanup preferences").alignment(Alignment::Center),
-                    Line::from(""),
+                    Line::from("Application preferences").alignment(Alignment::Center),
                     settings_row(
                         "Theme",
                         &format!("{} ▾", draft.theme.label()),
@@ -1150,8 +1172,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     }
                 }
                 lines.push(settings_row(
-                    "Agent limit",
-                    &format!("{} ▾", draft.agent_limit.label()),
+                    "Default agent for new tasks",
+                    &format!("{} ▾", draft.default_agent.label()),
                     row_width,
                     if *focus == 1 {
                         value_style
@@ -1165,6 +1187,57 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     },
                 ));
                 if *dropdown_open && *focus == 1 {
+                    let (start, count) = visible_agent_window(draft.default_agent, a.height);
+                    if start > 0 {
+                        lines.push(settings_row(
+                            "",
+                            "↑ earlier agents",
+                            row_width,
+                            Style::default(),
+                            Style::default().fg(muted),
+                        ));
+                    }
+                    for index in start..start + count {
+                        let agent = crate::settings::DefaultAgent::at(index);
+                        let selected = draft.default_agent == agent;
+                        lines.push(settings_row(
+                            "",
+                            &format!("{} {}", if selected { "›" } else { " " }, agent.label()),
+                            row_width,
+                            Style::default(),
+                            if selected {
+                                selected_style
+                            } else {
+                                Style::default().fg(ink)
+                            },
+                        ));
+                    }
+                    if start + count < crate::beads::HARNESSES.len() + 2 {
+                        lines.push(settings_row(
+                            "",
+                            "↓ later agents",
+                            row_width,
+                            Style::default(),
+                            Style::default().fg(muted),
+                        ));
+                    }
+                }
+                lines.push(settings_row(
+                    "Agent limit",
+                    &format!("{} ▾", draft.agent_limit.label()),
+                    row_width,
+                    if *focus == 2 {
+                        value_style
+                    } else {
+                        Style::default().fg(ink)
+                    },
+                    if *focus == 2 {
+                        selected_style
+                    } else {
+                        value_style
+                    },
+                ));
+                if *dropdown_open && *focus == 2 {
                     let (start, count) = visible_limit_window(draft.agent_limit, a.height);
                     if start > 0 {
                         lines.push(settings_row(
@@ -1222,7 +1295,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .into_iter()
                 .enumerate()
                 {
-                    let focused = *focus == index + 2;
+                    let focused = *focus == index + 3;
                     lines.push(settings_row(
                         label,
                         if enabled { "[x]" } else { "[ ]" },
@@ -1250,7 +1323,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 lines.push(
                     Line::from(Span::styled(
                         "[ Close ]",
-                        if *focus == 6 {
+                        if *focus == 7 {
                             selected_style
                         } else {
                             value_style
@@ -2985,6 +3058,7 @@ mod tests {
             WorktreeStatus::Reserved,
             WorktreeStatus::InProgress,
             WorktreeStatus::Unmerged,
+            WorktreeStatus::MergeQueued,
             WorktreeStatus::MergeRequested,
             WorktreeStatus::NeedsResolution,
             WorktreeStatus::Integrated,
@@ -3300,9 +3374,9 @@ mod tests {
         assert!(text.contains("settings.json"));
         assert!(text.contains("Permission") && text.contains("denied"));
         assert!(text.contains("try again"));
-        assert!(text.contains("← / → change choice"));
+        assert!(text.contains("← / → choice"));
         assert!(text.contains("Dark"));
-        assert!(text.contains("Enter / Space save"));
+        assert!(text.contains("Enter / Space select"));
         assert!(text.contains("Esc") && text.contains("close"));
         assert!(a.modal_ready);
         assert_eq!(buffer[(0, 3)].bg, Color::Rgb(246, 248, 247));
@@ -3404,6 +3478,24 @@ mod tests {
         assert!(compact.contains("Theme"));
         assert!(compact.contains("Remove checkout + clo…"));
         assert!(compact.contains("[ ]"));
+    }
+    #[test]
+    fn settings_agent_picker_shows_saved_choice_and_scrolls_to_later_kinds() {
+        let mut a = app();
+        a.modal = Some(crate::app::Modal::Settings {
+            draft: crate::settings::Settings {
+                default_agent: crate::settings::DefaultAgent::Kind("hermes"),
+                ..Default::default()
+            },
+            error: None,
+            dropdown_open: true,
+            focus: 1,
+        });
+        let screen = draw((80, 24), &mut a).0;
+        assert!(screen.contains("Default agent for new tasks"));
+        assert!(screen.contains("› hermes"));
+        assert!(screen.contains("↑ earlier agents"));
+        assert!(screen.contains("↓ later agents"));
     }
     #[test]
     fn light_create_type_dropdown_uses_catalog_selection_colors() {
@@ -3573,7 +3665,7 @@ mod tests {
             draft: crate::settings::Settings::default(),
             error: None,
             dropdown_open: true,
-            focus: 1,
+            focus: 2,
         });
         let screen = draw((80, 30), &mut app).0;
         let labels = ["› 5", "  Unlimited", "  1", "  2", "  3", "  4"];
@@ -3590,7 +3682,7 @@ mod tests {
             },
             error: None,
             dropdown_open: true,
-            focus: 1,
+            focus: 2,
         });
         let later = draw((80, 24), &mut app).0;
         assert!(later.contains("› 12"));

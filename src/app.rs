@@ -5,7 +5,7 @@ use crate::{
     beads::{self, Bead, CreateBead, UpdateBead},
     event,
     hotkeys::{self, Help},
-    settings::{self, Settings, Theme},
+    settings::{self, DefaultAgent, Settings, Theme},
     ui,
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
@@ -225,20 +225,32 @@ impl Default for CreateForm {
 }
 
 impl CreateForm {
-    fn set_harnesses(&mut self, harnesses: Vec<String>) {
+    fn set_harnesses(&mut self, harnesses: Vec<String>, preferred: DefaultAgent) {
         self.harnesses = harnesses;
-        self.harness = self
-            .harnesses
+        self.harness = match preferred {
+            DefaultAgent::Unassigned => 0,
+            DefaultAgent::Kind(kind) => self
+                .harnesses
+                .iter()
+                .position(|available| available == kind)
+                .map(|index| index + 1)
+                .unwrap_or_else(|| self.automatic_harness()),
+            DefaultAgent::Automatic => self.automatic_harness(),
+        };
+        self.harness_loading = false;
+        self.harness_error = None;
+        self.dropdown = None;
+        self.dropdown_original = None;
+    }
+
+    fn automatic_harness(&self) -> usize {
+        self.harnesses
             .iter()
             .position(|kind| kind == "codex")
             .map_or_else(
                 || usize::from(!self.harnesses.is_empty()),
                 |index| index + 1,
-            );
-        self.harness_loading = false;
-        self.harness_error = None;
-        self.dropdown = None;
-        self.dropdown_original = None;
+            )
     }
 }
 
@@ -1021,9 +1033,11 @@ impl App {
                         && form.harness_seq == seq
                     {
                         match result {
-                            Ok(harnesses) => form.set_harnesses(harnesses),
+                            Ok(harnesses) => {
+                                form.set_harnesses(harnesses, self.settings.default_agent)
+                            }
                             Err(error) => {
-                                form.set_harnesses(Vec::new());
+                                form.set_harnesses(Vec::new(), self.settings.default_agent);
                                 form.harness_error =
                                     Some(format!("Herdr integration discovery failed: {error}"));
                             }
@@ -1510,6 +1524,7 @@ impl App {
                 item.status,
                 worktrees::WorktreeStatus::InProgress
                     | worktrees::WorktreeStatus::Unmerged
+                    | worktrees::WorktreeStatus::MergeQueued
                     | worktrees::WorktreeStatus::NeedsResolution
             )
         {
@@ -1597,10 +1612,10 @@ impl App {
                 match key.code {
                     Tab | BackTab => {
                         *dropdown_open = false;
-                        *focus = (*focus + if key.code == Tab { 1 } else { 6 }) % 7;
+                        *focus = (*focus + if key.code == Tab { 1 } else { 7 }) % 8;
                     }
                     Up | Down => {
-                        *focus = (*focus + if key.code == Down { 1 } else { 6 }) % 7;
+                        *focus = (*focus + if key.code == Down { 1 } else { 7 }) % 8;
                         *dropdown_open = false;
                     }
                     Left | Right if *focus == 0 => {
@@ -1608,26 +1623,33 @@ impl App {
                         save_settings = Some(*draft);
                     }
                     Left | Right if *focus == 1 => {
+                        let count = beads::HARNESSES.len() + 2;
+                        let index =
+                            cycle_choice(draft.default_agent.index(), count, key.code == Right);
+                        draft.default_agent = DefaultAgent::at(index);
+                        save_settings = Some(*draft);
+                    }
+                    Left | Right if *focus == 2 => {
                         draft.agent_limit = draft.agent_limit.step(key.code == Right);
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus <= 1 && *dropdown_open => {
+                    Enter | Char(' ') if *focus <= 2 && *dropdown_open => {
                         *dropdown_open = false;
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus <= 1 => {
+                    Enter | Char(' ') if *focus <= 2 => {
                         *dropdown_open = true;
                     }
-                    Enter | Char(' ') if (2..=5).contains(focus) => {
+                    Enter | Char(' ') if (3..=6).contains(focus) => {
                         match *focus {
-                            2 => draft.auto_merge = !draft.auto_merge,
-                            3 => draft.auto_merge_children = !draft.auto_merge_children,
-                            4 => draft.auto_close_workspace = !draft.auto_close_workspace,
+                            3 => draft.auto_merge = !draft.auto_merge,
+                            4 => draft.auto_merge_children = !draft.auto_merge_children,
+                            5 => draft.auto_close_workspace = !draft.auto_close_workspace,
                             _ => draft.auto_remove_checkout = !draft.auto_remove_checkout,
                         }
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus == 6 => {
+                    Enter | Char(' ') if *focus == 7 => {
                         self.modal = None;
                     }
                     _ => {}
@@ -2107,6 +2129,7 @@ pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'stat
         Reserved => "PREPARED",
         InProgress => "IN PROGRESS",
         Unmerged => "READY TO MERGE",
+        MergeQueued => "MERGE QUEUED",
         MergeRequested => "MERGE PENDING",
         NeedsResolution => "NEEDS RESOLUTION",
         Integrated => "INTEGRATED",
@@ -3182,6 +3205,75 @@ mod tests {
         );
     }
     #[test]
+    fn saved_default_agent_applies_to_new_and_child_forms_with_safe_fallback() {
+        let (mut a, rx, tx) = connected_app();
+        a.beads[0].data["issue_type"] = serde_json::json!("task");
+        a.settings.default_agent = DefaultAgent::Kind("hermes");
+        press(&mut a, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&rx);
+        tx.send(Response::HarnessesDiscovered(
+            seq,
+            Ok(vec!["codex".into(), "hermes".into()]),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(&a.modal, Some(Modal::Create(form)) if form.harness == 2));
+        press(&mut a, KeyCode::Esc);
+
+        a.settings.default_agent = DefaultAgent::Unassigned;
+        press(&mut a, KeyCode::Char('N'));
+        let seq = take_harness_discovery(&rx);
+        tx.send(Response::HarnessesDiscovered(seq, Ok(vec!["codex".into()])))
+            .unwrap();
+        a.receive();
+        assert!(
+            matches!(&a.modal, Some(Modal::Create(form)) if form.parent_id.is_some() && form.harness == 0)
+        );
+        press(&mut a, KeyCode::Esc);
+
+        a.settings.default_agent = DefaultAgent::Kind("hermes");
+        press(&mut a, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&rx);
+        tx.send(Response::HarnessesDiscovered(seq, Ok(vec!["codex".into()])))
+            .unwrap();
+        a.receive();
+        assert!(matches!(&a.modal, Some(Modal::Create(form)) if form.harness == 1));
+        assert_eq!(a.settings.default_agent, DefaultAgent::Kind("hermes"));
+
+        let existing = serde_json::json!({
+            "title": "Existing task",
+            "issue_type": "task",
+            "priority": 2,
+            "labels": ["ontrack:agent:codex"]
+        });
+        let edit = edit_form(&existing).unwrap();
+        assert_eq!(edit.harnesses[edit.harness - 1], "codex");
+    }
+
+    #[test]
+    fn settings_agent_choice_saves_and_reloads() {
+        let (mut a, _, _) = connected_app();
+        let dir =
+            std::env::temp_dir().join(format!("ontrack-agent-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        a.settings_path = Some(path.clone());
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.settings.default_agent, DefaultAgent::Unassigned);
+        assert_eq!(
+            settings::load_from(&path).unwrap().default_agent,
+            DefaultAgent::Unassigned
+        );
+        press(&mut a, KeyCode::Right);
+        assert_eq!(
+            a.settings.default_agent,
+            DefaultAgent::Kind(beads::HARNESSES[0])
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
     fn startup_and_interval_polling_wait_for_completion_without_queue_growth() {
         let (mut a, rx, tx) = connected_app();
         a.beads.clear();
@@ -3725,7 +3817,7 @@ mod tests {
             "reopening does not change the saved theme"
         );
         assert!(matches!(a.modal, Some(Modal::Settings { .. })));
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut a, KeyCode::Tab);
         }
         press(&mut a, KeyCode::Enter);
@@ -3777,19 +3869,20 @@ mod tests {
         a.settings_path = Some(path.clone());
         press(&mut a, KeyCode::Char('s'));
         press(&mut a, KeyCode::Up);
-        assert!(matches!(a.modal, Some(Modal::Settings { focus: 6, .. })));
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 7, .. })));
         press(&mut a, KeyCode::Down);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 0, .. })));
         press(&mut a, KeyCode::Down);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 1, .. })));
         press(&mut a, KeyCode::Down);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 2, .. })));
+        press(&mut a, KeyCode::Down);
         press(&mut a, KeyCode::Enter);
         assert_eq!(a.theme, Theme::Dark);
         assert!(a.settings.auto_merge);
         assert!(settings::load_from(&path).unwrap().auto_merge);
         press(&mut a, KeyCode::Down);
-        assert!(matches!(a.modal, Some(Modal::Settings { focus: 3, .. })));
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 4, .. })));
         press(&mut a, KeyCode::Enter);
         assert!(!a.settings.auto_merge_children);
         assert!(!settings::load_from(&path).unwrap().auto_merge_children);
@@ -3815,7 +3908,8 @@ mod tests {
         a.settings_path = Some(path.clone());
         press(&mut a, KeyCode::Char('s'));
         press(&mut a, KeyCode::Tab);
-        assert!(matches!(a.modal, Some(Modal::Settings { focus: 1, .. })));
+        press(&mut a, KeyCode::Tab);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 2, .. })));
         for expected in [4, 3, 2, 1] {
             press(&mut a, KeyCode::Left);
             assert_eq!(

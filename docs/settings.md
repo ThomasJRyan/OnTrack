@@ -1,9 +1,8 @@
 # Settings
 
-OnTrack stores the theme, agent limit, and cleanup preferences globally for
-your Linux user, not in the workspace or Beads database. OnTrack Dark is the
-default theme. Twelve built-in themes
-are available:
+OnTrack stores theme, default-agent, agent-limit, and cleanup preferences
+globally for your Linux user, not in the workspace or Beads database. OnTrack
+Dark is the default theme. Twelve built-in themes are available:
 
 | Stable ID | Display name | Style |
 | --- | --- | --- |
@@ -56,7 +55,7 @@ The OnTrack-specific role mapping and contrast choices are maintained in
 The file is a JSON object:
 
 ```json
-{"theme":"dark","agent_limit":5,"auto_merge":false,"auto_merge_children":true,"auto_close_workspace":false,"auto_remove_checkout":false}
+{"theme":"dark","default_agent":"automatic","agent_limit":5,"auto_merge":false,"auto_merge_children":true,"auto_close_workspace":false,"auto_remove_checkout":false}
 ```
 
 `theme` accepts one of the stable IDs above; existing `"dark"` and `"light"`
@@ -70,20 +69,31 @@ Unknown additional keys
 are accepted for future expansion. Invalid JSON,
 non-object JSON, unknown themes, and non-string theme values are errors.
 
+`default_agent` accepts `automatic`, `unassigned`, or a supported agent kind such
+as `codex` or `hermes`. Existing files without this field use `automatic`.
+Settings lists the supported kinds; the new-task form checks current Herdr
+integrations when it opens. `automatic` selects Codex when available, otherwise
+the first available integration. A saved kind that is not currently available
+uses that same fallback in the form while retaining the saved preference.
+`unassigned` starts new Tasks without a selected agent. New child Tasks use the
+same preference. The form choice can always be changed; editing an existing
+Bead keeps its stored agent choice.
+
 ## Changing settings
 
-Press `s` to open Settings. `Up` / `Down` moves among Theme, Agent limit,
-top-level merge, child merge, workspace close, checkout removal, and Close.
+Press `s` to open Settings. `Up` / `Down` moves among Theme, Default agent for
+new tasks, Agent limit, top-level merge, child merge, workspace close, checkout
+removal, and Close.
 The dialog places setting titles in a wider, left-aligned column and centers
-theme, agent limit, and cleanup controls in the right column. The choice lists open beneath
+theme, agent, limit, and cleanup controls in the right column. The choice lists open beneath
 its value; on narrow supported terminals, long titles and values may be
 shortened with an ellipsis.
 
-`Left` / `Right` cycles themes
-with wraparound and immediately saves the new choice, whether the list is open
-or closed. The bounded list scrolls to keep the current choice visible. `Enter`
-or `Space` opens the list; while it is open, either key saves the selected theme
-again and closes the list, which also lets you retry a failed save. `Esc` closes
+`Left` / `Right` cycles theme or default-agent choices with wraparound and
+immediately saves the new choice, whether the list is open
+or closed. The bounded lists scroll to keep the current choice visible. `Enter`
+or `Space` opens the focused list; while it is open, either key saves the selected
+choice again and closes the list, which also lets you retry a failed save. `Esc` closes
 an open list without reverting a successful change; `Esc` again closes Settings.
 `Enter` / `Space` toggles a cleanup preference. Every change saves all settings
 together. The removal preference is labeled “Remove checkout + close Herdr workspace”;
@@ -123,7 +133,7 @@ still match and the agent has finished. This also works for earlier handoffs
 whose launch response retained those fields. Missing or changed evidence keeps
 the worktree visible with a recovery reason instead of triggering cleanup.
 
-Each settings change is saved immediately. On success, the active appearance and
+Each setting change is saved immediately. On success, the active appearance and
 the saved settings update together, and any startup or save error clears. On
 failure, the active theme and saved file stay at their last successful values;
 the dialog keeps the attempted choice and shows an error so you can retry it by
@@ -151,9 +161,10 @@ the containing directory is not explicitly synchronized.
 
 ## Developer interface
 
-`src/settings.rs` exposes `Theme`, `AgentLimit`, `Settings` (theme, a five-agent
-default limit, a true-by-default child merge preference, and three false-by-default
-worktree preferences), `config_path()`, `load_from(path)`,
+`src/settings.rs` exposes `Theme`, `DefaultAgent`, `AgentLimit`, `Settings`
+(theme, default agent, five-agent default limit, a true-by-default child merge
+preference, and three false-by-default worktree preferences), `config_path()`,
+`load_from(path)`,
 and `save_to(path, settings)`. The filesystem functions return `io::Result`;
 invalid settings contents use `io::ErrorKind::InvalidData` with the file path and
 reason. Loading never writes. Saving serializes the current supported fields

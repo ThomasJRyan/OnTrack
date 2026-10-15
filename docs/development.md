@@ -6,10 +6,10 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Defines the terminal type, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
-| `src/settings.rs` | Loads and atomically saves theme, agent limit, and worktree-cleanup preferences under the user's XDG config directory. |
+| `src/main.rs` | Defines the terminal type, ensures Beads is initialized, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
+| `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
-| `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
+| `src/beads.rs` | Initializes missing workspaces, builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/herdr.rs` | Discovers usable agent integrations, maps the current checkout to a Herdr workspace, focuses a selected managed workspace, and explicitly creates a worktree and starts/prompts an agent. |
 | `src/worktrees.rs` | Journals OnTrack-created handoffs separately from Beads and verifies Git/Herdr evidence before merge finalization or cleanup. |
 | `src/app.rs` | Holds selection, focus, scrolling, modal form and handoff toast state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
@@ -33,13 +33,15 @@ The create/edit Description field uses `description_layout` to insert visual lin
 
 The hotkey reference is a separate `App::help` overlay, not a modal replacement. `App::key` handles its toggle and scroll keys before dispatching to the underlying pane or dialog; the mutation lock still takes precedence. `hotkeys::Context` captures the current pane or dialog when opened and owns its key/action list. Add new keyboard commands to the matching context when changing input handling. `ui::render_help` wraps the right column, clamps scrolling to the rendered lines, and renders over either browser view. Enhanced keyboard reports distinguish `Ctrl+?` or `Ctrl+Shift+/`; legacy terminals may report it as plain Backspace, which must remain text deletion/navigation rather than opening help.
 
-The `s` settings dialog saves each theme, agent-limit, or cleanup-preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes the focused choice, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
+The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, default agent, or agent limit, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. The default-agent setting uses stable supported kind IDs; `automatic` preserves the old Codex/first-available form behavior, `unassigned` selects no harness, and an unavailable preferred kind falls back only for the current form. Agent limit controls automatic Ready-task scheduling. See the [settings guide](settings.md) for details.
 Settings rows in `src/ui.rs` share a two-thirds title column and one-third
 value column. `settings_row` aligns titles to the left and centers controls
 by terminal cell width; keep dropdown entries on the same value boundary and
 retain the existing compact-terminal fallback when changing this layout.
 
 ## Beads CLI contract
+
+Before terminal initialization, `beads::ensure_workspace` runs `bd --no-color init --init-if-missing --non-interactive --skip-agents --skip-hooks --quiet` in the launch directory. Beads creates a local workspace only when none is discoverable, including from an ancestor directory. A failed command stops startup before raw mode and alternate-screen setup; its error includes the launch directory and the CLI failure. The skip flags preserve tracked agent instructions and avoid installing hooks on application launch. Tests exercise first startup, repeated startup, inherited workspaces, and command failure.
 
 ### Ready and agent harness labels
 
@@ -131,6 +133,8 @@ Focused tests (`cargo test herdr::tests`) inject command execution, Bead retriev
 
 Worktree registry tests create exclusive temporary fixture directories and keep each registry lock inside its fixture. These test paths do not change the production rule that Herdr launch discovery starts from the main checkout.
 
+Merge requests use the repository-wide registry lock and persist `merge_queue` order and provenance on each handoff. Manual requests and automatic reconciliation both enqueue; reconciliation dispatches at most one prompt when no unresolved `merge_request` remains. A queued request is revalidated at dispatch against current Git and agent state, with a fresh closed-Bead check for automatic requests. Failed pre-prompt dispatch is marked for explicit retry; possibly sent prompts retain the existing durable request marker and block later prompts. Verified integration and a settled prompted agent release the slot on the next reconciliation. External Git clients do not share this queue, so Git checks and ff-only integration remain required.
+
 ## Background work and cached state
 
 `App` uses standard-library channels and one background thread for blocking CLI calls. The UI loop receives available responses, draws, and polls input with a short timeout rather than waiting for subprocess completion.
@@ -218,7 +222,7 @@ versions may omit these optional fields; the view then shows a fallback. The
 pane wraps multiline descriptions and keeps its own bounded scroll position,
 reset when the selected worktree changes.
 
-For a parent with open or unintegrated children, the first confirmed `h` action creates and verifies a managed parent checkout, then persists journal phase `reserved` without starting an agent. The parent stays in the tracked-worktrees view. A child launch requires one open managed parent checkout, records its parent Bead ID, target branch, and canonical target checkout path, and passes `--base PARENT_BRANCH` to Herdr worktree creation. If the child closes and integrates, a later `h` on the parent reuses the exact reserved workspace and root pane to start its agent; no second worktree is created. The registry rejects duplicate active handoffs for the same Bead. Reconciliation selects `auto_merge_children` for entries with `parent_bead_id` and `auto_merge` for top-level entries; the former defaults true, the latter false, including when a field is absent from an older settings file. Both call the same guarded `request_merge` path. The merge path verifies the recorded source and target identities, cleanliness, branch names, and Git tips before sending a resolution prompt or fast-forwarding the target checkout. Parent merge requests and finalization recheck live open descendants and pending child integrations. Child entries are sorted below their parent for display and indented; selection remains keyed by the worktree ID. A parent checkout cannot be closed or removed while tracked child checkouts still exist.
+For a parent with open or unintegrated children, the first confirmed `h` action creates and verifies a managed parent checkout, then persists journal phase `reserved` without starting an agent. The parent stays in the tracked-worktrees view. A child launch requires one open managed parent checkout, records its parent Bead ID, target branch, and canonical target checkout path, and passes `--base PARENT_BRANCH` to Herdr worktree creation. If the child closes and integrates, a later `h` on the parent reuses the exact reserved workspace and root pane to start its agent; no second worktree is created. The registry rejects duplicate active handoffs for the same Bead. Reconciliation selects `auto_merge_children` for entries with `parent_bead_id` and `auto_merge` for top-level entries; the former defaults true, the latter false, including when a field is absent from an older settings file. Both use the same durable `queue_merge` path and guarded dispatch. The merge path verifies the recorded source and target identities, cleanliness, branch names, and Git tips before sending a resolution prompt or fast-forwarding the target checkout. Parent merge requests and finalization recheck live open descendants and pending child integrations. Child entries are sorted below their parent for display and indented; selection remains keyed by the worktree ID. A parent checkout cannot be closed or removed while tracked child checkouts still exist.
 The verified repository target branch is shown to the user. A merge request is
 pending work, not a completed merge; Git ancestry/cleanliness checks decide
 integration. Conflicts and uncertain outcomes remain inspectable for manual
