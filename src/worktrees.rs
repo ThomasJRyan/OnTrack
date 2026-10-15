@@ -466,12 +466,13 @@ impl LaunchJournal {
     pub(crate) fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()> {
         let entry = &mut self.registry.entries[self.index];
         entry["responses"][kind] = json!(String::from_utf8_lossy(bytes));
-        if let Ok(result) = envelope(bytes)
-            && result["agent"]["agent_session"].is_object()
-        {
-            entry["agent_session"] = result["agent"]["agent_session"].clone();
+        if let Ok(result) = envelope(bytes) {
             if kind == "ready" {
                 entry["initial_lifecycle_seq"] = result["agent"]["state_change_seq"].clone();
+                entry["initial_terminal_id"] = result["agent"]["terminal_id"].clone();
+            }
+            if result["agent"]["agent_session"].is_object() {
+                entry["agent_session"] = result["agent"]["agent_session"].clone();
             }
         }
         self.registry.save()
@@ -1013,6 +1014,31 @@ pub fn pending_child_handoffs(parent_id: &str) -> io::Result<Vec<String>> {
 
 /// Native lifecycle evidence is mandatory for automatic operations. It is not a
 /// completion claim: Git ancestry/cleanliness and a fresh closed Bead are separate gates.
+fn initial_agent_evidence(entry: &Value) -> io::Result<(u64, Option<String>)> {
+    // Older handoffs kept the raw readiness response but failed to copy these
+    // fields when Herdr had not yet attached the native session.
+    let ready = entry["responses"]["ready"]
+        .as_str()
+        .and_then(|raw| envelope(raw.as_bytes()).ok())
+        .filter(|result| {
+            result["type"] == "agent_info"
+                && result["agent"]["pane_id"] == entry["pane_id"]
+                && result["agent"]["workspace_id"] == entry["workspace_id"]
+                && result["agent"]["agent"] == entry["agent"]
+        });
+    let before = entry["initial_lifecycle_seq"]
+        .as_u64()
+        .or_else(|| ready.as_ref()?.pointer("/agent/state_change_seq")?.as_u64())
+        .ok_or_else(|| {
+            error("Automatic action deferred: no recorded native pre-prompt lifecycle sequence")
+        })?;
+    let terminal = entry["initial_terminal_id"]
+        .as_str()
+        .or_else(|| ready.as_ref()?.pointer("/agent/terminal_id")?.as_str())
+        .map(str::to_owned);
+    Ok((before, terminal))
+}
+
 fn settled(
     executor: &mut impl Executor,
     entry: &Value,
@@ -1041,14 +1067,24 @@ fn settled(
             return Err(error("Agent session changed; automation/merge deferred"));
         }
     } else if require_session {
-        return Err(error(
-            "Automatic action deferred: launch response did not record a native Herdr agent_session; idle alone cannot prove the original agent completed",
-        ));
+        let (_, terminal) = initial_agent_evidence(entry)?;
+        let terminal = terminal.ok_or_else(|| {
+            error("Automatic action deferred: no recorded launch terminal identity for late agent session")
+        })?;
+        if agent["terminal_id"] != terminal
+            || !agent["agent_session"].is_object()
+            || agent["agent_session"]["agent"] != entry["agent"]
+            || agent["agent_session"]["value"]
+                .as_str()
+                .is_none_or(str::is_empty)
+        {
+            return Err(error(
+                "Automatic action deferred: native agent session or terminal identity is unavailable or changed",
+            ));
+        }
     }
     if require_session {
-        let before = entry["initial_lifecycle_seq"].as_u64().ok_or_else(|| {
-            error("Automatic action deferred: no recorded native pre-prompt lifecycle sequence")
-        })?;
+        let (before, _) = initial_agent_evidence(entry)?;
         if agent["state_change_seq"]
             .as_u64()
             .is_none_or(|now| now <= before)
@@ -1093,6 +1129,17 @@ fn settled(
         }
     }
     Ok(agent.clone())
+}
+
+fn bind_late_session(registry: &mut Registry, index: usize, agent: &Value) -> io::Result<()> {
+    if registry.entries[index]["agent_session"].is_null() {
+        let (before, terminal) = initial_agent_evidence(&registry.entries[index])?;
+        registry.entries[index]["agent_session"] = agent["agent_session"].clone();
+        registry.entries[index]["initial_lifecycle_seq"] = json!(before);
+        registry.entries[index]["initial_terminal_id"] = json!(terminal);
+        registry.save()?;
+    }
+    Ok(())
 }
 
 fn request_merge(
@@ -1142,6 +1189,9 @@ fn request_merge(
         verified.target_tip,
         verified.target.display()
     );
+    if automatic {
+        bind_late_session(registry, index, &ready)?;
+    }
     registry.entries[index]["merge_request"] = json!({"source_tip":verified.source_tip, "target_tip":verified.target_tip, "possibly_sent":true, "provenance":if automatic {"automatic"} else {"manual"}, "lifecycle_seq":ready["state_change_seq"], "agent_session":ready["agent_session"]});
     registry.entries[index]["detail"] =
         json!("Merge prompt possibly sent; inspect agent before recovery, never blindly resend.");
@@ -1590,9 +1640,10 @@ fn reconcile_with(
             }
             // Only open workspaces reach this gate. A closed workspace has no
             // documented Herdr removal path and must not query a departed agent.
-            settled(executor, entry, true)?;
+            let agent = settled(executor, entry, true)?;
+            bind_late_session(&mut registry, index, &agent)?;
             if status == WorktreeStatus::Unmerged {
-                if policy.auto_merge && entry["merge_request"].is_null() {
+                if policy.auto_merge && registry.entries[index]["merge_request"].is_null() {
                     request_merge(&mut registry, index, executor, true)?;
                 }
             } else if policy.auto_remove_checkout {
@@ -1891,6 +1942,26 @@ mod tests {
                 "agent_session":{"agent":"opencode", "kind":"id", "source":"herdr:opencode", "value":"session-1"},
                 "state_change_seq":seq
             }}})
+        }
+
+        fn late_session_agent(&self, seq: u64, state: &str) -> Value {
+            let mut agent = self.agent(seq, state);
+            agent["result"]["agent"]["terminal_id"] = json!("term-task");
+            agent
+        }
+
+        fn simulate_legacy_late_session(&self) {
+            let mut registry = Registry::open(&self.main).unwrap();
+            let mut ready = self.late_session_agent(10, "idle");
+            ready["result"]["agent"]
+                .as_object_mut()
+                .unwrap()
+                .remove("agent_session");
+            registry.entries[0]["responses"]["ready"] = json!(ready.to_string());
+            registry.entries[0]["agent_session"] = Value::Null;
+            registry.entries[0]["initial_lifecycle_seq"] = Value::Null;
+            registry.entries[0]["initial_terminal_id"] = Value::Null;
+            registry.save().unwrap();
         }
 
         fn prompt_result(&self) -> Value {
@@ -2768,6 +2839,156 @@ mod tests {
             WorktreeStatus::Integrated
         );
         assert!(executor.calls.is_empty());
+    }
+
+    #[test]
+    fn readiness_without_native_session_still_records_initial_lifecycle_and_terminal() {
+        let fixture = Fixture::new();
+        let mut journal =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        let mut ready = fixture.late_session_agent(10, "idle");
+        ready["result"]["agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_session");
+        journal
+            .capture("ready", ready.to_string().as_bytes())
+            .unwrap();
+        assert_eq!(journal.registry.entries[0]["initial_lifecycle_seq"], 10);
+        assert_eq!(
+            journal.registry.entries[0]["initial_terminal_id"],
+            "term-task"
+        );
+        assert!(journal.registry.entries[0]["agent_session"].is_null());
+    }
+
+    #[test]
+    fn late_native_session_recovers_legacy_handoff_and_completes_automatic_lifecycle() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implemented\n");
+        fixture.simulate_legacy_late_session();
+        let policy = CleanupPolicy {
+            auto_merge: true,
+            auto_close_workspace: true,
+            auto_remove_checkout: true,
+        };
+        let mut request = Fake::default();
+        request.json(fixture.late_session_agent(12, "done"));
+        request.json(fixture.late_session_agent(12, "done"));
+        request.json(fixture.prompt_result());
+        assert_eq!(
+            reconcile_with(&fixture.main, policy, &mut request).unwrap()[0].status,
+            WorktreeStatus::MergeRequested
+        );
+        assert_eq!(
+            request
+                .calls
+                .iter()
+                .filter(|args| args.starts_with(&["agent".into(), "prompt".into()]))
+                .count(),
+            1
+        );
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["initial_lifecycle_seq"], 10);
+        assert_eq!(registry.entries[0]["initial_terminal_id"], "term-task");
+        assert_eq!(registry.entries[0]["agent_session"]["value"], "session-1");
+        drop(registry);
+
+        let main = fixture.main.clone();
+        let source = fixture.source.clone();
+        let mut finish = Fake {
+            hook: Some(Box::new(move |args| {
+                if args.starts_with(&["worktree", "remove"]) {
+                    git(&main, &["worktree", "remove", source.to_str().unwrap()]).unwrap();
+                }
+            })),
+            ..Fake::default()
+        };
+        finish.json(fixture.late_session_agent(14, "done"));
+        finish.json(fixture.late_session_agent(14, "done"));
+        finish.json(fixture.inventory(true, true));
+        finish.json(json!({"result":{"type":"worktree_removed"}}));
+        finish.json(fixture.inventory(false, false));
+        assert_eq!(
+            reconcile_with(&fixture.main, policy, &mut finish).unwrap()[0].status,
+            WorktreeStatus::CheckoutRemoved
+        );
+        assert!(!fixture.source.exists());
+        assert!(
+            finish
+                .calls
+                .iter()
+                .any(|args| { args == &["worktree", "remove", "--workspace", "wTask"] })
+        );
+    }
+
+    #[test]
+    fn late_native_session_on_changed_terminal_never_triggers_automatic_cleanup() {
+        let fixture = Fixture::managed();
+        fixture.integrated();
+        fixture.simulate_legacy_late_session();
+        let mut agent = fixture.late_session_agent(12, "done");
+        agent["result"]["agent"]["terminal_id"] = json!("term-replaced");
+        let mut executor = Fake::default();
+        executor.json(agent);
+        let rows = reconcile_with(
+            &fixture.main,
+            CleanupPolicy {
+                auto_merge: true,
+                auto_close_workspace: true,
+                auto_remove_checkout: true,
+            },
+            &mut executor,
+        )
+        .unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::Integrated);
+        assert!(
+            rows[0]
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("terminal identity")
+        );
+        assert_eq!(executor.calls.len(), 2);
+        assert!(fixture.source.exists());
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert!(registry.entries[0]["agent_session"].is_null());
+    }
+
+    #[test]
+    fn late_native_session_closes_integrated_workspace_when_only_close_is_enabled() {
+        let fixture = Fixture::managed();
+        fixture.integrated();
+        fixture.simulate_legacy_late_session();
+        let mut executor = Fake::default();
+        executor.json(fixture.late_session_agent(12, "done"));
+        executor.json(fixture.inventory(true, true));
+        executor.json(json!({"result":{"type":"workspace_closed"}}));
+        executor.json(fixture.inventory(false, true));
+        let rows = reconcile_with(
+            &fixture.main,
+            CleanupPolicy {
+                auto_close_workspace: true,
+                ..CleanupPolicy::default()
+            },
+            &mut executor,
+        )
+        .unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::WorkspaceClosed);
+        assert!(fixture.source.exists());
+        assert!(
+            executor
+                .calls
+                .iter()
+                .any(|args| { args == &["workspace", "close", "wTask"] })
+        );
+        assert!(
+            !executor
+                .calls
+                .iter()
+                .any(|args| args.starts_with(&["worktree".into(), "remove".into()]))
+        );
     }
 
     #[test]

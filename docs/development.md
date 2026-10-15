@@ -230,6 +230,14 @@ The display check makes read-only Beads and Herdr calls during worktree refresh;
 it does not change merge, finalization, or cleanup gates. Explicit manual merge
 confirmation remains available for `InProgress` rows and is still subject to
 the existing Git and agent checks.
+The launch journal records `state_change_seq` and `terminal_id` from the
+pre-prompt `agent get` response even when `agent_session` has not appeared yet.
+Reconciliation can recover those observations from the retained `ready`
+response in older entries. A later native session is bound and persisted only
+after the same pane, workspace, agent kind, terminal, checkout, and post-prompt
+activity pass the settled-agent check. Subsequent merge and cleanup passes
+require that exact session. Missing or changed evidence leaves the worktree
+visible; no automatic action is dispatched.
 `inspect_for_display` only changes a `NeedsResolution` merge-request row to
 `MergeRequested` when a read-only Herdr `agent get` response reports `working`
 for the recorded pane, workspace, and agent kind, with the recorded session
