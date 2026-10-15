@@ -82,11 +82,13 @@ fn themed_type_color(kind: &str, theme: Theme) -> Color {
 fn themed_priority_color(priority: u64, theme: Theme) -> Color {
     crate::theme::priority_color(theme, priority)
 }
-fn settings_hint(dropdown_open: bool) -> &'static str {
+fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
-        "← / → or ↑ / ↓ cycle · Enter keep · Esc revert · Tab actions"
+        "↑ / ↓ settings · ← / → change + save · Enter save · Tab Close · Esc back"
+    } else if focus == 1 {
+        "Shift+Tab Theme · Enter / Space Close · Esc close"
     } else {
-        "Tab / Shift+Tab focus · arrows cycle · Enter / Space open · Esc cancel"
+        "↑ / ↓ settings · ← / → change + save · Enter / Space options · Tab Close"
     }
 }
 const MAX_VISIBLE_THEMES: usize = 6;
@@ -502,14 +504,14 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 error,
                 dropdown_open,
                 draft,
-                ..
+                focus,
             } => {
                 let error_lines = error
                     .as_deref()
                     .map(|message| wrap_words(message, width.saturating_sub(4) as usize).len())
                     .unwrap_or(0);
                 let hint_lines = wrap_words(
-                    settings_hint(*dropdown_open),
+                    settings_hint(*dropdown_open, *focus),
                     width.saturating_sub(4) as usize,
                 )
                 .len();
@@ -544,10 +546,15 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         if a.width < min_width || a.height < height {
             app.modal_ready = false;
             f.render_widget(Clear, a);
-            let prompt = if a.width < min_width {
-                format!("Expand terminal width to {min_width} columns · Esc cancels")
+            let escape_hint = if matches!(modal, crate::app::Modal::Settings { .. }) {
+                "Esc closes"
             } else {
-                format!("Expand terminal height to {height} rows · Esc cancels")
+                "Esc cancels"
+            };
+            let prompt = if a.width < min_width {
+                format!("Expand terminal width to {min_width} columns · {escape_hint}")
+            } else {
+                format!("Expand terminal height to {height} rows · {escape_hint}")
             };
             f.render_widget(
                 Paragraph::new(prompt)
@@ -587,10 +594,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 error,
                 dropdown_open,
                 focus,
-                ..
             } => {
                 let mut lines = vec![
-                    Line::from("Choose the workspace appearance"),
+                    Line::from("Theme changes save immediately"),
                     Line::from(""),
                     Line::from(Span::styled(
                         format!("Theme  [ {}  ▾ ]", draft.label()),
@@ -632,31 +638,17 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     }
                 }
                 lines.push(Line::from(""));
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "[ Save ]",
-                        if *focus == 1 {
-                            Style::default()
-                                .fg(palette.selected_foreground)
-                                .bg(palette.selected_background)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(teal).add_modifier(Modifier::BOLD)
-                        },
-                    ),
-                    Span::raw("   "),
-                    Span::styled(
-                        "[ Cancel ]",
-                        if *focus == 2 {
-                            Style::default()
-                                .fg(palette.selected_foreground)
-                                .bg(gold)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(gold)
-                        },
-                    ),
-                ]));
+                lines.push(Line::from(Span::styled(
+                    "[ Close ]",
+                    if *focus == 1 {
+                        Style::default()
+                            .fg(palette.selected_foreground)
+                            .bg(palette.selected_background)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(teal).add_modifier(Modifier::BOLD)
+                    },
+                )));
                 if let Some(error) = error {
                     lines.extend(
                         wrap_words(error, inner.width as usize)
@@ -667,7 +659,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     );
                 }
                 lines.extend(
-                    wrap_words(settings_hint(*dropdown_open), inner.width as usize)
+                    wrap_words(settings_hint(*dropdown_open, *focus), inner.width as usize)
                         .into_iter()
                         .map(|line| Line::from(line).style(Style::default().fg(muted))),
                 );
@@ -1624,7 +1616,6 @@ mod tests {
             draft: crate::settings::Theme::Light,
             error: Some(storage_error.into()),
             dropdown_open: true,
-            dropdown_original: Some(Theme::Dark),
             focus: 0,
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1640,15 +1631,16 @@ mod tests {
         assert!(text.contains("SETTINGS"));
         assert!(text.contains("Light"));
         assert!(text.contains("› OnTrack Light"));
-        assert!(text.contains("Save"));
-        assert!(text.contains("Cancel"));
+        assert!(text.contains("Close"));
+        assert!(!text.contains("[ Save ]"));
+        assert!(!text.contains("Cancel"));
         assert!(text.contains("settings.json"));
         assert!(text.contains("Permission") && text.contains("denied"));
         assert!(text.contains("try again"));
-        assert!(text.contains("cycle"));
+        assert!(text.contains("change + save"));
         assert!(text.contains("Dark"));
-        assert!(text.contains("Enter keep"));
-        assert!(text.contains("Esc revert"));
+        assert!(text.contains("Enter save"));
+        assert!(text.contains("Esc") && text.contains("back"));
         assert!(a.modal_ready);
         assert_eq!(buffer[(0, 3)].bg, Color::Rgb(246, 248, 247));
         assert!(a.modal_ready);
@@ -1657,17 +1649,15 @@ mod tests {
             draft: crate::settings::Theme::Dark,
             error: None,
             dropdown_open: false,
-            dropdown_original: None,
             focus: 0,
         });
         let closed = draw((80, 24), &mut a).0;
         assert!(closed.contains("Dark"));
-        assert!(closed.contains("Enter / Space open"));
+        assert!(closed.contains("Enter / Space options"));
         a.modal = Some(crate::app::Modal::Settings {
             draft: Theme::Light,
             error: None,
             dropdown_open: true,
-            dropdown_original: Some(Theme::Dark),
             focus: 0,
         });
         assert!(draw((18, 5), &mut a).0.contains("Resize"));
@@ -1755,7 +1745,6 @@ mod tests {
                     draft: theme,
                     error: None,
                     dropdown_open: true,
-                    dropdown_original: Some(Theme::Dark),
                     focus: 0,
                 });
                 let settings = draw(size, &mut app).0;
@@ -1796,7 +1785,6 @@ mod tests {
             draft: Theme::RosePine,
             error: None,
             dropdown_open: true,
-            dropdown_original: Some(Theme::Dark),
             focus: 0,
         });
         let late = draw((80, 24), &mut app).0;
@@ -1809,14 +1797,14 @@ mod tests {
             draft: Theme::TokyoNight,
             error: None,
             dropdown_open: true,
-            dropdown_original: Some(Theme::Dark),
             focus: 0,
         });
         let early = draw((80, 24), &mut app).0;
         assert!(early.contains("Tokyo Night"));
         assert!(early.contains("↓ later themes"));
-        assert!(early.contains("Save"));
-        assert!(early.contains("Cancel"));
+        assert!(early.contains("Close"));
+        assert!(!early.contains("Save"));
+        assert!(!early.contains("Cancel"));
         assert!(app.modal_ready);
     }
     #[test]

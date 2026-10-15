@@ -18,11 +18,11 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 
 `src/ui.rs` renders a centered ASCII ONTRACK wordmark during startup, with a short subtitle and a compact text fallback for narrower terminals. Keep the splash readable across terminal sizes and ensure it yields to the normal browser view after startup.
 
-Theme is explicit app state (`App::theme`) threaded into rendering; do not introduce global or thread-local palette state. Keep Dark as the existing default look. New colors need readable Light equivalents for surfaces, text, semantic metadata, startup splash, details, and dialogs. Settings preview a draft but commit `App::settings` only after `settings::save_to` succeeds; cancellation restores the committed theme. Tests should use isolated settings paths rather than changing process-wide environment variables.
+Theme is explicit app state (`App::theme`) threaded into rendering; do not introduce global or thread-local palette state. Keep Dark as the existing default look. New colors need readable Light equivalents for surfaces, text, semantic metadata, startup splash, details, and dialogs. Settings changes immediately attempt persistence; update `App::settings` and the active theme only after `settings::save_to` succeeds. Failed writes retain the candidate for retry without changing the active theme. Tests should use isolated settings paths rather than changing process-wide environment variables.
 
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
-The `s` settings dialog previews every bundled theme across the browser and splash. Its bounded dropdown scrolls to keep the selection visible. Saving is explicit; Esc closes an open dropdown before cancelling the dialog. Config read/write errors are presented in the UI and must not be reported as successful saves. See the [settings guide](settings.md) for stable theme IDs and instructions for extending the catalog.
+The `s` settings dialog applies and saves theme changes immediately. Up / Down navigates setting rows, while Left / Right changes values. Its bounded dropdown scrolls to keep the selection visible. Esc closes an open dropdown before closing the dialog; closing never reverts successful changes or writes settings. Config read/write errors are presented in the UI and must not be reported as successful saves. See the [settings guide](settings.md) for stable theme IDs and instructions for extending the catalog.
 
 ## Beads CLI contract
 

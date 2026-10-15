@@ -71,7 +71,6 @@ pub enum Modal {
         draft: Theme,
         error: Option<String>,
         dropdown_open: bool,
-        dropdown_original: Option<Theme>,
         focus: usize,
     },
 }
@@ -547,7 +546,6 @@ impl App {
                     draft: self.settings.theme,
                     error: load_error,
                     dropdown_open: false,
-                    dropdown_original: None,
                     focus: 0,
                 });
                 self.modal_ready = false;
@@ -610,21 +608,10 @@ impl App {
             return false;
         }
         if key.code == Esc {
-            if let Some(Modal::Settings {
-                draft,
-                dropdown_original,
-                dropdown_open,
-                error,
-                ..
-            }) = self.modal.as_mut()
-            {
+            if let Some(Modal::Settings { dropdown_open, .. }) = self.modal.as_mut() {
                 if *dropdown_open {
-                    *draft = dropdown_original.take().unwrap_or(self.settings.theme);
-                    self.theme = *draft;
                     *dropdown_open = false;
-                    *error = None;
                 } else {
-                    self.theme = self.settings.theme;
                     self.modal = None;
                 }
                 return false;
@@ -647,39 +634,32 @@ impl App {
             let mut save_theme = None;
             if let Some(Modal::Settings {
                 draft,
-                error,
                 dropdown_open,
-                dropdown_original,
                 focus,
+                ..
             }) = self.modal.as_mut()
             {
                 match key.code {
                     Tab | BackTab => {
                         *dropdown_open = false;
-                        *dropdown_original = None;
-                        *focus = if key.code == Tab {
-                            (*focus + 1) % 3
-                        } else {
-                            (*focus + 2) % 3
-                        };
+                        *focus = 1 - *focus;
                     }
-                    Left | Right | Up | Down if *focus == 0 => {
-                        *draft = cycle_theme(*draft, matches!(key.code, Right | Down));
-                        *error = None;
-                        self.theme = *draft;
+                    Up | Down => {
+                        *focus = 0;
+                        *dropdown_open = false;
+                    }
+                    Left | Right if *focus == 0 => {
+                        *draft = cycle_theme(*draft, key.code == Right);
+                        save_theme = Some(*draft);
+                    }
+                    Enter | Char(' ') if *focus == 0 && *dropdown_open => {
+                        *dropdown_open = false;
+                        save_theme = Some(*draft);
                     }
                     Enter | Char(' ') if *focus == 0 => {
-                        if *dropdown_open {
-                            *dropdown_open = false;
-                            *dropdown_original = None;
-                        } else {
-                            *dropdown_open = true;
-                            *dropdown_original = Some(*draft);
-                        }
+                        *dropdown_open = true;
                     }
-                    Enter | Char(' ') if *focus == 1 => save_theme = Some(*draft),
-                    Enter | Char(' ') if *focus == 2 => {
-                        self.theme = self.settings.theme;
+                    Enter | Char(' ') if *focus == 1 => {
                         self.modal = None;
                     }
                     _ => {}
@@ -902,8 +882,10 @@ impl App {
                 self.settings = proposed;
                 self.theme = theme;
                 self.settings_load_error = None;
-                self.modal = None;
                 self.notice = Some(format!("{} theme saved", theme.label()));
+                if let Some(Modal::Settings { error, .. }) = self.modal.as_mut() {
+                    *error = None;
+                }
             }
             Err(error) => {
                 if let Some(Modal::Settings { error: message, .. }) = self.modal.as_mut() {
@@ -1579,11 +1561,13 @@ mod tests {
         assert_bead(&a, "b1");
     }
     #[test]
-    fn settings_preview_cancel_save_and_modal_isolation() {
+    fn settings_change_autosaves_and_close_keeps_committed_theme() {
         let mut a = app();
         let dir = std::env::temp_dir().join(format!("ontrack-app-settings-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         a.settings_path = Some(dir.join("ontrack/settings.json"));
+        a.settings_load_error = Some("startup settings failed".into());
+        a.notice = Some("startup settings failed".into());
         press(&mut a, KeyCode::Char('s'));
         assert!(matches!(
             a.modal,
@@ -1608,11 +1592,34 @@ mod tests {
             })
         ));
         press(&mut a, KeyCode::Right);
-        assert_eq!(a.theme, Theme::Light, "draft choice previews immediately");
+        assert_eq!(
+            a.theme,
+            Theme::Light,
+            "successful change applies immediately"
+        );
+        assert_eq!(a.settings.theme, Theme::Light);
+        assert!(a.settings_load_error.is_none());
+        assert!(matches!(a.modal, Some(Modal::Settings { error: None, .. })));
+        assert_eq!(
+            settings::load_from(a.settings_path.as_deref().unwrap())
+                .unwrap()
+                .theme,
+            Theme::Light
+        );
         press(&mut a, KeyCode::Left);
         assert_eq!(a.theme, Theme::Dark, "left returns to the first choice");
+        assert_eq!(
+            settings::load_from(a.settings_path.as_deref().unwrap())
+                .unwrap()
+                .theme,
+            Theme::Dark
+        );
         press(&mut a, KeyCode::Right);
-        assert_eq!(a.theme, Theme::Light, "right selects the second choice");
+        assert_eq!(
+            a.theme,
+            Theme::Light,
+            "right selects and saves the second choice"
+        );
         press(&mut a, KeyCode::Enter);
         assert!(matches!(
             a.modal,
@@ -1624,38 +1631,31 @@ mod tests {
         assert_eq!(
             a.theme,
             Theme::Light,
-            "Enter keeps and closes the dropdown choice"
+            "Enter retries/saves the selected option and closes the dropdown"
         );
-        press(&mut a, KeyCode::Enter);
         press(&mut a, KeyCode::Left);
-        press(&mut a, KeyCode::Esc);
-        assert!(matches!(
-            a.modal,
-            Some(Modal::Settings {
-                dropdown_open: false,
-                ..
-            })
-        ));
-        assert_eq!(
-            a.theme,
-            Theme::Light,
-            "closing the dropdown reverts its latest preview"
-        );
-        press(&mut a, KeyCode::Esc);
-        assert_eq!(a.theme, Theme::Dark, "cancel restores the applied theme");
-        assert_eq!(a.settings.theme, Theme::Dark);
-        press(&mut a, KeyCode::Char('s'));
-        press(&mut a, KeyCode::Tab);
-        press(&mut a, KeyCode::Tab);
-        assert!(matches!(a.modal, Some(Modal::Settings { focus: 2, .. })));
-        press(&mut a, KeyCode::Enter);
-        assert!(a.modal.is_none(), "focused Cancel closes without saving");
         assert_eq!(a.theme, Theme::Dark);
-        press(&mut a, KeyCode::Char('s'));
+        assert_eq!(
+            settings::load_from(a.settings_path.as_deref().unwrap())
+                .unwrap()
+                .theme,
+            Theme::Dark
+        );
         press(&mut a, KeyCode::Right);
+        assert_eq!(a.theme, Theme::Light);
+        assert_eq!(
+            settings::load_from(a.settings_path.as_deref().unwrap())
+                .unwrap()
+                .theme,
+            Theme::Light
+        );
         press(&mut a, KeyCode::Tab);
-        press(&mut a, KeyCode::Enter);
-        assert!(a.modal.is_none());
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 1, .. })));
+        assert_eq!(a.theme, Theme::Light, "Tab only focuses Close");
+        press(&mut a, KeyCode::BackTab);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none(), "Esc closes Settings without rollback");
+        assert_eq!(a.theme, Theme::Light);
         assert_eq!(a.settings.theme, Theme::Light);
         assert_eq!(
             settings::load_from(a.settings_path.as_deref().unwrap())
@@ -1663,7 +1663,22 @@ mod tests {
                 .theme,
             Theme::Light
         );
-        assert!(a.notice.as_deref().unwrap().contains("saved"));
+        press(&mut a, KeyCode::Char('s'));
+        assert_eq!(
+            a.theme,
+            Theme::Light,
+            "reopening does not change the saved theme"
+        );
+        assert!(matches!(a.modal, Some(Modal::Settings { .. })));
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none());
+        assert_eq!(
+            settings::load_from(a.settings_path.as_deref().unwrap())
+                .unwrap()
+                .theme,
+            Theme::Light
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
@@ -1677,13 +1692,70 @@ mod tests {
             matches!(&a.modal, Some(Modal::Settings { error: Some(message), .. }) if message.contains("defaults are active") && message.contains("settings.json"))
         );
         assert_eq!(a.notice.as_deref(), Some(startup_error));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Down);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                error: Some(_),
+                dropdown_open: false,
+                ..
+            })
+        ));
+        assert_eq!(
+            a.notice.as_deref(),
+            Some(startup_error),
+            "row navigation must not clear startup errors"
+        );
         press(&mut a, KeyCode::Esc);
         assert_eq!(a.notice.as_deref(), Some(startup_error));
         assert_eq!(a.theme, Theme::Dark);
     }
     #[test]
-    fn settings_selector_cycles_all_catalog_entries_and_wraps_both_directions() {
+    fn settings_vertical_navigation_never_changes_or_saves_theme() {
+        let dir = std::env::temp_dir().join(format!("ontrack-settings-nav-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
         let mut a = app();
+        a.settings_path = Some(path.clone());
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.theme, Theme::Dark);
+        assert!(!path.exists());
+        press(&mut a, KeyCode::Tab);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 1, .. })));
+        press(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none());
+        assert!(!path.exists(), "Close must not save settings");
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Down);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: false,
+                ..
+            })
+        ));
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.theme, Theme::Dark);
+        assert!(!path.exists(), "row navigation must not write settings");
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        assert!(
+            !path.exists(),
+            "closing without a change must not write settings"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn settings_selector_cycles_all_catalog_entries_and_wraps_both_directions() {
+        let dir =
+            std::env::temp_dir().join(format!("ontrack-settings-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut a = app();
+        a.settings_path = Some(dir.join("settings.json"));
         press(&mut a, KeyCode::Char('s'));
         press(&mut a, KeyCode::Enter);
         assert!(matches!(
@@ -1718,8 +1790,8 @@ mod tests {
         press(&mut a, KeyCode::Esc);
         assert_eq!(
             a.theme,
-            Theme::Dark,
-            "Esc restores the opened dropdown choice"
+            *Theme::ALL.last().unwrap(),
+            "closing the dropdown retains the last successfully saved theme"
         );
         assert!(matches!(
             a.modal,
@@ -1730,6 +1802,15 @@ mod tests {
         ));
         press(&mut a, KeyCode::Esc);
         assert!(a.modal.is_none());
+        let reloaded = settings::load_from(a.settings_path.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            reloaded.theme, a.settings.theme,
+            "reopening reloads the committed theme"
+        );
+        press(&mut a, KeyCode::Char('s'));
+        assert!(matches!(a.modal, Some(Modal::Settings { draft, .. }) if draft == reloaded.theme));
+        press(&mut a, KeyCode::Esc);
+        let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
     fn mouse_targets_follow_scrolled_natural_lines_without_relocated_headers() {
@@ -2442,29 +2523,13 @@ mod tests {
     }
 
     #[test]
-    fn choice_cycling_wraps_both_directions_and_settings_open_cancel_restores() {
+    fn choice_cycling_wraps_both_directions() {
         assert_eq!(cycle_choice(0, 3, false), 2);
         assert_eq!(cycle_choice(2, 3, true), 0);
-
-        let mut a = app();
-        press(&mut a, KeyCode::Char('s'));
-        press(&mut a, KeyCode::Left); // Closed focused setting wraps Dark -> last theme.
-        let last_theme = *Theme::ALL.last().unwrap();
-        assert_eq!(a.theme, last_theme);
-        press(&mut a, KeyCode::Enter);
-        press(&mut a, KeyCode::Right); // Open setting wraps the last theme -> Dark.
-        assert_eq!(a.theme, Theme::Dark);
-        press(&mut a, KeyCode::Esc);
-        assert_eq!(a.theme, last_theme, "Esc restores the opening choice");
-        press(&mut a, KeyCode::Enter);
-        press(&mut a, KeyCode::Left);
-        assert_eq!(a.theme, Theme::SolarizedLight);
-        press(&mut a, KeyCode::Enter);
-        assert_eq!(a.theme, Theme::SolarizedLight, "Enter keeps the preview");
     }
 
     #[test]
-    fn settings_preview_cancel_save_failure_and_reload_use_isolated_path() {
+    fn settings_autosave_failure_preserves_commit_and_same_choice_can_retry() {
         use std::fs;
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
@@ -2476,45 +2541,67 @@ mod tests {
         let path = root.join("settings.json");
         let mut a = app();
         a.settings_path = Some(path.clone());
+        settings::save_to(&path, &Settings { theme: Theme::Dark }).unwrap();
         press(&mut a, KeyCode::Char('s'));
-        press(&mut a, KeyCode::Down);
-        assert_eq!(a.theme, Theme::Light);
-        assert!(!path.exists(), "preview must not write settings");
-        press(&mut a, KeyCode::Esc);
-        assert_eq!(a.theme, Theme::Dark);
-        assert!(!path.exists(), "cancel must not write settings");
-
-        press(&mut a, KeyCode::Char('s'));
-        press(&mut a, KeyCode::Down);
-        press(&mut a, KeyCode::Tab);
-        press(&mut a, KeyCode::Enter);
-        assert!(a.modal.is_none());
-        assert_eq!(a.settings.theme, Theme::Light);
-        assert_eq!(settings::load_from(&path).unwrap().theme, Theme::Light);
-
         // A regular file where the parent directory should be makes saving fail.
         let blocker = root.join("blocked");
         fs::write(&blocker, "preserve").unwrap();
         a.settings_path = Some(blocker.join("settings.json"));
-        press(&mut a, KeyCode::Char('s'));
-        press(&mut a, KeyCode::Up);
-        press(&mut a, KeyCode::Tab);
-        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Right);
         assert_eq!(
             a.settings.theme,
-            Theme::Light,
+            Theme::Dark,
             "failed save keeps committed value"
         );
         assert_eq!(
             a.theme,
             Theme::Dark,
-            "live draft remains previewed in dialog"
+            "failed save leaves the active theme unchanged"
         );
         assert!(matches!(
             a.modal,
-            Some(Modal::Settings { error: Some(_), .. })
+            Some(Modal::Settings {
+                draft: Theme::Light,
+                error: Some(_),
+                ..
+            })
         ));
+        assert_eq!(settings::load_from(&path).unwrap().theme, Theme::Dark);
         assert_eq!(fs::read_to_string(blocker).unwrap(), "preserve");
+
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Up);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: false,
+                error: Some(_),
+                ..
+            })
+        ));
+        assert_eq!(a.theme, Theme::Dark);
+        assert_eq!(settings::load_from(&path).unwrap().theme, Theme::Dark);
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(a.modal, Some(Modal::Settings { error: Some(_), .. })),
+            "retry on the same candidate still reports failure"
+        );
+
+        a.settings_path = Some(path.clone());
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        assert_eq!(a.theme, Theme::Light);
+        assert_eq!(a.settings.theme, Theme::Light);
+        assert!(matches!(a.modal, Some(Modal::Settings { error: None, .. })));
+        assert_eq!(settings::load_from(&path).unwrap().theme, Theme::Light);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        assert_eq!(
+            a.theme,
+            Theme::Light,
+            "closing retains the successful choice"
+        );
         let _ = fs::remove_dir_all(root);
     }
 }

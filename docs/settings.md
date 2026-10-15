@@ -65,15 +65,22 @@ non-object JSON, unknown themes, and non-string theme values are errors.
 
 ## Changing the theme
 
-Press `s` to open settings. The Theme dropdown starts focused. `Enter` or `Space`
-opens it; Left / Right or Up / Down cycles through every theme with wraparound
-and previews the selection immediately. The bounded list scrolls to keep the
-current choice visible. `Enter` keeps the preview and closes the list. `Esc`
-while the list is open restores its opening choice; `Esc` again cancels Settings and
-restores the saved theme. Use `Tab` / `Shift+Tab` to focus Save or Cancel, then
-press `Enter` to activate that button. A save commits only after the write
-succeeds. A failed save leaves the popup open with an error and does not change
-the saved selection.
+Press `s` to open Settings. The Theme row starts focused. `Up` / `Down` moves
+between setting rows; Theme is currently the only row, so these keys leave its
+value unchanged and close an open options list. `Left` / `Right` cycles themes
+with wraparound and immediately saves the new choice, whether the list is open
+or closed. The bounded list scrolls to keep the current choice visible. `Enter`
+or `Space` opens the list; while it is open, either key saves the selected theme
+again and closes the list, which also lets you retry a failed save. `Esc` closes
+an open list without reverting a successful change; `Esc` again closes Settings.
+Use `Tab` / `Shift+Tab` to focus Close, then `Enter` or `Space` to close the
+dialog. Closing never writes settings or rolls back a successful change.
+
+Each theme change is saved immediately. On success, the active appearance and
+the saved settings update together, and any startup or save error clears. On
+failure, the active theme and saved file stay at their last successful values;
+the dialog keeps the attempted choice and shows an error so you can retry it by
+opening the list and pressing `Enter` / `Space`, or choose another theme.
 
 ## Recovery and failure policy
 
@@ -103,8 +110,10 @@ invalid settings contents use `io::ErrorKind::InvalidData` with the file path an
 reason. Loading never writes. Saving serializes the current supported fields
 only, so unknown fields are accepted when reading but are not preserved on save.
 
-The caller owns startup notices and popup state. Keep the draft separate from
-the committed settings and update committed state only after `save_to` succeeds.
+The caller owns startup notices and popup state. Keep the selected candidate
+separate from committed settings so a failed write cannot change the active or
+saved theme. Update both only after `save_to` succeeds; closing Settings does
+not roll back prior successful saves.
 To add a theme, add a stable variant to `settings::Theme`, then add exactly one
 `ThemeDefinition` to `theme::CATALOG` with a unique kebab-case ID, display name,
 light/dark classification, and complete palette. Keep `Theme::ALL` in catalog
