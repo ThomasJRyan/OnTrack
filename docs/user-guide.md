@@ -79,6 +79,8 @@ Title-only or incomplete beads are supported: the agent is instructed to infer a
 
 Start ontrack from the **main checkout** (or an ordinary subdirectory) to hand off work. Launch discovery from existing linked checkouts, submodules or nested repositories is unsupported and stops before creation; Herdr 0.9.1 reports the main source checkout for linked paths, so ontrack will not guess a linked workspace. Newly created worktrees remain the verified targets for agent startup.
 
+Contributors can run `cargo test` from a linked Git worktree. The Herdr test fixtures model a main checkout independently of the directory where Cargo runs; this test support does not change the launch restriction above.
+
 The new checkout contains committed Git content only; uncommitted changes are not copied. A successful handoff does not mean the agent completed the bead. Failures may leave a worktree or may have delivered a prompt. Inspect Herdr/Git worktree lists and the reported workspace/branch before retrying; nothing is automatically deleted or blindly resubmitted.
 
 Long launch results stay in a height-limited dialog instead of requiring a taller terminal. Use PageUp / PageDown to read the full recovery message; the dialog marks when more text is outside the visible area. Enter does not launch again after a result arrives. Press Esc to close the result. The compact dialog keeps the same scroll controls; widen the terminal only if the dialog itself cannot fit.
