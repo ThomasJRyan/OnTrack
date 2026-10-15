@@ -5,20 +5,22 @@ A terminal browser for Beads issues in the current workspace.
 Versioned Linux and macOS binaries are published from Git tags; see [releases](docs/releases.md) for supported platforms, checksums, and installation.
 
 - Browse open and closed Beads, with explicit create, edit, and permanent-delete actions.
-- Mark open Tasks Ready, or mark an Epic and all its open descendant Tasks Ready together. The scheduler prepares a Ready Epic's checkout and hands eligible child Tasks to Herdr agents. Sent Tasks remain Ready until their Beads status becomes In Progress. Set a concurrent agent limit in Settings (five by default).
+- Mark open Tasks Ready, or mark an Epic and all its open descendant Tasks Ready together. Press `r` again to unready an unsent Task; sent Tasks stay Ready until their Beads status becomes In Progress. The scheduler prepares a Ready Epic's checkout and hands eligible child Tasks to Herdr agents. Set a concurrent agent limit in Settings (five by default).
 - Press `Shift+N` on an open task to create a child task. Child issues appear indented beneath their parent within a status pane. Parent handoff waits for children, and completed child work automatically requests integration into the managed parent worktree by default; Settings can turn this off.
 - When creating an Epic, optionally generate child tasks with assessed P0–P4 priorities from its Description using a Herdr agent in a separate workspace at the same checkout.
 - Two-pane browsing with scrollable, Markdown-rendered descriptions, notes, comments, relationships, and Beads details.
+- Paste PNG or JPEG screenshots into a Bead description with `Ctrl+V`; agent handoffs include the saved local image paths.
 - Automatic background refresh picks up external changes, with cached records and visible errors; no watcher setup required.
 - Press `u` to check the latest published GitHub release against the running version. When one is available, press `i` to prepare a compatible asset, then `y` to install its verified download. Restart OnTrack after a successful update.
 - Persistent theme and default new-task agent selection in a structured settings dialog.
 - A brief animated terminal splash with the ONTRACK wordmark and a waving anime girl, with compact layouts for smaller terminals.
+- A top-right header notice when a newer OnTrack release is available.
 - Press `h` to hand a selected Bead to a Herdr agent in a new worktree. A top-right toast shows progress and the result; Open and Ready issues show `· sent` once the prompt is confirmed. See the [user guide](docs/user-guide.md) for setup and recovery limits.
 - Press `w` to inspect OnTrack-tracked outstanding worktrees, with colour-coded statuses and Bead details. Completed tasks show Ready to Merge after the Bead closes and the recorded agent settles; enabled preferences queue merge requests one at a time, then clean up verified integrated worktrees. Older handoffs without enough evidence show a manual merge hint. Active merge work stays Pending, and verified removed checkouts leave this view. Press `Enter` to switch to a worktree's Herdr workspace, request a merge or safe cleanup, or use `Shift+R` to confirm a fresh start for the task.
 
 ## Requirements
 
-Source builds need Rust 1.88 or newer and the `bd` command-line tool; the release check also needs `curl`. In-app updates need `curl` and `tar`; release installation checks for both `bd` and Herdr. OnTrack initializes Beads in the launch directory when no workspace is available. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
+Source builds need Rust 1.88 or newer and the `bd` command-line tool; release checks also need `curl`. In-app updates need `curl` and `tar`; release installation checks for both `bd` and Herdr. OnTrack initializes Beads in the launch directory when no workspace is available and disables issue JSONL auto-export in the active workspace. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
 
 ## Run
 

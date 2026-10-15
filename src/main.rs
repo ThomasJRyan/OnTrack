@@ -6,11 +6,13 @@ mod event;
 mod herdr;
 mod hotkeys;
 mod release;
+mod screenshots;
 mod settings;
 mod terminal;
 mod theme;
 mod ui;
 mod update;
+mod updates;
 mod worktrees;
 
 use std::{error::Error, io};
