@@ -1492,6 +1492,7 @@ impl App {
                 item.status,
                 worktrees::WorktreeStatus::InProgress
                     | worktrees::WorktreeStatus::Unmerged
+                    | worktrees::WorktreeStatus::MergeQueued
                     | worktrees::WorktreeStatus::NeedsResolution
             )
         {
@@ -2083,6 +2084,7 @@ pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'stat
         Reserved => "PREPARED",
         InProgress => "IN PROGRESS",
         Unmerged => "READY TO MERGE",
+        MergeQueued => "MERGE QUEUED",
         MergeRequested => "MERGE PENDING",
         NeedsResolution => "NEEDS RESOLUTION",
         Integrated => "INTEGRATED",

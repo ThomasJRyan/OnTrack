@@ -2908,6 +2908,7 @@ mod tests {
             WorktreeStatus::Reserved,
             WorktreeStatus::InProgress,
             WorktreeStatus::Unmerged,
+            WorktreeStatus::MergeQueued,
             WorktreeStatus::MergeRequested,
             WorktreeStatus::NeedsResolution,
             WorktreeStatus::Integrated,

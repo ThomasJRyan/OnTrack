@@ -122,6 +122,8 @@ Focused tests (`cargo test herdr::tests`) inject command execution, Bead retriev
 
 Worktree registry tests create exclusive temporary fixture directories and keep each registry lock inside its fixture. These test paths do not change the production rule that Herdr launch discovery starts from the main checkout.
 
+Merge requests use the repository-wide registry lock and persist `merge_queue` order and provenance on each handoff. Manual requests and automatic reconciliation both enqueue; reconciliation dispatches at most one prompt when no unresolved `merge_request` remains. A queued request is revalidated at dispatch against current Git and agent state, with a fresh closed-Bead check for automatic requests. Failed pre-prompt dispatch is marked for explicit retry; possibly sent prompts retain the existing durable request marker and block later prompts. Verified integration and a settled prompted agent release the slot on the next reconciliation. External Git clients do not share this queue, so Git checks and ff-only integration remain required.
+
 ## Background work and cached state
 
 `App` uses standard-library channels and one background thread for blocking CLI calls. The UI loop receives available responses, draws, and polls input with a short timeout rather than waiting for subprocess completion.
