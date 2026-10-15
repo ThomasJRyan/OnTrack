@@ -2,6 +2,8 @@
 
 A terminal browser for Beads issues in the current workspace.
 
+Versioned Linux and macOS binaries are published from Git tags; see [releases](docs/releases.md) for supported platforms, checksums, and installation.
+
 - Browse open and closed Beads, with explicit create, edit, and permanent-delete actions.
 - Mark open Tasks Ready, or mark an Epic and all its open descendant Tasks Ready together. The scheduler prepares a Ready Epic's checkout and hands eligible child Tasks to Herdr agents. Sent Tasks remain Ready until their Beads status becomes In Progress. Set a concurrent agent limit in Settings (five by default).
 - Press `Shift+N` on an open task to create a child task. Child issues appear indented beneath their parent within a status pane. Parent handoff waits for children, and completed child work automatically requests integration into the managed parent worktree by default; Settings can turn this off.
@@ -25,7 +27,7 @@ cargo run
 
 Issues are grouped into coloured, collapsible panes (Open, Ready, other statuses, Closed), with Closed collapsed on launch. Press `Ctrl+?` for hotkeys, `r` (or `Shift+R`) to toggle Ready for an open Task or Epic, `w` for tracked handoffs, `s` for settings, `n` to create a bead, `Shift+N` to create a child task, `e` to edit, and `d` to delete (confirmation required). `Esc` goes back or closes a dialog; `q` and `Ctrl+C` quit. See the [user guide](docs/user-guide.md) for controls and the [development guide](docs/development.md) for scheduling and tracked worktrees.
 
-See the [user guide](docs/user-guide.md) for setup and controls, the [settings guide](docs/settings.md) for theme, default agent, agent limit, and worktree preferences, the [development guide](docs/development.md) for architecture and checks, and the [official Beads documentation](https://beads.gascity.com) for workspace setup.
+See the [user guide](docs/user-guide.md) for setup and controls, the [settings guide](docs/settings.md) for theme, default agent, agent limit, and worktree preferences, the [development guide](docs/development.md) for architecture and checks, the [release guide](docs/releases.md) for downloads and publishing, and the [official Beads documentation](https://beads.gascity.com) for workspace setup.
 
 ## Checks
 

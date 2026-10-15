@@ -9,7 +9,7 @@ ontrack browses Beads issues in a two-pane terminal view and can create, edit, o
 - OnTrack initializes Beads in the launch directory if no workspace is accessible there. An existing workspace, including one inherited from a parent directory, is reused.
 - An interactive terminal supporting raw mode and the alternate screen; mouse support is needed for clicking and wheel input.
 
-See the [official Beads documentation](https://beads.gascity.com) for installing `bd` and setting up a workspace.
+See the [official Beads documentation](https://beads.gascity.com) for installing `bd` and setting up a workspace. For supported binary downloads and checksum verification, see the [release guide](releases.md).
 
 From this repository, when it is the workspace you want to browse:
 
