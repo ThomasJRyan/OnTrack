@@ -553,7 +553,10 @@ fn parse_show(bytes: &[u8], id: &str) -> io::Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use std::collections::HashMap;
 
+    #[cfg(unix)]
     #[test]
     fn startup_initializes_missing_workspace_and_preserves_existing_one() {
         struct Fixture(std::path::PathBuf);
@@ -574,53 +577,102 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         let _fixture = Fixture(directory.clone());
 
-        ensure_workspace_in(&directory).unwrap();
+        let mut config = HashMap::new();
+        ensure_workspace_in_with(&directory, |workspace, args| {
+            fake_bd(&mut config, workspace, args)
+        })
+        .unwrap();
         assert!(directory.join(".beads").is_dir());
         assert!(!directory.join("AGENTS.md").exists());
-        assert_eq!(config_value(&directory, "export.auto"), "false");
+        assert_eq!(config_value(&config, &directory, "export.auto"), "false");
 
         let marker = directory.join(".beads/ontrack-marker");
         std::fs::write(&marker, b"keep").unwrap();
-        set_config(&directory, "export.auto", "true");
-        set_config(&directory, "list.limit", "17");
-        ensure_workspace_in(&directory).unwrap();
+        set_config(&mut config, &directory, "export.auto", "true");
+        set_config(&mut config, &directory, "list.limit", "17");
+        ensure_workspace_in_with(&directory, |workspace, args| {
+            fake_bd(&mut config, workspace, args)
+        })
+        .unwrap();
         assert_eq!(std::fs::read(&marker).unwrap(), b"keep");
-        assert_eq!(config_value(&directory, "export.auto"), "false");
-        assert_eq!(config_value(&directory, "list.limit"), "17");
+        assert_eq!(config_value(&config, &directory, "export.auto"), "false");
+        assert_eq!(config_value(&config, &directory, "list.limit"), "17");
 
         let nested = directory.join("nested");
         std::fs::create_dir(&nested).unwrap();
-        set_config(&directory, "export.auto", "true");
-        ensure_workspace_in(&nested).unwrap();
+        set_config(&mut config, &directory, "export.auto", "true");
+        ensure_workspace_in_with(&nested, |workspace, args| {
+            fake_bd(&mut config, workspace, args)
+        })
+        .unwrap();
         assert!(!nested.join(".beads").exists());
-        assert_eq!(config_value(&directory, "export.auto"), "false");
+        assert_eq!(config_value(&config, &directory, "export.auto"), "false");
     }
 
-    fn config_value(directory: &Path, key: &str) -> String {
-        let output = Command::new("bd")
-            .args(["config", "get", key])
-            .current_dir(directory)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    #[cfg(unix)]
+    fn fake_bd(
+        config: &mut HashMap<(std::path::PathBuf, String), String>,
+        workspace: &Path,
+        args: &[&str],
+    ) -> io::Result<Output> {
+        use std::os::unix::process::ExitStatusExt;
+
+        if args == INIT_ARGS {
+            let already_initialized = workspace
+                .ancestors()
+                .any(|ancestor| ancestor.join(".beads").is_dir());
+            if !already_initialized {
+                std::fs::create_dir(workspace.join(".beads"))?;
+            }
+        } else if args == DISABLE_EXPORT_ARGS {
+            let beads_root = workspace
+                .ancestors()
+                .find(|ancestor| ancestor.join(".beads").is_dir())
+                .expect("init should make a Beads workspace available");
+            config.insert(
+                (beads_root.to_path_buf(), "export.auto".to_owned()),
+                "false".to_owned(),
+            );
+        } else {
+            panic!("unexpected bd arguments: {args:?}");
+        }
+
+        Ok(Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
     }
 
-    fn set_config(directory: &Path, key: &str, value: &str) {
-        let output = Command::new("bd")
-            .args(["config", "set", key, value])
-            .current_dir(directory)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+    #[cfg(unix)]
+    fn config_root(directory: &Path) -> std::path::PathBuf {
+        directory
+            .ancestors()
+            .find(|ancestor| ancestor.join(".beads").is_dir())
+            .expect("directory should have a Beads workspace")
+            .to_path_buf()
+    }
+
+    #[cfg(unix)]
+    fn config_value(
+        config: &HashMap<(std::path::PathBuf, String), String>,
+        directory: &Path,
+        key: &str,
+    ) -> String {
+        config
+            .get(&(config_root(directory), key.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn set_config(
+        config: &mut HashMap<(std::path::PathBuf, String), String>,
+        directory: &Path,
+        key: &str,
+        value: &str,
+    ) {
+        config.insert((config_root(directory), key.to_owned()), value.to_owned());
     }
 
     #[test]
