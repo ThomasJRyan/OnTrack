@@ -1,6 +1,6 @@
 # Development guide
 
-ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only, while create and delete are explicit user actions. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
+ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only, while create, edit, and delete are explicit user actions. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
 ## Modules
 
@@ -22,11 +22,13 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 
 In the managed-worktree view, Enter queues `herdr workspace focus WORKSPACE_ID` on the existing background worker. The ID comes from the selected OnTrack handoff, never global focus. The adapter passes arguments separately, rejects unsafe IDs, and requires Herdr's `workspace_focused` result to repeat the selected ID. Closed workspaces and removed checkouts are rejected before dispatch. Focus success and errors are shown in the view without changing Git, Beads, or the handoff registry.
 
+`theme::worktree_status_color` maps every `WorktreeStatus` to a semantic palette role. `ui::worktree_status_style` draws that colour behind the label with a contrasting black or white foreground; the surrounding selected-row highlight remains separate. Keep list and detail labels in sync when adding a worktree state. Theme tests enforce that pending and attention colours differ from integrated in every bundled theme, and UI buffer tests check all list badges and selected details.
+
 Theme is explicit app state (`App::theme`) threaded into rendering; do not introduce global or thread-local palette state. Keep Dark as the existing default look. New colors need readable Light equivalents for surfaces, text, semantic metadata, startup splash, details, and dialogs. Settings changes immediately attempt persistence; update `App::settings` and the active theme only after `settings::save_to` succeeds. Failed writes retain the candidate for retry without changing the active theme. Tests should use isolated settings paths rather than changing process-wide environment variables.
 
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
-The new-bead Description field uses `wrapped_description` to insert visual line breaks before whole words and map its byte cursor to display cells; words wider than the field still wrap by character. It preserves explicit newlines and the stored text. While Description has focus, Shift+Enter inserts a newline and plain Enter focuses Create without submitting. Terminal setup enables Crossterm's keyboard enhancement protocol so supported terminals can distinguish modified Enter; restoration pops that mode on normal exit, initialization failure, and panic. Terminals without modified-key reporting cannot distinguish Shift+Enter from Enter.
+The create/edit Description field uses `wrapped_description` to insert visual line breaks before whole words and map its byte cursor to display cells; words wider than the field still wrap by character. It preserves explicit newlines and the stored text. While Description has focus, Shift+Enter inserts a newline and plain Enter focuses the form's action without submitting. Terminal setup enables Crossterm's keyboard enhancement protocol so supported terminals can distinguish modified Enter; restoration pops that mode on normal exit, initialization failure, and panic. Terminals without modified-key reporting cannot distinguish Shift+Enter from Enter.
 
 The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
 Settings rows in `src/ui.rs` share a two-thirds title column and one-third
@@ -42,14 +44,15 @@ The subprocess inherits the application's working directory. Commands are passed
 bd --readonly --no-color list --all --limit 0 --json
 bd --readonly --no-color show --id=ISSUE_ID --json --long --include-comments --include-dependents
 bd --no-color create --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json
+bd --no-color update --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json -- ISSUE_ID
 bd --no-color delete --force --json -- ISSUE_ID
 ```
 
-Create returns a JSON object containing the created ID; delete is successful on a successful command exit. Create/delete are not passed `--readonly`; delete uses `--force` for the selected issue only and never requests cascading deletion. The worker processes queued requests sequentially, preserving mutation order.
+Create returns a JSON object containing the created ID; update and delete are successful on a successful command exit. Mutations are not passed `--readonly`; update sends only the four form fields, and delete uses `--force` for the selected issue only and never requests cascading deletion. The worker processes queued requests sequentially, preserving mutation order. Edit opening fetches the current `bd show` record on that worker, validates the editable type and priority, and ignores stale load responses using a request sequence. A failed update leaves the draft open; success triggers an immediate refresh and reselects the same ID.
 
 `--all` includes closed issues and `--limit 0` removes the default list cap. `--id=ISSUE_ID` is a single argument. The list and show responses must be JSON arrays. List parsing requires nonempty string `id`, `title`, and `status`; a missing or null priority defaults to 2, and supplied priority must be an unsigned integer. Each `Bead` retains the entire JSON object as well as its summary fields.
 
-Detail parsing selects the requested ID, rejects duplicate matching records, and reports a missing ID. It retains the returned JSON intact, including comments, relationships, metadata, and fields unknown to ontrack. Process-start errors, unsuccessful exit statuses with stderr, and invalid JSON/records are surfaced as errors rather than panics.
+Detail parsing selects the requested ID, rejects duplicate matching records, and reports a missing ID. It retains the returned JSON intact, including comments, relationships, metadata, and fields unknown to ontrack. The detail renderer omits only the top-level `revision` field from display, for both cached list records and full show records; nested revision fields and other metadata remain visible. Process-start errors, unsuccessful exit statuses with stderr, and invalid JSON/records are surfaced as errors rather than panics.
 
 ## Herdr launch adapter
 
@@ -100,7 +103,7 @@ Automatic refresh uses the same public read-only list/show commands above. Sched
 
 The background worker executes each request in channel order. It does not coalesce or reorder requests, so mutation commands cannot be lost. Responses for a show ID other than the current selection are ignored.
 
-Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Automatic updates also retain group collapse state, focus, scroll positions within current bounds, and active form input. Failed list/detail refreshes retain the last loaded data or available snapshot, display errors in the footer, and retry automatically. The presentation layer renders narrative Markdown via `tui-markdown`; all remaining fields, including unknown nested values, remain represented. Rendered text drives both wrapping and scroll bounds.
+Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Automatic updates also retain group collapse state, focus, scroll positions within current bounds, and active form input. Failed list/detail refreshes retain the last loaded data or available snapshot, display errors in the footer, and retry automatically. The presentation layer renders narrative Markdown via `tui-markdown`; all remaining fields except the top-level revision, including unknown nested values, remain represented. Rendered text drives both wrapping and scroll bounds.
 
 Keep CLI calls off the input/render loop and preserve stale-response filtering when changing the worker. The worker is not joined on quit, so terminal cleanup does not wait for a slow CLI call; in-flight commands are not cancelled on quit.
 
@@ -143,7 +146,7 @@ Unit tests do not replace an interactive terminal cleanup check. When changing f
 
 ## Mutations
 
-Create and delete are explicit, asynchronous CLI operations. The create form uses the Beads type vocabulary and P0–P4 priorities; deletion requires a second, affirmative confirmation and never cascades. Each worker request is processed in channel order, without batching mutations together, and the UI disables repeat submissions while one is in flight. The CLI adapter is defined in `src/beads.rs`; the UI only calls its create/delete functions and refreshes the normal list/detail views after success.
+Create, edit, and delete are explicit, asynchronous CLI operations. The create and edit forms use the Beads type vocabulary and P0–P4 priorities; deletion requires a second, affirmative confirmation and never cascades. Each worker request is processed in channel order, without batching mutations together, and the UI disables repeat submissions while one is in flight. The CLI adapter is defined in `src/beads.rs`; the UI calls its create/update/delete functions and refreshes the normal list/detail views after success.
 
 ## Status-grouped list
 
