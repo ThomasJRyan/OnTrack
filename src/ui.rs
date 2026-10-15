@@ -2807,6 +2807,7 @@ mod tests {
             WorktreeStatus::Integrated,
             WorktreeStatus::WorkspaceClosed,
             WorktreeStatus::CheckoutRemoved,
+            WorktreeStatus::DirtyCheckout,
             WorktreeStatus::NeedsAttention,
         ];
         let locate = |buffer: &ratatui::buffer::Buffer, rect: Rect, label: &str| {

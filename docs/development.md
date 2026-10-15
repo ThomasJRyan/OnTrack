@@ -220,6 +220,15 @@ that an agent is idle or its changes safe to merge. Automatic merge may therefor
 defer; manual merge remains the user-controlled path.
 
 `inspect` in `src/worktrees.rs` remains the Git-based safety classification.
+Read-only inspection checks checkout identity, branch, Git tips, and unfinished
+operations separately from ordinary tracked or untracked changes. A dirty source
+or target yields `DirtyCheckout` (`UNCOMMITTED CHANGES`) rather than
+`NeedsAttention`; it cannot be displayed as ready or integrated, so it cannot
+enable cleanup or automatic merge. A pending merge request keeps
+`MergeRequested` and includes a dirty-checkout detail. Unresolved source merge
+conflicts still take `NeedsResolution`, and identity or history failures still
+take `NeedsAttention`. Mutating paths use strict `verify`, which requires both
+checkouts to be clean before any merge, close, or removal operation.
 For an active branch with task commits outside its target, `inspect_for_display`
 shows `InProgress` until a live `bd show` identifies the same Bead as closed and
 the recorded Herdr agent has settled after prompt activity. A launch with a

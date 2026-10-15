@@ -351,6 +351,7 @@ pub fn worktree_status_color(theme: Theme, status: WorktreeStatus) -> Color {
         WorktreeStatus::Integrated => p.success,
         WorktreeStatus::WorkspaceClosed => p.accent_alt,
         WorktreeStatus::CheckoutRemoved => p.muted,
+        WorktreeStatus::DirtyCheckout => p.warning,
     }
 }
 
@@ -533,6 +534,7 @@ mod tests {
                 WorktreeStatus::Integrated,
                 WorktreeStatus::WorkspaceClosed,
                 WorktreeStatus::CheckoutRemoved,
+                WorktreeStatus::DirtyCheckout,
                 WorktreeStatus::NeedsAttention,
             ] {
                 assert!(matches!(color(status), Color::Rgb(_, _, _)));

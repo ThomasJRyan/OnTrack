@@ -2016,6 +2016,7 @@ pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'stat
         Integrated => "INTEGRATED",
         WorkspaceClosed => "WORKSPACE CLOSED",
         CheckoutRemoved => "CHECKOUT REMOVED",
+        DirtyCheckout => "UNCOMMITTED CHANGES",
         NeedsAttention => "NEEDS ATTENTION",
     }
 }

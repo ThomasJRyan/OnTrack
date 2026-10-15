@@ -40,6 +40,7 @@ pub enum WorktreeStatus {
     Integrated,
     WorkspaceClosed,
     CheckoutRemoved,
+    DirtyCheckout,
     NeedsAttention,
 }
 
@@ -107,14 +108,12 @@ fn ancestor(path: &Path, source: &str, target: &str) -> io::Result<bool> {
     }
 }
 
-fn clean(path: &Path) -> io::Result<()> {
-    if !git(path, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty() {
-        return Err(error(format!(
-            "Dirty checkout {}; commit/resolve changes first",
-            path.display()
-        )));
-    }
-    // Some in-progress operations can have a temporarily clean index/worktree.
+fn dirty(path: &Path) -> io::Result<bool> {
+    Ok(!git(path, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty())
+}
+
+fn unfinished_operation(path: &Path) -> io::Result<()> {
+    // A clean-looking index can still be in the middle of an operation.
     for name in [
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -135,6 +134,16 @@ fn clean(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn clean(path: &Path) -> io::Result<()> {
+    if dirty(path)? {
+        return Err(error(format!(
+            "Dirty checkout {}; commit/resolve changes first",
+            path.display()
+        )));
+    }
+    unfinished_operation(path)
 }
 
 /// Remote symbolic HEADs must agree. Without one, only the verified primary
@@ -556,7 +565,7 @@ struct Verified {
     target_tip: String,
 }
 
-fn target_checkout(repo: &RepositoryIdentity, entry: &Value) -> io::Result<PathBuf> {
+fn target_checkout_identity(repo: &RepositoryIdentity, entry: &Value) -> io::Result<PathBuf> {
     let default = default_branch(repo)?;
     let Some(recorded) = entry["target_path"].as_str() else {
         if field(entry, "target_branch")? != default {
@@ -564,7 +573,6 @@ fn target_checkout(repo: &RepositoryIdentity, entry: &Value) -> io::Result<PathB
                 "Repository default branch changed; explicit registry recovery required",
             ));
         }
-        clean(&repo.main_root)?;
         return Ok(repo.main_root.clone());
     };
     let target = Path::new(recorded).canonicalize()?;
@@ -575,6 +583,11 @@ fn target_checkout(repo: &RepositoryIdentity, entry: &Value) -> io::Result<PathB
     {
         return Err(error("Parent target checkout identity or branch changed"));
     }
+    Ok(target)
+}
+
+fn target_checkout(repo: &RepositoryIdentity, entry: &Value) -> io::Result<PathBuf> {
+    let target = target_checkout_identity(repo, entry)?;
     clean(&target)?;
     Ok(target)
 }
@@ -595,7 +608,7 @@ fn task_commits(repo: &RepositoryIdentity, entry: &Value, source_tip: &str) -> i
     Ok(())
 }
 
-fn verify(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
+fn verify_identity(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
     let actual = SystemExecutor.git_identity(&repo.main_root)?;
     if actual != *repo
         || entry["common_dir"].as_str() != repo.common_dir.to_str()
@@ -603,7 +616,7 @@ fn verify(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
     {
         return Err(error("Repository identity changed"));
     }
-    let target = target_checkout(repo, entry)?;
+    let target = target_checkout_identity(repo, entry)?;
     let source = Path::new(field(entry, "path")?).canonicalize()?;
     if source.to_str() != entry["path"].as_str()
         || source == repo.main_root
@@ -617,7 +630,6 @@ fn verify(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
     if branch(&source)? != field(entry, "branch")? {
         return Err(error("Source checkout branch changed"));
     }
-    clean(&source)?;
     Ok(Verified {
         source_tip: tip(&source, "HEAD")?,
         target_tip: tip(&target, "HEAD")?,
@@ -625,6 +637,22 @@ fn verify(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
         target,
     })
 }
+
+fn verify(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
+    let verified = verify_identity(repo, entry)?;
+    clean(&verified.target)?;
+    clean(&verified.source)?;
+    Ok(verified)
+}
+
+fn inspection_dirty(verified: &Verified) -> io::Result<bool> {
+    unfinished_operation(&verified.target)?;
+    unfinished_operation(&verified.source)?;
+    Ok(dirty(&verified.target)? || dirty(&verified.source)?)
+}
+
+const DIRTY_CHECKOUT_DETAIL: &str =
+    "Uncommitted checkout changes are present; commit or resolve them before merge or cleanup.";
 
 fn view(entry: &Value, status: WorktreeStatus, detail: Option<String>) -> ManagedWorktree {
     let string = |key: &str| entry[key].as_str().unwrap_or_default().to_owned();
@@ -681,15 +709,9 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
         return view(entry, CheckoutRemoved, None);
     }
     if entry["phase"] == "reserved" {
-        return match verify(repo, entry) {
-            Ok(_) => view(
-                entry,
-                Reserved,
-                Some(
-                    "Parent worktree prepared; press h on the parent after its children close and integrate"
-                        .into(),
-                ),
-            ),
+        return match verify_identity(repo, entry).and_then(|verified| inspection_dirty(&verified)) {
+            Ok(true) => view(entry, DirtyCheckout, Some(DIRTY_CHECKOUT_DETAIL.into())),
+            Ok(false) => view(entry, Reserved, Some("Parent worktree prepared; press h on the parent after its children close and integrate".into())),
             Err(error) => view(entry, NeedsAttention, Some(error.to_string())),
         };
     }
@@ -749,7 +771,7 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
     if entry["cleanup_pending"].is_string() {
         return view(entry, NeedsAttention, Some(entry["detail"].as_str().unwrap_or("Cleanup possibly sent; reconciling read-only evidence, never blindly retrying.").to_owned()));
     }
-    let verified = match verify(repo, entry) {
+    let verified = match verify_identity(repo, entry) {
         Ok(verified) => verified,
         Err(e) => {
             let conflicts = entry["merge_request"].is_object()
@@ -768,19 +790,43 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
             );
         }
     };
+    let conflicts = entry["merge_request"].is_object()
+        && git(&verified.source, &["ls-files", "--unmerged"]).is_ok_and(|files| !files.is_empty());
+    if conflicts {
+        return view(
+            entry,
+            NeedsResolution,
+            Some("Unresolved merge conflicts in the source checkout".into()),
+        );
+    }
+    let checkout_dirty = match inspection_dirty(&verified) {
+        Ok(dirty) => dirty,
+        Err(e) => return view(entry, NeedsAttention, Some(e.to_string())),
+    };
     if let Err(e) = task_commits(repo, entry, &verified.source_tip) {
         return view(
             entry,
             if verified.source_tip == entry["base"] {
-                InProgress
+                if checkout_dirty {
+                    DirtyCheckout
+                } else {
+                    InProgress
+                }
             } else {
                 NeedsAttention
             },
-            Some(e.to_string()),
+            Some(if checkout_dirty && verified.source_tip == entry["base"] {
+                DIRTY_CHECKOUT_DETAIL.into()
+            } else {
+                e.to_string()
+            }),
         );
     }
     match ancestor(&repo.main_root, &verified.source_tip, &verified.target_tip) {
         Ok(true) => {
+            if checkout_dirty {
+                return view(entry, DirtyCheckout, Some(DIRTY_CHECKOUT_DETAIL.into()));
+            }
             return view(
                 entry,
                 if entry["workspace_closed"] == true {
@@ -804,7 +850,19 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
         if entry["merge_request"]["target_tip"] != verified.target_tip {
             return view(entry, NeedsResolution, Some("Target advanced since the request; explicitly request another agent resolution. Never automatically resend.".into()));
         }
-        return view(entry, MergeRequested, Some(entry["detail"].as_str().unwrap_or("Merge prompt possibly sent; waiting for verified current Git ancestry. Native idle/sequence changes are not proof that this particular prompt completed. Never blindly resend.").to_owned()));
+        let detail = entry["detail"].as_str().unwrap_or("Merge prompt possibly sent; waiting for verified current Git ancestry. Native idle/sequence changes are not proof that this particular prompt completed. Never blindly resend.");
+        return view(
+            entry,
+            MergeRequested,
+            Some(if checkout_dirty {
+                format!("{detail} {DIRTY_CHECKOUT_DETAIL}")
+            } else {
+                detail.to_owned()
+            }),
+        );
+    }
+    if checkout_dirty {
+        return view(entry, DirtyCheckout, Some(DIRTY_CHECKOUT_DETAIL.into()));
     }
     view(entry, Unmerged, entry["detail"].as_str().map(str::to_owned))
 }
@@ -2429,7 +2487,11 @@ mod tests {
             }
             assert_eq!(
                 fixture.status().status,
-                WorktreeStatus::NeedsAttention,
+                if matches!(mode, "target" | "source") {
+                    WorktreeStatus::DirtyCheckout
+                } else {
+                    WorktreeStatus::NeedsAttention
+                },
                 "{mode}"
             );
             let mut executor = Fake::default();
@@ -2439,6 +2501,51 @@ mod tests {
             );
             assert!(executor.calls.is_empty());
         }
+    }
+
+    #[test]
+    fn uncommitted_changes_in_active_checkouts_do_not_claim_merge_readiness() {
+        for (location, file) in [
+            ("source", "in-progress"),
+            ("target", "in-progress"),
+            ("source", "file"),
+            ("target", "file"),
+        ] {
+            let fixture = Fixture::managed();
+            let path = if location == "source" {
+                &fixture.source
+            } else {
+                &fixture.main
+            };
+            fs::write(path.join(file), "uncommitted").unwrap();
+            let status = fixture.status();
+            assert_eq!(status.status, WorktreeStatus::DirtyCheckout, "{location}");
+            assert!(
+                status
+                    .detail
+                    .unwrap()
+                    .contains("Uncommitted checkout changes")
+            );
+            let rows = list_with(&fixture.main, &mut Fake::default()).unwrap();
+            assert_eq!(rows[0].status, WorktreeStatus::DirtyCheckout, "{location}");
+            let mut executor = Fake::default();
+            assert!(
+                act_with(&fixture.main, ID, Action::RequestMerge, &mut executor).is_err(),
+                "{location}"
+            );
+            assert!(executor.calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn merge_request_with_ordinary_changes_stays_pending() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implemented\n");
+        fixture.request();
+        fs::write(fixture.source.join("in-progress"), "uncommitted").unwrap();
+        let status = fixture.status();
+        assert_eq!(status.status, WorktreeStatus::MergeRequested);
+        assert!(status.detail.unwrap().contains(DIRTY_CHECKOUT_DETAIL));
     }
 
     #[test]
