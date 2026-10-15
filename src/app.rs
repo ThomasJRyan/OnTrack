@@ -1082,26 +1082,14 @@ impl App {
                         self.handoff = None;
                         match result {
                             Ok(outcome) => {
-                                let mut clear_error = false;
                                 if let Some(id) = ready_id {
                                     self.known_handoffs.insert(id.clone());
                                     if outcome.reserved {
                                         self.scheduler_attempted.remove(&id);
-                                    } else {
-                                        self.mutation_busy = true;
-                                        if self.requests.send(Request::SetReady(id, false)).is_err()
-                                        {
-                                            self.mutation_busy = false;
-                                            clear_error = true;
-                                        }
                                     }
                                 }
                                 self.toast = Some(Toast::result(outcome.message.clone(), false));
-                                self.notice = Some(if clear_error {
-                                    "Handoff started, but Ready could not be cleared; refresh and clear it manually".into()
-                                } else {
-                                    outcome.message
-                                });
+                                self.notice = Some(outcome.message);
                                 // The launch journal is now active. Reload it even if the
                                 // initial worktree scan found no managed handoffs.
                                 if self.worktrees_inflight {
@@ -2385,7 +2373,7 @@ mod tests {
     }
 
     #[test]
-    fn scheduler_uses_selected_harness_once_and_clears_ready_after_launch() {
+    fn scheduler_uses_selected_harness_once_and_keeps_ready_after_launch() {
         let mut a = app();
         let (tx, rx) = mpsc::channel();
         a.requests = tx;
@@ -2417,10 +2405,13 @@ mod tests {
         ))
         .unwrap();
         a.receive();
-        assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+        assert!(rx.try_recv().is_err(), "handoff must not clear Ready");
+        assert_eq!(display_status(&a.beads[0]), "ready");
         assert!(a.known_handoffs.contains("b0"));
         a.poll_scheduler();
         assert!(rx.try_recv().is_err());
+        a.beads[0].status = "in_progress".into();
+        assert_eq!(display_status(&a.beads[0]), "in_progress");
     }
 
     #[test]
@@ -2445,6 +2436,37 @@ mod tests {
         assert!(rx.try_recv().is_err());
         a.scheduler_attempted.remove("b0");
         a.known_handoffs.insert("b0".into());
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn scheduler_skips_ready_task_with_journaled_handoff_after_restart() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        let (requests, rx) = mpsc::channel();
+        a.requests = requests;
+        let (responses, incoming) = mpsc::channel();
+        a.responses = incoming;
+        responses
+            .send(Response::Worktrees(Ok(vec![ManagedWorktree {
+                id: "handoff".into(),
+                bead_id: "b0".into(),
+                parent_bead_id: None,
+                handoff_accepted: true,
+                bead_title: None,
+                bead_description: None,
+                branch: "ontrack/b0".into(),
+                target_branch: "main".into(),
+                workspace_id: "ws".into(),
+                status: worktrees::WorktreeStatus::InProgress,
+                detail: None,
+            }])))
+            .unwrap();
+        a.receive();
+        assert_eq!(display_status(&a.beads[0]), "ready");
+        assert!(a.known_handoffs.contains("b0"));
         a.poll_scheduler();
         assert!(rx.try_recv().is_err());
     }
@@ -2682,6 +2704,8 @@ mod tests {
     #[test]
     fn handoff_result_sets_toast_and_refreshes_tracked_worktrees() {
         let (mut a, rx, tx) = connected_app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
         press(&mut a, KeyCode::Char('h'));
         let seq = match rx.try_recv().unwrap() {
             Request::Discover(seq) => seq,
@@ -2702,6 +2726,11 @@ mod tests {
         .unwrap();
         a.receive();
         assert!(a.handoff.is_none());
+        assert_eq!(display_status(&a.beads[0]), "ready");
+        assert!(
+            rx.try_recv().is_err(),
+            "manual handoff must not clear Ready"
+        );
         assert!(a.worktrees_refresh_pending);
         assert!(a.modal.is_none());
         assert!(

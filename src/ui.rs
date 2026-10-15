@@ -2290,6 +2290,8 @@ mod tests {
     fn open_issue_shows_confirmed_agent_handoff_only() {
         let mut a = app();
         a.beads[0].status = "open".into();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([crate::beads::READY_LABEL]);
         a.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "demo-1".into(),
@@ -2305,11 +2307,12 @@ mod tests {
         });
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));
         a.worktrees[0].handoff_accepted = true;
-        assert!(draw((80, 24), &mut a).0.contains("open · sent"));
+        assert!(draw((80, 24), &mut a).0.contains("ready · sent"));
         a.worktrees.clear();
         a.accepted_handoffs.insert("demo-1".into());
-        assert!(draw((80, 24), &mut a).0.contains("open · sent"));
+        assert!(draw((80, 24), &mut a).0.contains("ready · sent"));
         a.beads[0].status = "in_progress".into();
+        assert!(draw((80, 24), &mut a).0.contains("in_progress"));
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));
     }
     #[test]
