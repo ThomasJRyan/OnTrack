@@ -7,7 +7,7 @@ use crate::{
     hotkeys::{self, Help},
     screenshots,
     settings::{self, DefaultAgent, Settings, Theme},
-    ui,
+    ui, updates,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
@@ -61,6 +61,7 @@ pub(super) enum Response {
     WorktreeChanged(std::io::Result<ManagedWorktree>),
     WorktreeRestarted(std::io::Result<String>),
     ScreenshotRead(u64, std::io::Result<Vec<u8>>),
+    UpdateAvailable(Option<String>),
 }
 pub(super) enum WorktreeFocusFeedback {
     Success(String),
@@ -86,6 +87,7 @@ pub struct App {
     pub(super) launch_seq: u64,
     pub(super) handoff: Option<PendingHandoff>,
     pub toast: Option<Toast>,
+    pub update_available: Option<String>,
     pub list_rect: Rect,
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
@@ -344,6 +346,10 @@ impl App {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel::<Request>();
         let (out, responses) = mpsc::channel();
+        let updates_out = out.clone();
+        thread::spawn(move || {
+            let _ = updates_out.send(Response::UpdateAvailable(updates::available_version()));
+        });
         thread::spawn(move || {
             while let Ok(request) = rx.recv() {
                 let response = match request {
@@ -472,6 +478,7 @@ impl App {
             launch_seq: 0,
             handoff: None,
             toast: None,
+            update_available: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -828,6 +835,7 @@ impl App {
     fn receive_at(&mut self, now: Instant) {
         while let Ok(r) = self.responses.try_recv() {
             match r {
+                Response::UpdateAvailable(version) => self.update_available = version,
                 Response::List(res) => {
                     self.refresh_inflight = false;
                     self.next_refresh = now + REFRESH_INTERVAL;
@@ -2616,6 +2624,7 @@ mod tests {
             launch_seq: 0,
             handoff: None,
             toast: None,
+            update_available: None,
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,

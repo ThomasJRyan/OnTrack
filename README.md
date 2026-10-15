@@ -11,6 +11,7 @@ A terminal browser for Beads issues in the current workspace.
 - Automatic background refresh picks up external changes, with cached records and visible errors; no watcher setup required.
 - Persistent theme and default new-task agent selection in a structured settings dialog.
 - A brief animated terminal splash with the ONTRACK wordmark and a waving anime girl, with compact layouts for smaller terminals.
+- A top-right header notice when a newer OnTrack release is available.
 - Press `h` to hand a selected Bead to a Herdr agent in a new worktree. A top-right toast shows progress and the result; Open and Ready issues show `· sent` once the prompt is confirmed. See the [user guide](docs/user-guide.md) for setup and recovery limits.
 - Press `w` to inspect OnTrack-tracked outstanding worktrees, with colour-coded statuses and Bead details. Completed tasks show Ready to Merge after the Bead closes and the recorded agent settles; enabled preferences queue merge requests one at a time, then clean up verified integrated worktrees. Older handoffs without enough evidence show a manual merge hint. Active merge work stays Pending, and verified removed checkouts leave this view. Press `Enter` to switch to a worktree's Herdr workspace, request a merge or safe cleanup, or use `Shift+R` to confirm a fresh start for the task.
 

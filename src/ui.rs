@@ -285,6 +285,36 @@ fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
         .max(2);
     (type_width, priority_width)
 }
+fn render_header(f: &mut Frame, area: Rect, left: Line<'static>, app: &App) {
+    let palette = crate::theme::definition(app.theme).palette;
+    let mut left_area = area;
+    if let Some(version) = &app.update_available {
+        let full = format!(" UPDATE AVAILABLE · v{version} ");
+        let badge = if usize::from(area.width) > left.width() + Span::raw(&full).width() {
+            full.as_str()
+        } else {
+            " UPDATE "
+        };
+        let badge_width = Span::raw(badge).width() as u16;
+        if area.width > badge_width + 7 {
+            left_area.width = area.width - badge_width;
+            f.render_widget(
+                Paragraph::new(Span::styled(
+                    badge.to_owned(),
+                    Style::default()
+                        .fg(palette.warning)
+                        .add_modifier(Modifier::BOLD),
+                ))
+                .alignment(Alignment::Right),
+                Rect::new(area.x + left_area.width, area.y, badge_width, 1),
+            );
+        }
+    }
+    f.render_widget(
+        Paragraph::new(left).style(Style::default().fg(palette.foreground)),
+        left_area,
+    );
+}
 pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     let a = f.area();
     let palette = crate::theme::definition(app.theme).palette;
@@ -344,8 +374,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 Constraint::Length(3),
             ])
             .split(a);
-        f.render_widget(
-            Paragraph::new(Line::from(vec![
+        render_header(
+            f,
+            areas[0],
+            Line::from(vec![
                 Span::styled(
                     " WORKTREES ",
                     Style::default()
@@ -354,9 +386,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         .add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("  ONTRACK  /  Git integration, not Bead status"),
-            ]))
-            .style(Style::default().fg(ink)),
-            areas[0],
+            ]),
+            app,
         );
         let panes = Layout::default()
             .direction(Direction::Horizontal)
@@ -637,8 +668,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             Constraint::Length(1),
         ])
         .split(a);
-    f.render_widget(
-        Paragraph::new(Line::from(vec![
+    render_header(
+        f,
+        v[0],
+        Line::from(vec![
             Span::styled(
                 " BEADS ",
                 Style::default()
@@ -647,9 +680,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  ONTRACK  /  WORKSPACE ISSUES"),
-        ]))
-        .style(Style::default().fg(ink)),
-        v[0],
+        ]),
+        app,
     );
     let split = Layout::default()
         .direction(Direction::Horizontal)
@@ -2281,6 +2313,7 @@ mod tests {
             launch_seq: 0,
             handoff: None,
             toast: None,
+            update_available: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -2381,6 +2414,36 @@ mod tests {
         let help = draw_at((60, 18), Duration::ZERO, &mut app);
         assert!(help.contains("HOTKEYS"));
         assert!(!help.contains(".-\"\"\"-."));
+    }
+    #[test]
+    fn update_badge_fits_headers_and_survives_a_handoff_toast() {
+        let mut app = app();
+        app.update_available = Some("0.2.0".into());
+        let wide = draw_at((100, 24), SPLASH_DURATION, &mut app);
+        assert!(wide.contains("UPDATE AVAILABLE · v0.2.0"));
+        assert!(wide.contains("ONTRACK  /  WORKSPACE ISSUES"));
+
+        let compact = draw_at((24, 7), SPLASH_DURATION, &mut app);
+        assert!(compact.contains("UPDATE"));
+        assert!(compact.contains("BEADS"));
+
+        app.worktrees_view = true;
+        let worktrees = draw_at((100, 24), SPLASH_DURATION, &mut app);
+        assert!(worktrees.contains("UPDATE AVAILABLE · v0.2.0"));
+        assert!(worktrees.contains("WORKTREES"));
+
+        app.toast = Some(crate::app::Toast {
+            message: "Agent started".into(),
+            error: false,
+            expires_at: None,
+        });
+        let with_toast = draw_at((100, 24), SPLASH_DURATION, &mut app);
+        assert!(with_toast.contains("HERDR"));
+        assert!(with_toast.contains("Agent started"));
+        app.toast = None;
+        assert!(
+            draw_at((100, 24), SPLASH_DURATION, &mut app).contains("UPDATE AVAILABLE · v0.2.0")
+        );
     }
     #[test]
     fn hotkey_reference_has_columns_and_scrolls_in_compact_terminals() {

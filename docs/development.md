@@ -15,12 +15,15 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | `src/worktrees.rs` | Journals OnTrack-created handoffs separately from Beads and verifies Git/Herdr evidence before merge finalization or cleanup. |
 | `src/app.rs` | Holds selection, focus, scrolling, modal form and handoff toast state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
+| `src/updates.rs` | Checks the latest published GitHub release with a bounded `curl` request and compares its tag with the Cargo package version. |
 | `src/hotkeys.rs` | Maps the active pane or dialog to its keyboard command list and recognizes modified help-key reports. |
 | `src/ui.rs` | Renders splash, issue list, wrapped Markdown details, status, and top-right handoff toasts; maintains list visibility and scroll bounds. |
 | `src/detail.rs` | Presents complete issue records with Markdown rendering for narrative fields and readable structured fallbacks for metadata. |
 | `src/terminal.rs` | Manages raw mode, alternate screen, mouse capture, and cleanup, including initialization failures and panic handling. |
 
 `src/ui.rs` renders the supplied centered ONTRACK wordmark and a terminal-drawn anime girl during the 1.2-second startup splash. `girl_frame` chooses the blink and wave pose from elapsed time supplied by `app::run`'s existing redraw loop, so the animation needs no separate timer or state. If the full wordmark and character do not fit, the renderer uses the compact ONTRACK title with the character when possible, then a text-only fallback. Width checks use terminal cell widths; preserve the wordmark verbatim, keep the splash centered and theme-aware, and ensure it yields to the normal browser view after startup.
+
+`App::new` starts a separate, one-shot update check thread so network delay cannot stall the Beads request worker or terminal startup. `updates::available_version` runs `curl` with a five-second limit against the repository's latest published release endpoint, parses its `tag_name`, and uses `semver` to compare it with `CARGO_PKG_VERSION`. Errors and absent/invalid release data yield no notice. The response stores only a newer version in app state. `ui::render_header` uses a full top-right badge where it fits and a compact badge in narrow headers; Herdr toasts render last and may temporarily cover it. Tests cover version comparisons, both headers, compact layout, and toast overlap.
 
 In the managed-worktree view, Enter queues `herdr workspace focus WORKSPACE_ID` on the existing background worker. The ID comes from the selected OnTrack handoff, never global focus. The adapter passes arguments separately, rejects unsafe IDs, and requires Herdr's `workspace_focused` result to repeat the selected ID. Closed workspaces and removed checkouts are rejected before dispatch. Focus success and errors are shown in the view without changing Git, Beads, or the handoff registry.
 

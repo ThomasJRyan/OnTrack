@@ -779,6 +779,7 @@ dependencies = [
  "ratatui",
  "ratatui-cheese",
  "ratcn",
+ "semver",
  "serde_json",
  "tui-markdown",
 ]
