@@ -67,6 +67,8 @@ Create returns a JSON object containing the created ID; update and delete are su
 
 `--all` includes closed issues and `--limit 0` removes the default list cap. `--id=ISSUE_ID` is a single argument. The list and show responses must be JSON arrays. List parsing requires nonempty string `id`, `title`, and `status`; a missing or null priority defaults to 2, and supplied priority must be an unsigned integer. Each `Bead` retains the entire JSON object as well as its summary fields.
 
+The issue list layout sorts each status pane by the visible ancestry derived from `parent` in the uncapped list records. It keeps the existing status and ID order for unrelated roots and siblings, places descendants after their parent, and uses the ancestry depth to indent titles. An absent parent or one in another display-status pane starts a visible root; the title row shows that parent ID so the relationship remains apparent. Selection and hit testing use the layout's issue indices, so sorting the display rows does not change the underlying Beads records or Ready scheduler order.
+
 Detail parsing selects the requested ID, rejects duplicate matching records, and reports a missing ID. It retains the returned JSON intact, including comments, relationships, metadata, and fields unknown to ontrack. The detail renderer omits only the top-level `revision` field from display, for both cached list records and full show records; nested revision fields and other metadata remain visible. Process-start errors, unsuccessful exit statuses with stderr, and invalid JSON/records are surfaced as errors rather than panics.
 
 ## Epic planning workspace

@@ -39,6 +39,8 @@ While OnTrack is running from a Herdr main checkout, its scheduler picks Ready t
 
 The left pane lists all returned issues, including closed ones, without the CLI's usual list cap. Each entry shows its colour-coded issue type, priority, status, and a white title; the selected issue's ID appears in the details pane title. The rounded details pane shares the issue list's theme background. Its title shows the selected issue's ID, status, and P0–P4 priority; those fields are omitted from the body. It presents narrative fields as Markdown, while other metadata, comments, relationships, and unfamiliar nested values remain available as you scroll.
 
+Within a status pane, a parent appears before its children and nested children are indented beneath it. A child whose parent is in another status pane or absent from the current list stays in its own pane and shows the parent ID before its title. Status panes still control collapse and navigation; indentation does not change a Bead's status or parent relationship.
+
 An Open issue shows `· sent` beside its status after Herdr confirms the initial agent prompt and OnTrack saves the handoff. The marker survives refresh and restart through the tracked worktree record. The Beads status still reads Open until the agent changes it; once it changes, the marker disappears. A handoff without confirmed prompt submission does not show the marker. Use `w` to inspect any incomplete or uncertain launch.
 
 | Input | Action |
