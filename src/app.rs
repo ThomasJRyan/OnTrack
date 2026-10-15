@@ -491,6 +491,21 @@ impl App {
         if !self.worktrees_discovered || self.handoff.is_some() || self.mutation_busy {
             return;
         }
+        let active_agents = self
+            .worktrees
+            .iter()
+            .filter(|item| {
+                item.handoff_accepted
+                    && matches!(
+                        item.status,
+                        worktrees::WorktreeStatus::InProgress
+                            | worktrees::WorktreeStatus::DirtyCheckout
+                    )
+            })
+            .count();
+        if !self.settings.agent_limit.allows(active_agents) {
+            return;
+        }
         let next = self
             .beads
             .iter()
@@ -1579,32 +1594,36 @@ impl App {
                 match key.code {
                     Tab | BackTab => {
                         *dropdown_open = false;
-                        *focus = (*focus + if key.code == Tab { 1 } else { 4 }) % 5;
+                        *focus = (*focus + if key.code == Tab { 1 } else { 5 }) % 6;
                     }
                     Up | Down => {
-                        *focus = (*focus + if key.code == Down { 1 } else { 4 }) % 5;
+                        *focus = (*focus + if key.code == Down { 1 } else { 5 }) % 6;
                         *dropdown_open = false;
                     }
                     Left | Right if *focus == 0 => {
                         draft.theme = cycle_theme(draft.theme, key.code == Right);
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus == 0 && *dropdown_open => {
+                    Left | Right if *focus == 1 => {
+                        draft.agent_limit = draft.agent_limit.step(key.code == Right);
+                        save_settings = Some(*draft);
+                    }
+                    Enter | Char(' ') if *focus <= 1 && *dropdown_open => {
                         *dropdown_open = false;
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus == 0 => {
+                    Enter | Char(' ') if *focus <= 1 => {
                         *dropdown_open = true;
                     }
-                    Enter | Char(' ') if (1..=3).contains(focus) => {
+                    Enter | Char(' ') if (2..=4).contains(focus) => {
                         match *focus {
-                            1 => draft.auto_merge = !draft.auto_merge,
-                            2 => draft.auto_close_workspace = !draft.auto_close_workspace,
+                            2 => draft.auto_merge = !draft.auto_merge,
+                            3 => draft.auto_close_workspace = !draft.auto_close_workspace,
                             _ => draft.auto_remove_checkout = !draft.auto_remove_checkout,
                         }
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus == 4 => {
+                    Enter | Char(' ') if *focus == 5 => {
                         self.modal = None;
                     }
                     _ => {}
@@ -2544,6 +2563,66 @@ mod tests {
         a.known_handoffs.insert("b0".into());
         a.poll_scheduler();
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn scheduler_waits_at_limit_and_resumes_after_active_handoff_finishes() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.settings.agent_limit = settings::AgentLimit::Limited(1);
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        a.worktrees.push(ManagedWorktree {
+            id: "manual".into(),
+            bead_id: "other".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/other".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws-other".into(),
+            status: worktrees::WorktreeStatus::DirtyCheckout,
+            detail: None,
+        });
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        assert!(!a.scheduler_attempted.contains("b0"));
+        let (out, responses) = mpsc::channel();
+        a.responses = responses;
+        let mut finished = a.worktrees[0].clone();
+        finished.status = worktrees::WorktreeStatus::Unmerged;
+        out.send(Response::Worktrees(Ok(vec![finished]))).unwrap();
+        a.receive();
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+        assert_eq!(a.handoff.as_ref().unwrap().bead.id, "b0");
+    }
+
+    #[test]
+    fn unlimited_scheduler_ignores_active_handoff_count() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.settings.agent_limit = settings::AgentLimit::Unlimited;
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        a.worktrees.push(ManagedWorktree {
+            id: "active".into(),
+            bead_id: "other".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/other".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws-other".into(),
+            status: worktrees::WorktreeStatus::InProgress,
+            detail: None,
+        });
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
     }
     #[test]
     fn ready_toggle_uses_label_mutation_and_does_not_change_beads_status() {
@@ -3493,7 +3572,7 @@ mod tests {
         );
         press(&mut a, KeyCode::Tab);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 1, .. })));
-        assert_eq!(a.theme, Theme::Light, "Tab only focuses Close");
+        assert_eq!(a.theme, Theme::Light, "Tab only moves focus");
         press(&mut a, KeyCode::BackTab);
         press(&mut a, KeyCode::Esc);
         assert!(a.modal.is_none(), "Esc closes Settings without rollback");
@@ -3512,7 +3591,7 @@ mod tests {
             "reopening does not change the saved theme"
         );
         assert!(matches!(a.modal, Some(Modal::Settings { .. })));
-        for _ in 0..4 {
+        for _ in 0..5 {
             press(&mut a, KeyCode::Tab);
         }
         press(&mut a, KeyCode::Enter);
@@ -3564,11 +3643,13 @@ mod tests {
         a.settings_path = Some(path.clone());
         press(&mut a, KeyCode::Char('s'));
         press(&mut a, KeyCode::Up);
-        assert!(matches!(a.modal, Some(Modal::Settings { focus: 4, .. })));
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 5, .. })));
         press(&mut a, KeyCode::Down);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 0, .. })));
         press(&mut a, KeyCode::Down);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 1, .. })));
+        press(&mut a, KeyCode::Down);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 2, .. })));
         press(&mut a, KeyCode::Enter);
         assert_eq!(a.theme, Theme::Dark);
         assert!(a.settings.auto_merge);
@@ -3583,6 +3664,49 @@ mod tests {
         assert_eq!(a.theme, Theme::Dark);
         assert!(a.settings.auto_merge);
         press(&mut a, KeyCode::Esc);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settings_agent_limit_changes_save_and_survive_reopening() {
+        let dir = std::env::temp_dir().join(format!("ontrack-agent-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        let mut a = app();
+        a.settings_path = Some(path.clone());
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Tab);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 1, .. })));
+        for expected in [4, 3, 2, 1] {
+            press(&mut a, KeyCode::Left);
+            assert_eq!(
+                a.settings.agent_limit,
+                settings::AgentLimit::Limited(expected)
+            );
+            assert_eq!(
+                settings::load_from(&path).unwrap().agent_limit,
+                a.settings.agent_limit
+            );
+        }
+        press(&mut a, KeyCode::Left);
+        assert_eq!(a.settings.agent_limit, settings::AgentLimit::Unlimited);
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: true,
+                ..
+            })
+        ));
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.settings.agent_limit, settings::AgentLimit::Limited(1));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        press(&mut a, KeyCode::Char('s'));
+        assert!(
+            matches!(a.modal, Some(Modal::Settings { draft, .. }) if draft.agent_limit == settings::AgentLimit::Limited(1))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]

@@ -7,7 +7,7 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Defines the terminal type, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
-| `src/settings.rs` | Loads and atomically saves theme and worktree-cleanup preferences under the user's XDG config directory. |
+| `src/settings.rs` | Loads and atomically saves theme, agent limit, and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
 | `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/herdr.rs` | Discovers usable agent integrations, maps the current checkout to a Herdr workspace, focuses a selected managed workspace, and explicitly creates a worktree and starts/prompts an agent. |
@@ -33,7 +33,7 @@ The create/edit Description field uses `description_layout` to insert visual lin
 
 The hotkey reference is a separate `App::help` overlay, not a modal replacement. `App::key` handles its toggle and scroll keys before dispatching to the underlying pane or dialog; the mutation lock still takes precedence. `hotkeys::Context` captures the current pane or dialog when opened and owns its key/action list. Add new keyboard commands to the matching context when changing input handling. `ui::render_help` wraps the right column, clamps scrolling to the rendered lines, and renders over either browser view. Enhanced keyboard reports distinguish `Ctrl+?` or `Ctrl+Shift+/`; legacy terminals may report it as plain Backspace, which must remain text deletion/navigation rather than opening help.
 
-The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
+The `s` settings dialog saves each theme, agent-limit, or cleanup-preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes the focused choice, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
 Settings rows in `src/ui.rs` share a two-thirds title column and one-third
 value column. `settings_row` aligns titles to the left and centers controls
 by terminal cell width; keep dropdown entries on the same value boundary and
@@ -66,6 +66,15 @@ Create returns a JSON object containing the created ID; update and delete are su
 `Shift+N` opens the create form with an immutable selected parent ID. Child creation passes `--parent=PARENT_ID` as its own argument, so Beads records the hierarchy and list/show JSON exposes the child's `parent` field. It fetches the parent labels, uses `--no-inherit-labels`, then explicitly carries over ordinary labels; the parent's Ready and harness labels are excluded so the new child starts Open with its own selected harness. OnTrack reads the uncapped live list to find open descendants before a parent starts or merges. Beads rejects a `blocks` dependency from a parent to its descendant because blocked state would cascade back to that descendant; its `bd ready` output still includes the parent. The child-first gate is therefore enforced by OnTrack, not by a reverse Beads dependency.
 
 `--all` includes closed issues and `--limit 0` removes the default list cap. `--id=ISSUE_ID` is a single argument. The list and show responses must be JSON arrays. List parsing requires nonempty string `id`, `title`, and `status`; a missing or null priority defaults to 2, and supplied priority must be an unsigned integer. Each `Bead` retains the entire JSON object as well as its summary fields.
+
+The Ready scheduler counts accepted managed handoffs with `InProgress` or
+`DirtyCheckout` display status before selecting another task. A pending launch
+pauses scheduling, and a successful launch requires a fresh worktree scan before
+the next selection, so a newly accepted handoff is counted before another one
+starts. Reserved parent worktrees and finished or cleanup states do not take a
+slot. The setting is global to the user and defaults to five; Unlimited bypasses
+the count. Explicit `h` launches bypass the gate but count while active. A full
+limit leaves Ready labels and the existing priority and ID ordering untouched.
 
 The issue list layout sorts each status pane by the visible ancestry derived from `parent` in the uncapped list records. It keeps the existing status and ID order for unrelated roots and siblings, places descendants after their parent, and uses the ancestry depth to indent titles. An absent parent or one in another display-status pane starts a visible root; the title row shows that parent ID so the relationship remains apparent. Selection and hit testing use the layout's issue indices, so sorting the display rows does not change the underlying Beads records or Ready scheduler order.
 

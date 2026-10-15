@@ -194,11 +194,11 @@ fn worktree_status_style(theme: Theme, status: crate::worktrees::WorktreeStatus)
 }
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
-        "↑ / ↓ move · ← / → theme · Enter / Space toggle · Tab moves · Esc close"
-    } else if focus == 1 {
+        "↑ / ↓ move · ← / → change choice · Enter / Space save · Tab moves · Esc close"
+    } else if (2..=4).contains(&focus) {
         "↑ / ↓ move · Enter / Space toggle · Tab moves · Esc close"
     } else {
-        "↑ / ↓ move · ← / → theme · Enter / Space toggle · Tab moves"
+        "↑ / ↓ move · ← / → change choice · Enter / Space open · Tab moves"
     }
 }
 fn settings_columns(width: usize) -> (usize, usize) {
@@ -245,6 +245,16 @@ fn visible_theme_window(theme: Theme, available_height: u16) -> (usize, usize) {
         .saturating_sub(visible.saturating_sub(1))
         .min(total.saturating_sub(visible));
     (start, visible)
+}
+fn visible_limit_window(limit: crate::settings::AgentLimit, available_height: u16) -> (u64, usize) {
+    let visible = usize::from(available_height)
+        .saturating_sub(21)
+        .clamp(1, MAX_VISIBLE_THEMES);
+    let selected = match limit {
+        crate::settings::AgentLimit::Unlimited => 0,
+        crate::settings::AgentLimit::Limited(count) => u64::from(count),
+    };
+    (selected.saturating_sub((visible - 1) as u64), visible)
 }
 fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
     let type_width = beads
@@ -966,15 +976,20 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     width.saturating_sub(4) as usize,
                 )
                 .len();
-                let option_lines = if *dropdown_open {
+                let option_lines = if *dropdown_open && *focus == 0 {
                     let (start, count) = visible_theme_window(draft.theme, a.height);
                     count
                         + usize::from(start > 0)
                         + usize::from(start + count < crate::theme::CATALOG.len())
+                } else if *dropdown_open && *focus == 1 {
+                    let (start, count) = visible_limit_window(draft.agent_limit, a.height);
+                    count
+                        + usize::from(start > 0)
+                        + usize::from(start + count as u64 <= u32::MAX as u64)
                 } else {
                     0
                 };
-                (9 + option_lines + error_lines + hint_lines + 2) as u16
+                (10 + option_lines + error_lines + hint_lines + 2) as u16
             }
             crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
                 let epic_toggle = matches!(modal, crate::app::Modal::Create(_))
@@ -1098,7 +1113,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         },
                     ),
                 ];
-                if *dropdown_open {
+                if *dropdown_open && *focus == 0 {
                     let (start, count) = visible_theme_window(draft.theme, a.height);
                     let end = start + count;
                     if start > 0 {
@@ -1134,6 +1149,61 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         ));
                     }
                 }
+                lines.push(settings_row(
+                    "Agent limit",
+                    &format!("{} ▾", draft.agent_limit.label()),
+                    row_width,
+                    if *focus == 1 {
+                        value_style
+                    } else {
+                        Style::default().fg(ink)
+                    },
+                    if *focus == 1 {
+                        selected_style
+                    } else {
+                        value_style
+                    },
+                ));
+                if *dropdown_open && *focus == 1 {
+                    let (start, count) = visible_limit_window(draft.agent_limit, a.height);
+                    if start > 0 {
+                        lines.push(settings_row(
+                            "",
+                            "↑ earlier limits",
+                            row_width,
+                            Style::default(),
+                            Style::default().fg(muted),
+                        ));
+                    }
+                    for index in start..start + count as u64 {
+                        let choice = if index == 0 {
+                            crate::settings::AgentLimit::Unlimited
+                        } else {
+                            crate::settings::AgentLimit::Limited(index as u32)
+                        };
+                        let selected = draft.agent_limit == choice;
+                        lines.push(settings_row(
+                            "",
+                            &format!("{} {}", if selected { "›" } else { " " }, choice.label()),
+                            row_width,
+                            Style::default(),
+                            if selected {
+                                selected_style
+                            } else {
+                                Style::default().fg(ink)
+                            },
+                        ));
+                    }
+                    if start + count as u64 <= u32::MAX as u64 {
+                        lines.push(settings_row(
+                            "",
+                            "↓ later limits",
+                            row_width,
+                            Style::default(),
+                            Style::default().fg(muted),
+                        ));
+                    }
+                }
                 for (index, (label, enabled)) in [
                     ("Auto-request merge", draft.auto_merge),
                     (
@@ -1148,7 +1218,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .into_iter()
                 .enumerate()
                 {
-                    let focused = *focus == index + 1;
+                    let focused = *focus == index + 2;
                     lines.push(settings_row(
                         label,
                         if enabled { "[x]" } else { "[ ]" },
@@ -1176,7 +1246,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 lines.push(
                     Line::from(Span::styled(
                         "[ Close ]",
-                        if *focus == 4 {
+                        if *focus == 5 {
                             selected_style
                         } else {
                             value_style
@@ -3223,9 +3293,9 @@ mod tests {
         assert!(text.contains("settings.json"));
         assert!(text.contains("Permission") && text.contains("denied"));
         assert!(text.contains("try again"));
-        assert!(text.contains("← / → theme"));
+        assert!(text.contains("← / → change choice"));
         assert!(text.contains("Dark"));
-        assert!(text.contains("Enter / Space toggle"));
+        assert!(text.contains("Enter / Space save"));
         assert!(text.contains("Esc") && text.contains("close"));
         assert!(a.modal_ready);
         assert_eq!(buffer[(0, 3)].bg, Color::Rgb(246, 248, 247));
@@ -3242,7 +3312,7 @@ mod tests {
         });
         let closed = draw((80, 24), &mut a).0;
         assert!(closed.contains("Dark"));
-        assert!(closed.contains("Enter / Space toggle"));
+        assert!(closed.contains("Enter / Space open"));
         a.modal = Some(crate::app::Modal::Settings {
             draft: crate::settings::Settings {
                 theme: crate::settings::Theme::Light,
@@ -3282,7 +3352,7 @@ mod tests {
             },
             error: None,
             dropdown_open: true,
-            focus: 3,
+            focus: 0,
         });
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal
@@ -3292,6 +3362,7 @@ mod tests {
         assert_eq!(settings_columns(60), (40, 20));
         let title_x = locate(buffer, "Theme").0;
         for label in [
+            "Agent limit",
             "Auto-request merge",
             "Close Herdr workspace after integration",
             "Remove checkout + close Herdr workspace",
@@ -3485,6 +3556,37 @@ mod tests {
         assert!(!early.contains("Save"));
         assert!(!early.contains("Cancel"));
         assert!(app.modal_ready);
+    }
+    #[test]
+    fn agent_limit_dropdown_shows_unlimited_then_increasing_counts() {
+        let mut app = app();
+        app.modal = Some(crate::app::Modal::Settings {
+            draft: crate::settings::Settings::default(),
+            error: None,
+            dropdown_open: true,
+            focus: 1,
+        });
+        let screen = draw((80, 30), &mut app).0;
+        let labels = ["› 5", "  Unlimited", "  1", "  2", "  3", "  4"];
+        for label in labels {
+            assert!(screen.contains(label), "missing {label:?}");
+        }
+        assert!(screen.find("Unlimited").unwrap() < screen.find("› 5").unwrap());
+        assert!(screen.contains("↓ later limits"));
+
+        app.modal = Some(crate::app::Modal::Settings {
+            draft: crate::settings::Settings {
+                agent_limit: crate::settings::AgentLimit::Limited(12),
+                ..Default::default()
+            },
+            error: None,
+            dropdown_open: true,
+            focus: 1,
+        });
+        let later = draw((80, 24), &mut app).0;
+        assert!(later.contains("› 12"));
+        assert!(later.contains("↑ earlier limits"));
+        assert!(later.contains("↓ later limits"));
     }
     #[test]
     fn wide_title_horizontal_scroll_starts_at_character_boundary() {
