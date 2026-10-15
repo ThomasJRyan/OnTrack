@@ -252,6 +252,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
             .split(areas[1]);
+        app.list_rect = panes[0];
+        app.detail_rect = panes[1];
         let item_height = 2usize;
         let visible = (usize::from(panes[0].height.saturating_sub(2)) / item_height).max(1);
         if app.selected_worktree < app.worktree_offset {
@@ -321,6 +323,17 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         );
         let selected = app.worktrees.get(app.selected_worktree);
         let detail = if let Some(item) = selected {
+            let live_bead = app.beads.iter().find(|bead| bead.id == item.bead_id);
+            let title = live_bead
+                .map(|bead| bead.title.as_str())
+                .filter(|title| !title.trim().is_empty())
+                .or(item.bead_title.as_deref())
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or("(not recorded at handoff)");
+            let description = live_bead
+                .and_then(|bead| bead.data.get("description"))
+                .and_then(serde_json::Value::as_str)
+                .or(item.bead_description.as_deref());
             let mut lines = vec![
                 Line::from(Span::styled(
                     format!(
@@ -350,10 +363,35 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     ),
                 )));
             }
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled("Title: ", Style::default().fg(muted)),
+                Span::raw(title),
+            ]));
+            lines.push(Line::from(Span::styled(
+                "Description:",
+                Style::default().fg(muted),
+            )));
+            match description {
+                Some(description) if !description.trim().is_empty() => {
+                    lines.extend(description.split('\n').map(Line::from));
+                }
+                _ => lines.push(Line::from("(none recorded at handoff)")),
+            }
             lines
         } else {
             vec![Line::from("Select a tracked handoff to inspect its state.")]
         };
+        let detail_width = panes[1].width.saturating_sub(2);
+        let detail_height = panes[1].height.saturating_sub(2);
+        let line_count = Paragraph::new(detail.clone())
+            .wrap(Wrap { trim: false })
+            .line_count(detail_width);
+        app.worktree_detail_offset = app.worktree_detail_offset.min(
+            line_count
+                .saturating_sub(detail_height as usize)
+                .min(u16::MAX as usize) as u16,
+        );
         f.render_widget(
             Paragraph::new(detail)
                 .block(
@@ -362,7 +400,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         .title(" HANDOFF DETAILS ")
                         .border_style(Style::default().fg(palette.border)),
                 )
-                .wrap(Wrap { trim: true })
+                .wrap(Wrap { trim: false })
+                .scroll((app.worktree_detail_offset, 0))
                 .style(Style::default().fg(ink).bg(bg)),
             panes[1],
         );
@@ -377,13 +416,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             format!("ERROR · {error} · Esc / w back")
         } else if let Some(item) = selected.filter(|item| item.detail.is_some()) {
             format!(
-                "{} · {} · r refresh",
+                "{} · {} · PgUp/PgDn details · r refresh",
                 crate::app::worktree_status_label(item.status),
                 item.detail.as_deref().unwrap_or_default()
             )
         } else {
-            "↑/↓ select · m request merge · c close · x remove · r refresh · Esc / w back"
-                .to_owned()
+            "↑/↓ select · PgUp/PgDn details · m request merge · c close · x remove · r refresh · Esc / w back".to_owned()
         };
         let footer_lines = wrap_words(&footer, areas[2].width as usize)
             .into_iter()
@@ -1150,7 +1188,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Paragraph::new(wrapped_description)
                         .block(
                             Block::default()
-                                .title(" Description · Enter for newline ")
+                                .title(" Description · Shift+Enter newline · Enter Create ")
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(if form.focus == 1 {
                                     teal
@@ -1485,17 +1523,48 @@ fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, 
     let mut row = 0;
     let mut col = 0;
     for (byte, ch) in s.char_indices() {
-        if byte == cursor {
-            caret = Some(if col == width {
-                (0, row + 1)
-            } else {
-                (col, row)
-            });
-        }
         if ch == '\n' {
+            if byte == cursor {
+                caret = Some(if col == width {
+                    (0, row + 1)
+                } else {
+                    (col, row)
+                });
+            }
             out.push('\n');
             row += 1;
             col = 0;
+            continue;
+        }
+        if !ch.is_whitespace()
+            && (byte == 0
+                || s[..byte]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace))
+        {
+            let word = s[byte..].split(char::is_whitespace).next().unwrap_or("");
+            if col > 0 && col + Span::raw(word).width() > width {
+                out.push('\n');
+                row += 1;
+                col = 0;
+            }
+        }
+        // A separator at the right edge belongs to the next visual line, but
+        // need not occupy a cell there before the next word.
+        if ch == ' '
+            && col == width
+            && s[byte + ch.len_utf8()..]
+                .chars()
+                .next()
+                .is_some_and(|next| !next.is_whitespace())
+        {
+            out.push('\n');
+            row += 1;
+            col = 0;
+            if byte == cursor {
+                caret = Some((col, row));
+            }
             continue;
         }
         let cw = Span::raw(ch.to_string()).width();
@@ -1503,6 +1572,9 @@ fn wrapped_description(s: &str, cursor: usize, width: usize) -> (String, usize, 
             out.push('\n');
             row += 1;
             col = 0;
+        }
+        if byte == cursor {
+            caret = Some((col, row));
         }
         out.push(ch);
         col += cw;
@@ -1676,6 +1748,7 @@ mod tests {
             worktrees: Vec::new(),
             selected_worktree: 0,
             worktree_offset: 0,
+            worktree_detail_offset: 0,
             worktrees_view: false,
             worktrees_loading: false,
             worktrees_error: None,
@@ -2180,6 +2253,8 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "handoff-1".into(),
             bead_id: "closed-1".into(),
+            bead_title: Some("Review handoff".into()),
+            bead_description: Some("First line\nSecond line".into()),
             branch: "ontrack/closed-1".into(),
             target_branch: "main".into(),
             workspace_id: "ws-7".into(),
@@ -2195,6 +2270,100 @@ mod tests {
         assert!(screen.contains("Git integration"));
     }
     #[test]
+    fn selected_worktree_shows_its_captured_title_and_multiline_description() {
+        let mut app = app();
+        app.worktrees_view = true;
+        let first = crate::worktrees::ManagedWorktree {
+            id: "handoff-1".into(),
+            bead_id: "bead-1".into(),
+            bead_title: Some("First task".into()),
+            bead_description: Some("Line one\nLine two".into()),
+            branch: "ontrack/bead-1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws-1".into(),
+            status: crate::worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        };
+        app.worktrees.push(first.clone());
+        app.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "handoff-2".into(),
+            bead_id: "bead-2".into(),
+            bead_title: Some("Second task".into()),
+            bead_description: Some("Another description".into()),
+            ..first
+        });
+        let first_screen = draw((100, 23), &mut app).0;
+        for value in [
+            "First task",
+            "Line one",
+            "Line two",
+            "Branch: ontrack/bead-1",
+        ] {
+            assert!(first_screen.contains(value), "{value} missing");
+        }
+        app.selected_worktree = 1;
+        let second_screen = draw((100, 23), &mut app).0;
+        for value in ["Second task", "Another description"] {
+            assert!(second_screen.contains(value), "{value} missing");
+        }
+        assert!(!second_screen.contains("Line one"));
+    }
+    #[test]
+    fn worktree_description_scrolls_and_missing_context_has_fallback() {
+        let mut app = app();
+        app.worktrees_view = true;
+        app.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "legacy".into(),
+            bead_id: "old-bead".into(),
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/old-bead".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: crate::worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        });
+        let legacy = draw((100, 20), &mut app).0;
+        assert!(legacy.contains("old-bead"));
+        assert!(legacy.contains("not recorded at handoff"));
+        app.worktrees[0].bead_description = Some(
+            (0..30)
+                .map(|index| format!("Detail line {index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        );
+        app.worktree_detail_offset = u16::MAX;
+        let scrolled = draw((100, 20), &mut app).0;
+        assert!(app.worktree_detail_offset > 0);
+        assert!(scrolled.contains("Detail line 29"));
+    }
+    #[test]
+    fn current_bead_text_updates_worktree_details_and_snapshot_survives_bead_removal() {
+        let mut app = app();
+        app.worktrees_view = true;
+        app.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "handoff".into(),
+            bead_id: "demo-1".into(),
+            bead_title: Some("Original title".into()),
+            bead_description: Some("Original description".into()),
+            branch: "ontrack/demo-1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: crate::worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        });
+        app.beads[0].title = "Updated title".into();
+        app.beads[0].data["description"] = json!("Updated description");
+        let current = draw((100, 23), &mut app).0;
+        assert!(current.contains("Updated title"));
+        assert!(current.contains("Updated description"));
+        assert!(!current.contains("Original description"));
+        app.beads.clear();
+        let fallback = draw((100, 23), &mut app).0;
+        assert!(fallback.contains("Original title"));
+        assert!(fallback.contains("Original description"));
+    }
+    #[test]
     fn selected_worktree_and_confirmation_stay_visible_with_long_lists() {
         let mut app = app();
         app.worktrees_view = true;
@@ -2202,6 +2371,8 @@ mod tests {
             app.worktrees.push(crate::worktrees::ManagedWorktree {
                 id: format!("wt-{index}"),
                 bead_id: format!("bead-{index}"),
+                bead_title: None,
+                bead_description: None,
                 branch: format!("ontrack/bead-{index}"),
                 target_branch: "main".into(),
                 workspace_id: format!("ws-{index}"),
@@ -2227,6 +2398,8 @@ mod tests {
         state.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "wt-remove".into(),
             bead_id: "b-closed".into(),
+            bead_title: None,
+            bead_description: None,
             branch: "ontrack/b".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),
@@ -2273,6 +2446,21 @@ mod tests {
         let scroll = y.saturating_sub(2);
         assert_eq!(y - scroll, 2);
         assert!(x < 5);
+    }
+    #[test]
+    fn description_wraps_words_and_keeps_cursor_on_the_rendered_line() {
+        let (s, x, y) = wrapped_description("hello world", 6, 8);
+        assert_eq!(s, "hello \nworld");
+        assert_eq!((x, y), (0, 1));
+        let (s, x, y) = wrapped_description("hello world", 11, 5);
+        assert_eq!(s, "hello\nworld");
+        assert_eq!((x, y), (0, 2));
+        let (s, x, y) = wrapped_description("ab longword\n界", 7, 4);
+        assert_eq!(s, "ab \nlong\nword\n界");
+        assert_eq!((x, y), (0, 2));
+        let (s, x, y) = wrapped_description("a 界界", 2, 4);
+        assert_eq!(s, "a \n界界");
+        assert_eq!((x, y), (0, 1));
     }
     #[test]
     fn settings_dialog_and_light_theme_render_with_contrast_at_small_sizes() {
