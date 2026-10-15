@@ -82,7 +82,7 @@ pub(crate) trait Executor {
     fn launch_intent(
         &mut self,
         _checkout: &Path,
-        _bead: &str,
+        _bead: &Value,
         _branch: &str,
         _agent: &str,
         _name: &str,
@@ -98,7 +98,7 @@ impl Executor for SystemExecutor {
     fn launch_intent(
         &mut self,
         checkout: &Path,
-        bead: &str,
+        bead: &Value,
         branch: &str,
         agent: &str,
         name: &str,
@@ -504,7 +504,7 @@ fn launch_with(
             "Bead capture: expected the requested full issue object; nothing created",
         ));
     }
-    let prompt = prompt(request, bead)?;
+    let prompt = prompt(request, &bead)?;
     let source = discover_with(executor, cwd)?;
     if source.discovery.workspace_id != request.workspace_id {
         return Err(io::Error::other(
@@ -545,7 +545,7 @@ fn launch_with(
         };
     let mut journal = executor.launch_intent(
         &source.checkout,
-        request.id,
+        &bead,
         &branch,
         request.agent,
         request.name,
@@ -747,7 +747,7 @@ fn agent_response(bytes: &[u8], kind: &str, target: &Launch) -> io::Result<()> {
     Ok(())
 }
 
-fn prompt(request: &Request<'_>, bead: Value) -> io::Result<String> {
+fn prompt(request: &Request<'_>, bead: &Value) -> io::Result<String> {
     let captured = serde_json::to_string_pretty(&json!({
         "requested_issue": {"id": request.id, "title": request.title},
         "bead": bead,
@@ -879,12 +879,17 @@ mod tests {
     }
 
     impl FakeJournal {
-        fn new(root: &Path) -> io::Result<Self> {
+        fn new(root: &Path, bead: &Value) -> io::Result<Self> {
             let path = root.join("main/.git/ontrack-worktrees/registry.json");
             std::fs::create_dir_all(path.parent().unwrap())?;
             let journal = Self {
                 path,
-                entry: json!({"phase": "create_possibly_sent", "responses": {}}),
+                entry: json!({
+                    "phase": "create_possibly_sent", "responses": {},
+                    "bead_id": bead["id"],
+                    "bead_title": bead["title"].as_str(),
+                    "bead_description": bead["description"].as_str()
+                }),
             };
             journal.save()?;
             Ok(journal)
@@ -967,14 +972,14 @@ mod tests {
         fn launch_intent(
             &mut self,
             _checkout: &Path,
-            _bead: &str,
+            bead: &Value,
             _branch: &str,
             _agent: &str,
             _name: &str,
             _workspace: &str,
         ) -> io::Result<Option<Box<dyn LaunchRecord>>> {
             if let Some(root) = self.tracked_root.as_ref() {
-                FakeJournal::new(root)
+                FakeJournal::new(root, bead)
                     .map(|journal| Some(Box::new(journal) as Box<dyn LaunchRecord>))
             } else {
                 Ok(None)
@@ -1427,6 +1432,12 @@ mod tests {
             );
             assert_eq!(registry["entries"][0]["workspace_id"], "wNew");
             assert_eq!(registry["entries"][0]["pane_id"], "wNew:p1");
+            assert_eq!(registry["entries"][0]["bead_id"], bead()["id"]);
+            assert_eq!(registry["entries"][0]["bead_title"], bead()["title"]);
+            assert_eq!(
+                registry["entries"][0]["bead_description"],
+                bead()["description"]
+            );
             assert_eq!(registry["entries"][0]["initial_lifecycle_seq"], 10);
             if fail_prompt {
                 assert!(

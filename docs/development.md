@@ -24,6 +24,8 @@ Theme is explicit app state (`App::theme`) threaded into rendering; do not intro
 
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
+The new-bead Description field uses `wrapped_description` to insert visual line breaks before whole words and map its byte cursor to display cells; words wider than the field still wrap by character. It preserves explicit newlines and the stored text. While Description has focus, Shift+Enter inserts a newline and plain Enter focuses Create without submitting. Terminal setup enables Crossterm's keyboard enhancement protocol so supported terminals can distinguish modified Enter; restoration pops that mode on normal exit, initialization failure, and panic. Terminals without modified-key reporting cannot distinguish Shift+Enter from Enter.
+
 The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
 Settings rows in `src/ui.rs` share a two-thirds title column and one-third
 value column. `settings_row` aligns titles to the left and centers controls
@@ -145,6 +147,13 @@ The list row's first line derives issue type from the retained `Bead.data` (`iss
 OnTrack records only worktrees created by its own confirmed Herdr handoffs; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
 from Beads: a closed or missing Bead does not remove the managed-worktree record.
+The launch journal stores the authoritative Bead title and description before
+Herdr creates a worktree. The right pane prefers current text from the already
+refreshed Beads list and falls back to this registry snapshot after Bead removal
+or a list failure; it makes no extra `bd` request. Registry entries from older
+versions may omit these optional fields; the view then shows a fallback. The
+pane wraps multiline descriptions and keeps its own bounded scroll position,
+reset when the selected worktree changes.
 The verified repository target branch is shown to the user. A merge request is
 pending work, not a completed merge; Git ancestry/cleanliness checks decide
 integration. Conflicts and uncertain outcomes remain inspectable for manual
