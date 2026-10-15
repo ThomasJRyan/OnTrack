@@ -34,6 +34,36 @@ pub struct LaunchContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchOutcome {
     pub message: String,
+    pub workspace_id: String,
+    pub pane_id: String,
+    pub branch: String,
+    /// Completion counter captured before prompt dispatch, when available.
+    pub completion_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentObservation {
+    pub status: String,
+    pub completion_seq: Option<u64>,
+}
+
+/// A failed mutation may have succeeded remotely. Never blindly retry it.
+#[derive(Debug)]
+pub struct LaunchFailure {
+    pub target: Option<LaunchOutcome>,
+    pub retry_safe: bool,
+    message: String,
+}
+
+impl std::fmt::Display for LaunchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for LaunchFailure {}
+
+pub fn launch_failure(error: &io::Error) -> Option<&LaunchFailure> {
+    error.get_ref()?.downcast_ref()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +77,7 @@ struct Launch {
     pub workspace_id: String,
     pub pane_id: String,
     pub branch: String,
+    pub completion_seq: Option<u64>,
 }
 
 // Keep both external boundaries injectable: tests never execute Herdr or bd.
@@ -115,12 +146,55 @@ pub fn discover() -> io::Result<LaunchContext> {
 pub fn launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result<LaunchOutcome> {
     handoff_with(
         &mut SystemExecutor,
-        &current_dir()?,
+        &current_dir().map_err(preflight_failure)?,
         context,
         agent,
         bead,
         &unique_name(&bead.id),
     )
+}
+
+pub fn observe(target: &LaunchOutcome) -> io::Result<AgentObservation> {
+    observe_with(&mut SystemExecutor, target)
+}
+
+fn observe_with(
+    executor: &mut impl Executor,
+    target: &LaunchOutcome,
+) -> io::Result<AgentObservation> {
+    let identity = json!({"pane_id": target.pane_id, "workspace_id": target.workspace_id});
+    identifier(&identity, "pane_id")?;
+    identifier(&identity, "workspace_id")?;
+    // Installed CLI help: `agent get <target>`; JSON is the default, no --json.
+    let result = envelope(&executor.run(&["agent", "get", &target.pane_id])?)?;
+    if result["type"].as_str() != Some("agent_info")
+        || result["agent"]["pane_id"].as_str() != Some(&target.pane_id)
+        || result["agent"]["workspace_id"].as_str() != Some(&target.workspace_id)
+    {
+        return Err(invalid(
+            "Unexpected Herdr agent observation type or workspace/pane identity",
+        ));
+    }
+    let agent = &result["agent"];
+    if agent
+        .get("completion_seq")
+        .is_some_and(|seq| !seq.is_null() && seq.as_u64().is_none())
+    {
+        return Err(invalid("Herdr response has invalid completion_seq"));
+    }
+    let status = agent["agent_status"]
+        .as_str()
+        .filter(|status| {
+            matches!(
+                *status,
+                "idle" | "working" | "done" | "blocked" | "error" | "unknown"
+            )
+        })
+        .unwrap_or("unknown");
+    Ok(AgentObservation {
+        status: status.to_owned(),
+        completion_seq: agent["completion_seq"].as_u64(),
+    })
 }
 
 impl From<Discovery> for LaunchContext {
@@ -159,9 +233,9 @@ fn handoff_with(
         .iter()
         .any(|available| available.id == agent.id)
     {
-        return Err(invalid(
+        return Err(preflight_failure(invalid(
             "Launch validation: select an agent from discovery; nothing created",
-        ));
+        )));
     }
     let outcome = launch_with(
         executor,
@@ -173,12 +247,17 @@ fn handoff_with(
             title: &bead.title,
             name,
         },
-    )?;
+    )
+    .map_err(preflight_failure)?;
     Ok(LaunchOutcome {
         message: format!(
             "Prompt sent to {} · workspace {} · pane {} · branch {}. Handoff is not proof the bead is complete.",
             agent.label, outcome.workspace_id, outcome.pane_id, outcome.branch
         ),
+        workspace_id: outcome.workspace_id,
+        pane_id: outcome.pane_id,
+        branch: outcome.branch,
+        completion_seq: outcome.completion_seq,
     })
 }
 
@@ -531,8 +610,18 @@ fn launch_with(
         .and_then(Value::as_str);
     let pane = result.pointer("/root_pane/pane_id").and_then(Value::as_str);
     let recover = |message: &str| recovery(request, &branch, workspace, pane, message);
-    let target = created_target(&result, &source, &branch)
-        .map_err(|error| recover(&format!("Worktree creation response: {error}")))?;
+    let mut target = created_target(&result, &source, &branch).map_err(|error| {
+        let mut failure = recover(&format!("Worktree creation response: {error}"));
+        // Raw IDs remain in recovery text, but unvalidated/reused targets
+        // must never be monitored as if they were our newly launched agent.
+        if let Some(detail) = failure
+            .get_mut()
+            .and_then(|inner| inner.downcast_mut::<LaunchFailure>())
+        {
+            detail.target = None;
+        }
+        failure
+    })?;
     let trust_override = if let Some(expected) = expected_repository {
         let mut verify = || -> io::Result<String> {
             let path = Path::new(text(&result["worktree"], "path")?);
@@ -544,9 +633,15 @@ fn launch_with(
             }
             codex_trust_override(&actual.main_root)
         };
-        Some(verify().map_err(|error| recover(&format!(
-            "Codex repository trust validation failed after worktree creation at {}: {error}. No agent was started and no prompt was sent", result["worktree"]["path"]
-        )))?)
+        Some(verify().map_err(|error| {
+            let mut failure = recover(&format!(
+                "Codex repository trust validation failed after worktree creation at {}: {error}. No agent was started and no prompt was sent", result["worktree"]["path"]
+            ));
+            if let Some(detail) = failure.get_mut().and_then(|inner| inner.downcast_mut::<LaunchFailure>()) {
+                detail.retry_safe = true;
+            }
+            failure
+        })?)
     } else {
         None
     };
@@ -572,14 +667,18 @@ fn launch_with(
             "check_for_update_on_startup=false",
         ]);
     }
-    executor
+    let started = executor
         .run(&start_args)
-        .and_then(|bytes| agent_response(&bytes, "agent_started", &target))
+        .and_then(|bytes| {
+            agent_response(&bytes, "agent_started", &target)?;
+            envelope(&bytes)
+        })
         .map_err(|error| {
             recover(&format!(
                 "Agent start failed: {error}. The agent may still be running; no prompt was sent"
             ))
         })?;
+    target.completion_seq = started["agent"]["completion_seq"].as_u64();
     // No --wait: submit once and return rather than blocking for the agent's turn.
     executor.run(&["agent", "prompt", &target.pane_id, &prompt])
         .and_then(|bytes| agent_response(&bytes, "agent_prompted", &target))
@@ -613,6 +712,7 @@ fn created_target(result: &Value, source: &Source, branch: &str) -> io::Result<L
         workspace_id: workspace.to_owned(),
         pane_id: pane.to_owned(),
         branch: branch.to_owned(),
+        completion_seq: None,
     })
 }
 
@@ -683,13 +783,37 @@ fn recovery(
     pane: Option<&str>,
     message: &str,
 ) -> io::Error {
-    io::Error::other(format!(
+    let message = format!(
         "{message}. Recovery: source workspace {}, new workspace {}, root pane {}, branch {branch}, agent name {}. Inspect `herdr worktree list`, `git worktree list`, and the new pane/agent before retrying. Nothing was automatically deleted.",
         request.workspace_id,
         workspace.unwrap_or("unknown"),
         pane.unwrap_or("unknown"),
         request.name
-    ))
+    );
+    io::Error::other(LaunchFailure {
+        target: workspace.zip(pane).map(|(workspace, pane)| LaunchOutcome {
+            message: message.clone(),
+            workspace_id: workspace.to_owned(),
+            pane_id: pane.to_owned(),
+            branch: branch.to_owned(),
+            completion_seq: None,
+        }),
+        retry_safe: false,
+        message,
+    })
+}
+
+fn preflight_failure(error: io::Error) -> io::Error {
+    if launch_failure(&error).is_some() {
+        error
+    } else {
+        // Every post-creation error is already marked with recovery metadata.
+        io::Error::other(LaunchFailure {
+            target: None,
+            retry_safe: true,
+            message: error.to_string(),
+        })
+    }
 }
 
 fn envelope(bytes: &[u8]) -> io::Result<Value> {
@@ -827,9 +951,18 @@ mod tests {
     }
 
     fn cwd() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .unwrap()
+        // Model a main checkout even when cargo runs in a linked worktree.
+        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        ROOT.get_or_init(|| {
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target")
+                .join(unique_name("herdr-tests"));
+            for directory in [".git", "src", "target"] {
+                std::fs::create_dir_all(root.join(directory)).unwrap();
+            }
+            root.canonicalize().unwrap()
+        })
+        .clone()
     }
 
     fn identity() -> RepositoryIdentity {
@@ -1088,7 +1221,8 @@ mod tests {
             Launch {
                 workspace_id: "wNew".into(),
                 pane_id: "wNew:p1".into(),
-                branch: BRANCH.into()
+                branch: BRANCH.into(),
+                completion_seq: None
             }
         );
         assert_eq!(executor.calls[0], ["show_bead", "OnTrack-z2y"]);
@@ -1238,6 +1372,13 @@ mod tests {
         assert!(outcome.message.contains("wNew:p1"));
         assert!(outcome.message.contains(BRANCH));
         assert!(outcome.message.contains("not proof"));
+        assert_eq!(outcome.workspace_id, "wNew");
+        assert_eq!(outcome.pane_id, "wNew:p1");
+        assert_eq!(outcome.branch, BRANCH);
+        assert_eq!(
+            outcome.completion_seq, None,
+            "start can omit the counter until the first completion"
+        );
         let submitted = &executor.mutations()[2][3];
         assert!(
             submitted.contains("unknown_nested"),
@@ -1616,6 +1757,88 @@ mod tests {
                 assert!(error.contains(expected), "{error}");
             }
         }
+    }
+
+    #[test]
+    fn observes_agent_info_shape_and_fails_closed_for_missing_or_malformed_states() {
+        let target = LaunchOutcome {
+            message: "handoff".into(),
+            workspace_id: "wNew".into(),
+            pane_id: "wNew:p1".into(),
+            branch: BRANCH.into(),
+            completion_seq: Some(4),
+        };
+        for (status, expected) in [
+            (json!("working"), "working"),
+            (json!("done"), "done"),
+            (json!("blocked"), "blocked"),
+            (json!("error"), "error"),
+            (json!("idle"), "idle"),
+            (json!("unknown"), "unknown"),
+            (Value::Null, "unknown"),
+            (json!({"status":"done"}), "unknown"),
+            (json!("finished"), "unknown"),
+        ] {
+            let mut executor = FakeExecutor::default();
+            executor.json(json!({"result":{"type":"agent_info", "agent":{
+                "pane_id":"wNew:p1", "workspace_id":"wNew", "agent_status":status,
+                "completion_seq":5
+            }}}));
+            let observation = observe_with(&mut executor, &target).unwrap();
+            assert_eq!(observation.status, expected);
+            assert_eq!(observation.completion_seq, Some(5));
+            assert_eq!(executor.calls, [vec!["agent", "get", "wNew:p1"]]);
+        }
+        for mode in ["type", "pane", "workspace", "counter", "json", "error"] {
+            let mut executor = FakeExecutor::default();
+            let mut value = json!({"result":{"type":"agent_info", "agent":{
+                "pane_id":"wNew:p1", "workspace_id":"wNew", "agent_status":"done"
+            }}});
+            match mode {
+                "type" => value["result"]["type"] = json!("agent_list"),
+                "pane" => value["result"]["agent"]["pane_id"] = json!("other"),
+                "workspace" => value["result"]["agent"]["workspace_id"] = json!("other"),
+                "counter" => value["result"]["agent"]["completion_seq"] = json!("5"),
+                "error" => value["error"] = json!({"message":"missing agent"}),
+                _ => {}
+            }
+            if mode == "json" {
+                executor.output("bad json");
+            } else {
+                executor.json(value);
+            }
+            assert!(observe_with(&mut executor, &target).is_err(), "{mode}");
+        }
+        let mut unsafe_target = target;
+        unsafe_target.pane_id = "--current".into();
+        let mut executor = FakeExecutor::default();
+        assert!(observe_with(&mut executor, &unsafe_target).is_err());
+        assert!(executor.calls.is_empty());
+    }
+
+    #[test]
+    fn launch_captures_pre_prompt_counter_and_retains_typed_uncertain_recovery() {
+        let mut executor = FakeExecutor::launch();
+        let mut started = agent_result("agent_started");
+        started["result"]["agent"]["completion_seq"] = json!(7);
+        executor.outputs[4] = Ok(started.to_string().into_bytes());
+        assert_eq!(run_launch(&mut executor).unwrap().completion_seq, Some(7));
+
+        let mut executor = FakeExecutor::launch();
+        executor.outputs[5] = Err(io::Error::other("delivery uncertain"));
+        let error = run_launch(&mut executor).unwrap_err();
+        let failure = launch_failure(&error).unwrap();
+        assert!(!failure.retry_safe);
+        let target = failure.target.as_ref().unwrap();
+        assert_eq!(target.pane_id, "wNew:p1");
+        assert_eq!(target.workspace_id, "wNew");
+        assert_eq!(target.branch, BRANCH);
+
+        let mut executor = FakeExecutor::launch();
+        executor.identities[1] = Err(invalid("no metadata"));
+        let error = run_launch(&mut executor).unwrap_err();
+        assert!(launch_failure(&error).unwrap().retry_safe);
+        assert_eq!(executor.mutations().len(), 1);
     }
 
     #[test]

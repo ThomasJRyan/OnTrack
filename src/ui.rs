@@ -210,7 +210,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     .bg(palette.selected_background)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::raw("  ONTRACK  /  WORKSPACE ISSUES"),
+            Span::raw(format!(
+                "  ONTRACK / ISSUES · TASKS {}/{} ACTIVE (t)",
+                app.tasks.len(),
+                app.tasks.iter().filter(|task| task.active).count()
+            )),
         ]))
         .style(Style::default().fg(ink)),
         v[0],
@@ -497,6 +501,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             crate::app::Modal::Create(_) => 70,
             crate::app::Modal::Settings { .. } => 64,
             crate::app::Modal::Launch(_) => 58,
+            crate::app::Modal::Tasks { .. } => 72,
+            crate::app::Modal::ReleaseTask { .. } => 68,
             _ => 62,
         }
         .min(a.width.saturating_sub(2));
@@ -557,12 +563,18 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .saturating_add(3)
             .min(usize::from(a.height.saturating_sub(2)))
             .max(7) as u16,
+            crate::app::Modal::Tasks { .. } => (app.tasks.len().max(1) * 5 + 5)
+                .min(usize::from(a.height.saturating_sub(2)))
+                .max(7) as u16,
+            crate::app::Modal::ReleaseTask { .. } => 12,
         };
         let min_width = if matches!(modal, crate::app::Modal::Create(_)) {
             70
         } else if matches!(
             modal,
-            crate::app::Modal::Settings { .. } | crate::app::Modal::Launch(_)
+            crate::app::Modal::Settings { .. }
+                | crate::app::Modal::Launch(_)
+                | crate::app::Modal::Tasks { .. }
         ) {
             38
         } else {
@@ -571,7 +583,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         if a.width < min_width || a.height < height {
             app.modal_ready = false;
             f.render_widget(Clear, a);
-            let escape_hint = if matches!(modal, crate::app::Modal::Settings { .. }) {
+            let escape_hint = if matches!(
+                modal,
+                crate::app::Modal::Settings { .. } | crate::app::Modal::Tasks { .. }
+            ) {
                 "Esc closes"
             } else {
                 "Esc cancels"
@@ -606,6 +621,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 crate::app::Modal::Create(_) => " NEW BEAD ",
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 crate::app::Modal::Launch(_) => " HAND OFF BEAD ",
+                crate::app::Modal::Tasks { .. } => " BACKGROUND TASKS ",
+                crate::app::Modal::ReleaseTask { .. } => " RELEASE LOCAL PROTECTION? ",
                 _ => " DELETE BEAD? ",
             })
             .borders(Borders::ALL)
@@ -1030,6 +1047,71 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Rect::new(inner.x, inner.y + viewport, inner.width, 1),
                 );
             }
+            crate::app::Modal::Tasks { scroll } => {
+                let mut lines = Vec::new();
+                if app.tasks.is_empty() {
+                    lines.push(Line::from("No handoffs in this session."));
+                    lines.push(Line::from("Choose a bead and press h to start one."));
+                } else {
+                    for task in &app.tasks {
+                        let state = if task.active {
+                            "ACTIVE"
+                        } else {
+                            "ENDED · verify"
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("{}  ", state),
+                                Style::default()
+                                    .fg(if task.active { teal } else { muted })
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("{} · {}", task.bead_id, task.title),
+                                Style::default().fg(ink).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                        lines.push(Line::from(format!(
+                            "Agent: {} · {}",
+                            task.agent, task.status
+                        )));
+                        for value in [&task.detail] {
+                            if !value.is_empty() {
+                                push_wrapped(&mut lines, value, inner.width as usize);
+                            }
+                        }
+                        lines.push(Line::from(""));
+                    }
+                }
+                lines.push(Line::from(
+                    "Session-local only · handoff is not completion proof.",
+                ));
+                let visible = inner.height.saturating_sub(1);
+                let max_scroll = lines.len().saturating_sub(usize::from(visible));
+                let offset = usize::from(*scroll).min(max_scroll);
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .scroll((offset as u16, 0))
+                        .style(Style::default().fg(ink)),
+                    Rect::new(inner.x, inner.y, inner.width, visible),
+                );
+                f.render_widget(
+                    Paragraph::new("↑/↓ · PgUp/PgDn scroll · Esc close")
+                        .style(Style::default().fg(muted)),
+                    Rect::new(inner.x, inner.y + visible, inner.width, 1),
+                );
+            }
+            crate::app::Modal::ReleaseTask { bead_id, .. } => {
+                let warning = format!(
+                    "Bead: {bead_id}\nInspect Herdr and Git worktrees first.\nRelease clears only this session's duplicate guard.\nDoes not stop remote agents.\nDoes not delete worktrees or launch anything.\nReleasing active remote work can duplicate it.\n[y] Release protection   [n / Enter / Esc] Cancel"
+                );
+                f.render_widget(
+                    Paragraph::new(warning)
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
         }
     }
 }
@@ -1038,7 +1120,7 @@ fn footer_text(state: &str, width: usize) -> String {
     // long status/error cannot push create, delete, or handoff offscreen. At
     // narrow widths, spend the remaining cells on the start of the status and
     // mark its truncation rather than letting Ratatui clip the actions.
-    let actions = " · n new · d delete · h hand off · r refresh · q quit";
+    let actions = " · n new · d delete · h hand off · t tasks · r refresh · q quit";
     let state_width = width.saturating_sub(1 + Span::raw(actions).width());
     let state = truncate_display(state, state_width);
     let core = if state.is_empty() {
@@ -1083,7 +1165,7 @@ fn launch_dialog_lines(
         push_wrapped(&mut lines, &format!("Discovery failed: {error}"), width);
         push_wrapped(&mut lines, "Esc closes · h to try discovery again", width);
     } else if busy {
-        push_wrapped(&mut lines, "Creating worktree and starting agent…", width);
+        push_wrapped(&mut lines, "Starting handoff in background…", width);
     } else if let Some(context) = &launch.context {
         if context.agents.is_empty() {
             push_wrapped(
@@ -1117,7 +1199,11 @@ fn launch_dialog_lines(
                 }
             }
         }
-        push_wrapped(&mut lines, "↑/↓ choose · Enter launch · Esc cancel", width);
+        push_wrapped(
+            &mut lines,
+            "↑/↓ choose · Enter launch / confirm · Esc cancel",
+            width,
+        );
     } else {
         push_wrapped(&mut lines, "Finding available agents… · Esc cancels", width);
     }
@@ -1384,6 +1470,8 @@ mod tests {
             settings_load_error: None,
             notice: None,
             mutation_busy: false,
+            tasks: vec![],
+            task_states: std::collections::HashMap::new(),
             modal_ready: true,
             preferred_id: None,
             refresh_inflight: false,
@@ -2159,6 +2247,67 @@ mod tests {
         );
     }
     #[test]
+    fn task_summary_and_history_render_independent_states_errors_and_compact_scroll() {
+        let mut app = app();
+        app.tasks = vec![
+            crate::app::BackgroundTask { seq: 1, bead_id: "bead-a".into(), title: "Investigate cache".into(), agent: "codex".into(), status: "running".into(), detail: "Workspace: /tmp/a · branch: ontrack/a · pane: pane-1".into(), active: true },
+            crate::app::BackgroundTask { seq: 2, bead_id: "bead-b".into(), title: "Blocked follow-up".into(), agent: "opencode".into(), status: "blocked".into(), detail: "Polling error: connection refused; status unknown. Inspect worktree before retry.".into(), active: true },
+            crate::app::BackgroundTask { seq: 3, bead_id: "bead-c".into(), title: "Ended handoff".into(), agent: "codex".into(), status: "done (unverified)".into(), detail: "Verify the bead; handoff is not completion proof.".into(), active: false },
+        ];
+        let summary = draw((72, 18), &mut app).0;
+        assert!(summary.contains("TASKS 3") && summary.contains("2 ACTIVE"));
+        assert!(summary.contains("t tasks"));
+        app.modal = Some(crate::app::Modal::Tasks { scroll: 0 });
+        let list = draw((72, 18), &mut app).0;
+        assert!(list.contains("BACKGROUND TASKS"));
+        assert!(list.contains("bead-a") && list.contains("running"));
+        assert!(list.contains("bead-b") && list.contains("blocked"));
+        assert!(list.contains("Polling error"));
+        if let Some(crate::app::Modal::Tasks { scroll }) = app.modal.as_mut() {
+            *scroll = 5;
+        }
+        let scrolled = draw((72, 18), &mut app).0;
+        assert!(scrolled.contains("bead-c"));
+        assert!(scrolled.contains("not completion proof"));
+        let tiny = draw((52, 14), &mut app).0;
+        assert!(tiny.contains("bead-c"));
+        assert!(
+            tiny.contains("(t)"),
+            "task-list shortcut remains visible on compact screens"
+        );
+    }
+    #[test]
+    fn uncertain_handoff_release_requires_explicit_confirmation_and_warns_in_compact_layout() {
+        let mut app = app();
+        app.modal = Some(crate::app::Modal::ReleaseTask {
+            seq: 9,
+            bead_id: "bead-uncertain".into(),
+        });
+        let normal = draw((90, 24), &mut app).0;
+        for text in [
+            "RELEASE LOCAL PROTECTION",
+            "bead-uncertain",
+            "Inspect Herdr and Git worktrees first",
+            "Does not stop",
+            "remote agents",
+            "delete worktrees",
+            "launch anything",
+            "[y] Release protection",
+            "[n / Enter / Esc] Cancel",
+        ] {
+            assert!(normal.contains(text), "missing confirmation detail: {text}");
+        }
+        let compact = draw((52, 14), &mut app).0;
+        assert!(
+            app.modal_ready,
+            "release warning should fit compact terminal"
+        );
+        assert!(compact.contains("Inspect Herdr"));
+        assert!(compact.contains("[y] Release protection"));
+        assert!(compact.contains("[n / Enter / Esc]"));
+        assert!(compact.contains("Cancel"));
+    }
+    #[test]
     fn every_discovered_agent_is_rendered_and_selected_choice_scrolls_into_view() {
         let crate::app::Modal::Launch(mut launch) = launch_modal() else {
             unreachable!()
@@ -2201,7 +2350,7 @@ mod tests {
         );
     }
     #[test]
-    fn launch_dialog_has_actionable_compact_fallback_and_wraps_errors_and_busy_notice() {
+    fn launch_dialog_has_actionable_compact_fallback_and_task_view_keeps_recovery_detail() {
         let mut app = app();
         app.modal = Some(launch_modal());
         let compact = draw((30, 14), &mut app).0;
@@ -2238,9 +2387,16 @@ mod tests {
             );
         }
 
-        app.modal = Some(launch_modal());
-        app.mutation_busy = true;
-        app.notice = Some("Agent started in the target worktree, but prompt dispatch failed after partial setup; inspect the worktree and retry only after confirming its state.".into());
+        app.tasks.push(crate::app::BackgroundTask {
+            seq: 7,
+            bead_id: "task-42".into(),
+            title: "Investigate the launch flow".into(),
+            agent: "codex".into(),
+            status: "unknown".into(),
+            detail: "Agent started in the target worktree, but prompt dispatch failed after partial setup; inspect the worktree and retry only after confirming its state. workspace w-1 · pane p-1 · branch ontrack/task-42".into(),
+            active: true,
+        });
+        app.modal = Some(crate::app::Modal::Tasks { scroll: 0 });
         terminal
             .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
             .unwrap();
@@ -2252,10 +2408,18 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(app.modal_ready);
-        for value in ["Creating worktree", "partial setup", "confirming its state"] {
+        for value in ["task-42", "partial setup"] {
             assert!(
                 text.contains(value),
-                "missing busy/recovery message: {value}"
+                "missing task recovery detail: {value}"
+            );
+        }
+        app.modal = Some(crate::app::Modal::Tasks { scroll: u16::MAX });
+        let tail = draw((100, 30), &mut app).0;
+        for value in ["confirming its state", "workspace w-1", "ontrack/task-42"] {
+            assert!(
+                tail.contains(value),
+                "missing scrolled recovery detail: {value}"
             );
         }
     }

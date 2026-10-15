@@ -1,4 +1,4 @@
-use crate::herdr::{Agent, LaunchContext, LaunchOutcome};
+use crate::herdr::{Agent, AgentObservation, LaunchContext, LaunchOutcome};
 use crate::{
     Tui,
     beads::{self, Bead, CreateBead},
@@ -9,14 +9,15 @@ use crate::{
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::mpsc,
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const TASK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub(super) enum Request {
     List,
@@ -25,6 +26,7 @@ pub(super) enum Request {
     Delete(String),
     Discover(u64),
     Launch(u64, LaunchContext, Agent, Bead),
+    PollTask(u64, LaunchOutcome),
 }
 pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
@@ -33,8 +35,83 @@ pub(super) enum Response {
     Deleted(std::io::Result<()>),
     Discovered(u64, std::io::Result<LaunchContext>),
     Launched(u64, std::io::Result<LaunchOutcome>),
+    TaskPolled(u64, std::io::Result<AgentObservation>),
+}
+
+#[derive(Debug, Clone)]
+pub struct BackgroundTask {
+    pub seq: u64,
+    pub bead_id: String,
+    pub title: String,
+    pub agent: String,
+    pub status: String,
+    pub detail: String,
+    /// Unresolved work (including unknown/blocked) prevents duplicate launch.
+    pub active: bool,
+}
+
+pub(super) struct TaskState {
+    target: Option<LaunchOutcome>,
+    poll_inflight: bool,
+    next_poll: Instant,
+    observed_activity: bool,
+    recovery: Option<String>,
+}
+
+fn execute_request(request: Request) -> Response {
+    match request {
+        Request::List => Response::List(beads::list_beads()),
+        Request::Show(id, seq) => Response::Show(id.clone(), seq, beads::show_bead(&id)),
+        Request::Create(input) => Response::Created(beads::create_bead(&input)),
+        Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
+        Request::Discover(seq) => Response::Discovered(seq, crate::herdr::discover()),
+        Request::Launch(seq, context, agent, bead) => {
+            Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
+        }
+        Request::PollTask(seq, target) => Response::TaskPolled(seq, crate::herdr::observe(&target)),
+    }
+}
+
+/// The router never performs IO. bd stays serial, but each Herdr job is
+/// independent, including discovery/polls while another launch is starting.
+/// Threads are detached: leaving OnTrack neither waits nor cancels agents.
+fn start_workers(
+    execute: impl Fn(Request) -> Response + Send + Sync + 'static,
+) -> (mpsc::Sender<Request>, mpsc::Receiver<Response>) {
+    let execute = Arc::new(execute);
+    let (requests, incoming) = mpsc::channel();
+    let (out, responses) = mpsc::channel();
+    let (bd_requests, bd_incoming) = mpsc::channel();
+    let bd_execute = execute.clone();
+    let bd_out = out.clone();
+    thread::spawn(move || {
+        while let Ok(request) = bd_incoming.recv() {
+            if bd_out.send(bd_execute(request)).is_err() {
+                break;
+            }
+        }
+    });
+    thread::spawn(move || {
+        while let Ok(request) = incoming.recv() {
+            if matches!(
+                request,
+                Request::Discover(_) | Request::Launch(..) | Request::PollTask(..)
+            ) {
+                let execute = execute.clone();
+                let out = out.clone();
+                thread::spawn(move || {
+                    let _ = out.send(execute(request));
+                });
+            } else if bd_requests.send(request).is_err() {
+                break;
+            }
+        }
+    });
+    (requests, responses)
 }
 pub struct App {
+    pub tasks: Vec<BackgroundTask>,
+    pub(super) task_states: HashMap<u64, TaskState>,
     pub beads: Vec<Bead>,
     pub collapsed: HashSet<String>,
     pub collapse_context: Option<String>,
@@ -68,10 +145,17 @@ pub struct App {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
+    Tasks {
+        scroll: u16,
+    },
     Create(CreateForm),
     ConfirmDelete {
         id: String,
         title: String,
+    },
+    ReleaseTask {
+        seq: u64,
+        bead_id: String,
     },
     Settings {
         draft: Theme,
@@ -187,27 +271,7 @@ fn cycle_theme(theme: Theme, forward: bool) -> Theme {
 }
 impl App {
     fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<Request>();
-        let (out, responses) = mpsc::channel();
-        thread::spawn(move || {
-            while let Ok(request) = rx.recv() {
-                let response = match request {
-                    Request::List => Response::List(beads::list_beads()),
-                    Request::Show(id, seq) => {
-                        Response::Show(id.clone(), seq, beads::show_bead(&id))
-                    }
-                    Request::Create(input) => Response::Created(beads::create_bead(&input)),
-                    Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
-                    Request::Discover(seq) => Response::Discovered(seq, crate::herdr::discover()),
-                    Request::Launch(seq, context, agent, bead) => {
-                        Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
-                    }
-                };
-                if out.send(response).is_err() {
-                    break;
-                }
-            }
-        });
+        let (tx, responses) = start_workers(execute_request);
         let (settings, settings_path, settings_error) = match settings::config_path() {
             Ok(path) => match settings::load_from(&path) {
                 Ok(value) => (value, Some(path), None),
@@ -225,6 +289,8 @@ impl App {
         };
         let theme = settings.theme;
         let mut a = Self {
+            tasks: Vec::new(),
+            task_states: HashMap::new(),
             beads: vec![],
             collapsed: HashSet::new(),
             collapse_context: None,
@@ -433,6 +499,167 @@ impl App {
     fn receive(&mut self) {
         self.receive_at(Instant::now());
     }
+    fn launched(&mut self, seq: u64, result: std::io::Result<LaunchOutcome>, now: Instant) {
+        let Some(task) = self.tasks.iter_mut().find(|task| task.seq == seq) else {
+            return;
+        };
+        let Some(state) = self.task_states.get_mut(&seq) else {
+            return;
+        };
+        // A duplicate/stale launch response must not resurrect terminal work.
+        if !task.active || task.status != "starting" || state.target.is_some() {
+            return;
+        }
+        state.next_poll = now;
+        match result {
+            Ok(outcome) => {
+                task.status = "unknown".into();
+                task.detail = format!(
+                    "{} Waiting for observed agent activity/status.",
+                    outcome.message
+                );
+                self.notice = Some(outcome.message.clone());
+                state.target = Some(outcome);
+            }
+            Err(error) => {
+                let failure = crate::herdr::launch_failure(&error);
+                let retry_safe = failure.is_some_and(|failure| failure.retry_safe);
+                state.target = failure.and_then(|failure| failure.target.clone());
+                state.recovery = Some(error.to_string());
+                task.status = if retry_safe {
+                    "launch failed"
+                } else {
+                    "unknown"
+                }
+                .into();
+                task.active = !retry_safe;
+                task.detail = format!(
+                    "Launch failed: {error}. {}",
+                    if retry_safe {
+                        "No work was submitted; retry is safe."
+                    } else {
+                        "Remote state is uncertain; inspect before retrying."
+                    }
+                );
+                self.notice = Some(task.detail.clone());
+            }
+        }
+    }
+    fn poll_tasks(&mut self, now: Instant) {
+        for task in &mut self.tasks {
+            let Some(state) = self.task_states.get_mut(&task.seq) else {
+                continue;
+            };
+            if !task.active || state.poll_inflight || now < state.next_poll {
+                continue;
+            }
+            let Some(target) = state.target.clone() else {
+                continue;
+            };
+            state.poll_inflight = true;
+            if self
+                .requests
+                .send(Request::PollTask(task.seq, target))
+                .is_err()
+            {
+                state.poll_inflight = false;
+                state.next_poll = now + TASK_POLL_INTERVAL;
+                task.status = "unknown".into();
+                let target = state.target.as_ref().unwrap();
+                task.detail = format!(
+                    "workspace {} · pane {} · branch {}. Status poll could not be queued; retrying.",
+                    target.workspace_id, target.pane_id, target.branch
+                );
+                if let Some(recovery) = &state.recovery {
+                    task.detail
+                        .push_str(&format!(" Launch recovery: {recovery}"));
+                }
+            }
+        }
+    }
+    fn task_polled(&mut self, seq: u64, result: std::io::Result<AgentObservation>, now: Instant) {
+        let Some(task) = self.tasks.iter_mut().find(|task| task.seq == seq) else {
+            return;
+        };
+        let Some(state) = self.task_states.get_mut(&seq) else {
+            return;
+        };
+        // Exactly one poll per task, so unsolicited/late responses are ignored.
+        if !task.active || !state.poll_inflight {
+            return;
+        }
+        state.poll_inflight = false;
+        state.next_poll = now + TASK_POLL_INTERVAL;
+        let Some(target) = &state.target else {
+            return;
+        };
+        let identity = format!(
+            "workspace {} · pane {} · branch {}",
+            target.workspace_id, target.pane_id, target.branch
+        );
+        let detail = match result {
+            Err(error) => {
+                task.status = "unknown".into();
+                format!("Status poll failed: {error}. Retrying; completion is not known.")
+            }
+            Ok(observation) => {
+                if matches!(observation.status.as_str(), "working" | "blocked") {
+                    state.observed_activity = true;
+                }
+                // A newly started idle agent may still show an earlier `done`
+                // before the submitted prompt begins. Counters fence that state;
+                // a counter first appearing after a validated successful handoff
+                // to our new pane is fresh even if its working turn was too fast
+                // to poll. Uncertain launches cannot use that shortcut. Servers
+                // without counters still need observed activity first.
+                let fresh_done = match (target.completion_seq, observation.completion_seq) {
+                    (Some(before), Some(after)) => after > before,
+                    (Some(_), None) => false,
+                    (None, Some(_)) if state.recovery.is_none() => true,
+                    (None, _) => state.observed_activity,
+                };
+                match observation.status.as_str() {
+                    "done" if fresh_done => {
+                        task.status = "done".into();
+                        task.active = false;
+                        "Herdr observed done; this is agent lifecycle state, not proof the bead is complete.".into()
+                    }
+                    "done" => {
+                        task.status = "unknown".into();
+                        "Herdr reports done, but no post-prompt activity/new completion is confirmed; still monitoring.".into()
+                    }
+                    "working" => {
+                        task.status = "running".into();
+                        "Herdr observed working.".into()
+                    }
+                    "blocked" => {
+                        task.status = "blocked".into();
+                        "Herdr observed blocked; inspect the agent for approval or a question."
+                            .into()
+                    }
+                    "error" => {
+                        task.status = "error".into();
+                        "Herdr observed error; inspect the agent. Completion is not known; monitoring continues.".into()
+                    }
+                    "idle" => {
+                        task.status = "idle".into();
+                        "Herdr observed idle; completion is not confirmed; monitoring continues."
+                            .into()
+                    }
+                    _ => {
+                        task.status = "unknown".into();
+                        "Herdr status is unknown, missing, or unsupported; monitoring continues."
+                            .into()
+                    }
+                }
+            }
+        };
+        task.detail = format!("{identity}. {detail}");
+        if let Some(recovery) = &state.recovery {
+            task.detail
+                .push_str(&format!(" Launch recovery: {recovery}"));
+        }
+    }
     fn receive_at(&mut self, now: Instant) {
         while let Ok(r) = self.responses.try_recv() {
             match r {
@@ -588,26 +815,9 @@ impl App {
                     }
                 }
                 Response::Launched(seq, result) => {
-                    self.mutation_busy = false;
-                    if seq == self.launch_seq {
-                        match result {
-                            Ok(outcome) => {
-                                self.notice = Some(outcome.message);
-                                if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
-                                    modal.finished = true;
-                                    modal.scroll = 0;
-                                }
-                            }
-                            Err(error) => {
-                                self.notice = Some(format!("Launch failed: {error}"));
-                                if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
-                                    modal.finished = true;
-                                    modal.scroll = 0;
-                                }
-                            }
-                        }
-                    }
+                    self.launched(seq, result, now);
                 }
+                Response::TaskPolled(seq, result) => self.task_polled(seq, result, now),
             }
         }
     }
@@ -622,6 +832,10 @@ impl App {
             return true;
         }
         match k.code {
+            KeyCode::Char('t') => {
+                self.modal = Some(Modal::Tasks { scroll: 0 });
+                self.modal_ready = false;
+            }
             KeyCode::Char('r') => self.refresh(),
             KeyCode::Char('s') => {
                 let load_error = self
@@ -722,6 +936,47 @@ impl App {
             self.modal = None;
             return false;
         }
+        if let Some(Modal::Tasks { scroll }) = self.modal.as_mut() {
+            match key.code {
+                Up | Char('k') => *scroll = scroll.saturating_sub(1),
+                Down | Char('j') => *scroll = scroll.saturating_add(1),
+                PageUp => *scroll = scroll.saturating_sub(6),
+                PageDown => *scroll = scroll.saturating_add(6),
+                Home => *scroll = 0,
+                End => *scroll = u16::MAX,
+                _ => {}
+            }
+            return false;
+        }
+        if let Some(Modal::ReleaseTask { seq, bead_id }) = self.modal.as_ref() {
+            let seq = *seq;
+            let bead_id = bead_id.clone();
+            match key.code {
+                Char('y') => {
+                    if self.can_release_task(seq, &bead_id) {
+                        let task = self
+                            .tasks
+                            .iter_mut()
+                            .find(|task| task.seq == seq && task.bead_id == bead_id)
+                            .unwrap();
+                        task.active = false;
+                        task.status = "tracking released".into();
+                        task.detail.push_str(" Local tracking manually released after confirmation. This does not certify completion, cancel agents, or delete remote work. Inspect Herdr/Git state before retrying.");
+                        self.notice = Some(format!(
+                            "Local tracking released for {bead_id}; remote work was not cancelled or deleted. Press h again to explicitly start another handoff."
+                        ));
+                    } else {
+                        self.notice = Some(
+                            "Tracking release is no longer available; inspect Tasks (t)".into(),
+                        );
+                    }
+                    self.modal = None;
+                }
+                Char('n') | Enter => self.modal = None,
+                _ => {}
+            }
+            return false;
+        }
         if matches!(self.modal, Some(Modal::Settings { .. })) {
             let mut save_theme = None;
             if let Some(Modal::Settings {
@@ -786,13 +1041,50 @@ impl App {
                     };
                     let seq = modal.seq;
                     let bead = modal.bead.clone();
-                    self.mutation_busy = true;
+                    if self
+                        .tasks
+                        .iter()
+                        .any(|task| task.bead_id == bead.id && task.active)
+                    {
+                        self.notice = Some(format!(
+                            "{} already has unresolved work; inspect Tasks (t)",
+                            bead.id
+                        ));
+                        self.modal = None;
+                        return false;
+                    }
+                    self.tasks.push(BackgroundTask {
+                        seq,
+                        bead_id: bead.id.clone(),
+                        title: bead.title.clone(),
+                        agent: agent.label.clone(),
+                        status: "starting".into(),
+                        detail: "Preparing an independent Herdr worktree and agent".into(),
+                        active: true,
+                    });
+                    self.task_states.insert(
+                        seq,
+                        TaskState {
+                            target: None,
+                            poll_inflight: false,
+                            next_poll: Instant::now(),
+                            observed_activity: false,
+                            recovery: None,
+                        },
+                    );
+                    // Record ownership before dispatch, then return to navigation.
+                    self.modal = None;
+                    self.notice = Some(format!("Starting {} in background · Tasks: t", bead.id));
                     if self
                         .requests
                         .send(Request::Launch(seq, context, agent, bead))
                         .is_err()
                     {
-                        self.mutation_busy = false;
+                        let task = self.tasks.last_mut().unwrap();
+                        task.status = "launch failed".into();
+                        task.active = false;
+                        task.detail =
+                            "Launch could not be queued; nothing dispatched; retry is safe".into();
                         self.notice = Some("Launch could not be queued; try again".into());
                     }
                 }
@@ -1044,6 +1336,13 @@ impl App {
             }
         }
     }
+    fn can_release_task(&self, seq: u64, bead_id: &str) -> bool {
+        self.tasks.iter().any(|task| {
+            task.seq == seq && task.bead_id == bead_id && task.active && task.status != "starting"
+        }) && self.task_states.get(&seq).is_some_and(|state| {
+            state.recovery.is_some() && state.target.is_none() && !state.poll_inflight
+        })
+    }
     fn open_launch(&mut self) {
         let Some(bead) = self
             .selected
@@ -1053,6 +1352,27 @@ impl App {
             self.notice = Some("Select a bead before handing it to an agent".into());
             return;
         };
+        if let Some(seq) = self
+            .tasks
+            .iter()
+            .find(|task| task.bead_id == bead.id && task.active)
+            .map(|task| task.seq)
+        {
+            if self.can_release_task(seq, &bead.id) {
+                self.modal = Some(Modal::ReleaseTask {
+                    seq,
+                    bead_id: bead.id,
+                });
+                self.modal_ready = false;
+                self.notice = None;
+            } else {
+                self.notice = Some(format!(
+                    "{} already has unresolved work; inspect Tasks (t)",
+                    bead.id
+                ));
+            }
+            return;
+        }
         self.launch_seq = self.launch_seq.wrapping_add(1);
         let seq = self.launch_seq;
         self.modal = Some(Modal::Launch(LaunchModal {
@@ -1204,6 +1524,7 @@ pub fn run(t: &mut Tui) -> std::io::Result<()> {
     loop {
         app.receive();
         app.poll_refresh(Instant::now());
+        app.poll_tasks(Instant::now());
         t.draw(|f| ui::render(f, start.elapsed(), &mut app))?;
         if let Some(e) = event::poll_event(Duration::from_millis(35))? {
             match e {
@@ -1233,6 +1554,8 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let (_out, responses) = mpsc::channel();
         App {
+            tasks: Vec::new(),
+            task_states: HashMap::new(),
             beads: (0..4)
                 .map(|i| Bead {
                     id: format!("b{i}"),
@@ -1469,7 +1792,7 @@ mod tests {
         assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
     }
     #[test]
-    fn completed_launch_result_scrolls_without_relaunch_and_can_be_dismissed() {
+    fn handoff_closes_modal_immediately_and_tasks_scroll_without_relaunch() {
         let (mut a, rx, tx) = connected_app();
         press(&mut a, KeyCode::Char('h'));
         let seq = match rx.try_recv().unwrap() {
@@ -1481,34 +1804,48 @@ mod tests {
         a.receive();
         press(&mut a, KeyCode::Enter);
         assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
-        tx.send(Response::Launched(
-            seq,
-            Ok(LaunchOutcome {
-                message: "Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0".into(),
-            }),
-        ))
-        .unwrap();
+        assert!(a.modal.is_none());
+        assert!(!a.mutation_busy);
+        assert_eq!(a.tasks[0].status, "starting");
+        assert!(a.tasks[0].active);
+        tx.send(Response::Launched(seq, Ok(launch_outcome())))
+            .unwrap();
         a.receive();
         assert!(!a.mutation_busy);
         assert_eq!(
             a.notice.as_deref(),
             Some("Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0")
         );
-        assert!(matches!(&a.modal, Some(Modal::Launch(m)) if m.finished));
+        assert!(a.modal.is_none());
+        assert_eq!(a.tasks[0].status, "unknown");
         press(&mut a, KeyCode::Enter);
         assert!(
             rx.try_recv().is_err(),
             "Enter cannot repeat a completed launch"
         );
+        press(&mut a, KeyCode::Char('h'));
+        assert!(a.modal.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicates blocked after modal close"
+        );
+        press(&mut a, KeyCode::Char('t'));
         press(&mut a, KeyCode::PageDown);
-        assert!(matches!(&a.modal, Some(Modal::Launch(m)) if m.scroll == 6));
+        assert!(matches!(&a.modal, Some(Modal::Tasks { scroll: 6 })));
         press(&mut a, KeyCode::PageUp);
-        assert!(matches!(&a.modal, Some(Modal::Launch(m)) if m.scroll == 0));
+        assert!(matches!(&a.modal, Some(Modal::Tasks { scroll: 0 })));
+        press(&mut a, KeyCode::Down);
+        assert!(matches!(&a.modal, Some(Modal::Tasks { scroll: 1 })));
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::End);
+        assert!(matches!(&a.modal, Some(Modal::Tasks { scroll: u16::MAX })));
+        press(&mut a, KeyCode::Home);
+        assert!(matches!(&a.modal, Some(Modal::Tasks { scroll: 0 })));
         press(&mut a, KeyCode::Esc);
         assert!(a.modal.is_none());
     }
     #[test]
-    fn failed_launch_clears_busy_and_keeps_actionable_result_open() {
+    fn uncertain_launch_failure_retains_recovery_and_prevents_blind_retry() {
         let (mut a, rx, tx) = connected_app();
         press(&mut a, KeyCode::Char('h'));
         let seq = match rx.try_recv().unwrap() {
@@ -1531,12 +1868,579 @@ mod tests {
         .unwrap();
         a.receive();
         assert!(!a.mutation_busy);
-        assert!(matches!(&a.modal, Some(Modal::Launch(modal)) if modal.finished));
+        assert!(a.modal.is_none());
+        assert_eq!(a.tasks[0].status, "unknown");
+        assert!(a.tasks[0].active);
         assert!(
             a.notice
                 .as_deref()
                 .is_some_and(|notice| notice.contains("inspect before retrying"))
         );
+        press(&mut a, KeyCode::Char('h'));
+        assert_eq!(
+            a.modal,
+            Some(Modal::ReleaseTask {
+                seq,
+                bead_id: "b0".into()
+            })
+        );
+        assert!(rx.try_recv().is_err());
+    }
+    fn untrackable_launch() -> (App, mpsc::Receiver<Request>, mpsc::Sender<Response>, u64) {
+        let (mut a, rx, tx) = connected_app();
+        let seq = confirm_launch(&mut a, &rx, &tx);
+        tx.send(Response::Launched(seq, Err(std::io::Error::other("Creation response unreadable. Recovery: branch ontrack/b0; workspace/pane unknown; inspect before retrying.")))).unwrap();
+        a.receive();
+        assert!(a.can_release_task(seq, "b0"));
+        (a, rx, tx, seq)
+    }
+
+    #[test]
+    fn manual_release_requires_y_preserves_history_and_allows_separate_explicit_retry() {
+        let (mut a, rx, tx, seq) = untrackable_launch();
+        let original = a.tasks[0].clone();
+        let recovery = a.task_states[&seq].recovery.clone();
+        press(&mut a, KeyCode::Char('h'));
+        assert_eq!(
+            a.modal,
+            Some(Modal::ReleaseTask {
+                seq,
+                bead_id: "b0".into()
+            })
+        );
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Char('y'));
+        assert!(a.modal.is_none());
+        assert!(!a.mutation_busy);
+        assert!(!a.tasks[0].active);
+        assert_eq!(a.tasks[0].status, "tracking released");
+        assert_eq!(a.tasks[0].seq, original.seq);
+        assert_eq!(a.tasks[0].bead_id, original.bead_id);
+        assert_eq!(a.tasks[0].title, original.title);
+        assert_eq!(a.tasks[0].agent, original.agent);
+        assert!(a.tasks[0].detail.starts_with(&original.detail));
+        for warning in [
+            "does not certify completion",
+            "cancel agents",
+            "delete remote work",
+        ] {
+            assert!(a.tasks[0].detail.contains(warning));
+        }
+        assert_eq!(a.task_states[&seq].recovery, recovery);
+        assert!(a.task_states[&seq].target.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "manual release must not dispatch any remote request"
+        );
+
+        let released_detail = a.tasks[0].detail.clone();
+        let retry_seq = confirm_launch(&mut a, &rx, &tx);
+        assert_ne!(retry_seq, seq);
+        assert_eq!(a.tasks.len(), 2);
+        tx.send(Response::Launched(seq, Ok(launch_outcome())))
+            .unwrap();
+        tx.send(Response::TaskPolled(
+            seq,
+            Ok(AgentObservation {
+                status: "working".into(),
+                completion_seq: None,
+            }),
+        ))
+        .unwrap();
+        a.receive();
+        assert_eq!(a.tasks[0].status, "tracking released");
+        assert!(!a.tasks[0].active);
+        assert_eq!(a.tasks[0].detail, released_detail);
+        assert!(a.task_states[&seq].target.is_none());
+        assert_eq!(a.task_states[&seq].recovery, recovery);
+        assert_eq!(a.tasks[1].status, "starting");
+        assert!(a.tasks[1].active);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn manual_release_enter_n_and_escape_cancel_without_changing_history() {
+        for cancel in [KeyCode::Enter, KeyCode::Char('n'), KeyCode::Esc] {
+            let (mut a, rx, _, seq) = untrackable_launch();
+            let detail = a.tasks[0].detail.clone();
+            let recovery = a.task_states[&seq].recovery.clone();
+            press(&mut a, KeyCode::Char('h'));
+            press(&mut a, cancel);
+            assert!(a.modal.is_none());
+            assert!(a.tasks[0].active);
+            assert_eq!(a.tasks[0].status, "unknown");
+            assert_eq!(a.tasks[0].detail, detail);
+            assert_eq!(a.task_states[&seq].recovery, recovery);
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn manual_release_cannot_confirm_before_render_or_in_compact_fallback_but_escape_works() {
+        let (mut a, rx, _, _) = untrackable_launch();
+        a.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
+        assert!(matches!(a.modal, Some(Modal::ReleaseTask { .. })));
+        assert!(!a.modal_ready);
+        for _ in 0..2 {
+            a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            assert!(a.tasks[0].active);
+            assert!(matches!(a.modal, Some(Modal::ReleaseTask { .. })));
+            assert!(rx.try_recv().is_err());
+        }
+        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.modal.is_none());
+        assert!(a.tasks[0].active);
+    }
+
+    #[test]
+    fn manual_release_rechecks_task_identity_and_every_guard_on_confirmation() {
+        for change in [
+            "inactive",
+            "starting",
+            "no recovery",
+            "target",
+            "inflight",
+            "bead",
+            "seq",
+            "missing state",
+            "missing task",
+        ] {
+            let (mut a, rx, _, seq) = untrackable_launch();
+            press(&mut a, KeyCode::Char('h'));
+            match change {
+                "inactive" => a.tasks[0].active = false,
+                "starting" => a.tasks[0].status = "starting".into(),
+                "no recovery" => a.task_states.get_mut(&seq).unwrap().recovery = None,
+                "target" => a.task_states.get_mut(&seq).unwrap().target = Some(launch_outcome()),
+                "inflight" => a.task_states.get_mut(&seq).unwrap().poll_inflight = true,
+                "bead" => a.tasks[0].bead_id = "another-bead".into(),
+                "seq" => a.tasks[0].seq += 1,
+                "missing state" => {
+                    a.task_states.remove(&seq);
+                }
+                "missing task" => a.tasks.clear(),
+                _ => unreachable!(),
+            }
+            let before = a
+                .tasks
+                .first()
+                .map(|task| (task.status.clone(), task.active, task.detail.clone()));
+            press(&mut a, KeyCode::Char('y'));
+            assert!(a.modal.is_none());
+            assert_eq!(
+                a.tasks
+                    .first()
+                    .map(|task| (task.status.clone(), task.active, task.detail.clone())),
+                before,
+                "{change}"
+            );
+            assert!(a.notice.as_deref().unwrap().contains("no longer available"));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn manual_release_is_unavailable_for_starting_or_any_pollable_task() {
+        for status in ["starting", "running", "blocked", "error", "unknown", "idle"] {
+            let (mut a, rx, _, seq) = untrackable_launch();
+            a.tasks[0].status = status.into();
+            if status != "starting" {
+                // Even a recovered launch with a validated target must stay
+                // monitored; neither poll errors nor agent state permit release.
+                a.task_states.get_mut(&seq).unwrap().target = Some(launch_outcome());
+            }
+            press(&mut a, KeyCode::Char('h'));
+            assert!(a.modal.is_none(), "{status}");
+            assert!(a.tasks[0].active);
+            assert!(rx.try_recv().is_err());
+        }
+        let (mut a, rx, tx) = connected_app();
+        let seq = confirm_launch(&mut a, &rx, &tx);
+        tx.send(Response::Launched(seq, Ok(launch_outcome())))
+            .unwrap();
+        let now = Instant::now();
+        a.receive_at(now);
+        a.poll_tasks(now);
+        assert!(matches!(rx.try_recv(), Ok(Request::PollTask(..))));
+        tx.send(Response::TaskPolled(
+            seq,
+            Err(std::io::Error::other("poll failed")),
+        ))
+        .unwrap();
+        a.receive_at(now);
+        press(&mut a, KeyCode::Char('h'));
+        assert!(
+            a.modal.is_none(),
+            "normal polling errors cannot be manually released"
+        );
+        assert!(a.tasks[0].active);
+        assert!(rx.try_recv().is_err());
+    }
+
+    fn launch_outcome() -> LaunchOutcome {
+        LaunchOutcome {
+            message: "Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0".into(),
+            pane_id: "p1".into(),
+            workspace_id: "ws-new".into(),
+            branch: "ontrack/b0".into(),
+            completion_seq: Some(3),
+        }
+    }
+    fn confirm_launch(
+        a: &mut App,
+        rx: &mpsc::Receiver<Request>,
+        tx: &mpsc::Sender<Response>,
+    ) -> u64 {
+        press(a, KeyCode::Char('h'));
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!("expected discovery")
+        };
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        press(a, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
+        assert!(a.modal.is_none());
+        assert!(!a.mutation_busy);
+        seq
+    }
+
+    #[test]
+    fn blocked_launch_does_not_delay_another_launch_discovery_poll_or_bd() {
+        use std::sync::Barrier;
+        let gate = Arc::new(Barrier::new(2));
+        let worker_gate = gate.clone();
+        let (entered, first_entered) = mpsc::channel();
+        let (requests, responses) = start_workers(move |request| match request {
+            Request::Launch(seq, ..) => {
+                if seq == 1 {
+                    entered.send(()).unwrap();
+                    worker_gate.wait();
+                }
+                Response::Launched(
+                    seq,
+                    if seq == 2 {
+                        Err(std::io::Error::other("second failed independently"))
+                    } else {
+                        Ok(launch_outcome())
+                    },
+                )
+            }
+            Request::Discover(seq) => Response::Discovered(seq, Ok(launch_context())),
+            Request::PollTask(seq, _) => Response::TaskPolled(
+                seq,
+                Ok(AgentObservation {
+                    status: "blocked".into(),
+                    completion_seq: None,
+                }),
+            ),
+            Request::List => Response::List(Ok(vec![])),
+            _ => panic!("unexpected request"),
+        });
+        let bead = app().beads[0].clone();
+        let launch = |seq| {
+            Request::Launch(
+                seq,
+                launch_context(),
+                launch_context().agents[0].clone(),
+                bead.clone(),
+            )
+        };
+        requests.send(launch(1)).unwrap();
+        first_entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        requests.send(launch(2)).unwrap();
+        requests.send(Request::Discover(3)).unwrap();
+        requests
+            .send(Request::PollTask(4, launch_outcome()))
+            .unwrap();
+        requests.send(Request::List).unwrap();
+        let mut observed = HashSet::new();
+        for _ in 0..4 {
+            let kind = match responses.recv_timeout(Duration::from_secs(5)).unwrap() {
+                Response::Launched(2, Err(_)) => "second launch",
+                Response::Discovered(3, Ok(_)) => "discovery",
+                Response::TaskPolled(4, Ok(_)) => "poll",
+                Response::List(Ok(_)) => "bd",
+                _ => panic!("first launch must still be blocked"),
+            };
+            observed.insert(kind);
+        }
+        assert_eq!(observed.len(), 4);
+        gate.wait();
+        assert!(matches!(
+            responses.recv_timeout(Duration::from_secs(5)),
+            Ok(Response::Launched(1, Ok(_)))
+        ));
+    }
+
+    #[test]
+    fn independent_task_results_survive_navigation_other_modals_and_bd_mutations() {
+        let (mut a, rx, tx) = connected_app();
+        let first = confirm_launch(&mut a, &rx, &tx);
+        press(&mut a, KeyCode::Down);
+        take_show(&rx, "b1");
+        let second = confirm_launch(&mut a, &rx, &tx);
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        press(&mut a, KeyCode::Char('n'));
+        a.mutation_busy = true; // an unrelated bd create is in flight
+        tx.send(Response::Launched(first, Ok(launch_outcome())))
+            .unwrap();
+        tx.send(Response::Launched(
+            second,
+            Err(std::io::Error::other("inspect second workspace")),
+        ))
+        .unwrap();
+        tx.send(Response::Launched(900, Ok(launch_outcome())))
+            .unwrap();
+        a.receive();
+        assert!(
+            a.mutation_busy,
+            "launch response cannot clear a bd mutation lock"
+        );
+        assert!(matches!(a.modal, Some(Modal::Create(_))));
+        assert_eq!(a.tasks.len(), 2);
+        assert_eq!(a.tasks[0].bead_id, "b0");
+        assert!(a.tasks[0].detail.contains("pane p1"));
+        assert_eq!(a.tasks[1].bead_id, "b1");
+        assert!(a.tasks[1].detail.contains("inspect second workspace"));
+        let detail = a.tasks[0].detail.clone();
+        tx.send(Response::Launched(
+            first,
+            Err(std::io::Error::other("stale")),
+        ))
+        .unwrap();
+        a.receive();
+        assert_eq!(a.tasks[0].detail, detail);
+    }
+
+    #[test]
+    fn starting_launch_keeps_navigation_refresh_create_delete_and_quit_responsive() {
+        let (mut a, rx, tx) = connected_app();
+        let _ = confirm_launch(&mut a, &rx, &tx);
+        press(&mut a, KeyCode::Down);
+        take_show(&rx, "b1");
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        press(&mut a, KeyCode::Char('n'));
+        if let Some(Modal::Create(form)) = a.modal.as_mut() {
+            form.title = "Create while agent starts".into();
+            form.focus = 4;
+        }
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Create(input)) if input.title == "Create while agent starts")
+        );
+        tx.send(Response::Created(Err(std::io::Error::other("try later"))))
+            .unwrap();
+        a.receive();
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('d'));
+        press(&mut a, KeyCode::Char('y'));
+        assert!(matches!(rx.try_recv(), Ok(Request::Delete(id)) if id == "b1"));
+        tx.send(Response::Deleted(Err(std::io::Error::other("try later"))))
+            .unwrap();
+        a.receive();
+        press(&mut a, KeyCode::Esc);
+        assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert_eq!(a.tasks[0].status, "starting");
+        assert!(
+            a.tasks[0].active,
+            "quit does not cancel or wait for background work"
+        );
+    }
+
+    #[test]
+    fn disconnected_poll_queue_preserves_identity_and_retries_without_detail_growth() {
+        let (mut a, rx, tx) = connected_app();
+        let seq = confirm_launch(&mut a, &rx, &tx);
+        tx.send(Response::Launched(seq, Ok(launch_outcome())))
+            .unwrap();
+        let now = Instant::now();
+        a.receive_at(now);
+        drop(rx);
+        a.poll_tasks(now);
+        assert_eq!(a.tasks[0].status, "unknown");
+        assert!(a.tasks[0].active);
+        assert!(!a.task_states[&seq].poll_inflight);
+        assert!(a.tasks[0].detail.contains("pane p1"));
+        let detail = a.tasks[0].detail.clone();
+        a.poll_tasks(now + TASK_POLL_INTERVAL);
+        assert_eq!(a.tasks[0].detail, detail);
+    }
+
+    #[test]
+    fn task_polling_is_bounded_recovers_and_rejects_stale_done() {
+        let (mut a, rx, tx) = connected_app();
+        let seq = confirm_launch(&mut a, &rx, &tx);
+        tx.send(Response::Launched(seq, Ok(launch_outcome())))
+            .unwrap();
+        let now = Instant::now();
+        a.receive_at(now);
+        for elapsed in [0, 1, 20] {
+            a.poll_tasks(now + Duration::from_secs(elapsed));
+        }
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::PollTask(s, target)) if s == seq && target.pane_id == "p1")
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "overlap guard bounds inflight polls"
+        );
+        let observe = |status: &str, completion_seq| {
+            Ok(AgentObservation {
+                status: status.into(),
+                completion_seq,
+            })
+        };
+        tx.send(Response::TaskPolled(seq, observe("done", Some(3))))
+            .unwrap();
+        a.receive_at(now);
+        assert_eq!(a.tasks[0].status, "unknown");
+        assert!(a.tasks[0].active);
+        a.poll_tasks(now + TASK_POLL_INTERVAL - Duration::from_nanos(1));
+        assert!(rx.try_recv().is_err());
+        let mut time = now;
+        for (result, expected) in [
+            (Err(std::io::Error::other("disconnected")), "unknown"),
+            (observe("working", Some(3)), "running"),
+            (observe("done", None), "unknown"),
+            (observe("done", Some(3)), "unknown"),
+            (observe("blocked", Some(3)), "blocked"),
+            (observe("error", Some(3)), "error"),
+            (observe("unexpected", None), "unknown"),
+            (observe("idle", Some(3)), "idle"),
+            (observe("done", Some(4)), "done"),
+        ] {
+            time += TASK_POLL_INTERVAL;
+            a.poll_tasks(time);
+            assert!(matches!(rx.try_recv(), Ok(Request::PollTask(..))));
+            tx.send(Response::TaskPolled(seq, result)).unwrap();
+            a.receive_at(time);
+            assert_eq!(a.tasks[0].status, expected);
+            assert!(a.tasks[0].detail.contains("pane p1"));
+            assert!(a.tasks[0].detail.contains("workspace ws-new"));
+            assert!(a.tasks[0].detail.contains("branch ontrack/b0"));
+        }
+        assert!(!a.tasks[0].active);
+        a.poll_tasks(time + TASK_POLL_INTERVAL);
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::TaskPolled(seq, observe("working", Some(3))))
+            .unwrap();
+        a.receive_at(time);
+        assert_eq!(
+            a.tasks[0].status, "done",
+            "late responses cannot resurrect completed work"
+        );
+        press(&mut a, KeyCode::Char('h'));
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Discover(_))),
+            "observed done permits retry"
+        );
+    }
+
+    #[test]
+    fn first_poll_accepts_new_completion_counter_only_after_confirmed_new_pane_handoff() {
+        for (baseline, observed, status, uncertain, expected) in [
+            (None, Some(1), "done", false, "done"),
+            (Some(3), Some(3), "done", false, "unknown"),
+            (Some(3), Some(4), "done", false, "done"),
+            (None, None, "done", false, "unknown"),
+            (Some(3), None, "done", false, "unknown"),
+            (None, Some(1), "unknown", false, "unknown"),
+            (None, Some(1), "done", true, "unknown"),
+        ] {
+            let (mut a, rx, tx) = connected_app();
+            let seq = confirm_launch(&mut a, &rx, &tx);
+            let mut target = launch_outcome();
+            target.completion_seq = baseline;
+            tx.send(Response::Launched(seq, Ok(target))).unwrap();
+            let now = Instant::now();
+            a.receive_at(now);
+            if uncertain {
+                // Same pollable identity as a recovered partial launch, without
+                // claiming the prompt was accepted successfully.
+                a.task_states.get_mut(&seq).unwrap().recovery = Some("delivery uncertain".into());
+            }
+            assert!(!a.task_states[&seq].observed_activity);
+            a.poll_tasks(now);
+            assert!(matches!(rx.try_recv(), Ok(Request::PollTask(..))));
+            tx.send(Response::TaskPolled(
+                seq,
+                Ok(AgentObservation {
+                    status: status.into(),
+                    completion_seq: observed,
+                }),
+            ))
+            .unwrap();
+            a.receive_at(now);
+            assert_eq!(
+                a.tasks[0].status, expected,
+                "baseline={baseline:?}, observed={observed:?}, status={status}, uncertain={uncertain}"
+            );
+            assert_eq!(a.tasks[0].active, expected != "done");
+
+            if baseline == Some(3) && observed == Some(3) {
+                // The same launch must recover when a later poll sees an
+                // increment, without ever having sampled working/blocked.
+                a.poll_tasks(now + TASK_POLL_INTERVAL);
+                assert!(matches!(rx.try_recv(), Ok(Request::PollTask(..))));
+                tx.send(Response::TaskPolled(
+                    seq,
+                    Ok(AgentObservation {
+                        status: "done".into(),
+                        completion_seq: Some(4),
+                    }),
+                ))
+                .unwrap();
+                a.receive_at(now + TASK_POLL_INTERVAL);
+                assert_eq!(a.tasks[0].status, "done");
+                assert!(!a.tasks[0].active);
+            }
+        }
+    }
+
+    #[test]
+    fn servers_without_completion_counter_require_activity_and_known_launch_failure_allows_retry() {
+        let (mut a, rx, tx) = connected_app();
+        let seq = confirm_launch(&mut a, &rx, &tx);
+        let mut target = launch_outcome();
+        target.completion_seq = None;
+        tx.send(Response::Launched(seq, Ok(target))).unwrap();
+        let now = Instant::now();
+        a.receive_at(now);
+        for (step, status) in ["done", "unknown", "working", "done"]
+            .into_iter()
+            .enumerate()
+        {
+            let time = now + TASK_POLL_INTERVAL * step as u32;
+            a.poll_tasks(time);
+            assert!(matches!(rx.try_recv(), Ok(Request::PollTask(..))));
+            tx.send(Response::TaskPolled(
+                seq,
+                Ok(AgentObservation {
+                    status: status.into(),
+                    completion_seq: None,
+                }),
+            ))
+            .unwrap();
+            a.receive_at(time);
+            assert_eq!(a.tasks[0].active, step < 3);
+        }
+        let retry = confirm_launch(&mut a, &rx, &tx);
+        let invalid_agent = Agent {
+            id: "not-discovered".into(),
+            label: "invalid".into(),
+        };
+        let failure =
+            crate::herdr::launch(&launch_context(), &invalid_agent, &a.beads[0]).unwrap_err();
+        tx.send(Response::Launched(retry, Err(failure))).unwrap();
+        a.receive();
+        assert_eq!(a.tasks[1].status, "launch failed");
+        assert!(!a.tasks[1].active);
+        assert!(a.tasks[1].detail.contains("retry is safe"));
+        let _ = confirm_launch(&mut a, &rx, &tx);
+        assert_eq!(a.tasks.len(), 3);
     }
     fn respond(a: &mut App, response: Response) {
         let (tx, rx) = mpsc::channel();
