@@ -1616,9 +1616,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         .block(
                             Block::default()
                                 .title(if editing {
-                                    " Description · Shift+Enter newline · Enter Save "
+                                    " Description · Ctrl+V image · Shift+Enter newline · Enter Save "
                                 } else {
-                                    " Description · Shift+Enter newline · Enter Create "
+                                    " Description · Ctrl+V image · Shift+Enter newline · Enter Create "
                                 })
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(if form.focus == 1 {
@@ -2334,6 +2334,9 @@ mod tests {
             notice: None,
             mutation_busy: false,
             modal_ready: true,
+            paste_seq: 0,
+            paste_pending: false,
+            created_screenshots: Vec::new(),
             preferred_id: None,
             refresh_inflight: false,
             refresh_pending: false,

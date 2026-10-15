@@ -5,10 +5,11 @@ use crate::{
     beads::{self, Bead, CreateBead, UpdateBead},
     event,
     hotkeys::{self, Help},
+    screenshots,
     settings::{self, DefaultAgent, Settings, Theme},
     ui,
 };
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet},
@@ -40,6 +41,7 @@ pub(super) enum Request {
     WorktreeAction(String, WorktreeAction),
     RestartWorktree(String),
     ReconcileWorktrees(CleanupPolicy),
+    ReadScreenshot(u64),
 }
 pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
@@ -58,6 +60,7 @@ pub(super) enum Response {
     WorkspaceFocused(String, std::io::Result<()>),
     WorktreeChanged(std::io::Result<ManagedWorktree>),
     WorktreeRestarted(std::io::Result<String>),
+    ScreenshotRead(u64, std::io::Result<Vec<u8>>),
 }
 pub(super) enum WorktreeFocusFeedback {
     Success(String),
@@ -112,6 +115,9 @@ pub struct App {
     pub notice: Option<String>,
     pub mutation_busy: bool,
     pub modal_ready: bool,
+    pub(crate) paste_seq: u64,
+    pub(crate) paste_pending: bool,
+    pub(crate) created_screenshots: Vec<PathBuf>,
     pub preferred_id: Option<String>,
     pub(super) refresh_inflight: bool,
     pub(super) refresh_pending: bool,
@@ -225,6 +231,14 @@ impl Default for CreateForm {
 }
 
 impl CreateForm {
+    fn insert_screenshot(&mut self, path: &std::path::Path) {
+        let reference = screenshots::markdown_reference(path);
+        let cursor = self.description_cursor.min(self.description.len());
+        self.description.insert_str(cursor, &reference);
+        self.description_cursor = cursor + reference.len();
+        self.description_preferred_col = None;
+    }
+
     fn set_harnesses(&mut self, harnesses: Vec<String>, preferred: DefaultAgent) {
         self.harnesses = harnesses;
         self.harness = match preferred {
@@ -377,6 +391,9 @@ impl App {
                     Request::Update(input) => {
                         Response::Updated(input.id.clone(), beads::update_bead(&input))
                     }
+                    Request::ReadScreenshot(seq) => {
+                        Response::ScreenshotRead(seq, screenshots::read_clipboard())
+                    }
                     Request::SetReady(id, ready) => Response::ReadySet(
                         id.clone(),
                         ready,
@@ -481,6 +498,9 @@ impl App {
             notice: settings_error,
             mutation_busy: false,
             modal_ready: true,
+            paste_seq: 0,
+            paste_pending: false,
+            created_screenshots: Vec::new(),
             preferred_id: None,
             refresh_inflight: false,
             refresh_pending: false,
@@ -511,6 +531,37 @@ impl App {
         if !self.worktrees_discovered || self.handoff.is_some() || self.mutation_busy {
             return;
         }
+        // A child must branch from its managed parent checkout. Preparing an
+        // Epic only reserves that checkout; it does not occupy an agent slot.
+        if let Some(epic) = self
+            .beads
+            .iter()
+            .find(|bead| {
+                if !beads::is_ready(bead)
+                    || bead.data["issue_type"] != "epic"
+                    || self.scheduler_attempted.contains(&bead.id)
+                    || self.known_handoffs.contains(&bead.id)
+                    || self.worktrees.iter().any(|item| item.bead_id == bead.id)
+                {
+                    return false;
+                }
+                let descendants = beads::open_descendants_in(&self.beads, &bead.id);
+                self.beads.iter().any(|child| {
+                    beads::is_ready(child)
+                        && child.data["issue_type"] == "task"
+                        && !beads::explicitly_unassigned(&child.data)
+                        && (!beads::has_harness_label(&child.data)
+                            || beads::harness(&child.data).is_some())
+                        && !self.known_handoffs.contains(&child.id)
+                        && descendants.contains(&child.id)
+                })
+            })
+            .cloned()
+        {
+            self.scheduler_attempted.insert(epic.id.clone());
+            self.start_launch(epic, false);
+            return;
+        }
         let active_agents = self
             .worktrees
             .iter()
@@ -539,9 +590,16 @@ impl App {
             .cloned();
         if let Some(bead) = next {
             self.scheduler_attempted.insert(bead.id.clone());
-            if beads::harness(&bead.data).is_none() {
+            if beads::explicitly_unassigned(&bead.data) {
                 let message = format!(
-                    "{} is Ready but has no supported agent harness; edit it to select one",
+                    "{} is Ready but explicitly Unassigned; edit it to select an agent",
+                    bead.id
+                );
+                self.notice = Some(message.clone());
+                self.toast = Some(Toast::result(message, true));
+            } else if beads::has_harness_label(&bead.data) && beads::harness(&bead.data).is_none() {
+                let message = format!(
+                    "{} has an unsupported agent harness; edit it to select one",
                     bead.id
                 );
                 self.notice = Some(message.clone());
@@ -915,6 +973,7 @@ impl App {
                                 )));
                             }
                             self.notice = Some(format!("Created {id}"));
+                            self.created_screenshots.clear();
                             self.modal = None;
                             self.preferred_id = Some(id);
                             self.refresh_at(now);
@@ -961,11 +1020,32 @@ impl App {
                     match result {
                         Ok(()) => {
                             self.notice = Some(format!("Updated {id}"));
+                            self.created_screenshots.clear();
                             self.modal = None;
                             self.preferred_id = Some(id);
                             self.refresh_at(now);
                         }
                         Err(e) => self.notice = Some(format!("Update failed: {e}")),
+                    }
+                }
+                Response::ScreenshotRead(seq, result) => {
+                    if seq != self.paste_seq {
+                        continue;
+                    }
+                    self.paste_pending = false;
+                    if let Some(Modal::Create(form) | Modal::Edit { form, .. }) =
+                        self.modal.as_mut()
+                    {
+                        match result.and_then(|bytes| screenshots::save(&bytes)) {
+                            Ok(path) => {
+                                form.insert_screenshot(&path);
+                                self.notice = Some(format!("Screenshot saved: {}", path.display()));
+                                self.created_screenshots.push(path);
+                            }
+                            Err(error) => {
+                                self.notice = Some(format!("Screenshot paste failed: {error}"))
+                            }
+                        }
                     }
                 }
                 Response::ReadySet(id, ready, result) => {
@@ -1061,6 +1141,27 @@ impl App {
                                 let chosen = beads::harness(&pending.bead.data);
                                 let agent = if let Some(kind) = chosen {
                                     context.agents.iter().find(|agent| agent.id == kind)
+                                } else if pending.scheduled {
+                                    match self.settings.default_agent {
+                                        DefaultAgent::Kind(kind) => context
+                                            .agents
+                                            .iter()
+                                            .find(|agent| agent.id == kind)
+                                            .or_else(|| {
+                                                context
+                                                    .agents
+                                                    .iter()
+                                                    .find(|agent| agent.id == "codex")
+                                            })
+                                            .or_else(|| context.agents.first()),
+                                        DefaultAgent::Automatic | DefaultAgent::Unassigned => {
+                                            context
+                                                .agents
+                                                .iter()
+                                                .find(|agent| agent.id == "codex")
+                                                .or_else(|| context.agents.first())
+                                        }
+                                    }
                                 } else {
                                     context
                                         .agents
@@ -1576,7 +1677,16 @@ impl App {
                 }
                 return false;
             }
+            for path in self.created_screenshots.drain(..) {
+                let _ = std::fs::remove_file(path);
+            }
             self.modal = None;
+            self.paste_seq = self.paste_seq.wrapping_add(1);
+            self.paste_pending = false;
+            return false;
+        }
+        if self.paste_pending {
+            self.notice = Some("Wait for screenshot paste or press Esc to cancel".into());
             return false;
         }
         if let Some(Modal::ConfirmWorktree { id, action }) = self.modal.as_ref() {
@@ -1739,6 +1849,20 @@ impl App {
         }
         if form.focus == 1 && !matches!(key.code, Up | Down) {
             form.description_preferred_col = None;
+        }
+        if key.code == Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) && form.focus == 1
+        {
+            self.paste_seq = self.paste_seq.wrapping_add(1);
+            self.paste_pending = true;
+            if self
+                .requests
+                .send(Request::ReadScreenshot(self.paste_seq))
+                .is_err()
+            {
+                self.paste_pending = false;
+                self.notice = Some("Screenshot paste could not be queued".into());
+            }
+            return false;
         }
         match key.code {
             Tab => {
@@ -2496,6 +2620,9 @@ mod tests {
             notice: None,
             mutation_busy: false,
             modal_ready: true,
+            paste_seq: 0,
+            paste_pending: false,
+            created_screenshots: Vec::new(),
             preferred_id: None,
             refresh_inflight: false,
             refresh_pending: false,
@@ -2568,6 +2695,135 @@ mod tests {
         assert!(rx.try_recv().is_err());
         a.beads[0].status = "in_progress".into();
         assert_eq!(display_status(&a.beads[0]), "in_progress");
+    }
+
+    #[test]
+    fn ready_epic_prepares_parent_before_unlabelled_child_launch() {
+        let mut a = app();
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        let (replies, responses) = mpsc::channel();
+        a.responses = responses;
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[1].data["labels"] = json!([beads::READY_LABEL]);
+        a.settings.default_agent = DefaultAgent::Kind("opencode");
+        a.settings.agent_limit = settings::AgentLimit::Limited(1);
+        a.worktrees.push(ManagedWorktree {
+            id: "active".into(),
+            bead_id: "other".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/other".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws-other".into(),
+            status: worktrees::WorktreeStatus::InProgress,
+            detail: None,
+        });
+
+        a.poll_scheduler();
+        let Request::Discover(parent_seq) = queued.try_recv().unwrap() else {
+            panic!("parent discovery not queued")
+        };
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        replies
+            .send(Response::Discovered(parent_seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(matches!(queued.try_recv(), Ok(Request::Launch(_, _, _, bead)) if bead.id == "b0"));
+        replies
+            .send(Response::Launched(
+                parent_seq,
+                Ok(LaunchOutcome {
+                    message: "Prepared".into(),
+                    reserved: true,
+                }),
+            ))
+            .unwrap();
+        a.receive();
+        assert!(a.known_handoffs.contains("b0"));
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        replies
+            .send(Response::Worktrees(Ok(vec![ManagedWorktree {
+                id: "parent".into(),
+                bead_id: "b0".into(),
+                parent_bead_id: None,
+                handoff_accepted: false,
+                bead_title: None,
+                bead_description: None,
+                branch: "ontrack/parent".into(),
+                target_branch: "main".into(),
+                workspace_id: "ws-parent".into(),
+                status: worktrees::WorktreeStatus::Reserved,
+                detail: None,
+            }])))
+            .unwrap();
+        a.receive();
+        a.poll_scheduler();
+        let Request::Discover(child_seq) = queued.try_recv().unwrap() else {
+            panic!("child discovery not queued")
+        };
+        replies
+            .send(Response::Discovered(child_seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(
+            matches!(queued.try_recv(), Ok(Request::LaunchReady(_, _, agent, bead))
+            if bead.id == "b1" && agent.id == "opencode")
+        );
+    }
+
+    #[test]
+    fn explicit_unassigned_ready_task_is_not_scheduled() {
+        let mut a = app();
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, beads::UNASSIGNED_LABEL]);
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        assert!(a.notice.as_deref().unwrap().contains("Unassigned"));
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_epic_preparation_is_not_retried_or_duplicated() {
+        let mut a = app();
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        let (replies, responses) = mpsc::channel();
+        a.responses = responses;
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[1].data["labels"] = json!([beads::READY_LABEL]);
+        a.poll_scheduler();
+        let Request::Discover(seq) = queued.try_recv().unwrap() else {
+            panic!("parent discovery not queued")
+        };
+        replies
+            .send(Response::Discovered(
+                seq,
+                Err(std::io::Error::other("Herdr unavailable")),
+            ))
+            .unwrap();
+        a.receive();
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        assert!(a.notice.as_deref().unwrap().contains("Herdr unavailable"));
+
+        a.scheduler_attempted.clear();
+        a.known_handoffs.insert("b0".into());
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
     }
 
     #[test]
@@ -4698,6 +4954,93 @@ mod tests {
             panic!()
         };
         assert_eq!(form.description, "qrnd\n界");
+    }
+
+    #[test]
+    fn screenshot_paste_inserts_reference_at_description_caret() {
+        let mut form = CreateForm {
+            description: "before after".into(),
+            description_cursor: 7,
+            focus: 1,
+            ..Default::default()
+        };
+        form.insert_screenshot(std::path::Path::new("/shared/.beads/screenshots/test.png"));
+        assert_eq!(
+            form.description,
+            "before ![Screenshot](</shared/.beads/screenshots/test.png>)after"
+        );
+        assert_eq!(form.description_cursor, form.description.len() - 5);
+    }
+
+    #[test]
+    fn failed_screenshot_paste_keeps_description() {
+        let mut a = app();
+        a.modal = Some(Modal::Create(CreateForm {
+            description: "keep this".into(),
+            description_cursor: 4,
+            focus: 1,
+            ..Default::default()
+        }));
+        a.paste_seq = 1;
+        a.paste_pending = true;
+        let (tx, rx) = mpsc::channel();
+        a.responses = rx;
+        tx.send(Response::ScreenshotRead(
+            1,
+            Err(std::io::Error::other("no image")),
+        ))
+        .unwrap();
+        a.receive();
+        let Some(Modal::Create(form)) = a.modal else {
+            panic!("create form was closed")
+        };
+        assert_eq!(form.description, "keep this");
+        assert!(!a.paste_pending);
+        assert!(a.notice.as_deref().unwrap().contains("no image"));
+    }
+
+    #[test]
+    fn control_v_requests_image_only_in_description_for_create_and_edit() {
+        for editing in [false, true] {
+            let mut a = app();
+            let mut form = CreateForm {
+                focus: 1,
+                ..Default::default()
+            };
+            form.description = "draft".into();
+            a.modal = Some(if editing {
+                Modal::Edit {
+                    id: "b0".into(),
+                    form,
+                }
+            } else {
+                Modal::Create(form)
+            });
+            let (tx, rx) = mpsc::channel();
+            a.requests = tx;
+            a.modal_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+            assert!(matches!(rx.try_recv(), Ok(Request::ReadScreenshot(1))));
+            assert!(a.paste_pending);
+            a.modal_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            let form = match a.modal.as_ref().unwrap() {
+                Modal::Create(form) | Modal::Edit { form, .. } => form,
+                _ => unreachable!(),
+            };
+            assert_eq!(form.description, "draft");
+        }
+    }
+
+    #[test]
+    fn cancel_form_removes_unsaved_screenshot() {
+        let path =
+            std::env::temp_dir().join(format!("ontrack-unsaved-screenshot-{}", std::process::id()));
+        std::fs::write(&path, b"image").unwrap();
+        let mut a = app();
+        a.modal = Some(Modal::Create(CreateForm::default()));
+        a.created_screenshots.push(path.clone());
+        a.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.modal.is_none());
+        assert!(!path.exists());
     }
     #[test]
     fn enter_from_description_focuses_create_without_submitting() {

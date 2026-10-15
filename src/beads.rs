@@ -18,6 +18,7 @@ pub const BEAD_TYPES: &[&str] = &[
 ];
 pub const READY_LABEL: &str = "ontrack:ready";
 pub const HARNESS_PREFIX: &str = "ontrack:agent:";
+pub const UNASSIGNED_LABEL: &str = "ontrack:unassigned";
 pub const HARNESSES: &[&str] = &[
     "pi",
     "claude",
@@ -151,7 +152,11 @@ pub fn create_child(input: &CreateBead, parent_id: &str) -> io::Result<String> {
     validate_id(parent_id)?;
     let parent = show_bead(parent_id)?;
     let inherited = labels(&parent)
-        .filter(|label| *label != READY_LABEL && !label.starts_with(HARNESS_PREFIX))
+        .filter(|label| {
+            *label != READY_LABEL
+                && *label != UNASSIGNED_LABEL
+                && !label.starts_with(HARNESS_PREFIX)
+        })
         .map(str::to_owned)
         .collect::<Vec<_>>();
     let args = create_child_args(input, parent_id, &inherited)?;
@@ -169,7 +174,7 @@ fn create_child_args(
     args.push(format!("--parent={parent_id}"));
     args.push("--no-inherit-labels".into());
     for label in inherited {
-        if label == READY_LABEL || label.starts_with(HARNESS_PREFIX) {
+        if label == READY_LABEL || label == UNASSIGNED_LABEL || label.starts_with(HARNESS_PREFIX) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "OnTrack parent state cannot be inherited by child",
@@ -306,6 +311,14 @@ pub fn harness(data: &Value) -> Option<&str> {
         .find(|kind| HARNESSES.contains(kind))
 }
 
+pub fn explicitly_unassigned(data: &Value) -> bool {
+    labels(data).any(|label| label == UNASSIGNED_LABEL)
+}
+
+pub fn has_harness_label(data: &Value) -> bool {
+    labels(data).any(|label| label.starts_with(HARNESS_PREFIX))
+}
+
 fn labels(data: &Value) -> impl Iterator<Item = &str> {
     data.get("labels")
         .and_then(Value::as_array)
@@ -331,8 +344,11 @@ fn create_args(input: &CreateBead) -> io::Result<Vec<String>> {
         format!("--priority={}", input.priority),
         "--json".to_owned(),
     ];
-    if let Some(harness) = &input.harness {
-        args.push(format!("--labels={HARNESS_PREFIX}{harness}"));
+    if input.issue_type == "task" {
+        args.push(match &input.harness {
+            Some(harness) => format!("--labels={HARNESS_PREFIX}{harness}"),
+            None => format!("--labels={UNASSIGNED_LABEL}"),
+        });
     }
     Ok(args)
 }
@@ -356,6 +372,11 @@ fn update_args(input: &UpdateBead) -> io::Result<Vec<String>> {
         if let Some(new) = &input.fields.harness {
             args.push(format!("--add-label={HARNESS_PREFIX}{new}"));
         }
+    }
+    if input.fields.issue_type == "task" && input.fields.harness.is_none() {
+        args.push(format!("--add-label={UNASSIGNED_LABEL}"));
+    } else {
+        args.push(format!("--remove-label={UNASSIGNED_LABEL}"));
     }
     args.extend(["--".to_owned(), input.id.clone()]);
     Ok(args)
@@ -682,6 +703,14 @@ mod tests {
         assert!(
             create_child_args(&create_input(), "ontrack-parent", &[READY_LABEL.into()]).is_err()
         );
+        assert!(
+            create_child_args(
+                &create_input(),
+                "ontrack-parent",
+                &[UNASSIGNED_LABEL.into()]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -774,7 +803,30 @@ mod tests {
         let args = update_args(&update).unwrap();
         assert!(args.contains(&"--remove-label=ontrack:agent:codex".into()));
         assert!(args.contains(&"--add-label=ontrack:agent:opencode".into()));
+        assert!(args.contains(&"--remove-label=ontrack:unassigned".into()));
         assert_eq!(&args[args.len() - 2..], ["--", "b1"]);
+    }
+
+    #[test]
+    fn unassigned_marker_distinguishes_new_choice_from_legacy_missing_label() {
+        let legacy = json!({"labels": [READY_LABEL]});
+        let unassigned = json!({"labels": [READY_LABEL, UNASSIGNED_LABEL]});
+        assert!(!explicitly_unassigned(&legacy));
+        assert!(explicitly_unassigned(&unassigned));
+        assert!(harness(&legacy).is_none());
+        assert!(harness(&unassigned).is_none());
+        let args = create_args(&create_input()).unwrap();
+        assert!(args.contains(&"--labels=ontrack:unassigned".into()));
+        let mut selected = create_input();
+        selected.harness = Some("codex".into());
+        let args = update_args(&UpdateBead {
+            id: "b1".into(),
+            fields: selected,
+            previous_harness: None,
+        })
+        .unwrap();
+        assert!(args.contains(&"--remove-label=ontrack:unassigned".into()));
+        assert!(args.contains(&"--add-label=ontrack:agent:codex".into()));
     }
 
     #[test]
@@ -789,6 +841,7 @@ mod tests {
                 "--type=task",
                 "--priority=2",
                 "--json",
+                "--labels=ontrack:unassigned",
             ]
         );
     }
@@ -799,7 +852,7 @@ mod tests {
         input.title = "--force $(touch ignored); 'quoted'".to_owned();
         input.description = "--cascade\n\"; $(touch ignored)".to_owned();
         let args = create_args(&input).unwrap();
-        assert_eq!(args.len(), 7);
+        assert_eq!(args.len(), 8);
         assert_eq!(args[2], format!("--title={}", input.title));
         assert_eq!(args[3], format!("--description={}", input.description));
         assert!(!args.iter().any(|arg| arg == "--readonly"));
@@ -825,6 +878,7 @@ mod tests {
                 "--type=task",
                 "--priority=2",
                 "--json",
+                "--add-label=ontrack:unassigned",
                 "--",
                 "ontrack-70t",
             ]

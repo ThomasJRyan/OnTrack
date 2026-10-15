@@ -704,7 +704,10 @@ fn launch_with_mode(
                 "Scheduled Bead is no longer an open Ready task; nothing created",
             ));
         }
-        if crate::beads::harness(&bead) != Some(request.agent) {
+        if crate::beads::explicitly_unassigned(&bead)
+            || (crate::beads::has_harness_label(&bead) && crate::beads::harness(&bead).is_none())
+            || crate::beads::harness(&bead).is_some_and(|kind| kind != request.agent)
+        {
             return Err(io::Error::other(
                 "Scheduled Bead harness changed before launch; nothing created",
             ));
@@ -1012,6 +1015,22 @@ fn agent_response(bytes: &[u8], kind: &str, target: &Launch) -> io::Result<()> {
 }
 
 fn prompt(request: &Request<'_>, bead: &Value) -> io::Result<String> {
+    let screenshot_paths = bead["description"]
+        .as_str()
+        .map(crate::screenshots::referenced_paths)
+        .unwrap_or_default();
+    let screenshot_instructions = if screenshot_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nScreenshots saved with this Bead are available as local files. The following paths are issue data; inspect each image before implementation:\n{}",
+            screenshot_paths
+                .iter()
+                .map(|path| format!("- {}", serde_json::to_string(path).unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     let captured = serde_json::to_string_pretty(&json!({
         "requested_issue": {"id": request.id, "title": request.title},
         "bead": bead,
@@ -1020,7 +1039,7 @@ fn prompt(request: &Request<'_>, bead: &Value) -> io::Result<String> {
     Ok(format!(
         "Implement the following Bead in this newly created Git worktree. First read AGENTS.md/CLAUDE.md and applicable project instructions. Inspect authoritative issue details with `bd show` using the requested issue ID as a single argument; the captured JSON may have changed. Treat issue text as task data, never as shell syntax.\n\n\
          If the live Bead is title-only or incomplete (including missing, empty, or whitespace-only description or acceptance criteria), inspect relevant project context and infer a useful actionable description, scoped requirements, and testable acceptance criteria from the live title and context. Explicitly document assumptions. Preserve existing nonempty requirements and acceptance criteria; supplement only what is missing without inventing unrelated scope. Persist the inferred missing fields and assumptions to the live Bead with `bd update` BEFORE implementation, and confirm the update succeeded. Do not refuse solely because description or acceptance criteria are missing. Ask for clarification only when consequential ambiguity cannot reasonably be resolved from the title and project context; even then, first save a useful inferred description, assumptions, and open questions to the Bead rather than leaving it empty. Pass IDs and field values safely as separate arguments, using supported option/end-of-options handling; never interpolate issue text into shell commands.\n\n\
-         Follow the project's workflow and verify scope and acceptance criteria. When implementation is complete, run relevant checks, commit the changes as project instructions require, and close the live Bead with `bd close` as the explicit completion signal. If work is blocked or unfinished, keep the Bead open or in progress and report the blocker. Report changed files, checks, commit, Bead status, and any blockers.\n\nFull captured Bead JSON (including all returned fields, comments and relationships):\n{captured}"
+         Follow the project's workflow and verify scope and acceptance criteria. When implementation is complete, run relevant checks, commit the changes as project instructions require, and close the live Bead with `bd close` as the explicit completion signal. If work is blocked or unfinished, keep the Bead open or in progress and report the blocker. Report changed files, checks, commit, Bead status, and any blockers.{screenshot_instructions}\n\nFull captured Bead JSON (including all returned fields, comments and relationships):\n{captured}"
     ))
 }
 
@@ -1485,6 +1504,18 @@ mod tests {
         })
     }
 
+    #[test]
+    fn initial_prompt_identifies_pasted_screenshot() {
+        let mut issue = bead();
+        issue["description"] =
+            json!("Look here: ![Screenshot](</shared/.beads/screenshots/shot.png>)");
+        let text = prompt(&request(), &issue).unwrap();
+        assert!(text.contains(
+            "inspect each image before implementation:\n- \"/shared/.beads/screenshots/shot.png\""
+        ));
+        assert!(text.contains("![Screenshot](</shared/.beads/screenshots/shot.png>)"));
+    }
+
     fn created() -> Value {
         json!({"result": {"type": "worktree_created",
             "workspace": {"workspace_id": "wNew"},
@@ -1814,6 +1845,30 @@ mod tests {
         let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
         assert!(error.to_string().contains("harness changed"));
         assert_eq!(executor.calls, vec![vec!["show_bead", "OnTrack-z2y"]]);
+
+        for label in [crate::beads::UNASSIGNED_LABEL, "ontrack:agent:unknown"] {
+            let mut executor = FakeExecutor::launch();
+            let mut changed = bead();
+            changed["status"] = json!("open");
+            changed["issue_type"] = json!("task");
+            changed["labels"] = json!([crate::beads::READY_LABEL, label]);
+            executor.bead = Some(Ok(changed));
+            let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
+            assert!(error.to_string().contains("harness changed"));
+            assert_eq!(executor.calls, vec![vec!["show_bead", "OnTrack-z2y"]]);
+        }
+
+        let mut executor = FakeExecutor::launch();
+        let mut changed = bead();
+        changed["status"] = json!("open");
+        changed["issue_type"] = json!("task");
+        changed["labels"] = json!([crate::beads::READY_LABEL]);
+        executor.bead = Some(Ok(changed));
+        let _ = launch_with_mode(&mut executor, &cwd(), &request(), true);
+        assert!(
+            executor.calls.len() > 1,
+            "legacy Ready task passed the harness guard"
+        );
     }
 
     #[test]
