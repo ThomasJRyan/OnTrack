@@ -297,9 +297,30 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             } else {
                 Style::default().fg(ink)
             };
+            let mut depth = 0usize;
+            let mut parent = item.parent_bead_id.as_deref();
+            while let Some(id) = parent {
+                let Some(ancestor) = app
+                    .worktrees
+                    .iter()
+                    .find(|candidate| candidate.bead_id == id)
+                else {
+                    break;
+                };
+                depth += 1;
+                if depth >= 4 {
+                    break;
+                }
+                parent = ancestor.parent_bead_id.as_deref();
+            }
             let width = panes[0].width.saturating_sub(2) as usize;
             let prefix = truncate_display(
-                &format!("{} {} · ", if selected { "›" } else { " " }, item.bead_id),
+                &format!(
+                    "{} {}{} · ",
+                    if selected { "›" } else { " " },
+                    "  ".repeat(depth),
+                    item.bead_id
+                ),
                 width,
             );
             let remaining = width.saturating_sub(Span::raw(prefix.as_str()).width());
@@ -310,7 +331,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             ]));
             rows.push(Line::from(Span::styled(
                 truncate_display(
-                    &format!("  {} → {}", item.branch, item.target_branch),
+                    &format!(
+                        "  {}{} → {}",
+                        "  ".repeat(depth),
+                        item.branch,
+                        item.target_branch
+                    ),
                     panes[0].width.saturating_sub(2) as usize,
                 ),
                 Style::default().fg(muted),
@@ -417,7 +443,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             let operation = match action {
                 0 => "MERGE REQUEST · dispatch only; not integrated",
                 1 => "CLOSE WORKSPACE · integrated only",
-                _ => "REMOVE CHECKOUT AND CLOSE HERDR WORKSPACE · integrated only; branch kept",
+                2 => "REMOVE CHECKOUT AND CLOSE HERDR WORKSPACE · integrated only; branch kept",
+                _ => "RESTART TASK · discard checkout changes; old branch kept",
             };
             format!("y confirm / Esc cancel · {operation} · {id}")
         } else if let Some(feedback) = &app.worktrees_focus_feedback {
@@ -429,12 +456,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             format!("ERROR · {error} · Esc / w back")
         } else if let Some(item) = selected.filter(|item| item.detail.is_some()) {
             format!(
-                "{} · {} · Enter switch workspace · PgUp/PgDn details · r refresh",
+                "Shift+R restart · {} · {} · Enter switch workspace · PgUp/PgDn details · r refresh",
                 crate::app::worktree_status_label(item.status),
                 item.detail.as_deref().unwrap_or_default()
             )
         } else {
-            "↑/↓ select · Enter switch workspace · PgUp/PgDn details · m request merge · c close · x remove · r refresh · Esc / w back".to_owned()
+            "↑/↓ select · Shift+R restart · Enter switch workspace · PgUp/PgDn details · m merge · c close · x remove · r refresh · Esc / w back".to_owned()
         };
         let footer_lines = wrap_words(&footer, areas[2].width as usize)
             .into_iter()
@@ -460,6 +487,47 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             ),
             areas[2],
         );
+        if let Some(crate::app::Modal::ConfirmWorktree { id, action: 3 }) = &app.modal {
+            let height = 12;
+            if a.width < 50 || a.height < height {
+                app.modal_ready = false;
+                f.render_widget(Clear, a);
+                f.render_widget(
+                    Paragraph::new("Resize terminal to confirm · Esc cancels")
+                        .style(Style::default().fg(gold))
+                        .alignment(Alignment::Center),
+                    a,
+                );
+            } else {
+                app.modal_ready = true;
+                let width = 62.min(a.width.saturating_sub(2));
+                let area = Rect::new(
+                    a.x + a.width.saturating_sub(width) / 2,
+                    a.y + a.height.saturating_sub(height) / 2,
+                    width,
+                    height,
+                );
+                f.render_widget(Clear, area);
+                f.render_widget(
+                    Block::default()
+                        .title(" RESTART TASK? ")
+                        .borders(Borders::ALL)
+                        .border_style(Style::default().fg(palette.border))
+                        .style(Style::default().bg(palette.panel)),
+                    area,
+                );
+                let prompt = "Restart this task from scratch?\n\nDiscard all uncommitted checkout changes.\nThe current Herdr workspace will close.\nThe old branch is kept. A fresh worktree\nand agent will start for this Bead.";
+                let inner = Rect::new(area.x + 2, area.y + 1, area.width - 4, area.height - 2);
+                f.render_widget(
+                    Paragraph::new(format!(
+                        "{prompt}\n\nWorktree: {id}\n\ny confirm · n / Esc cancel"
+                    ))
+                    .wrap(Wrap { trim: false })
+                    .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
+        }
         render_toast(f, app);
         return;
     }
@@ -824,6 +892,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             crate::app::Modal::ConfirmDelete { .. } => delete_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
+            crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
         };
         let min_width = if matches!(
@@ -871,11 +940,14 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         f.render_widget(Clear, area);
         let frame = Block::default()
             .title(match modal {
+                crate::app::Modal::Create(form) if form.parent_id.is_some() => " NEW CHILD TASK ",
                 crate::app::Modal::Create(_) => " NEW BEAD ",
                 crate::app::Modal::EditLoading { .. } | crate::app::Modal::Edit { .. } => {
                     " EDIT BEAD "
                 }
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
+                crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
+                crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
                 _ => " DELETE BEAD? ",
             })
             .borders(Borders::ALL)
@@ -1061,7 +1133,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Paragraph::new("")
                         .block(
                             Block::default()
-                                .title(" Title ")
+                                .title(match &form.parent_id {
+                                    Some(parent) => format!(" Title · child of {parent} "),
+                                    None => " Title ".to_owned(),
+                                })
                                 .borders(Borders::ALL)
                                 .border_style(Style::default().fg(if form.focus == 0 {
                                     teal
@@ -1327,8 +1402,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "Request merge resolution from the recorded agent? This is pending, not merged."
                     }
                     1 => "Close the integrated Herdr workspace?",
-                    _ => {
+                    2 => {
                         "Remove integrated checkout and close its Herdr workspace? Branch is preserved."
+                    }
+                    _ => {
+                        "Restart this task from scratch?\n\nDiscard all uncommitted checkout changes.\nThe current Herdr workspace will close.\nThe old branch is kept. A fresh worktree\nand agent will start for this Bead."
                     }
                 };
                 f.render_widget(
@@ -1398,7 +1476,14 @@ fn footer_text(state: &str, width: usize) -> String {
         format!(" {state}{actions}")
     };
     let navigation = " · ↑↓ · ←/→ · Tab panes · s settings · w worktrees";
-    if Span::raw(core.as_str()).width() + Span::raw(navigation).width() <= width {
+    let child_hint = " · N child";
+    if Span::raw(core.as_str()).width()
+        + Span::raw(navigation).width()
+        + Span::raw(child_hint).width()
+        <= width
+    {
+        format!("{core}{child_hint}{navigation}")
+    } else if Span::raw(core.as_str()).width() + Span::raw(navigation).width() <= width {
         format!("{core}{navigation}")
     } else {
         core
@@ -1638,6 +1723,45 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
     use std::sync::mpsc;
+    #[test]
+    fn tracked_child_row_is_indented_under_parent() {
+        let mut app = app();
+        app.worktrees_view = true;
+        let parent = crate::worktrees::ManagedWorktree {
+            id: "parent".into(),
+            bead_id: "parent".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/parent".into(),
+            target_branch: "trunk".into(),
+            workspace_id: "wParent".into(),
+            status: crate::worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        };
+        let child = crate::worktrees::ManagedWorktree {
+            id: "child".into(),
+            bead_id: "child".into(),
+            parent_bead_id: Some("parent".into()),
+            branch: "ontrack/child".into(),
+            target_branch: "ontrack/parent".into(),
+            ..parent.clone()
+        };
+        app.worktrees = vec![parent, child];
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        terminal
+            .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..app.list_rect.width)
+                .map(|x| buffer[(app.list_rect.x + x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(app.list_rect.y + 1).contains("› parent"));
+        assert!(row(app.list_rect.y + 3).contains("    child"));
+    }
     fn app() -> App {
         let (tx, _) = mpsc::channel();
         let (_, responses) = mpsc::channel();
@@ -1791,6 +1915,7 @@ mod tests {
         a.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "demo-1".into(),
+            parent_bead_id: None,
             handoff_accepted: false,
             bead_title: None,
             bead_description: None,
@@ -2213,6 +2338,21 @@ mod tests {
         assert!(error_delete.contains("permission denied"));
         assert!(error_delete.contains("[y] Delete"));
     }
+
+    #[test]
+    fn restart_dialog_shows_destructive_warning_and_handoff_id() {
+        let mut app = app();
+        app.worktrees_view = true;
+        app.modal = Some(crate::app::Modal::ConfirmWorktree {
+            id: "ot-selected".into(),
+            action: 3,
+        });
+        let rendered = draw((100, 30), &mut app).0;
+        assert!(rendered.contains("RESTART TASK?"));
+        assert!(rendered.contains("Discard all uncommitted checkout changes."));
+        assert!(rendered.contains("Worktree: ot-selected"));
+        assert!(rendered.contains("y confirm"));
+    }
     #[test]
     fn footer_keeps_mutation_and_handoff_shortcuts_ahead_of_optional_navigation() {
         for width in [64, 90, 120] {
@@ -2226,6 +2366,7 @@ mod tests {
             assert!(Span::raw(footer.as_str()).width() <= width);
         }
         assert!(footer_text("READY", 120).contains("Tab panes"));
+        assert!(footer_text("READY", 160).contains("N child"));
     }
     #[test]
     fn outstanding_worktrees_render_target_state_and_pending_dispatch_on_compact_terminal() {
@@ -2234,6 +2375,7 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "handoff-1".into(),
             bead_id: "closed-1".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: Some("Review handoff".into()),
             bead_description: Some("First line\nSecond line".into()),
@@ -2255,6 +2397,7 @@ mod tests {
     fn worktree_status_text_uses_theme_colours_in_list_and_detail() {
         use crate::worktrees::{ManagedWorktree, WorktreeStatus};
         let statuses = [
+            WorktreeStatus::Reserved,
             WorktreeStatus::Unmerged,
             WorktreeStatus::MergeRequested,
             WorktreeStatus::NeedsResolution,
@@ -2286,6 +2429,7 @@ mod tests {
                 .map(|(index, &status)| ManagedWorktree {
                     id: format!("handoff-{index}"),
                     bead_id: format!("bead-{index}"),
+                    parent_bead_id: None,
                     handoff_accepted: true,
                     bead_title: None,
                     bead_description: None,
@@ -2339,6 +2483,7 @@ mod tests {
         let first = crate::worktrees::ManagedWorktree {
             id: "handoff-1".into(),
             bead_id: "bead-1".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: Some("First task".into()),
             bead_description: Some("Line one\nLine two".into()),
@@ -2352,6 +2497,7 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "handoff-2".into(),
             bead_id: "bead-2".into(),
+            parent_bead_id: None,
             bead_title: Some("Second task".into()),
             bead_description: Some("Another description".into()),
             ..first
@@ -2379,6 +2525,7 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "legacy".into(),
             bead_id: "old-bead".into(),
+            parent_bead_id: None,
             handoff_accepted: false,
             bead_title: None,
             bead_description: None,
@@ -2409,6 +2556,7 @@ mod tests {
         app.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "handoff".into(),
             bead_id: "demo-1".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: Some("Original title".into()),
             bead_description: Some("Original description".into()),
@@ -2437,6 +2585,7 @@ mod tests {
             app.worktrees.push(crate::worktrees::ManagedWorktree {
                 id: format!("wt-{index}"),
                 bead_id: format!("bead-{index}"),
+                parent_bead_id: None,
                 handoff_accepted: true,
                 bead_title: None,
                 bead_description: None,
@@ -2465,6 +2614,7 @@ mod tests {
         state.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "wt-remove".into(),
             bead_id: "b-closed".into(),
+            parent_bead_id: None,
             handoff_accepted: true,
             bead_title: None,
             bead_description: None,

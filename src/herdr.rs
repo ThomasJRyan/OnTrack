@@ -47,6 +47,12 @@ struct Launch {
     pub workspace_id: String,
     pub pane_id: String,
     pub branch: String,
+    pub reserved: bool,
+}
+
+struct LaunchPlan {
+    reserve_for_children: bool,
+    expected_repository: Option<RepositoryIdentity>,
 }
 
 // Keep external commands and launch journaling injectable in Herdr unit tests.
@@ -55,6 +61,12 @@ pub(crate) trait LaunchRecord {
     fn created(&mut self, result: &Value) -> io::Result<()>;
     fn phase(&mut self, phase: &str) -> io::Result<()>;
     fn failed(&mut self, message: &str) -> io::Result<()>;
+    fn base_branch(&self) -> Option<&str> {
+        None
+    }
+    fn reserved_target(&self) -> Option<(String, String, String, PathBuf)> {
+        None
+    }
 }
 
 impl LaunchRecord for crate::worktrees::LaunchJournal {
@@ -73,11 +85,28 @@ impl LaunchRecord for crate::worktrees::LaunchJournal {
     fn failed(&mut self, message: &str) -> io::Result<()> {
         Self::failed(self, message)
     }
+
+    fn base_branch(&self) -> Option<&str> {
+        Self::base_branch(self)
+    }
+
+    fn reserved_target(&self) -> Option<(String, String, String, PathBuf)> {
+        Self::reserved_target(self)
+    }
 }
 
 pub(crate) trait Executor {
     fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>>;
     fn show_bead(&mut self, id: &str) -> io::Result<Value>;
+    fn open_descendants(&mut self, _id: &str) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    fn pending_child_handoffs(&mut self, _id: &str) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    fn reserved_name(&mut self, _id: &str) -> io::Result<Option<String>> {
+        Ok(None)
+    }
     fn git_identity(&mut self, checkout: &Path) -> io::Result<RepositoryIdentity>;
     fn launch_intent(
         &mut self,
@@ -129,6 +158,18 @@ impl Executor for SystemExecutor {
         crate::beads::show_bead(id)
     }
 
+    fn open_descendants(&mut self, id: &str) -> io::Result<Vec<String>> {
+        crate::beads::open_descendants(id)
+    }
+
+    fn pending_child_handoffs(&mut self, id: &str) -> io::Result<Vec<String>> {
+        crate::worktrees::pending_child_handoffs(id)
+    }
+
+    fn reserved_name(&mut self, id: &str) -> io::Result<Option<String>> {
+        crate::worktrees::reserved_name(id)
+    }
+
     fn git_identity(&mut self, checkout: &Path) -> io::Result<RepositoryIdentity> {
         repository_identity_with(checkout, |directory, args| {
             let output = Command::new("git")
@@ -162,14 +203,63 @@ pub fn discover() -> io::Result<LaunchContext> {
 }
 
 pub fn launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result<LaunchOutcome> {
+    let name = crate::worktrees::reserved_name(&bead.id)?.unwrap_or_else(|| unique_name(&bead.id));
     handoff_with(
         &mut SystemExecutor,
         &current_dir()?,
         context,
         agent,
         bead,
-        &unique_name(&bead.id),
+        &name,
     )
+}
+
+pub(crate) fn validate_restart_source(
+    executor: &mut impl Executor,
+    checkout: &Path,
+    workspace_id: &str,
+    agent_id: &str,
+) -> io::Result<()> {
+    let source = discover_with(executor, checkout)?;
+    if source.discovery.workspace_id != workspace_id
+        || !source
+            .discovery
+            .agents
+            .iter()
+            .any(|agent| agent == agent_id)
+    {
+        return Err(invalid(
+            "Recorded source workspace or agent integration is unavailable; restart cancelled",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn relaunch_from(
+    executor: &mut impl Executor,
+    checkout: &Path,
+    workspace_id: &str,
+    agent_id: &str,
+    bead_id: &str,
+    title: &str,
+) -> io::Result<LaunchOutcome> {
+    let result = launch_with(
+        executor,
+        checkout,
+        &Request {
+            workspace_id,
+            agent: agent_id,
+            id: bead_id,
+            title,
+            name: &unique_name(bead_id),
+        },
+    )?;
+    Ok(LaunchOutcome {
+        message: format!(
+            "Task restarted · new workspace {} · pane {} · branch {}",
+            result.workspace_id, result.pane_id, result.branch
+        ),
+    })
 }
 
 pub fn focus_workspace(workspace_id: &str) -> io::Result<()> {
@@ -246,10 +336,17 @@ fn handoff_with(
         },
     )?;
     Ok(LaunchOutcome {
-        message: format!(
-            "Prompt sent to {} · workspace {} · pane {} · branch {}. Handoff is not proof the bead is complete.",
-            agent.label, outcome.workspace_id, outcome.pane_id, outcome.branch
-        ),
+        message: if outcome.reserved {
+            format!(
+                "Parent worktree prepared in workspace {} on branch {}. Complete and integrate children, then press h on the parent to start its agent.",
+                outcome.workspace_id, outcome.branch
+            )
+        } else {
+            format!(
+                "Prompt sent to {} · workspace {} · pane {} · branch {}. Handoff is not proof the bead is complete.",
+                agent.label, outcome.workspace_id, outcome.pane_id, outcome.branch
+            )
+        },
     })
 }
 
@@ -526,7 +623,14 @@ fn launch_with(
             "Bead capture: expected the requested full issue object; nothing created",
         ));
     }
-    let prompt = prompt(request, &bead)?;
+    let open_children = executor
+        .open_descendants(request.id)
+        .map_err(|error| stage("Child task check (nothing created)", error))?;
+    let pending = executor
+        .pending_child_handoffs(request.id)
+        .map_err(|error| stage("Child worktree check (nothing created)", error))?;
+    let reserve_for_children = !open_children.is_empty() || !pending.is_empty();
+    let mut prompt = prompt(request, &bead)?;
     let source = discover_with(executor, cwd)?;
     if source.discovery.workspace_id != request.workspace_id {
         return Err(io::Error::other(
@@ -549,7 +653,8 @@ fn launch_with(
         ));
     }
     let branch = format!("ontrack/{}", request.name);
-    if source.branches.contains(&branch) {
+    let reserved_name = executor.reserved_name(request.id)?;
+    if source.branches.contains(&branch) && reserved_name.as_deref() != Some(request.name) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!(
@@ -573,13 +678,21 @@ fn launch_with(
         request.name,
         request.workspace_id,
     )?;
+    if let Some(parent_branch) = journal.as_ref().and_then(|record| record.base_branch()) {
+        prompt.push_str(&format!(
+            "\n\nThis is a child task. Your worktree was based on the managed parent branch {parent_branch}. Its integration target is that parent branch/worktree. Do not merge this child directly into the default branch."
+        ));
+    }
     let result = create_and_prompt(
         executor,
         request,
         &source,
         &branch,
         &prompt,
-        expected_repository,
+        LaunchPlan {
+            reserve_for_children,
+            expected_repository,
+        },
         &mut journal,
     );
     if let (Err(error), Some(journal)) = (&result, journal.as_mut()) {
@@ -594,11 +707,26 @@ fn create_and_prompt(
     source: &Source,
     branch: &str,
     prompt: &str,
-    expected_repository: Option<RepositoryIdentity>,
+    plan: LaunchPlan,
     journal: &mut Option<Box<dyn LaunchRecord>>,
 ) -> io::Result<Launch> {
-    let bytes = executor
-        .run(&[
+    let (mut target, checkout) = if let Some((workspace_id, pane_id, saved_branch, path)) =
+        journal.as_ref().and_then(|record| record.reserved_target())
+    {
+        if saved_branch != branch {
+            return Err(invalid("Reserved parent branch changed; no agent started"));
+        }
+        (
+            Launch {
+                workspace_id,
+                pane_id,
+                branch: saved_branch,
+                reserved: false,
+            },
+            path,
+        )
+    } else {
+        let mut create_args = vec![
             "worktree",
             "create",
             "--workspace",
@@ -608,8 +736,11 @@ fn create_and_prompt(
             "--label",
             request.name,
             "--no-focus",
-        ])
-        .map_err(|error| {
+        ];
+        if let Some(base) = journal.as_ref().and_then(|record| record.base_branch()) {
+            create_args.extend(["--base", base]);
+        }
+        let bytes = executor.run(&create_args).map_err(|error| {
             recovery(
                 request,
                 branch,
@@ -620,32 +751,55 @@ fn create_and_prompt(
                 ),
             )
         })?;
-    if let Some(journal) = journal.as_mut() {
-        journal.capture("create", &bytes)?;
-    }
-    let result = envelope(&bytes).map_err(|error| {
+        if let Some(journal) = journal.as_mut() {
+            journal.capture("create", &bytes)?;
+        }
+        let result = envelope(&bytes).map_err(|error| {
+            recovery(
+                request,
+                branch,
+                None,
+                None,
+                &format!("Worktree creation response: {error}"),
+            )
+        })?;
+        let workspace = result
+            .pointer("/workspace/workspace_id")
+            .and_then(Value::as_str);
+        let pane = result.pointer("/root_pane/pane_id").and_then(Value::as_str);
+        let target = created_target(&result, source, branch).map_err(|error| {
+            recovery(
+                request,
+                branch,
+                workspace,
+                pane,
+                &format!("Worktree creation response: {error}"),
+            )
+        })?;
+        if let Some(journal) = journal.as_mut() {
+            journal.created(&result)?;
+        }
+        (target, PathBuf::from(text(&result["worktree"], "path")?))
+    };
+    let recover = |message: &str| {
         recovery(
             request,
             branch,
-            None,
-            None,
-            &format!("Worktree creation response: {error}"),
+            Some(&target.workspace_id),
+            Some(&target.pane_id),
+            message,
         )
-    })?;
-    let workspace = result
-        .pointer("/workspace/workspace_id")
-        .and_then(Value::as_str);
-    let pane = result.pointer("/root_pane/pane_id").and_then(Value::as_str);
-    let recover = |message: &str| recovery(request, branch, workspace, pane, message);
-    let target = created_target(&result, source, branch)
-        .map_err(|error| recover(&format!("Worktree creation response: {error}")))?;
-    if let Some(journal) = journal.as_mut() {
-        journal.created(&result)?;
+    };
+    if plan.reserve_for_children {
+        if let Some(journal) = journal.as_mut() {
+            journal.phase("reserved")?;
+        }
+        target.reserved = true;
+        return Ok(target);
     }
-    let trust_override = if let Some(expected) = expected_repository {
+    let trust_override = if let Some(expected) = plan.expected_repository {
         let mut verify = || -> io::Result<String> {
-            let path = Path::new(text(&result["worktree"], "path")?);
-            let actual = executor.git_identity(path)?;
+            let actual = executor.git_identity(&checkout)?;
             if actual != expected {
                 return Err(invalid(
                     "Created worktree Git common directory/main root does not match the source repository",
@@ -654,7 +808,7 @@ fn create_and_prompt(
             codex_trust_override(&actual.main_root)
         };
         Some(verify().map_err(|error| recover(&format!(
-            "Codex repository trust validation failed after worktree creation at {}: {error}. No agent was started and no prompt was sent", result["worktree"]["path"]
+            "Codex repository trust validation failed after worktree creation at {}: {error}. No agent was started and no prompt was sent", checkout.display()
         )))?)
     } else {
         None
@@ -753,6 +907,7 @@ fn created_target(result: &Value, source: &Source, branch: &str) -> io::Result<L
         workspace_id: workspace.to_owned(),
         pane_id: pane.to_owned(),
         branch: branch.to_owned(),
+        reserved: false,
     })
 }
 
@@ -988,6 +1143,30 @@ mod tests {
         }
     }
 
+    struct FakeReservedJournal(PathBuf);
+    impl LaunchRecord for FakeReservedJournal {
+        fn capture(&mut self, _kind: &str, _bytes: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn created(&mut self, _result: &Value) -> io::Result<()> {
+            panic!("reserved worktree must be reused")
+        }
+        fn phase(&mut self, _phase: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn failed(&mut self, _message: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn reserved_target(&self) -> Option<(String, String, String, PathBuf)> {
+            Some((
+                "wNew".into(),
+                "wNew:p1".into(),
+                BRANCH.into(),
+                self.0.clone(),
+            ))
+        }
+    }
+
     #[derive(Default)]
     struct FakeExecutor {
         outputs: VecDeque<io::Result<Vec<u8>>>,
@@ -995,9 +1174,23 @@ mod tests {
         bead: Option<io::Result<Value>>,
         identities: VecDeque<io::Result<RepositoryIdentity>>,
         tracked_root: Option<PathBuf>,
+        open_children: Vec<String>,
+        pending_children: Vec<String>,
+        resume_target: Option<PathBuf>,
     }
 
     impl Executor for FakeExecutor {
+        fn open_descendants(&mut self, _id: &str) -> io::Result<Vec<String>> {
+            Ok(self.open_children.clone())
+        }
+
+        fn pending_child_handoffs(&mut self, _id: &str) -> io::Result<Vec<String>> {
+            Ok(self.pending_children.clone())
+        }
+
+        fn reserved_name(&mut self, _id: &str) -> io::Result<Option<String>> {
+            Ok(self.resume_target.as_ref().map(|_| NAME.to_owned()))
+        }
         fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
             self.calls
                 .push(args.iter().map(|arg| (*arg).to_owned()).collect());
@@ -1038,6 +1231,9 @@ mod tests {
             _name: &str,
             _workspace: &str,
         ) -> io::Result<Option<Box<dyn LaunchRecord>>> {
+            if let Some(path) = self.resume_target.as_ref() {
+                return Ok(Some(Box::new(FakeReservedJournal(path.clone()))));
+            }
             if let Some(root) = self.tracked_root.as_ref() {
                 FakeJournal::new(root, bead)
                     .map(|journal| Some(Box::new(journal) as Box<dyn LaunchRecord>))
@@ -1060,6 +1256,50 @@ mod tests {
                 .pop_front()
                 .expect("unexpected Git identity lookup")
         }
+    }
+
+    #[test]
+    fn open_or_unintegrated_children_prepare_parent_without_starting_agent() {
+        for pending_worktree in [false, true] {
+            let mut executor = FakeExecutor::launch();
+            executor.open_children = if pending_worktree {
+                vec![]
+            } else {
+                vec!["child-1".into()]
+            };
+            executor.pending_children = if pending_worktree {
+                vec!["child-1".into()]
+            } else {
+                vec![]
+            };
+            let outcome = run_launch(&mut executor).unwrap();
+            assert!(outcome.reserved);
+            assert_eq!(executor.mutations().len(), 1);
+            assert_eq!(executor.mutations()[0][..2], ["worktree", "create"]);
+        }
+    }
+
+    #[test]
+    fn reserved_parent_resume_starts_agent_in_existing_pane_without_create() {
+        let mut executor = FakeExecutor::launch();
+        executor.resume_target = Some(PathBuf::from("/new worktree/path"));
+        // Discovery, start, readiness, prompt. The existing worktree supplies
+        // the pane and path, so the queued create response is not consumed.
+        let create_index = executor.outputs.len() - 3;
+        executor.outputs.remove(create_index);
+        executor.outputs.insert(
+            create_index + 1,
+            Ok(json!({"result":{
+            "type":"agent_info", "agent":{"pane_id":"wNew:p1",
+            "workspace_id":"wNew", "agent":"codex"}}})
+            .to_string()
+            .into_bytes()),
+        );
+        let result = run_launch(&mut executor).unwrap();
+        assert!(!result.reserved);
+        assert_eq!(executor.mutations().len(), 2);
+        assert_eq!(executor.mutations()[0][..2], ["agent", "start"]);
+        assert_eq!(executor.mutations()[1][..2], ["agent", "prompt"]);
     }
 
     #[test]
@@ -1381,7 +1621,8 @@ mod tests {
             Launch {
                 workspace_id: "wNew".into(),
                 pane_id: "wNew:p1".into(),
-                branch: BRANCH.into()
+                branch: BRANCH.into(),
+                reserved: false,
             }
         );
         assert_eq!(executor.calls[0], ["show_bead", "OnTrack-z2y"]);

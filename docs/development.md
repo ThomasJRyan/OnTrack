@@ -44,11 +44,14 @@ The subprocess inherits the application's working directory. Commands are passed
 bd --readonly --no-color list --all --limit 0 --json
 bd --readonly --no-color show --id=ISSUE_ID --json --long --include-comments --include-dependents
 bd --no-color create --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json
+bd --no-color create --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json --parent=PARENT_ID
 bd --no-color update --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json -- ISSUE_ID
 bd --no-color delete --force --json -- ISSUE_ID
 ```
 
 Create returns a JSON object containing the created ID; update and delete are successful on a successful command exit. Mutations are not passed `--readonly`; update sends only the four form fields, and delete uses `--force` for the selected issue only and never requests cascading deletion. The worker processes queued requests sequentially, preserving mutation order. Edit opening fetches the current `bd show` record on that worker, validates the editable type and priority, and ignores stale load responses using a request sequence. A failed update leaves the draft open; success triggers an immediate refresh and reselects the same ID.
+
+`Shift+N` opens the create form with an immutable selected parent ID. Child creation passes `--parent=PARENT_ID` as its own argument, so Beads records the hierarchy and list/show JSON exposes the child's `parent` field. OnTrack reads the uncapped live list to find open descendants before a parent starts or merges. Beads rejects a `blocks` dependency from a parent to its descendant because blocked state would cascade back to that descendant; its `bd ready` output still includes the parent. The child-first gate is therefore enforced by OnTrack, not by a reverse Beads dependency.
 
 `--all` includes closed issues and `--limit 0` removes the default list cap. `--id=ISSUE_ID` is a single argument. The list and show responses must be JSON arrays. List parsing requires nonempty string `id`, `title`, and `status`; a missing or null priority defaults to 2, and supplied priority must be an unsigned integer. Each `Bead` retains the entire JSON object as well as its summary fields.
 
@@ -57,6 +60,8 @@ Detail parsing selects the requested ID, rejects duplicate matching records, and
 ## Herdr launch adapter
 
 `src/herdr.rs` exposes `discover() -> io::Result<LaunchContext>` and `launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result<LaunchOutcome>` for background-worker use. `LaunchContext` contains a `Workspace` and available `Agent` records (each with string `id` and `label`); `LaunchOutcome.message` carries the handoff result. These public records derive `Debug`, `Clone`, `PartialEq`, and `Eq`. The app queues the full selected Bead and typed context/agent; the backend still captures authoritative `bd show` JSON before mutation and revalidates workspace/agent availability.
+
+Restart is a separate confirmed worker request for a selected tracked handoff. The backend requires an active journal entry, verifies the main checkout identity and clean current target branch, checks the recorded checkout path/branch and Herdr ownership, and fetches the live Bead before mutation. It also checks that the recorded agent integration and source workspace are available. It saves a `restart_pending` marker before invoking `herdr worktree remove --workspace ID --force`, captures the response, and verifies both Herdr and Git inventories plus path absence. Only then does it mark the old handoff restarted and use the ordinary launch path with a new unique name and the live Bead. The old Git branch is retained. An uncertain removal is never retried automatically. A failed relaunch records an attention state; any partial new launch has its own normal launch journal for recovery. Normal cleanup still requires verified integration and never uses force.
 
 Pressing `h` records the selected Bead and queues discovery once. While that handoff is pending, another `h` is ignored and normal browsing remains available. The discovery response selects Codex if present, otherwise the first agent in the sorted discovery list, and immediately queues launch. Missing selection, discovery errors, and empty agent lists stop before launch. Stale or duplicate discovery responses cannot dispatch another launch. The top-right toast reports progress and a timed result; the outcome or error is also stored for the footer, where it may be truncated by terminal width. The existing tracked-worktree refresh runs after confirmed success. Rendering tests cover normal and compact toasts, and app tests cover automatic dispatch, selection capture, duplicate prevention, errors, and stale responses.
 
@@ -157,7 +162,7 @@ List results are sorted deterministically by status (open first, closed last, ot
 The list row's first line derives issue type from the retained `Bead.data` (`issue_type`, with `type` as a fallback); it does not replace the internal bead ID. Type, priority, and status spans each have a semantic colour helper in `src/ui.rs`; the display-width-aware metadata columns are shared across the list. Preserve white title text independently of selection emphasis and keep missing/custom types safe to display.
 ## Tracked worktree lifecycle
 
-OnTrack records only worktrees created by its own confirmed Herdr handoffs; it
+OnTrack records only worktrees created by its own explicit Herdr actions; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
 from Beads: a closed or missing Bead does not remove the managed-worktree record.
 The app filters verified `CheckoutRemoved` rows from the visible worktree list
@@ -171,8 +176,9 @@ handoff before considering automatic actions. A confirmed missing path sets
 `checkout_removed` and `checkout_removed_externally` in the registry even when
 cleanup preferences are off; it does not call Herdr, remove a Git branch, or
 claim that branch was integrated. An invalid path or filesystem inspection
-error is retained as `NeedsAttention`. A pending cleanup operation still uses
-its existing read-only confirmation before this check. External-removal records
+error is retained as `NeedsAttention`. A pending restart remains visible for
+recovery; a pending cleanup operation still uses its existing read-only
+confirmation before this check. External-removal records
 remain removed across restarts while the path is absent; if it reappears, they
 surface as `NeedsAttention` for identity review.
 The launch journal stores the authoritative Bead title and description before
@@ -182,6 +188,8 @@ or a list failure; it makes no extra `bd` request. Registry entries from older
 versions may omit these optional fields; the view then shows a fallback. The
 pane wraps multiline descriptions and keeps its own bounded scroll position,
 reset when the selected worktree changes.
+
+For a parent with open or unintegrated children, the first confirmed `h` action creates and verifies a managed parent checkout, then persists journal phase `reserved` without starting an agent. The parent stays in the tracked-worktrees view. A child launch requires one open managed parent checkout, records its parent Bead ID, target branch, and canonical target checkout path, and passes `--base PARENT_BRANCH` to Herdr worktree creation. If the child closes and integrates, a later `h` on the parent reuses the exact reserved workspace and root pane to start its agent; no second worktree is created. The registry rejects duplicate active handoffs for the same Bead. The merge path verifies the recorded source and target identities, cleanliness, branch names, and Git tips before sending a resolution prompt or fast-forwarding the target checkout. Parent merge requests and finalization recheck live open descendants and pending child integrations. Child entries are sorted below their parent for display and indented; selection remains keyed by the worktree ID. A parent checkout cannot be closed or removed while tracked child checkouts still exist.
 The verified repository target branch is shown to the user. A merge request is
 pending work, not a completed merge; Git ancestry/cleanliness checks decide
 integration. Conflicts and uncertain outcomes remain inspectable for manual
@@ -192,6 +200,15 @@ separate close. It never force-removes a checkout or deletes a branch. Bead
 closure is an eligibility signal only, not evidence
 that an agent is idle or its changes safe to merge. Automatic merge may therefore
 defer; manual merge remains the user-controlled path.
+
+`inspect` in `src/worktrees.rs` remains the Git-based safety classification.
+`inspect_for_display` only changes a `NeedsResolution` merge-request row to
+`MergeRequested` when a read-only Herdr `agent get` response reports `working`
+for the recorded pane, workspace, and agent kind, with the recorded session
+matching when available. The original Git concern stays in the detail text.
+Idle, done, blocked, mismatched, malformed, and unavailable observations retain
+`NeedsResolution`. Both listing and reconciliation use this display mapping;
+finalization, action gates, and cleanup continue to use the Git classification.
 
 Manual merge provenance is persisted separately from automatic requests: optional
 agent-session metadata is not required for an explicitly confirmed manual merge,
