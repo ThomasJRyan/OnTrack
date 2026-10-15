@@ -961,7 +961,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 FORM_DESCRIPTION_WIDTH as u16 + 6
             }
             crate::app::Modal::Settings { .. } => 64,
-            crate::app::Modal::Release => 76,
+            crate::app::Modal::Release | crate::app::Modal::ConfirmUpdate(_) => 76,
             _ => 62,
         }
         .min(a.width.saturating_sub(2));
@@ -1027,6 +1027,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
             crate::app::Modal::Release => 12,
+            crate::app::Modal::ConfirmUpdate(_) => 10,
+            crate::app::Modal::InstallingUpdate(_) => 8,
         };
         let min_width = if matches!(
             modal,
@@ -1038,6 +1040,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             crate::app::Modal::Settings { .. }
                 | crate::app::Modal::EditLoading { .. }
                 | crate::app::Modal::Release
+                | crate::app::Modal::ConfirmUpdate(_)
         ) {
             38
         } else {
@@ -1083,6 +1086,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 }
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 crate::app::Modal::Release => " ONTRACK RELEASE ",
+                crate::app::Modal::ConfirmUpdate(_) => " UPDATE ONTRACK? ",
+                crate::app::Modal::InstallingUpdate(_) => " INSTALLING ONTRACK ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
                 crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
                 _ => " DELETE BEAD? ",
@@ -1100,12 +1105,16 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         match modal {
             crate::app::Modal::Release => {
                 let version = env!("CARGO_PKG_VERSION");
-                let result = if app.release_inflight {
+                let result = if app.update_preparing {
+                    "Checking for a compatible release asset…".to_owned()
+                } else if app.release_inflight {
                     "Checking GitHub for the latest release…".to_owned()
                 } else {
                     match app.release_result.as_ref() {
                         Some(Ok(crate::release::CheckResult::Available { version, url })) => {
-                            format!("Update available: v{version}\n\nRelease link:\n{url}")
+                            format!(
+                                "Update available: v{version}\n\nRelease link:\n{url}\n\nPress i to prepare installation."
+                            )
                         }
                         Some(Ok(crate::release::CheckResult::Current { .. })) => {
                             "You are running the latest published release.".into()
@@ -1123,6 +1132,22 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     ))
                     .wrap(Wrap { trim: false })
                     .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
+            crate::app::Modal::ConfirmUpdate(release) => {
+                f.render_widget(
+                    Paragraph::new(format!("OnTrack {} is available.\n\n{}\n\nInstall the verified release?\ny confirm · n / Esc cancel", release.version, release.page))
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
+            crate::app::Modal::InstallingUpdate(version) => {
+                f.render_widget(
+                    Paragraph::new(format!("Downloading and verifying OnTrack {version}…\n\nEsc or c cancels before replacement.\nKeep this session open until the result appears."))
+                        .wrap(Wrap { trim: false })
+                        .style(Style::default().fg(ink)),
                     inner,
                 );
             }
@@ -2341,6 +2366,8 @@ mod tests {
             toast: None,
             release_result: None,
             release_inflight: false,
+            update_preparing: false,
+            release_cancel: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -2388,12 +2415,32 @@ mod tests {
         let screen = draw((100, 24), &mut state).0;
         assert!(screen.contains("Update available: v1.2.0"));
         assert!(screen.contains("https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0"));
+        assert!(screen.contains("Press i to prepare installation"));
         state.release_result = Some(Err("offline".into()));
         assert!(
             draw((100, 24), &mut state)
                 .0
                 .contains("Update check failed: offline")
         );
+    }
+    #[test]
+    fn update_confirmation_and_install_progress_show_actions() {
+        let mut state = app();
+        let release = crate::update::Available {
+            version: "1.2.0".into(),
+            page: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+            asset_name: "archive.tar.gz".into(),
+            asset_url: String::new(),
+            checksum_url: String::new(),
+            digest: None,
+        };
+        state.modal = Some(crate::app::Modal::ConfirmUpdate(release));
+        let screen = draw((100, 24), &mut state).0;
+        assert!(screen.contains("Install the verified release?"));
+        assert!(screen.contains("y confirm"));
+        state.modal = Some(crate::app::Modal::InstallingUpdate("1.2.0".into()));
+        let screen = draw((100, 24), &mut state).0;
+        assert!(screen.contains("Esc or c cancels before replacement"));
     }
     fn draw(size: (u16, u16), a: &mut App) -> (String, Rect) {
         let mut t = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();

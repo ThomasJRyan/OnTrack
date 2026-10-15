@@ -11,7 +11,7 @@ OnTrack publishes versioned binaries from the [release workflow](../.github/work
 | macOS | Intel | `x86_64-apple-darwin` |
 | macOS | Apple Silicon | `aarch64-apple-darwin` |
 
-For each target, a release contains `ontrack-vVERSION-TARGET.tar.gz` and a matching `ontrack-vVERSION-TARGET.tar.gz.sha256`. The archive contains one executable named `ontrack` at its root. The checksum file uses the standard `SHA256  filename` format and hashes the downloadable archive, not the unpacked binary. The `vVERSION` portion must match the release tag exactly. These names are the contract for the installer and in-app updates. Four targets produce eight downloadable files in total.
+For each target, a release contains `ontrack-vVERSION-TARGET.tar.gz` and a matching `ontrack-vVERSION-TARGET.tar.gz.sha256`. The archive contains one executable named `ontrack` at its root. The checksum file uses the standard `SHA256  filename` format and hashes the downloadable archive, not the unpacked binary. The `vVERSION` portion must match the release tag exactly. These names are the contract for the installer and in-app updater. Four targets produce eight downloadable files in total.
 
 Download the archive and its `.sha256` file from the same [GitHub Release](https://github.com/ThomasJRyan/OnTrack/releases). In the download directory, verify before unpacking:
 

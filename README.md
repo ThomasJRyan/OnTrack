@@ -10,7 +10,7 @@ Versioned Linux and macOS binaries are published from Git tags; see [releases](d
 - When creating an Epic, optionally generate child tasks with assessed P0–P4 priorities from its Description using a Herdr agent in a separate workspace at the same checkout.
 - Two-pane browsing with scrollable, Markdown-rendered descriptions, notes, comments, relationships, and Beads details.
 - Automatic background refresh picks up external changes, with cached records and visible errors; no watcher setup required.
-- Press `u` to check the latest published GitHub release against the running version; the result shows the version and release link without interrupting Beads browsing.
+- Press `u` to check the latest published GitHub release against the running version. When one is available, press `i` to prepare a compatible asset, then `y` to install its verified download. Restart OnTrack after a successful update.
 - Persistent theme and default new-task agent selection in a structured settings dialog.
 - A brief animated terminal splash with the ONTRACK wordmark and a waving anime girl, with compact layouts for smaller terminals.
 - Press `h` to hand a selected Bead to a Herdr agent in a new worktree. A top-right toast shows progress and the result; Open and Ready issues show `· sent` once the prompt is confirmed. See the [user guide](docs/user-guide.md) for setup and recovery limits.
@@ -18,7 +18,7 @@ Versioned Linux and macOS binaries are published from Git tags; see [releases](d
 
 ## Requirements
 
-Source builds need Rust 1.88 or newer and the `bd` command-line tool; the release check also needs `curl`. Release installation checks for both `bd` and Herdr. OnTrack initializes Beads in the launch directory when no workspace is available. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
+Source builds need Rust 1.88 or newer and the `bd` command-line tool; the release check also needs `curl`. In-app updates need `curl` and `tar`; release installation checks for both `bd` and Herdr. OnTrack initializes Beads in the launch directory when no workspace is available. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
 
 ## Run
 

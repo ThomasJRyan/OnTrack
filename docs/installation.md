@@ -54,6 +54,16 @@ For Herdr handoffs, start it inside a running Herdr shell as explained in the
 
 ## Update and remove
 
+From a running OnTrack session, press `u` in the issue browser to check the
+latest stable release. When a newer version appears, press `i` to select an
+asset for this machine, then `y` to confirm installation. This path needs
+`curl`, `tar`, and write access to the directory containing the running
+executable. OnTrack verifies the published SHA-256 checksum before replacing
+it. `Esc` or `c` requests cancellation during download; network, permission,
+and verification failures leave the existing executable usable. Quit and
+restart OnTrack after success. See the [user guide](user-guide.md#update-ontrack)
+for the dialog and recovery steps.
+
 An existing destination is left untouched unless `--replace` is explicit.
 Update by running the installer again with `--replace` and the same
 `--install-dir` (if used). In a pipeline, pass arguments after `bash -s --`:

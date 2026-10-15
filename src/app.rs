@@ -8,13 +8,18 @@ use crate::{
     release,
     settings::{self, DefaultAgent, Settings, Theme},
     ui,
+    update::{self, Available, Check},
 };
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -42,6 +47,8 @@ pub(super) enum Request {
     RestartWorktree(String),
     ReconcileWorktrees(CleanupPolicy),
     CheckRelease,
+    PrepareUpdate,
+    InstallRelease(Available, Arc<AtomicBool>),
 }
 pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
@@ -61,6 +68,8 @@ pub(super) enum Response {
     WorktreeChanged(std::io::Result<ManagedWorktree>),
     WorktreeRestarted(std::io::Result<String>),
     ReleaseChecked(Result<release::CheckResult, String>),
+    UpdatePrepared(std::io::Result<Check>),
+    ReleaseInstalled(std::io::Result<()>),
 }
 pub(super) enum WorktreeFocusFeedback {
     Success(String),
@@ -88,6 +97,8 @@ pub struct App {
     pub toast: Option<Toast>,
     pub release_result: Option<Result<release::CheckResult, String>>,
     pub release_inflight: bool,
+    pub update_preparing: bool,
+    pub release_cancel: Option<Arc<AtomicBool>>,
     pub list_rect: Rect,
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
@@ -151,6 +162,8 @@ pub enum Modal {
         action: u8,
     },
     Release,
+    ConfirmUpdate(Available),
+    InstallingUpdate(String),
 }
 #[derive(Debug, Clone)]
 pub struct Toast {
@@ -424,6 +437,22 @@ impl App {
                         });
                         continue;
                     }
+                    Request::PrepareUpdate => {
+                        let replies = out.clone();
+                        thread::spawn(move || {
+                            let _ = replies.send(Response::UpdatePrepared(update::check()));
+                        });
+                        continue;
+                    }
+                    Request::InstallRelease(release, cancel) => {
+                        let replies = out.clone();
+                        thread::spawn(move || {
+                            let _ = replies.send(Response::ReleaseInstalled(update::install(
+                                &release, &cancel,
+                            )));
+                        });
+                        continue;
+                    }
                 };
                 if out.send(response).is_err() {
                     break;
@@ -468,6 +497,8 @@ impl App {
             toast: None,
             release_result: None,
             release_inflight: false,
+            update_preparing: false,
+            release_cancel: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -1349,7 +1380,7 @@ impl App {
                     self.release_inflight = false;
                     self.notice = Some(match &result {
                         Ok(release::CheckResult::Available { version, .. }) => {
-                            format!("Update v{version} available · press u for release link")
+                            format!("Update v{version} available · press u to review")
                         }
                         Ok(release::CheckResult::Current { .. }) => "OnTrack is up to date".into(),
                         Ok(release::CheckResult::NoPublishedRelease) => {
@@ -1358,6 +1389,62 @@ impl App {
                         Err(error) => format!("Update check failed: {error}"),
                     });
                     self.release_result = Some(result);
+                }
+                Response::UpdatePrepared(result) => {
+                    self.update_preparing = false;
+                    match result {
+                        Ok(Check::Available(release)) => {
+                            if matches!(self.modal, Some(Modal::Release)) {
+                                self.modal = Some(Modal::ConfirmUpdate(release));
+                                self.modal_ready = false;
+                            } else {
+                                self.notice = Some(
+                                    "Update is ready to review; press u, then i to continue".into(),
+                                );
+                            }
+                        }
+                        Ok(Check::Current) => {
+                            self.notice = Some("OnTrack is up to date".into());
+                            self.release_result = Some(Ok(release::CheckResult::Current {
+                                version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                            }));
+                        }
+                        Ok(Check::NoPublishedRelease) => {
+                            self.notice = Some("No public OnTrack release is available".into());
+                            self.release_result =
+                                Some(Ok(release::CheckResult::NoPublishedRelease));
+                        }
+                        Err(error) => {
+                            let message =
+                                format!("Update preparation failed: {error}. Press i to retry.");
+                            self.notice = Some(message.clone());
+                            self.toast = Some(Toast::result(message, true));
+                        }
+                    }
+                }
+                Response::ReleaseInstalled(result) => {
+                    self.release_cancel = None;
+                    self.modal = None;
+                    let toast = match result {
+                        Ok(()) => Toast::result(
+                            "OnTrack updated. Quit and restart to run the new version.".into(),
+                            false,
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            Toast::result(
+                                "Update cancelled; existing executable is unchanged.".into(),
+                                false,
+                            )
+                        }
+                        Err(error) => Toast::result(
+                            format!(
+                                "Update failed: {error}. Existing executable remains usable; press u to retry."
+                            ),
+                            true,
+                        ),
+                    };
+                    self.notice = Some(toast.message.clone());
+                    self.toast = Some(toast);
                 }
             }
         }
@@ -1659,6 +1746,15 @@ impl App {
         if self.mutation_busy {
             return false;
         }
+        if matches!(self.modal, Some(Modal::InstallingUpdate(_))) {
+            if matches!(key.code, Esc | Char('c')) {
+                if let Some(cancel) = &self.release_cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                self.toast = Some(Toast::progress("Cancelling update…".into()));
+            }
+            return false;
+        }
         if !self.modal_ready && key.code != Esc {
             return false;
         }
@@ -1687,8 +1783,47 @@ impl App {
             return false;
         }
         if matches!(self.modal, Some(Modal::Release)) {
-            if key.code == KeyCode::Char('r') {
+            if key.code == KeyCode::Char('r') && !self.update_preparing {
                 self.start_release_check();
+            } else if key.code == KeyCode::Char('i')
+                && !self.update_preparing
+                && matches!(
+                    self.release_result,
+                    Some(Ok(release::CheckResult::Available { .. }))
+                )
+            {
+                self.update_preparing = true;
+                if self.requests.send(Request::PrepareUpdate).is_err() {
+                    self.update_preparing = false;
+                    self.notice = Some("Update preparation could not be queued".into());
+                }
+            }
+            return false;
+        }
+        if let Some(Modal::ConfirmUpdate(release)) = self.modal.as_ref() {
+            if matches!(key.code, Char('y') | Char('Y')) {
+                let release = release.clone();
+                let cancel = Arc::new(AtomicBool::new(false));
+                self.release_cancel = Some(cancel.clone());
+                self.modal = Some(Modal::InstallingUpdate(release.version.clone()));
+                self.toast = Some(Toast::progress(format!(
+                    "Downloading and verifying OnTrack {}…",
+                    release.version
+                )));
+                if self
+                    .requests
+                    .send(Request::InstallRelease(release, cancel))
+                    .is_err()
+                {
+                    self.release_cancel = None;
+                    self.modal = None;
+                    self.toast = Some(Toast::result(
+                        "Update could not be queued; press u to retry".into(),
+                        true,
+                    ));
+                }
+            } else if matches!(key.code, Char('n') | Char('N') | Enter) {
+                self.modal = None;
             }
             return false;
         }
@@ -2459,6 +2594,87 @@ mod tests {
     }
 
     #[test]
+    fn release_install_requires_available_asset_and_explicit_confirmation() {
+        let (mut app, requests, replies) = connected_app();
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::CheckRelease)));
+        app.modal_ready = true;
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(requests.try_recv().is_err());
+
+        replies
+            .send(Response::ReleaseChecked(Ok(
+                release::CheckResult::Available {
+                    version: semver::Version::parse("1.2.0").unwrap(),
+                    url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+                },
+            )))
+            .unwrap();
+        app.receive();
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::PrepareUpdate)));
+        assert!(app.update_preparing);
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(requests.try_recv().is_err());
+
+        replies
+            .send(Response::UpdatePrepared(Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no compatible asset",
+            ))))
+            .unwrap();
+        app.receive();
+        assert!(matches!(app.modal, Some(Modal::Release)));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("no compatible asset")
+        );
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::PrepareUpdate)));
+
+        let release = Available {
+            version: "1.2.0".into(),
+            page: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+            asset_name: "ontrack-v1.2.0-x86_64-unknown-linux-gnu.tar.gz".into(),
+            asset_url: "https://github.com/ThomasJRyan/OnTrack/releases/download/v1.2.0/ontrack-v1.2.0-x86_64-unknown-linux-gnu.tar.gz".into(),
+            checksum_url: "https://github.com/ThomasJRyan/OnTrack/releases/download/v1.2.0/ontrack-v1.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256".into(),
+            digest: None,
+        };
+        replies
+            .send(Response::UpdatePrepared(Ok(Check::Available(
+                release.clone(),
+            ))))
+            .unwrap();
+        app.receive();
+        assert!(matches!(app.modal, Some(Modal::ConfirmUpdate(_))));
+        app.modal_ready = true;
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert!(requests.try_recv().is_err());
+
+        app.modal = Some(Modal::ConfirmUpdate(release.clone()));
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let Ok(Request::InstallRelease(chosen, cancel)) = requests.try_recv() else {
+            panic!("install was not queued")
+        };
+        assert_eq!(chosen, release);
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(cancel.load(Ordering::Relaxed));
+        replies
+            .send(Response::ReleaseInstalled(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
+            ))))
+            .unwrap();
+        app.receive();
+        assert!(app.modal.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("cancelled"));
+    }
+
+    #[test]
     fn shift_n_creates_child_of_selected_task_and_n_stays_top_level() {
         let mut app = app();
         app.beads[0].data["issue_type"] = json!("task");
@@ -2611,6 +2827,8 @@ mod tests {
             toast: None,
             release_result: None,
             release_inflight: false,
+            update_preparing: false,
+            release_cancel: None,
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,

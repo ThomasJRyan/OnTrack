@@ -14,6 +14,8 @@ pub enum Context {
     Delete,
     WorktreeConfirm,
     Release,
+    UpdateConfirm,
+    UpdateInstalling,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,6 +40,8 @@ impl Context {
             Some(Modal::ConfirmDelete { .. }) => Self::Delete,
             Some(Modal::ConfirmWorktree { .. }) => Self::WorktreeConfirm,
             Some(Modal::Release) => Self::Release,
+            Some(Modal::ConfirmUpdate(_)) => Self::UpdateConfirm,
+            Some(Modal::InstallingUpdate(_)) => Self::UpdateInstalling,
             None if app.worktrees_view => Self::Worktrees,
             None if app.focus_detail => Self::Details,
             None => Self::Issues,
@@ -57,6 +61,8 @@ impl Context {
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
             Self::Release => "Release check",
+            Self::UpdateConfirm => "Update confirmation",
+            Self::UpdateInstalling => "Installing update",
         }
     }
 
@@ -162,8 +168,14 @@ impl Context {
             ],
             Self::Release => vec![
                 ("r", "Check GitHub again"),
+                ("i", "Prepare a compatible release for installation"),
                 ("Esc", "Return to issue browser"),
             ],
+            Self::UpdateConfirm => vec![
+                ("y / Y", "Install the verified release"),
+                ("n / N / Enter / Esc", "Cancel installation"),
+            ],
+            Self::UpdateInstalling => vec![("Esc / c", "Request cancellation before replacement")],
         };
         rows.extend([
             ("Ctrl+?", "Open or close this hotkey reference"),
