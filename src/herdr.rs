@@ -704,7 +704,10 @@ fn launch_with_mode(
                 "Scheduled Bead is no longer an open Ready task; nothing created",
             ));
         }
-        if crate::beads::harness(&bead) != Some(request.agent) {
+        if crate::beads::explicitly_unassigned(&bead)
+            || (crate::beads::has_harness_label(&bead) && crate::beads::harness(&bead).is_none())
+            || crate::beads::harness(&bead).is_some_and(|kind| kind != request.agent)
+        {
             return Err(io::Error::other(
                 "Scheduled Bead harness changed before launch; nothing created",
             ));
@@ -1842,6 +1845,30 @@ mod tests {
         let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
         assert!(error.to_string().contains("harness changed"));
         assert_eq!(executor.calls, vec![vec!["show_bead", "OnTrack-z2y"]]);
+
+        for label in [crate::beads::UNASSIGNED_LABEL, "ontrack:agent:unknown"] {
+            let mut executor = FakeExecutor::launch();
+            let mut changed = bead();
+            changed["status"] = json!("open");
+            changed["issue_type"] = json!("task");
+            changed["labels"] = json!([crate::beads::READY_LABEL, label]);
+            executor.bead = Some(Ok(changed));
+            let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
+            assert!(error.to_string().contains("harness changed"));
+            assert_eq!(executor.calls, vec![vec!["show_bead", "OnTrack-z2y"]]);
+        }
+
+        let mut executor = FakeExecutor::launch();
+        let mut changed = bead();
+        changed["status"] = json!("open");
+        changed["issue_type"] = json!("task");
+        changed["labels"] = json!([crate::beads::READY_LABEL]);
+        executor.bead = Some(Ok(changed));
+        let _ = launch_with_mode(&mut executor, &cwd(), &request(), true);
+        assert!(
+            executor.calls.len() > 1,
+            "legacy Ready task passed the harness guard"
+        );
     }
 
     #[test]

@@ -531,6 +531,37 @@ impl App {
         if !self.worktrees_discovered || self.handoff.is_some() || self.mutation_busy {
             return;
         }
+        // A child must branch from its managed parent checkout. Preparing an
+        // Epic only reserves that checkout; it does not occupy an agent slot.
+        if let Some(epic) = self
+            .beads
+            .iter()
+            .find(|bead| {
+                if !beads::is_ready(bead)
+                    || bead.data["issue_type"] != "epic"
+                    || self.scheduler_attempted.contains(&bead.id)
+                    || self.known_handoffs.contains(&bead.id)
+                    || self.worktrees.iter().any(|item| item.bead_id == bead.id)
+                {
+                    return false;
+                }
+                let descendants = beads::open_descendants_in(&self.beads, &bead.id);
+                self.beads.iter().any(|child| {
+                    beads::is_ready(child)
+                        && child.data["issue_type"] == "task"
+                        && !beads::explicitly_unassigned(&child.data)
+                        && (!beads::has_harness_label(&child.data)
+                            || beads::harness(&child.data).is_some())
+                        && !self.known_handoffs.contains(&child.id)
+                        && descendants.contains(&child.id)
+                })
+            })
+            .cloned()
+        {
+            self.scheduler_attempted.insert(epic.id.clone());
+            self.start_launch(epic, false);
+            return;
+        }
         let active_agents = self
             .worktrees
             .iter()
@@ -559,9 +590,16 @@ impl App {
             .cloned();
         if let Some(bead) = next {
             self.scheduler_attempted.insert(bead.id.clone());
-            if beads::harness(&bead.data).is_none() {
+            if beads::explicitly_unassigned(&bead.data) {
                 let message = format!(
-                    "{} is Ready but has no supported agent harness; edit it to select one",
+                    "{} is Ready but explicitly Unassigned; edit it to select an agent",
+                    bead.id
+                );
+                self.notice = Some(message.clone());
+                self.toast = Some(Toast::result(message, true));
+            } else if beads::has_harness_label(&bead.data) && beads::harness(&bead.data).is_none() {
+                let message = format!(
+                    "{} has an unsupported agent harness; edit it to select one",
                     bead.id
                 );
                 self.notice = Some(message.clone());
@@ -1103,6 +1141,27 @@ impl App {
                                 let chosen = beads::harness(&pending.bead.data);
                                 let agent = if let Some(kind) = chosen {
                                     context.agents.iter().find(|agent| agent.id == kind)
+                                } else if pending.scheduled {
+                                    match self.settings.default_agent {
+                                        DefaultAgent::Kind(kind) => context
+                                            .agents
+                                            .iter()
+                                            .find(|agent| agent.id == kind)
+                                            .or_else(|| {
+                                                context
+                                                    .agents
+                                                    .iter()
+                                                    .find(|agent| agent.id == "codex")
+                                            })
+                                            .or_else(|| context.agents.first()),
+                                        DefaultAgent::Automatic | DefaultAgent::Unassigned => {
+                                            context
+                                                .agents
+                                                .iter()
+                                                .find(|agent| agent.id == "codex")
+                                                .or_else(|| context.agents.first())
+                                        }
+                                    }
                                 } else {
                                     context
                                         .agents
@@ -2636,6 +2695,135 @@ mod tests {
         assert!(rx.try_recv().is_err());
         a.beads[0].status = "in_progress".into();
         assert_eq!(display_status(&a.beads[0]), "in_progress");
+    }
+
+    #[test]
+    fn ready_epic_prepares_parent_before_unlabelled_child_launch() {
+        let mut a = app();
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        let (replies, responses) = mpsc::channel();
+        a.responses = responses;
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[1].data["labels"] = json!([beads::READY_LABEL]);
+        a.settings.default_agent = DefaultAgent::Kind("opencode");
+        a.settings.agent_limit = settings::AgentLimit::Limited(1);
+        a.worktrees.push(ManagedWorktree {
+            id: "active".into(),
+            bead_id: "other".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/other".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws-other".into(),
+            status: worktrees::WorktreeStatus::InProgress,
+            detail: None,
+        });
+
+        a.poll_scheduler();
+        let Request::Discover(parent_seq) = queued.try_recv().unwrap() else {
+            panic!("parent discovery not queued")
+        };
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        replies
+            .send(Response::Discovered(parent_seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(matches!(queued.try_recv(), Ok(Request::Launch(_, _, _, bead)) if bead.id == "b0"));
+        replies
+            .send(Response::Launched(
+                parent_seq,
+                Ok(LaunchOutcome {
+                    message: "Prepared".into(),
+                    reserved: true,
+                }),
+            ))
+            .unwrap();
+        a.receive();
+        assert!(a.known_handoffs.contains("b0"));
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        replies
+            .send(Response::Worktrees(Ok(vec![ManagedWorktree {
+                id: "parent".into(),
+                bead_id: "b0".into(),
+                parent_bead_id: None,
+                handoff_accepted: false,
+                bead_title: None,
+                bead_description: None,
+                branch: "ontrack/parent".into(),
+                target_branch: "main".into(),
+                workspace_id: "ws-parent".into(),
+                status: worktrees::WorktreeStatus::Reserved,
+                detail: None,
+            }])))
+            .unwrap();
+        a.receive();
+        a.poll_scheduler();
+        let Request::Discover(child_seq) = queued.try_recv().unwrap() else {
+            panic!("child discovery not queued")
+        };
+        replies
+            .send(Response::Discovered(child_seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(
+            matches!(queued.try_recv(), Ok(Request::LaunchReady(_, _, agent, bead))
+            if bead.id == "b1" && agent.id == "opencode")
+        );
+    }
+
+    #[test]
+    fn explicit_unassigned_ready_task_is_not_scheduled() {
+        let mut a = app();
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, beads::UNASSIGNED_LABEL]);
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        assert!(a.notice.as_deref().unwrap().contains("Unassigned"));
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_epic_preparation_is_not_retried_or_duplicated() {
+        let mut a = app();
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        let (replies, responses) = mpsc::channel();
+        a.responses = responses;
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[1].data["labels"] = json!([beads::READY_LABEL]);
+        a.poll_scheduler();
+        let Request::Discover(seq) = queued.try_recv().unwrap() else {
+            panic!("parent discovery not queued")
+        };
+        replies
+            .send(Response::Discovered(
+                seq,
+                Err(std::io::Error::other("Herdr unavailable")),
+            ))
+            .unwrap();
+        a.receive();
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        assert!(a.notice.as_deref().unwrap().contains("Herdr unavailable"));
+
+        a.scheduler_attempted.clear();
+        a.known_handoffs.insert("b0".into());
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
     }
 
     #[test]

@@ -763,7 +763,11 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
             };
         }
         let check = (|| {
-            let target = target_checkout(repo, entry)?;
+            // This is historical, read-only status inspection. A dirty target
+            // must block new merges and cleanup, but it cannot invalidate an
+            // already removed checkout whose branch is contained in the
+            // target history.
+            let target = target_checkout_identity(repo, entry)?;
             let source = tip(
                 &repo.main_root,
                 &format!("refs/heads/{}", field(entry, "branch")?),
@@ -3314,6 +3318,26 @@ mod tests {
             fs::create_dir(&fixture.source).unwrap();
             assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
         }
+    }
+
+    #[test]
+    fn removed_integrated_checkout_stays_removed_when_target_is_dirty() {
+        let fixture = Fixture::managed();
+        fixture.integrated();
+        git(
+            &fixture.main,
+            &["worktree", "remove", fixture.source.to_str().unwrap()],
+        )
+        .unwrap();
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[0]["checkout_removed"] = json!(true);
+        registry.entries[0]["workspace_closed"] = json!(true);
+        registry.save().unwrap();
+        drop(registry);
+
+        fs::write(fixture.main.join("local-export-change"), "uncommitted\n").unwrap();
+
+        assert_eq!(fixture.status().status, WorktreeStatus::CheckoutRemoved);
     }
 
     #[test]
