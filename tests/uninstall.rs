@@ -3,8 +3,11 @@ use std::{
     io::Write,
     path::Path,
     process::{Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
 
 struct Fixture(std::path::PathBuf);
 
@@ -14,14 +17,19 @@ impl Fixture {
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let root =
-            std::env::temp_dir().join(format!("ontrack-uninstall-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "ontrack-uninstall-{}-{nonce}-{}",
+            std::process::id(),
+            NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("config/ontrack")).unwrap();
         fs::write(root.join("config/ontrack/settings.json"), b"{}").unwrap();
         fs::write(root.join("bin/bd"), b"keep").unwrap();
         fs::write(root.join("bin/herdr"), b"keep").unwrap();
-        fs::copy(env!("CARGO_BIN_EXE_ontrack"), root.join("bin/ontrack")).unwrap();
+        let staged = root.join("bin/ontrack-stage");
+        fs::copy(env!("CARGO_BIN_EXE_ontrack"), &staged).unwrap();
+        fs::rename(staged, root.join("bin/ontrack")).unwrap();
         Self(root)
     }
 

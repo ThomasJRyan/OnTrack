@@ -6,10 +6,10 @@ ontrack browses Beads issues in a two-pane terminal view and can create, edit, o
 
 - Rust 1.88 or newer to build this Rust 2024 project.
 - `bd` available on `PATH`, with support for the JSON commands shown in the [development guide](development.md#beads-cli-contract).
-- Run the browser from a Herdr-managed shell, which supplies `HERDR_ENV=1`. Outside Herdr, OnTrack exits before Beads discovery or terminal setup and tells you to open a Herdr workspace. `--help` and `uninstall` remain available outside Herdr.
+- Run the browser from a Herdr-managed shell, which supplies `HERDR_ENV=1`. Outside Herdr, OnTrack exits before Beads discovery or terminal setup and tells you to open a Herdr workspace. `--help`, `update`, and `uninstall` remain available outside Herdr.
 - If no Beads workspace is accessible from the launch directory, OnTrack tells you to run **`bd init`** and exits. Existing workspaces, including inherited and redirected ones, are reused with their configuration intact.
 - An interactive terminal supporting raw mode and the alternate screen; mouse support is needed for clicking and wheel input.
-- For in-app updates, `curl` must be on `PATH`; `tar` is also needed for `.tar.gz` release assets. The executable's directory must be writable for replacement.
+- For `ontrack update`, `curl` and `tar` must be on `PATH`, and the executable's directory must be writable for replacement. This command needs neither Herdr nor a Beads workspace.
 
 See the [official Beads documentation](https://beads.gascity.com) for installing `bd` and setting up a workspace. For supported binary downloads and checksum verification, see the [release guide](releases.md).
 
@@ -29,7 +29,6 @@ If `bd` is missing or workspace discovery fails, OnTrack stops before raw mode a
 
 A brief splash precedes the browser. A terminal-drawn anime girl blinks and waves beneath the ONTRACK wordmark; narrower terminals use a compact title, and very small terminals show text only. The animation lasts about 1.2 seconds and uses the selected theme. Issue loading starts in the background; quit keys work during startup too.
 
-OnTrack checks the latest published release from its GitHub repository in the background at startup. If that release is newer than the running version, an **UPDATE AVAILABLE** notice appears at the top right of the issue and worktree headers. Narrow headers show **UPDATE**. A Herdr toast may cover it temporarily; the notice returns when the toast clears. The check needs `curl` and network access. If either is unavailable, the release is missing, or its tag is not a valid version, OnTrack continues normally without an update notice.
 
 ## Status groups
 
@@ -79,7 +78,6 @@ An Open or Ready issue shows `· sent` beside its status after Herdr confirms th
 | `d` | Ask to permanently delete the selected bead. `y` confirms; `n` or Enter cancels. Deletion does not cascade; dependency links are removed and dependents may be orphaned. |
 | `g` on an Epic | Confirm generation of child tasks from its live Description using a Herdr agent. `y` confirms; `n`, Enter, or Esc cancels. Available with either issue pane focused. |
 | `h` | Immediately hand the selected bead to Herdr in the background. The top-right toast shows discovery, launch, and the result. No dialog or second confirmation appears. Repeated `h` for the same pending Bead is ignored; different Beads can launch concurrently. |
-| `u` | Check the official GitHub release for a newer version; press `i` in its dialog to prepare installation. |
 | `Shift+R` in the issue browser | Same Ready toggle as `r`. |
 | `w` | Open outstanding tracked worktrees. This list is independent of Beads statuses, so closing or deleting a Bead does not hide unfinished work. A checkout disappears after removal is verified, including when it was removed outside OnTrack; uncertain cleanup stays visible for recovery. Select an item and press Enter to focus its recorded Herdr workspace. A merge is a request, not proof of integration; inspect conflict/error states and recover in Git before retrying. Cleanup is separately confirmed and available only after verified integration. In this view, `Shift+R` opens a restart confirmation for the selected active handoff. |
 | `Esc` | Go back one level: close a dialog (or its open choice list first), return from outstanding worktrees to the main browser, or stay on the main browser if already there. A dialog stays locked while a mutation is running. |
@@ -95,13 +93,13 @@ The settings dialog captures input until it closes, so `q` cannot quit while it 
 
 ## Generate tasks for an Epic
 
-In the create form, choose **Epic** to reveal **Generate child tasks with a Herdr agent** below Description. Tab moves from Agent harness through Description to this option, then Create. The option starts off. Enter the proposal in Description, turn on the option, and create the Epic. OnTrack saves the Epic first, then opens a separate Herdr workspace at the current checkout, starts an available agent, and asks it to create direct child Beads with descriptions, acceptance criteria, and explicit P0–P4 priorities. The agent compares impact, urgency, and enabling work to distinguish priorities when the proposal supports it; comparable or unclear tasks may share a priority. Review the generated priorities before scheduling tasks. It does not create another Git worktree. The form hides and clears this option for other issue types; editing a Bead does not run generation.
+In the create form, choose **Epic** to reveal **Generate child tasks with a Herdr agent** below Description. Tab moves from Agent harness through Description to this option, then Create. The option starts off. Enter the proposal in Description, turn on the option, and create the Epic. OnTrack saves the Epic first, then opens a planning tab inside the current Herdr workspace at the current checkout, starts an available agent, and asks it to create direct child Beads with descriptions, acceptance criteria, and explicit P0–P4 priorities. The agent compares impact, urgency, and enabling work to distinguish priorities when the proposal supports it; comparable or unclear tasks may share a priority. Review the generated priorities before scheduling tasks. It does not create another Git worktree or top-level Herdr workspace. The form hides and clears this option for other issue types; editing a Bead does not run generation.
 
 To generate tasks after creation, select an Epic in either issue pane and press `g`. The shortcut appears only for Epics. The confirmation names the Epic and warns that existing children remain and another run may add duplicates. Press `y` to start or `n`, Enter, or Esc to cancel. Add a Description first if the proposal is empty. Repeated requests for the same Epic are blocked while planning runs in this OnTrack process. Editing alone still does not trigger generation.
 
-For Codex, OnTrack handles the first-directory trust check for the verified main Git repository and defers the startup update check for this planning session. This also works when the current checkout is a linked worktree. These settings apply only to the launched process; update Codex separately when convenient. Other agent integrations keep their normal startup settings. Authentication, administrator policy, or an unfamiliar startup dialog can still require your input. If startup fails, the error identifies the workspace and pane and confirms that no planning prompt was sent. Inspect that pane and resolve the input before retrying generation.
+For Codex, OnTrack handles the first-directory trust check for the verified main Git repository and defers the startup update check for this planning session. This also works when the current checkout is a linked worktree. These settings apply only to the launched process; update Codex separately when convenient. Other agent integrations keep their normal startup settings. Authentication, administrator policy, or an unfamiliar startup dialog can still require your input. If startup fails, the error identifies the workspace, tab, and pane and confirms that no planning prompt was sent. Inspect that pane and resolve the input before retrying generation.
 
-Keep OnTrack open while planning runs. The top-right message reports launch, completion, or a recovery error. After the agent finishes, OnTrack checks that at least one direct child exists and closes only the planning workspace. If the agent exits after creating children, OnTrack also accepts completion when Herdr confirms that its original pane is still present with no agent. If creation, agent start, prompt delivery, or child verification fails, the Epic remains. An already created planning workspace stays open so you can inspect its agent and Beads. Check that workspace before retrying; a prompt failure may still have delivered the proposal, and another run can duplicate children. This workflow requires OnTrack to run inside Herdr with a current agent integration.
+Keep OnTrack open while planning runs. The top-right message reports launch, completion, or a recovery error. After the agent finishes, OnTrack checks that at least one direct child exists and closes only the planning tab. If the agent exits after creating children, OnTrack also accepts completion when Herdr confirms that its original pane is still present with no agent. If creation, agent start, prompt delivery, or child verification fails, the Epic remains. An already created planning tab stays open so you can inspect its agent and Beads. Check that tab before retrying; a prompt failure may still have delivered the proposal, and another run can duplicate children. If the planning tab becomes the last tab in the workspace, OnTrack leaves it open to preserve the workspace. This workflow requires OnTrack to run inside Herdr with a current agent integration.
 
 ## Details, loading, and refresh
 
@@ -113,9 +111,22 @@ The issue-browser footer always shows short action hints and points to `Ctrl+?` 
 
 ## Update OnTrack
 
-Press `u` in the issue browser to check [OnTrack releases](https://github.com/ThomasJRyan/OnTrack/releases). The dialog shows your running version and the newer version and release link when available. Press `r` to check again, `Esc` to browse, or `i` to look for a compatible release asset. When an asset is found, a confirmation shows its version and release link; press `y` to install, or `n` or `Esc` to cancel. While downloading, `Esc` or `c` requests cancellation before the executable is replaced. Keep OnTrack open until the result appears. A successful update replaces the installed executable; quit and restart OnTrack to run the new version. The current session continues running its original code.
+Run `ontrack update` from a normal terminal, in any directory. It prints the
+running version and checks the [latest stable OnTrack release](https://github.com/ThomasJRyan/OnTrack/releases).
+If the version is current or no release is published, it reports that and exits.
+If a compatible newer release is available, it prints the version and release
+link, then asks `Install this verified release? [y/N]`. Enter `y` or `yes` to
+install; any other answer, including Enter alone, cancels before replacement.
+The command does not start the browser or require Herdr or Beads.
 
-The updater selects a release asset for the current operating system and architecture, downloads its published `.sha256` checksum, verifies the asset, and stages the replacement beside the running executable. A missing compatible asset, checksum mismatch, network error, missing `curl`/`tar`, or unwritable installation directory produces a message; the existing executable remains usable, and `u` then `i` can retry after the cause is fixed. The updater does not install Beads or Herdr. If a check finishes while another dialog or the worktree view is open, it reports the available version without replacing that view; return to the issue browser and press `u` again to review it.
+The updater selects an asset for the current operating system and architecture,
+downloads its published `.sha256` checksum, verifies the archive, and stages
+replacement beside the running executable. A missing compatible asset,
+checksum mismatch, network error, missing `curl`/`tar`, or unwritable install
+directory returns an error. The existing executable remains usable if the
+command fails before replacement; rerun `ontrack update` after fixing the cause.
+The updater does not install Beads or Herdr. Restart any OnTrack session already
+running after success; that session continues using its original code.
 
 ## Launch an agent with Herdr
 
