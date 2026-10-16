@@ -25,6 +25,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn spawn_epic_planning(id: String, replies: mpsc::Sender<Response>) {
+    thread::spawn(move || {
+        let session = match crate::epic::launch(&id) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = replies.send(Response::EpicLaunched(id, Err(error)));
+                return;
+            }
+        };
+        if replies
+            .send(Response::EpicLaunched(id.clone(), Ok(session.clone())))
+            .is_ok()
+        {
+            let result = crate::epic::finish(&session, &id);
+            let _ = replies.send(Response::EpicFinished(id, result));
+        }
+    });
+}
+
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) enum Request {
@@ -33,6 +52,7 @@ pub(super) enum Request {
     LoadEdit(String, u64),
     Create(CreateBead),
     CreateEpic(CreateBead, Option<String>),
+    GenerateEpic(String),
     CreateChild(CreateBead, String),
     Update(UpdateBead),
     SetReady(String, bool),
@@ -132,6 +152,7 @@ pub struct App {
     pub worktrees_next_refresh: Instant,
     pub notice: Option<String>,
     pub mutation_busy: bool,
+    pub planning_epics: HashSet<String>,
     pub modal_ready: bool,
     pub(crate) paste_seq: u64,
     pub(crate) paste_pending: bool,
@@ -154,6 +175,10 @@ pub enum Modal {
     Edit {
         id: String,
         form: CreateForm,
+    },
+    ConfirmGenerateEpic {
+        id: String,
+        title: String,
     },
     ConfirmDelete {
         id: String,
@@ -388,28 +413,15 @@ impl App {
                             if out.send(Response::Created(Ok(id.clone()))).is_err() {
                                 break;
                             }
-                            let replies = out.clone();
-                            thread::spawn(move || {
-                                let session = match crate::epic::launch(&id) {
-                                    Ok(session) => session,
-                                    Err(error) => {
-                                        let _ =
-                                            replies.send(Response::EpicLaunched(id, Err(error)));
-                                        return;
-                                    }
-                                };
-                                if replies
-                                    .send(Response::EpicLaunched(id.clone(), Ok(session.clone())))
-                                    .is_ok()
-                                {
-                                    let result = crate::epic::finish(&session, &id);
-                                    let _ = replies.send(Response::EpicFinished(id, result));
-                                }
-                            });
+                            spawn_epic_planning(id, out.clone());
                             continue;
                         }
                         Err(error) => Response::Created(Err(error)),
                     },
+                    Request::GenerateEpic(id) => {
+                        spawn_epic_planning(id, out.clone());
+                        continue;
+                    }
                     Request::CreateChild(input, parent) => {
                         Response::Created(beads::create_child(&input, &parent))
                     }
@@ -552,6 +564,7 @@ impl App {
             worktrees_next_refresh: Instant::now(),
             notice: settings_error,
             mutation_busy: false,
+            planning_epics: HashSet::new(),
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -1024,6 +1037,7 @@ impl App {
                         Ok(id) => {
                             if matches!(&self.modal, Some(Modal::Create(form)) if form.generate_children && beads::BEAD_TYPES[form.issue_type] == "epic")
                             {
+                                self.planning_epics.insert(id.clone());
                                 self.toast = Some(Toast::progress(format!(
                                     "Created Epic {id}; starting sub-task agent…"
                                 )));
@@ -1041,19 +1055,21 @@ impl App {
                 }
                 Response::EpicLaunched(id, result) => match result {
                     Ok(session) => {
+                        self.planning_epics.insert(id.clone());
                         let message =
                             format!("Planning {id} in Herdr workspace {}…", session.workspace_id);
                         self.notice = Some(message.clone());
                         self.toast = Some(Toast::progress(message));
                     }
                     Err(error) => {
-                        let message =
-                            format!("Epic {id} created; automatic planning failed: {error}");
+                        self.planning_epics.remove(&id);
+                        let message = format!("Epic {id}: planning failed: {error}");
                         self.notice = Some(message.clone());
                         self.toast = Some(Toast::result(message, true));
                     }
                 },
                 Response::EpicFinished(id, result) => {
+                    self.planning_epics.remove(&id);
                     let (message, error) = match result {
                         Ok(children) => (
                             format!(
@@ -1670,6 +1686,7 @@ impl App {
                     self.notice = None;
                 }
             }
+            KeyCode::Char('g') => self.open_epic_generation(),
             KeyCode::Char('h') => self.open_launch(),
             KeyCode::Tab => self.focus_detail = !self.focus_detail,
             KeyCode::Left if !self.focus_detail => {
@@ -1974,6 +1991,30 @@ impl App {
             }
             if let Some(settings) = save_settings {
                 self.save_settings(settings);
+            }
+            return false;
+        }
+        if let Some(Modal::ConfirmGenerateEpic { id, .. }) = self.modal.as_ref() {
+            if matches!(key.code, Char('y') | Char('Y')) {
+                let id = id.clone();
+                if !self.planning_epics.contains(&id) {
+                    if self
+                        .requests
+                        .send(Request::GenerateEpic(id.clone()))
+                        .is_ok()
+                    {
+                        self.planning_epics.insert(id.clone());
+                        self.modal = None;
+                        self.notice = Some(format!("Starting child-task planning for {id}…"));
+                        self.toast = Some(Toast::progress(format!(
+                            "Starting child-task planning for {id}…"
+                        )));
+                    } else {
+                        self.notice = Some("Epic planning could not be queued; try again".into());
+                    }
+                }
+            } else if matches!(key.code, Char('n') | Char('N') | Enter) {
+                self.modal = None;
             }
             return false;
         }
@@ -2315,6 +2356,27 @@ impl App {
                 }
             }
         }
+    }
+    pub fn selected_is_epic(&self) -> bool {
+        self.selected
+            .and_then(|i| self.beads.get(i))
+            .is_some_and(|bead| bead.data["issue_type"] == "epic")
+    }
+    fn open_epic_generation(&mut self) {
+        if !self.selected_is_epic() {
+            return;
+        }
+        let bead = &self.beads[self.selected.unwrap()];
+        if self.planning_epics.contains(&bead.id) {
+            self.notice = Some(format!("Epic {} is already being planned", bead.id));
+            return;
+        }
+        self.modal = Some(Modal::ConfirmGenerateEpic {
+            id: bead.id.clone(),
+            title: bead.title.clone(),
+        });
+        self.modal_ready = false;
+        self.notice = None;
     }
     fn open_launch(&mut self) {
         if self.handoff.is_some() {
@@ -2954,6 +3016,7 @@ mod tests {
             worktrees_next_refresh: Instant::now(),
             notice: None,
             mutation_busy: false,
+            planning_epics: HashSet::new(),
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -5214,6 +5277,105 @@ mod tests {
         a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 1);
         assert_eq!(a.selected, Some(0));
     }
+    #[test]
+    fn existing_epic_generation_requires_readable_confirmation_and_prevents_repeats() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.selected = None;
+        press(&mut a, KeyCode::Char('g'));
+        assert!(a.modal.is_none());
+        a.selected = Some(0);
+        a.beads[0].data["issue_type"] = json!("task");
+        press(&mut a, KeyCode::Char('g'));
+        assert!(a.modal.is_none());
+        assert!(rx.try_recv().is_err());
+        a.beads[0].data["issue_type"] = json!("epic");
+        for cancel in [
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+        ] {
+            press(&mut a, KeyCode::Char('g'));
+            assert!(matches!(&a.modal, Some(Modal::ConfirmGenerateEpic { id, .. }) if id == "b0"));
+            a.modal_ready = false;
+            a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            assert!(rx.try_recv().is_err()); // No render yet.
+            a.modal_ready = true;
+            press(&mut a, cancel);
+            assert!(a.modal.is_none());
+            assert!(rx.try_recv().is_err());
+        }
+        a.focus_detail = true;
+        press(&mut a, KeyCode::Char('g'));
+        a.modal_ready = true;
+        // The confirmation remains bound to the original Epic if selection changes.
+        a.selected = Some(1);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(matches!(rx.try_recv(), Ok(Request::GenerateEpic(id)) if id == "b0"));
+        assert!(a.modal.is_none());
+        assert!(a.planning_epics.contains("b0"));
+        assert!(!a.mutation_busy);
+        a.selected = Some(0);
+        press(&mut a, KeyCode::Char('g'));
+        assert!(a.modal.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn epic_planning_failure_completion_and_queue_errors_allow_recovery() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        let (out, responses) = mpsc::channel();
+        a.responses = responses;
+        a.planning_epics.insert("b0".into());
+        out.send(Response::EpicLaunched(
+            "b0".into(),
+            Err(std::io::Error::other("proposal is empty")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(!a.planning_epics.contains("b0"));
+        assert!(a.notice.as_deref().unwrap().contains("proposal is empty"));
+        assert!(!a.notice.as_deref().unwrap().contains("created"));
+        out.send(Response::EpicLaunched(
+            "b0".into(),
+            Ok(crate::epic::Session {
+                workspace_id: "w1".into(),
+                pane_id: "w1:p1".into(),
+            }),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(a.planning_epics.contains("b0"));
+        out.send(Response::EpicFinished("b0".into(), Ok(vec!["b0.1".into()])))
+            .unwrap();
+        a.receive();
+        assert!(!a.planning_epics.contains("b0"));
+        assert!(a.notice.as_deref().unwrap().contains("1 child Beads"));
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        a.planning_epics.insert("b0".into());
+        out.send(Response::EpicFinished(
+            "b0".into(),
+            Err(std::io::Error::other("agent blocked")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(!a.planning_epics.contains("b0"));
+        assert!(a.notice.as_deref().unwrap().contains("agent blocked"));
+        drop(rx);
+        a.selected = Some(0);
+        a.beads[0].data["issue_type"] = json!("epic");
+        press(&mut a, KeyCode::Char('g'));
+        a.modal_ready = true;
+        press(&mut a, KeyCode::Char('y'));
+        assert!(!a.planning_epics.contains("b0"));
+        assert!(a.modal.is_some());
+        assert!(a.notice.as_deref().unwrap().contains("could not be queued"));
+    }
+
     #[test]
     fn epic_toggle_only_dispatches_opted_in_epics() {
         let mut a = app();

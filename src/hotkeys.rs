@@ -5,6 +5,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 pub enum Context {
     Issues,
     Details,
+    EpicIssues,
+    EpicDetails,
     Worktrees,
     Form,
     FormChoices,
@@ -12,6 +14,7 @@ pub enum Context {
     SettingsChoices,
     EditLoading,
     Delete,
+    GenerateEpic,
     WorktreeConfirm,
     Release,
     UpdateConfirm,
@@ -37,12 +40,15 @@ impl Context {
             }) => Self::SettingsChoices,
             Some(Modal::Settings { .. }) => Self::Settings,
             Some(Modal::EditLoading { .. }) => Self::EditLoading,
+            Some(Modal::ConfirmGenerateEpic { .. }) => Self::GenerateEpic,
             Some(Modal::ConfirmDelete { .. }) => Self::Delete,
             Some(Modal::ConfirmWorktree { .. }) => Self::WorktreeConfirm,
             Some(Modal::Release) => Self::Release,
             Some(Modal::ConfirmUpdate(_)) => Self::UpdateConfirm,
             Some(Modal::InstallingUpdate(_)) => Self::UpdateInstalling,
             None if app.worktrees_view => Self::Worktrees,
+            None if app.selected_is_epic() && app.focus_detail => Self::EpicDetails,
+            None if app.selected_is_epic() => Self::EpicIssues,
             None if app.focus_detail => Self::Details,
             None => Self::Issues,
         }
@@ -50,14 +56,15 @@ impl Context {
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::Issues => "Issue list",
-            Self::Details => "Issue details",
+            Self::Issues | Self::EpicIssues => "Issue list",
+            Self::Details | Self::EpicDetails => "Issue details",
             Self::Worktrees => "Outstanding worktrees",
             Self::Form => "Create / edit form",
             Self::FormChoices => "Form choice list",
             Self::Settings => "Settings",
             Self::SettingsChoices => "Setting choices",
             Self::EditLoading => "Loading edit",
+            Self::GenerateEpic => "Generate Epic tasks",
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
             Self::Release => "Release check",
@@ -68,7 +75,7 @@ impl Context {
 
     pub fn entries(self) -> Vec<(&'static str, &'static str)> {
         let mut rows = match self {
-            Self::Issues => vec![
+            Self::Issues | Self::EpicIssues => vec![
                 ("↑ / ↓", "Select an issue or collapsed group"),
                 ("← / →", "Collapse / expand selected status group"),
                 ("Space", "Toggle selected status group"),
@@ -88,7 +95,7 @@ impl Context {
                 ("u", "Check for a newer OnTrack release"),
                 ("Esc", "Stay in the issue browser"),
             ],
-            Self::Details => vec![
+            Self::Details | Self::EpicDetails => vec![
                 ("↑ / ↓", "Scroll issue details one line"),
                 ("PgUp / PgDn", "Scroll issue details one page"),
                 ("Tab", "Focus issue list"),
@@ -161,7 +168,7 @@ impl Context {
                 ("e", "Retry a failed edit load"),
                 ("Esc", "Cancel edit loading"),
             ],
-            Self::Delete | Self::WorktreeConfirm => vec![
+            Self::Delete | Self::WorktreeConfirm | Self::GenerateEpic => vec![
                 ("y / Y", "Confirm action"),
                 ("n / N / Enter", "Cancel action"),
                 ("Esc", "Cancel action"),
@@ -177,6 +184,9 @@ impl Context {
             ],
             Self::UpdateInstalling => vec![("Esc / c", "Request cancellation before replacement")],
         };
+        if matches!(self, Self::EpicIssues | Self::EpicDetails) {
+            rows.push(("g", "Generate Epic child tasks after confirmation"));
+        }
         rows.extend([
             ("Ctrl+?", "Open or close this hotkey reference"),
             ("↑ / k · ↓ / j", "Scroll this reference while it is open"),
@@ -184,7 +194,10 @@ impl Context {
             ("Home / End", "Jump to start / end of this reference"),
             ("Esc", "Close this reference while it is open"),
         ]);
-        if matches!(self, Self::Issues | Self::Details | Self::Worktrees) {
+        if matches!(
+            self,
+            Self::Issues | Self::Details | Self::EpicIssues | Self::EpicDetails | Self::Worktrees
+        ) {
             rows.push(("q / Ctrl+C", "Quit ontrack"));
         }
         rows
