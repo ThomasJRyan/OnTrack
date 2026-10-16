@@ -1,10 +1,25 @@
-//! Read-only workspace discovery, completed before raw mode or the startup splash.
+//! Launch-context checks and read-only workspace discovery, completed before raw mode.
 use std::{
+    ffi::OsStr,
     io::{self, IsTerminal, Write},
     process::{Command, Output},
 };
 
 use crossterm::style::Stylize;
+
+pub fn ensure_herdr_workspace() -> io::Result<()> {
+    require_herdr_workspace(std::env::var_os("HERDR_ENV").as_deref())
+}
+
+fn require_herdr_workspace(marker: Option<&OsStr>) -> io::Result<()> {
+    if marker == Some(OsStr::new("1")) {
+        return Ok(());
+    }
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "OnTrack must be launched inside a Herdr workspace. Open a Herdr workspace and run ontrack from its shell.",
+    ))
+}
 
 pub fn ensure_workspace() -> io::Result<bool> {
     let directory = std::env::current_dir()?;
@@ -85,6 +100,22 @@ fn workspace_exists(output: &Output) -> io::Result<bool> {
 mod tests {
     use super::*;
     use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn herdr_workspace_requires_the_managed_pane_marker() {
+        assert!(require_herdr_workspace(Some(OsStr::new("1"))).is_ok());
+
+        for marker in [
+            None,
+            Some(OsStr::new("")),
+            Some(OsStr::new("0")),
+            Some(OsStr::new("true")),
+        ] {
+            let error = require_herdr_workspace(marker).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(error.to_string().contains("Open a Herdr workspace"));
+        }
+    }
 
     fn response(code: i32, stdout: &str, stderr: &str) -> Output {
         Output {

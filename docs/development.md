@@ -8,8 +8,8 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Defines the terminal type, checks for a Beads workspace, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
-| `src/startup.rs` | Discovers the active workspace through Beads; prints manual initialization guidance and exits when none exists. |
+| `src/main.rs` | Defines the terminal type, checks the Herdr launch context and Beads workspace, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
+| `src/startup.rs` | Requires the Herdr pane marker, then discovers the active workspace through Beads; prints manual initialization guidance and exits when none exists. |
 | `src/uninstall.rs` | Validates and removes the running executable and user settings after explicit CLI confirmation, before Beads discovery or terminal setup. |
 | `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
@@ -52,11 +52,13 @@ retain the existing compact-terminal fallback when changing this layout.
 
 ## Beads CLI contract
 
+For an interactive browser launch, `main` first calls `startup::ensure_herdr_workspace`. It accepts only `HERDR_ENV=1`, the marker Herdr supplies to managed pane processes. Missing or other values return an error with launch guidance before any `bd` command, raw mode, or splash. Help and uninstall dispatch before this guard. The guard checks the inherited marker and does not query Herdr's socket or infer a workspace from global focus.
+
 Before terminal initialization, `startup::ensure_workspace` runs only `bd --no-color where --json`. Successful discovery reuses the existing workspace with no configuration writes. Only the structured `no_beads_directory` error prints manual initialization guidance and returns `Ok(false)`; `main` then exits successfully before raw mode, the splash, or browser startup. Permission, malformed-output, and other discovery failures remain errors. Beads owns ancestor, worktree, and redirect discovery.
 
 Missing-workspace guidance asks the user to run the literal command `bd init`, as requested by the startup UX contract. The command is bold on terminal stdout and plain in redirected output. Startup reads no stdin and never invokes init, init help, or configuration writes. Existing workspace settings, including JSONL auto-export, are preserved; `.beads/issues.jsonl` remains optional interchange data, never the source of truth. Global OnTrack preferences remain separate.
 
-Focused `cargo test startup::tests` injects command execution and captures output to cover missing-workspace early exit, terminal highlighting, plain redirected output, the single discovery command, existing/inherited/redirected workspace bypass, malformed discovery, other discovery errors, and an unavailable CLI. No live project initialization occurs in unit tests. For a manual terminal check, run the built binary from a disposable directory with no ancestor Beads workspace: verify the highlighted instruction, immediate successful exit, and absence of setup prompts, alternate-screen entry, or workspace files. Redirect stdout to verify plain output. Launch from an existing workspace to verify normal splash/browser startup and terminal cleanup on quit.
+Focused `cargo test startup::tests` covers accepted and rejected Herdr markers, then injects command execution and captures output to cover missing-workspace early exit, terminal highlighting, plain redirected output, the single discovery command, existing/inherited/redirected workspace bypass, malformed discovery, other discovery errors, and an unavailable CLI. No live project initialization occurs in unit tests. For a manual terminal check, run the built binary from a disposable directory with no ancestor Beads workspace inside Herdr: verify the highlighted instruction, immediate successful exit, and absence of setup prompts, alternate-screen entry, or workspace files. Redirect stdout to verify plain output. Launch from an existing workspace to verify normal splash/browser startup and terminal cleanup on quit.
 
 `ontrack uninstall` is dispatched before workspace discovery and terminal setup. It uses the running executable path and `settings::config_path` to select only the current installation and OnTrack user settings; preflight rejects unexpected file types and symlinks. The executable is removed last and checked again against its original file identity. `cargo test --test uninstall` copies the built binary into disposable directories and verifies confirmation, cancellation, missing settings, unsafe paths, and preservation of sibling `bd` and Herdr fixtures.
 

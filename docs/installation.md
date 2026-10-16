@@ -60,9 +60,10 @@ To choose another location, pass an **absolute** directory path:
 bash install-ontrack.sh --install-dir "$HOME/bin"
 ```
 
-Add that directory to `PATH` if needed. Start `ontrack` from the Git workspace
-whose Beads you want to browse; its launch directory selects the workspace.
-For Herdr handoffs, start it inside a running Herdr shell as explained in the
+Add that directory to `PATH` if needed. Start `ontrack` inside a Herdr shell
+from the Git workspace whose Beads you want to browse; its launch directory
+selects the workspace. A browser launch outside Herdr stops before Beads
+discovery and prints guidance to open a Herdr workspace. See the
 [user guide](user-guide.md#launch-an-agent-with-herdr).
 
 ## Update and remove

@@ -6,6 +6,7 @@ ontrack browses Beads issues in a two-pane terminal view and can create, edit, o
 
 - Rust 1.88 or newer to build this Rust 2024 project.
 - `bd` available on `PATH`, with support for the JSON commands shown in the [development guide](development.md#beads-cli-contract).
+- Run the browser from a Herdr-managed shell, which supplies `HERDR_ENV=1`. Outside Herdr, OnTrack exits before Beads discovery or terminal setup and tells you to open a Herdr workspace. `--help` and `uninstall` remain available outside Herdr.
 - If no Beads workspace is accessible from the launch directory, OnTrack tells you to run **`bd init`** and exits. Existing workspaces, including inherited and redirected ones, are reused with their configuration intact.
 - An interactive terminal supporting raw mode and the alternate screen; mouse support is needed for clicking and wheel input.
 - For in-app updates, `curl` must be on `PATH`; `tar` is also needed for `.tar.gz` release assets. The executable's directory must be writable for replacement.
@@ -20,7 +21,7 @@ cargo run
 
 To browse another workspace, build with `cargo build`, change to that workspace, and launch the built binary using its absolute path. The launch directory, not the binary's location, determines which workspace `bd` uses. Do not launch the interactive application in a runner without a terminal.
 
-Before opening the terminal interface, OnTrack asks Beads to locate the active workspace. If none exists, it prints “No Beads workspace found. Run bd init in your project, then launch OnTrack again.” and exits successfully. The command **`bd init`** appears in bold on terminal stdout; redirected output contains plain text. OnTrack does not ask setup questions, read input, initialize Beads, or change its configuration. Initialize the workspace yourself, then launch OnTrack again.
+After confirming the Herdr launch marker and before opening the terminal interface, OnTrack asks Beads to locate the active workspace. If none exists, it prints “No Beads workspace found. Run bd init in your project, then launch OnTrack again.” and exits successfully. The command **`bd init`** appears in bold on terminal stdout; redirected output contains plain text. OnTrack does not ask setup questions, read input, initialize Beads, or change its configuration. Initialize the workspace yourself, then launch OnTrack again.
 
 Existing workspaces retain their configuration, including JSONL auto-export. OnTrack preferences such as theme, default agent, agent limit and cleanup remain available with `s` in the browser.
 

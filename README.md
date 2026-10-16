@@ -10,7 +10,7 @@ On macOS or Ubuntu 24.04-compatible Linux, with Bash, `curl`, and Python 3 insta
 curl -fsSLo install-ontrack.sh https://raw.githubusercontent.com/ThomasJRyan/OnTrack/main/scripts/install.sh && bash install-ontrack.sh
 ```
 
-The installer puts `ontrack` in `~/.local/bin` by default. Add that directory to `PATH` if needed, then run `ontrack` from the Git workspace you want to browse. See the [installation guide](docs/installation.md) for supported architectures, updates, and troubleshooting.
+The installer puts `ontrack` in `~/.local/bin` by default. Add that directory to `PATH` if needed, then run `ontrack` from a Herdr shell in the Git workspace you want to browse. See the [installation guide](docs/installation.md) for supported architectures, updates, and troubleshooting.
 
 To remove the installed executable and OnTrack user settings, run `ontrack uninstall` and confirm the printed paths. Beads and Herdr remain installed; see [uninstall details](docs/installation.md#uninstall).
 
@@ -30,7 +30,7 @@ To remove the installed executable and OnTrack user settings, run `ontrack unins
 
 ## Requirements
 
-Source builds need Rust 1.88 or newer and the `bd` command-line tool; release checks also need `curl`. In-app updates need `curl` and `tar`; release installation offers to install missing `bd` and Herdr commands. If no Beads workspace is available, OnTrack tells you to run **`bd init`** and exits; initialize the workspace yourself, then relaunch. Existing workspace settings are preserved. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
+Source builds need Rust 1.88 or newer and the `bd` command-line tool; release checks also need `curl`. Launch the browser inside a Herdr workspace, where `HERDR_ENV=1` is set. In-app updates need `curl` and `tar`; release installation offers to install missing `bd` and Herdr commands. If no Beads workspace is available, OnTrack tells you to run **`bd init`** and exits; initialize the workspace yourself, then relaunch. Existing workspace settings are preserved. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
 
 ## Run
 

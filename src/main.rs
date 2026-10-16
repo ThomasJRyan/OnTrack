@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         _ => return Err("Usage: ontrack [uninstall [--yes]]".into()),
     }
+    startup::ensure_herdr_workspace()?;
     if !startup::ensure_workspace()? {
         return Ok(());
     }
