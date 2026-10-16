@@ -30,6 +30,17 @@ If `bd` is missing or workspace discovery fails, OnTrack stops before raw mode a
 A brief splash precedes the browser. A terminal-drawn anime girl blinks and waves beneath the ONTRACK wordmark; narrower terminals use a compact title, and very small terminals show text only. The animation lasts about 1.2 seconds and uses the selected theme. Issue loading starts in the background; quit keys work during startup too.
 
 
+## Your first task
+
+Once the browser opens in your Herdr project workspace:
+
+1. Use `↑` / `↓` to select a Bead and `Tab` to focus its details. The arrow keys then scroll the description, comments, and relationships; `Tab` returns to the list.
+2. Press `n` to create a task, or `e` to refine the selected Bead. Give the agent a clear description and choose its harness. Use `Shift+N` on an open task to split off a child task.
+3. Press `r` to mark the task Ready for automatic scheduling. Run the scheduler from the main checkout; it waits for eligible work, an available agent slot, and a usable harness. For an immediate manual handoff, press `h`.
+4. Press `w` to follow the tracked worktree. `Enter` opens its Herdr workspace. When the work is ready, `m` requests a merge; inspect the result before using `c` or `x` to close the integrated workspace or remove its checkout. Return to the issue browser with `Esc`.
+
+Press `Ctrl+?` whenever you need the controls for the current view. See the scheduling and worktree sections below for eligibility, confirmation, and recovery details.
+
 ## Status groups
 
 Issues are shown in rounded, colour-coded panes. Open, Ready, Blocked, Deferred, In Progress, and Closed remain visible with a count of zero when empty, even when the workspace has no issues. Open appears first and Closed last; other and unrecognized statuses appear alphabetically between Ready and Closed when issues have those statuses. An empty status is labelled Unknown only when an issue has one. The Closed group starts collapsed after the first list loads; other groups start expanded. Pane titles show the status and count. Each issue's type, priority, and status columns align across groups; the selected issue's details pane title shows its ID, status, and priority. Use `↑` / `↓` to move through visible issues, empty group headers, and collapsed group headers. Expanded headers with issues are skipped. Movement clamps at the first and last target. A focused header is highlighted and does not select an issue or retain detail/delete identity. Press `Right` or `Space` on a collapsed header to expand the group and select its first issue when one exists; an empty header stays focused. `Left` collapses a group. Press `Space` on a selected issue or use `←` / `→` to collapse or expand its group; clicking a pane title also toggles that group. Collapsing a selected issue's group selects its collapsed header. Mouse title clicks can reopen any group. Refresh preserves focus on a collapsed or empty header while that group exists.
