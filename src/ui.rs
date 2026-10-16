@@ -981,7 +981,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         split[1],
     );
     f.render_widget(
-        Paragraph::new(footer_text(v[2].width as usize))
+        Paragraph::new(footer_text(v[2].width as usize, app.selected_is_epic()))
             .style(Style::default().fg(muted).bg(palette.panel_alt)),
         v[2],
     );
@@ -995,7 +995,17 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             _ => 62,
         }
         .min(a.width.saturating_sub(2));
-        let delete_lines = match modal {
+        let confirmation_lines = match modal {
+            crate::app::Modal::ConfirmGenerateEpic { id, title } => Some(wrap_words(
+                &format!(
+                    "Epic: {id}\n{title}\n\nGenerate child tasks from the live description using a Herdr agent?\nExisting children remain; this may add duplicate tasks.\n\ny confirm · n / Enter / Esc cancel{}",
+                    app.notice
+                        .as_ref()
+                        .map(|text| format!("\n\n{text}"))
+                        .unwrap_or_default()
+                ),
+                width.saturating_sub(4) as usize,
+            )),
             crate::app::Modal::ConfirmDelete { id, title } => Some(delete_dialog_lines(
                 id,
                 title,
@@ -1051,7 +1061,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 (if form.dropdown.is_some() { 22 } else { 18 }) + u16::from(epic_toggle)
             }
             crate::app::Modal::EditLoading { .. } => 8,
-            crate::app::Modal::ConfirmDelete { .. } => delete_lines
+            crate::app::Modal::ConfirmGenerateEpic { .. }
+            | crate::app::Modal::ConfirmDelete { .. } => confirmation_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
             crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
@@ -1114,6 +1125,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 crate::app::Modal::EditLoading { .. } | crate::app::Modal::Edit { .. } => {
                     " EDIT BEAD "
                 }
+                crate::app::Modal::ConfirmGenerateEpic { .. } => " GENERATE EPIC TASKS? ",
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 crate::app::Modal::Release => " ONTRACK RELEASE ",
                 crate::app::Modal::ConfirmUpdate(_) => " UPDATE ONTRACK? ",
@@ -1804,11 +1816,18 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     rows[6],
                 );
             }
+            crate::app::Modal::ConfirmGenerateEpic { .. } => {
+                f.render_widget(
+                    Paragraph::new(confirmation_lines.unwrap_or_default().join("\n"))
+                        .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
             crate::app::Modal::ConfirmDelete { id, title } => {
                 let text = if app.mutation_busy {
                     format!("Deleting bead\nID: {id}\n\nCommand running · dialog locked")
                 } else {
-                    delete_lines
+                    confirmation_lines
                         .unwrap_or_else(|| vec![format!("ID: {id}"), format!("Title: {title}")])
                         .join("\n")
                 };
@@ -1980,9 +1999,13 @@ fn render_toast(f: &mut Frame, app: &App) {
         box_area,
     );
 }
-fn footer_text(width: usize) -> String {
+fn footer_text(width: usize, epic: bool) -> String {
     let mut footer = truncate_display(
-        " n new · e edit · d delete · h hand off · r ready · q quit",
+        if epic {
+            " g generate · n new · e edit · d delete · h hand off · r ready · q quit"
+        } else {
+            " n new · e edit · d delete · h hand off · r ready · q quit"
+        },
         width,
     );
     for hint in [
@@ -2439,6 +2462,7 @@ mod tests {
             next_agent_observation: std::time::Instant::now(),
             notice: None,
             mutation_busy: false,
+            planning_epics: Default::default(),
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -3110,6 +3134,64 @@ mod tests {
         assert!(error_delete.contains("[y] Delete"));
     }
     #[test]
+    fn existing_epic_generation_dialog_and_hints_are_contextual_and_responsive() {
+        let mut state = app();
+        state.selected = Some(0);
+        state.beads[0].data["issue_type"] = serde_json::json!("task");
+        assert!(!draw((130, 30), &mut state).0.contains("g generate"));
+        assert!(
+            !crate::hotkeys::Context::current(&state)
+                .entries()
+                .iter()
+                .any(|(key, _)| *key == "g")
+        );
+        state.beads[0].data["issue_type"] = serde_json::json!("epic");
+        assert!(draw((130, 30), &mut state).0.contains("g generate"));
+        for details in [false, true] {
+            state.focus_detail = details;
+            assert!(
+                crate::hotkeys::Context::current(&state)
+                    .entries()
+                    .iter()
+                    .any(|(key, _)| *key == "g")
+            );
+        }
+        state.modal = Some(crate::app::Modal::ConfirmGenerateEpic {
+            id: "epic-1".into(),
+            title: "Plan release 界".into(),
+        });
+        for size in [(100, 30), (50, 24)] {
+            let screen = draw(size, &mut state).0;
+            assert!(state.modal_ready);
+            for text in [
+                "GENERATE EPIC TASKS?",
+                "Epic: epic-1",
+                "Plan release 界",
+                "Herdr agent?",
+                "duplicate tasks.",
+                "y confirm",
+                "Esc cancel",
+            ] {
+                assert!(screen.contains(text), "missing {text} at {size:?}");
+            }
+        }
+        for size in [(40, 24), (100, 8)] {
+            assert!(draw(size, &mut state).0.contains("Expand terminal"));
+            assert!(!state.modal_ready);
+        }
+        state.modal = Some(crate::app::Modal::ConfirmGenerateEpic {
+            id: "epic-1".into(),
+            title: "Long proposal 界 ".repeat(100),
+        });
+        assert!(
+            draw((80, 24), &mut state)
+                .0
+                .contains("Expand terminal height")
+        );
+        assert!(!state.modal_ready);
+    }
+
+    #[test]
     fn epic_generation_toggle_is_visible_only_when_creating_epic() {
         let mut app = app();
         let mut form = crate::app::CreateForm {
@@ -3189,7 +3271,7 @@ mod tests {
     #[test]
     fn browser_footer_keeps_action_hints_without_routine_state_or_arrow_tips() {
         for width in [64, 90, 120] {
-            let footer = footer_text(width);
+            let footer = footer_text(width, false);
             for action in ["n new", "d delete", "h hand off", "r ready", "q quit"] {
                 assert!(
                     footer.contains(action),
@@ -3201,9 +3283,9 @@ mod tests {
             assert!(!footer.contains("←"));
             assert!(!footer.contains("READY"));
         }
-        assert!(footer_text(120).contains("N child"));
-        assert!(footer_text(120).contains("u update"));
-        assert!(footer_text(120).contains("Ctrl+? keys"));
+        assert!(footer_text(120, false).contains("N child"));
+        assert!(footer_text(120, false).contains("u update"));
+        assert!(footer_text(120, false).contains("Ctrl+? keys"));
         let mut app = app();
         let original = draw((120, 24), &mut app).0;
         app.list_error = Some("current failure".into());

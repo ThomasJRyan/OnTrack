@@ -96,7 +96,7 @@ fn launch_with(
     }
     let live = backend.show(epic_id)?;
     if live["issue_type"] != "epic" {
-        return Err(invalid("Created Bead is no longer an Epic"));
+        return Err(invalid("Selected Bead is no longer an Epic"));
     }
     let proposal = live["description"]
         .as_str()
@@ -327,6 +327,7 @@ mod tests {
     }
 
     struct LaunchMock {
+        live: Value,
         step: usize,
         calls: Vec<Vec<String>>,
     }
@@ -349,7 +350,7 @@ mod tests {
         }
 
         fn show(&mut self, _id: &str) -> io::Result<Value> {
-            Ok(json!({"issue_type":"epic", "description":"A large proposal"}))
+            Ok(self.live.clone())
         }
 
         fn children(&mut self, _id: &str) -> io::Result<Vec<String>> {
@@ -358,8 +359,34 @@ mod tests {
     }
 
     #[test]
+    fn launch_revalidates_live_type_and_nonempty_proposal_before_creating_workspace() {
+        for live in [
+            json!({"issue_type":"task", "description":"Proposal"}),
+            json!({"issue_type":"epic"}),
+            json!({"issue_type":"epic", "description":"  \n "}),
+        ] {
+            let mut backend = LaunchMock {
+                live,
+                step: 0,
+                calls: Vec::new(),
+            };
+            assert!(
+                launch_with(
+                    &mut backend,
+                    &std::env::current_dir().unwrap(),
+                    "wSource",
+                    "epic-1"
+                )
+                .is_err()
+            );
+            assert_eq!(backend.calls.len(), 1);
+        }
+    }
+
+    #[test]
     fn launch_uses_same_checkout_and_parented_prompt_without_worktree() {
         let mut backend = LaunchMock {
+            live: json!({"issue_type":"epic", "description":"A large proposal"}),
             step: 0,
             calls: Vec::new(),
         };
