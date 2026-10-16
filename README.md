@@ -28,7 +28,7 @@ The installer puts `ontrack` in `~/.local/bin` by default. Add that directory to
 
 ## Requirements
 
-Source builds need Rust 1.88 or newer and the `bd` command-line tool; release checks also need `curl`. In-app updates need `curl` and `tar`; release installation checks for both `bd` and Herdr. OnTrack offers a first-run Beads setup dialogue when no workspace is available, including configuration choices and JSONL export control; existing workspace settings are preserved. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
+Source builds need Rust 1.88 or newer and the `bd` command-line tool; release checks also need `curl`. In-app updates need `curl` and `tar`; release installation checks for both `bd` and Herdr. If no Beads workspace is available, OnTrack tells you to run **`bd init`** and exits; initialize the workspace yourself, then relaunch. Existing workspace settings are preserved. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
 
 ## Run
 
