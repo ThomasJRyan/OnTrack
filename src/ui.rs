@@ -19,7 +19,7 @@ const GOLD: Color = Color::Rgb(239, 183, 99);
 fn status_color(status: &str) -> Color {
     match status {
         "open" => TEAL,
-        "ready" => Color::Rgb(130, 205, 135),
+        "ready" => Color::Rgb(125, 168, 235),
         "closed" | "blocked" => Color::Rgb(255, 123, 123),
         "in_progress" => GOLD,
         "deferred" => Color::Rgb(145, 170, 220),
@@ -720,7 +720,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         .as_ref()
         .and_then(|status| {
             layout.targets.iter().find(|target| {
-                target.row == DisplayRow::Group(status.clone()) && app.collapsed.contains(status)
+                target.row == DisplayRow::Group(status.clone())
+                    && (app.collapsed.contains(status)
+                        || !app
+                            .beads
+                            .iter()
+                            .any(|bead| crate::app::display_status(bead) == status))
             })
         })
         .or_else(|| {
@@ -765,8 +770,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 group.status.to_uppercase()
             };
             let marker = if group.collapsed { "▸" } else { "▾" };
-            let focused =
-                app.collapse_context.as_deref() == Some(group.status.as_str()) && group.collapsed;
+            let focused = app.collapse_context.as_deref() == Some(group.status.as_str())
+                && (group.collapsed || group.indices.is_empty());
             let title_style = if focused {
                 Style::default()
                     .fg(palette.selected_foreground)
@@ -2637,15 +2642,22 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
         };
-        let bead_row = a.list_rect.y + 1;
+        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+        let closed = layout
+            .groups
+            .iter()
+            .find(|group| group.status == "closed")
+            .unwrap();
+        let header_row = a.list_rect.y + (closed.y - a.list_offset) as u16;
+        let bead_row = header_row + 1;
         assert!(line(bead_row).contains("task     P1  closed"));
         assert!(line(bead_row + 1).contains("Title is visible"));
-        assert_eq!(buffer[(a.list_rect.x, a.list_rect.y)].symbol(), "╭");
+        assert_eq!(buffer[(a.list_rect.x, header_row)].symbol(), "╭");
         assert_eq!(
-            buffer[(a.list_rect.x, a.list_rect.y)].fg,
+            buffer[(a.list_rect.x, header_row)].fg,
             status_color("closed")
         );
-        assert!(line(a.list_rect.y).contains("CLOSED"));
+        assert!(line(header_row).contains("CLOSED"));
         assert_eq!(
             buffer[(a.list_rect.x + 3, bead_row)].fg,
             row_type_color("task")
@@ -2753,14 +2765,49 @@ mod tests {
             .unwrap();
         let palette = crate::theme::definition(a.theme).palette;
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(a.list_rect.x, a.list_rect.y)].symbol(), "╭");
+        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+        let closed_y = a.list_rect.y
+            + (layout
+                .groups
+                .iter()
+                .find(|group| group.status == "closed")
+                .unwrap()
+                .y
+                - a.list_offset) as u16;
+        assert_eq!(buffer[(a.list_rect.x, closed_y)].symbol(), "╭");
         assert!(
             (a.list_rect.x + 1..a.list_rect.x + a.list_rect.width - 1)
-                .any(|x| buffer[(x, a.list_rect.y)].bg == palette.selected_background)
+                .any(|x| buffer[(x, closed_y)].bg == palette.selected_background)
         );
         assert!(a.selected.is_none());
         assert!(a.detail.is_none());
         assert!(a.modal.is_none());
+    }
+    #[test]
+    fn empty_standard_groups_render_zero_counts_and_scroll_in_small_viewports() {
+        let mut a = app();
+        a.beads.clear();
+        a.selected = None;
+        let (screen, _) = draw((100, 30), &mut a);
+        for status in [
+            "OPEN",
+            "READY",
+            "BLOCKED",
+            "DEFERRED",
+            "IN_PROGRESS",
+            "CLOSED",
+        ] {
+            assert!(
+                screen.contains(&format!("{status} · 0")),
+                "missing {status}"
+            );
+        }
+
+        a.collapsed.insert("closed".into());
+        a.collapse_context = Some("closed".into());
+        let (compact, _) = draw((60, 12), &mut a);
+        assert!(compact.contains("CLOSED · 0"));
+        assert!(a.list_offset > 0);
     }
     #[test]
     fn issue_type_fallback_priority_bounds_and_title_color_are_safe() {
@@ -2787,7 +2834,13 @@ mod tests {
         terminal
             .draw(|f| render(f, Duration::from_secs(2), &mut a))
             .unwrap();
-        let y = a.list_rect.y + 2;
+        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+        let closed = layout
+            .groups
+            .iter()
+            .find(|group| group.status == "closed")
+            .unwrap();
+        let y = a.list_rect.y + (closed.y + 2 - a.list_offset) as u16;
         assert_eq!(
             terminal.backend().buffer()[(a.list_rect.x + 3, y)].fg,
             crate::theme::definition(a.theme).palette.foreground
@@ -2849,6 +2902,7 @@ mod tests {
     fn stable_status_colors_and_scrolled_last_group_render_in_small_viewport() {
         assert_eq!(status_color("custom"), Color::Rgb(125, 168, 235));
         assert_eq!(status_color("open"), TEAL);
+        assert_eq!(status_color("ready"), Color::Rgb(125, 168, 235));
         assert_eq!(status_color("closed"), Color::Rgb(255, 123, 123));
         let mut a = app();
         a.beads = (0..15)
@@ -2865,6 +2919,42 @@ mod tests {
         assert!(shown.contains("CLOSED"));
         assert!(shown.contains("b14"));
         assert!(a.list_offset > 0);
+    }
+    #[test]
+    fn ready_group_and_row_use_blue_in_every_theme() {
+        for theme in Theme::ALL {
+            let mut a = app();
+            a.theme = theme;
+            a.beads[0].status = "open".into();
+            a.beads[0].data["labels"] = json!([crate::beads::READY_LABEL]);
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+            let ready_group = layout
+                .groups
+                .iter()
+                .find(|group| group.status == "ready")
+                .unwrap();
+            let top = a.list_rect.y + (ready_group.y - a.list_offset) as u16;
+            let border_x = a.list_rect.x;
+            let ready = crate::theme::status_color(theme, "ready");
+            assert_eq!(buffer[(border_x, top)].fg, ready);
+            let row = top + 1;
+            let status_x = (0..96)
+                .find(|&x| {
+                    (x..x + 5)
+                        .map(|column| buffer[(column, row)].symbol())
+                        .collect::<String>()
+                        == "ready"
+                })
+                .expect("Ready row status is visible");
+            for x in status_x..status_x + 5 {
+                assert_eq!(buffer[(x, row)].fg, ready);
+            }
+        }
     }
     #[test]
     fn expanded_panes_enclose_rows_and_follow_status_order() {
@@ -2885,27 +2975,34 @@ mod tests {
                 .iter()
                 .map(|g| g.status.as_str())
                 .collect::<Vec<_>>(),
-            ["open", "closed"]
+            [
+                "open",
+                "ready",
+                "blocked",
+                "deferred",
+                "in_progress",
+                "closed"
+            ]
         );
         assert_eq!(
             layout.groups[0].height,
             2 + 2 * layout.groups[0].indices.len()
         );
         assert_eq!(
-            layout.groups[1].y,
-            layout.groups[0].y + layout.groups[0].height
+            layout.groups[5].y,
+            layout.groups[4].y + layout.groups[4].height
         );
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
             .draw(|f| render(f, Duration::from_secs(2), &mut a))
             .unwrap();
         let buf = terminal.backend().buffer();
-        let closed_y = a.list_rect.y + (layout.groups[1].y - a.list_offset) as u16;
+        let closed_y = a.list_rect.y + (layout.groups[5].y - a.list_offset) as u16;
         let line = (0..100)
             .map(|x| buf[(x, closed_y)].symbol())
             .collect::<String>();
         assert!(line.contains("CLOSED"));
-        let bottom = closed_y + layout.groups[1].height as u16 - 1;
+        let bottom = closed_y + layout.groups[5].height as u16 - 1;
         assert_eq!(buf[(a.list_rect.x, bottom)].symbol(), "╰");
         assert_eq!(buf[(a.list_rect.x, bottom)].fg, status_color("closed"));
         assert!(buf[(a.list_rect.x, closed_y + 1)].symbol() == "│");

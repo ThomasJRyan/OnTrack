@@ -328,10 +328,17 @@ pub fn find(id: &str) -> Option<Theme> {
 }
 
 pub fn status_color(theme: Theme, status: &str) -> Color {
-    let p = definition(theme).palette;
+    let definition = definition(theme);
+    let p = definition.palette;
     match status {
         "open" => p.success,
-        "ready" => p.accent,
+        "ready" => {
+            if definition.is_light {
+                rgb(0, 91, 172)
+            } else {
+                rgb(125, 168, 235)
+            }
+        }
         "closed" | "blocked" => p.danger,
         "in_progress" => p.warning,
         "deferred" => p.info,
@@ -508,6 +515,32 @@ mod tests {
                     entry.id
                 );
             }
+        }
+    }
+
+    #[test]
+    fn ready_is_readable_blue_in_every_theme() {
+        for entry in CATALOG {
+            let ready = status_color(entry.theme, "ready");
+            let Color::Rgb(red, green, blue) = ready else {
+                panic!("Ready must have an RGB colour");
+            };
+            assert!(
+                blue > green && green > red,
+                "{} Ready is not blue",
+                entry.id
+            );
+            assert!(
+                contrast(ready, entry.palette.background) >= 3.0,
+                "{} Ready has insufficient background contrast",
+                entry.id
+            );
+            assert!(
+                contrast(ready, entry.palette.panel) >= 3.0,
+                "{} Ready has insufficient panel contrast",
+                entry.id
+            );
+            assert_ne!(ready, status_color(entry.theme, "open"));
         }
     }
 
