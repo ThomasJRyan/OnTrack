@@ -32,6 +32,9 @@ Once a stable OnTrack GitHub Release with an asset for your platform exists:
 curl -fsSLo install-ontrack.sh https://raw.githubusercontent.com/ThomasJRyan/OnTrack/main/scripts/install.sh && bash install-ontrack.sh
 ```
 
+The installer finds the latest release through GitHub's Releases page, then
+downloads that release's versioned archive and checksum directly. It does not
+call the GitHub REST API, so API rate limits do not block release discovery.
 Review the downloaded script before running it if desired. It is also usable
 directly in a Bash pipeline; enable `pipefail` so a script-download error fails
 the whole pipeline:
@@ -111,8 +114,9 @@ running will continue until they exit.
   the destination. Check the [release page](https://github.com/ThomasJRyan/OnTrack/releases).
 - **Checksum mismatch or invalid archive:** do not use the download. Retry or
   inspect the release assets; the destination remains unchanged.
-- **Network or API error:** check connectivity and GitHub availability, then
-  retry. GitHub API rate limits can also prevent release lookup.
+- **Network or release lookup error:** check connectivity to `github.com` and
+  confirm a stable release is published, then retry. Release discovery uses
+  GitHub's Releases page rather than the REST API.
 - **Permission error:** choose a writable directory with `--install-dir`. The
   installer does not use `sudo` or modify system directories automatically.
 - **Unsupported OS, CPU, or libc:** use a supported build or build from source

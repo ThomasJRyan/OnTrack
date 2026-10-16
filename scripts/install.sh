@@ -2,7 +2,8 @@
 # Install the latest stable OnTrack release without modifying bd or Herdr.
 set -euo pipefail
 
-release_api='https://api.github.com/repos/ThomasJRyan/OnTrack/releases/latest'
+latest_release_page='https://github.com/ThomasJRyan/OnTrack/releases/latest'
+release_download_base='https://github.com/ThomasJRyan/OnTrack/releases/download'
 install_dir="${HOME:-}/.local/bin"
 replace=false
 scratch=''
@@ -99,54 +100,19 @@ download() {
 }
 
 log "checking latest stable release for $target"
-download "$release_api" "$scratch/release.json" 'release metadata'
-if ! selection=$(python3 - "$scratch/release.json" "$target" <<'PY'
-import json
-import re
-import sys
-from urllib.parse import urlparse
-
-path, target = sys.argv[1:]
-try:
-    with open(path, encoding="utf-8") as file:
-        release = json.load(file)
-    if not isinstance(release, dict) or not isinstance(release.get("assets"), list):
-        raise ValueError("release metadata has no assets")
-    if release.get("draft") or release.get("prerelease"):
-        raise ValueError("latest release is not stable")
-    tag = release.get("tag_name", "")
-    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
-        raise ValueError("release tag is not vMAJOR.MINOR.PATCH")
-    assets = {item.get("name"): item for item in release["assets"] if isinstance(item, dict)}
-    name = f"ontrack-{tag}-{target}.tar.gz"
-    asset = assets.get(name)
-    checksum = assets.get(f"{name}.sha256")
-    if asset is None:
-        raise ValueError(f"release has no compatible asset: {name}")
-    if checksum is None:
-        raise ValueError(f"release has no checksum asset: {name}.sha256")
-    digest = asset.get("digest") or ""
-    if digest and not re.fullmatch(r"sha256:[0-9a-fA-F]{64}", digest):
-        raise ValueError("release has an invalid asset digest")
-
-    def url(item):
-        value = item.get("browser_download_url", "")
-        parsed = urlparse(value)
-        if (parsed.scheme != "https" or parsed.netloc != "github.com" or
-                not parsed.path.startswith("/ThomasJRyan/OnTrack/releases/download/") or
-                any(c in value for c in "\r\n\t")):
-            raise ValueError("release contains an unexpected asset URL")
-        return value
-
-    print("\t".join((name, url(asset), url(checksum), digest)))
-except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
-    print(f"ontrack installer: invalid or incompatible release: {error}", file=sys.stderr)
-    sys.exit(1)
-PY
-); then
-  fail 'release selection failed'
+if ! latest_release_url=$(curl --fail --location --silent --show-error --retry 3 --connect-timeout 10 --max-time 120 \
+  --output /dev/null --write-out '%{url_effective}' "$latest_release_page"); then
+  fail "could not resolve the latest stable release from $latest_release_page; check network access and release availability"
 fi
-IFS=$'\t' read -r asset_name asset_url checksum_url expected_digest <<< "$selection"
+if [[ "$latest_release_url" =~ ^https://github\.com/ThomasJRyan/OnTrack/releases/tag/(v[0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
+  release_tag=${BASH_REMATCH[1]}
+else
+  fail "GitHub returned an unexpected latest release URL: $latest_release_url"
+fi
+asset_name="ontrack-${release_tag}-${target}.tar.gz"
+asset_url="${release_download_base}/${release_tag}/${asset_name}"
+checksum_url="${asset_url}.sha256"
+expected_digest=''
 download "$asset_url" "$scratch/asset" "$asset_name"
 download "$checksum_url" "$scratch/checksum" 'release checksum'
 
