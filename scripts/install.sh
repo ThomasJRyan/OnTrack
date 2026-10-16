@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install the latest stable OnTrack release without modifying bd or Herdr.
+# Install the latest stable OnTrack release, optionally installing bd and Herdr.
 set -euo pipefail
 
 latest_release_page='https://github.com/ThomasJRyan/OnTrack/releases/latest'
@@ -14,8 +14,8 @@ usage() {
 Usage: bash install.sh [--install-dir DIR] [--replace]
 
 Install the latest stable OnTrack release into ~/.local/bin by default.
-An existing destination requires --replace. The installer checks that bd and
-Herdr are on PATH and gives installation guidance when either is missing.
+An existing destination requires --replace. If bd or Herdr is missing, the
+installer offers to run that project's official installer.
 
 Options:
   --install-dir DIR  Install ontrack into DIR
@@ -67,17 +67,63 @@ command -v bash >/dev/null 2>&1 || fail 'Bash is required'
 command -v curl >/dev/null 2>&1 || fail 'curl is required'
 command -v python3 >/dev/null 2>&1 || fail 'Python 3 is required for release and checksum verification'
 
-missing=false
-if ! command -v bd >/dev/null 2>&1; then
-  log 'bd is missing. Install Beads from https://beads.gascity.com/ (for example: brew install beads, or its documented verified install script).'
-  missing=true
+confirm_dependency_install() {
+  local name=$1 answer
+  if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    log "no terminal is available to ask; install $name manually or rerun this installer in a terminal"
+    return 1
+  fi
+  printf 'Install %s now using its official installer? [y/N] ' "$name" >/dev/tty
+  if ! IFS= read -r answer </dev/tty; then answer=''; fi
+  [[ "$answer" =~ ^([Yy]|[Yy][Ee][Ss])$ ]]
+}
+
+ensure_dependency() {
+  local binary=$1 name=$2 install_command=$3
+  if command -v "$binary" >/dev/null 2>&1; then return 0; fi
+
+  log "$name is not installed or is not on PATH"
+  if ! confirm_dependency_install "$name"; then
+    log "skipping $name; install it manually with: $install_command"
+    return 1
+  fi
+
+  case "$binary" in
+    bd)
+      log 'running the official Beads installer'
+      if ! curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash; then
+        fail 'the official Beads installer failed'
+      fi
+      ;;
+    herdr)
+      log 'running the official Herdr installer'
+      if ! curl -fsSL https://herdr.dev/install.sh | sh; then
+        fail 'the official Herdr installer failed'
+      fi
+      ;;
+  esac
+
+  if [[ -n "${HOME:-}" && -d "$HOME/.local/bin" ]]; then
+    PATH="$HOME/.local/bin:$PATH"
+    export PATH
+  fi
+  hash -r
+  if ! command -v "$binary" >/dev/null 2>&1; then
+    fail "$name installer finished, but $binary is still not on PATH; restart your shell or add its install directory to PATH"
+  fi
+  log "$name is installed and available"
+  return 0
+}
+
+dependencies_skipped=false
+if ! ensure_dependency bd Beads 'curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash'; then
+  dependencies_skipped=true
 fi
-if ! command -v herdr >/dev/null 2>&1; then
-  log 'Herdr is missing. Install it using https://herdr.dev/docs/install/ (for example: brew install herdr, or its official installer).'
-  missing=true
+if ! ensure_dependency herdr Herdr 'curl -fsSL https://herdr.dev/install.sh | sh'; then
+  dependencies_skipped=true
 fi
-if [[ "$missing" == true ]]; then
-  fail 'install the missing dependencies, ensure they are on PATH, then rerun this installer'
+if [[ "$dependencies_skipped" == true ]]; then
+  fail 'install the missing dependencies and ensure both bd and herdr are on PATH, then rerun this installer'
 fi
 
 destination="${install_dir%/}/ontrack"

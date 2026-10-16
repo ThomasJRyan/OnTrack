@@ -4,7 +4,7 @@ A terminal browser for Beads issues in the current workspace.
 
 ## Quick install
 
-Install [Beads (`bd`)](https://beads.gascity.com/) and [Herdr](https://herdr.dev/docs/install/) first, and make sure both commands are on `PATH`. On macOS or Ubuntu 24.04-compatible Linux, with Bash, `curl`, and Python 3 installed, run this when a compatible stable release is available:
+On macOS or Ubuntu 24.04-compatible Linux, with Bash, `curl`, and Python 3 installed, run this when a compatible stable release is available. If Beads (`bd`) or Herdr is missing, the installer offers to install it using its official installer:
 
 ```sh
 curl -fsSLo install-ontrack.sh https://raw.githubusercontent.com/ThomasJRyan/OnTrack/main/scripts/install.sh && bash install-ontrack.sh
@@ -30,7 +30,7 @@ To remove the installed executable and OnTrack user settings, run `ontrack unins
 
 ## Requirements
 
-Source builds need Rust 1.88 or newer and the `bd` command-line tool; release checks also need `curl`. In-app updates need `curl` and `tar`; release installation checks for both `bd` and Herdr. If no Beads workspace is available, OnTrack tells you to run **`bd init`** and exits; initialize the workspace yourself, then relaunch. Existing workspace settings are preserved. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
+Source builds need Rust 1.88 or newer and the `bd` command-line tool; release checks also need `curl`. In-app updates need `curl` and `tar`; release installation offers to install missing `bd` and Herdr commands. If no Beads workspace is available, OnTrack tells you to run **`bd init`** and exits; initialize the workspace yourself, then relaunch. Existing workspace settings are preserved. A terminal with alternate-screen and mouse support is recommended. See [installation and updates](docs/installation.md) for supported systems and prerequisites.
 
 ## Run
 

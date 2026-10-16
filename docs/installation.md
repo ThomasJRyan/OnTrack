@@ -6,13 +6,23 @@ The installer supports macOS and Ubuntu 24.04-compatible glibc Linux on x86_64 o
 building from source. A terminal with alternate-screen support is needed to run
 OnTrack.
 
-Install [Beads (`bd`)](https://beads.gascity.com/) and
-[Herdr](https://herdr.dev/docs/install/) first, and make sure both commands are
-on `PATH`. The installer checks for both and exits with guidance if one is
-missing; it does not run another project's install script or change existing
-Beads or Herdr installations. The Beads project documents `brew install beads`
-and a checksum-verifying install script. Herdr documents `brew install herdr`
-and its own installer. Check `bd version` and `herdr --version` after installing.
+The installer checks for [Beads (`bd`)](https://beads.gascity.com/) and
+[Herdr](https://herdr.dev/docs/install/). If either command is missing, it asks
+before running that project's official installer:
+
+```sh
+# Beads
+curl -fsSL https://raw.githubusercontent.com/gastownhall/beads/main/scripts/install.sh | bash
+
+# Herdr
+curl -fsSL https://herdr.dev/install.sh | sh
+```
+
+Each prompt defaults to **No**. You can install either dependency yourself and
+rerun the OnTrack installer. Check `bd version` and `herdr --version` after
+installing. The official Beads script looks up its latest release through the
+GitHub REST API, so GitHub API rate limits can prevent that dependency install;
+wait for the limit to reset and rerun the installer if that happens.
 OnTrack has no pinned numeric minimum for `bd` or Herdr. It needs a `bd`
 version supporting the JSON commands in the
 [development guide](development.md#beads-cli-contract), and Herdr integration
@@ -107,8 +117,9 @@ running will continue until they exit.
 
 ## Troubleshooting
 
-- **Missing `bd` or Herdr:** use the linked official installation guide, then
-  confirm the command is visible in the same shell's `PATH`.
+- **Missing `bd` or Herdr:** accept the install prompt or use the linked
+  official installation guide, then confirm the command is visible in the
+  same shell's `PATH`.
 - **No compatible asset or release:** the latest stable GitHub Release may not
   exist yet or may not include your target. The installer exits without changing
   the destination. Check the [release page](https://github.com/ThomasJRyan/OnTrack/releases).
