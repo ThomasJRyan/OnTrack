@@ -158,6 +158,8 @@ pub struct App {
     pub(crate) next_agent_observation: Instant,
     pub notice: Option<String>,
     pub mutation_busy: bool,
+    /// Ready keeps mutation exclusion without locking browser input.
+    pub ready_pending: bool,
     pub planning_epics: HashSet<String>,
     pub modal_ready: bool,
     pub(crate) paste_seq: u64,
@@ -494,7 +496,8 @@ fn start_workers(
     let (out, responses) = mpsc::channel();
     let (browser, browser_in) = mpsc::channel();
     let (managed, managed_in) = mpsc::channel();
-    for lane in [browser_in, managed_in] {
+    let (ready, ready_in) = mpsc::channel();
+    for lane in [browser_in, managed_in, ready_in] {
         let execute = execute.clone();
         let out = out.clone();
         thread::spawn(move || {
@@ -527,6 +530,10 @@ fn start_workers(
                     | Request::ReconcileWorktrees(_)
             ) {
                 if managed.send(request).is_err() {
+                    break;
+                }
+            } else if matches!(request, Request::SetReady(..) | Request::SetEpicReady(..)) {
+                if ready.send(request).is_err() {
                     break;
                 }
             } else if browser.send(request).is_err() {
@@ -614,6 +621,7 @@ impl App {
             next_agent_observation: Instant::now(),
             notice: settings_error,
             mutation_busy: false,
+            ready_pending: false,
             planning_epics: HashSet::new(),
             modal_ready: true,
             paste_seq: 0,
@@ -1230,6 +1238,7 @@ impl App {
                 }
                 Response::ReadySet(id, ready, result) => {
                     self.mutation_busy = false;
+                    self.ready_pending = false;
                     match result {
                         Ok(ids) => {
                             for changed_id in &ids {
@@ -1727,7 +1736,7 @@ impl App {
         }
     }
     fn key(&mut self, k: KeyEvent) -> bool {
-        if self.mutation_busy {
+        if self.mutation_busy && !self.ready_pending {
             return false;
         }
         if let Some(help) = self.help.as_mut() {
@@ -1760,6 +1769,18 @@ impl App {
         }
         if event::is_quit(k) {
             return true;
+        }
+        // Keep browsing available during Ready, but do not open mutation dialogs
+        // or start handoffs against a partially updated cascade.
+        if self.ready_pending
+            && matches!(
+                k.code,
+                KeyCode::Char(
+                    'n' | 'N' | 'e' | 'd' | 'g' | 'h' | 's' | 'u' | 'm' | 'c' | 'x' | 'R'
+                )
+            )
+        {
+            return false;
         }
         if self.worktrees_view {
             match k.code {
@@ -2624,6 +2645,8 @@ impl App {
             return;
         }
         self.mutation_busy = true;
+        self.ready_pending = true;
+        self.notice = Some(format!("Updating Ready for {id}…"));
         let request = if epic {
             Request::SetEpicReady(id, ready, self.known_handoffs.clone(), protected_handoffs)
         } else {
@@ -2631,6 +2654,7 @@ impl App {
         };
         if self.requests.send(request).is_err() {
             self.mutation_busy = false;
+            self.ready_pending = false;
             self.notice = Some("Ready change could not be queued".into());
         }
     }
@@ -3232,6 +3256,7 @@ mod tests {
             next_agent_observation: Instant::now(),
             notice: None,
             mutation_busy: false,
+            ready_pending: false,
             planning_epics: HashSet::new(),
             modal_ready: true,
             paste_seq: 0,
@@ -3568,6 +3593,7 @@ mod tests {
         assert!(!a.refresh_pending);
         assert_eq!(a.beads[0].status, "open");
         a.mutation_busy = false;
+        a.ready_pending = false;
         a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
         a.focus_detail = true;
         press(&mut a, KeyCode::Char('r'));
@@ -3575,8 +3601,128 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(!a.refresh_pending);
         a.mutation_busy = false;
+        a.ready_pending = false;
         press(&mut a, KeyCode::Char('R'));
         assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+    }
+
+    #[test]
+    fn pending_ready_keeps_browser_input_live_and_excludes_mutations() {
+        for epic in [false, true] {
+            for ready in [false, true] {
+                let (mut a, requests, replies) = connected_app();
+                a.beads[0].data["issue_type"] = json!(if epic { "epic" } else { "task" });
+                a.beads[1].data["issue_type"] = json!("task");
+                if !ready {
+                    a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+                    a.beads[1].data["labels"] = json!([beads::READY_LABEL]);
+                }
+                press(&mut a, KeyCode::Char('r'));
+                assert!(a.ready_pending && a.mutation_busy);
+                assert!(a.notice.as_deref().unwrap().contains("Updating Ready"));
+                assert!(matches!(
+                    requests.try_recv(),
+                    Ok(Request::SetReady(..) | Request::SetEpicReady(..))
+                ));
+                for key in ['r', 'R', 'n', 'N', 'e', 'd', 'g', 'h', 's', 'u'] {
+                    press(&mut a, KeyCode::Char(key));
+                }
+                a.poll_scheduler();
+                assert!(requests.try_recv().is_err());
+                assert!(a.modal.is_none());
+                press(&mut a, KeyCode::Down);
+                assert_ne!(a.selected, Some(0));
+                assert!(matches!(requests.try_recv(), Ok(Request::Show(..))));
+                press(&mut a, KeyCode::Tab);
+                press(&mut a, KeyCode::Down);
+                assert!(a.focus_detail);
+                assert_eq!(a.detail_offset, 1);
+                // Ctrl+? opens help while a Ready update is still blocked.
+                a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+                assert!(a.help.is_some());
+                press(&mut a, KeyCode::Esc);
+                assert!(a.help.is_none());
+                assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+                assert_eq!(beads::is_ready(&a.beads[0]), !ready);
+                replies
+                    .send(Response::ReadySet(
+                        "b0".into(),
+                        ready,
+                        Ok(vec!["b0".into()]),
+                    ))
+                    .unwrap();
+                a.receive();
+                assert!(!a.ready_pending && !a.mutation_busy);
+                assert_eq!(beads::is_ready(&a.beads[0]), ready);
+                assert!(matches!(requests.try_recv(), Ok(Request::List)));
+            }
+        }
+    }
+
+    #[test]
+    fn ready_queue_failure_releases_input_and_mutation_state() {
+        let mut a = app(); // Its request receiver has been dropped.
+        a.beads[0].data["issue_type"] = json!("task");
+        press(&mut a, KeyCode::Char('r'));
+        assert!(!a.ready_pending && !a.mutation_busy);
+        assert!(a.notice.as_deref().unwrap().contains("could not be queued"));
+        assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn blocked_ready_does_not_delay_browser_reads_or_managed_work() {
+        for epic in [false, true] {
+            let (release, blocked) = mpsc::channel();
+            let blocked = std::sync::Mutex::new(blocked);
+            let (entered, started) = mpsc::channel();
+            let (requests, responses, _) = start_workers(move |request, out| {
+                let response = match request {
+                    Request::SetReady(id, ready) | Request::SetEpicReady(id, ready, ..) => {
+                        entered.send(()).unwrap();
+                        // Timeout also releases the worker if a regression fails the test.
+                        blocked
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                        Response::ReadySet(id.clone(), ready, Ok(vec![id]))
+                    }
+                    Request::List => Response::List(Ok(vec![])),
+                    Request::Show(id, seq) => Response::Show(id, seq, Ok(json!({}))),
+                    Request::ListWorktrees => Response::Worktrees(Ok(vec![])),
+                    _ => panic!("unexpected request"),
+                };
+                out.send(response).unwrap();
+            });
+            requests
+                .send(if epic {
+                    Request::SetEpicReady("epic".into(), true, HashSet::new(), HashSet::new())
+                } else {
+                    Request::SetReady("task".into(), false)
+                })
+                .unwrap();
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            requests.send(Request::List).unwrap();
+            requests.send(Request::Show("other".into(), 1)).unwrap();
+            requests.send(Request::ListWorktrees).unwrap();
+            let mut observed = HashSet::new();
+            for _ in 0..3 {
+                observed.insert(
+                    match responses.recv_timeout(Duration::from_secs(5)).unwrap() {
+                        Response::List(Ok(_)) => "list",
+                        Response::Show(_, _, Ok(_)) => "detail",
+                        Response::Worktrees(Ok(_)) => "managed",
+                        _ => panic!("Ready must still be blocked"),
+                    },
+                );
+            }
+            assert_eq!(observed.len(), 3);
+            release.send(()).unwrap();
+            assert!(matches!(
+                responses.recv_timeout(Duration::from_secs(5)),
+                Ok(Response::ReadySet(_, _, Ok(_)))
+            ));
+        }
     }
 
     #[test]
@@ -3686,6 +3832,7 @@ mod tests {
         let (replies, responses) = mpsc::channel();
         a.responses = responses;
         a.mutation_busy = true;
+        a.ready_pending = true;
         replies
             .send(Response::ReadySet(
                 "b0".into(),
@@ -3700,6 +3847,7 @@ mod tests {
 
         a.refresh_inflight = false;
         a.mutation_busy = true;
+        a.ready_pending = true;
         replies
             .send(Response::ReadySet(
                 "b0".into(),
@@ -3710,6 +3858,7 @@ mod tests {
         a.receive();
         assert!(matches!(queued.try_recv(), Ok(Request::List)));
         assert!(a.notice.as_deref().unwrap().contains("partial update"));
+        assert!(!a.ready_pending && !a.mutation_busy);
     }
 
     #[test]

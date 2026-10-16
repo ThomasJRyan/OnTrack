@@ -2462,6 +2462,7 @@ mod tests {
             next_agent_observation: std::time::Instant::now(),
             notice: None,
             mutation_busy: false,
+            ready_pending: false,
             planning_epics: Default::default(),
             modal_ready: true,
             paste_seq: 0,

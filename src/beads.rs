@@ -617,6 +617,28 @@ mod tests {
     }
 
     #[test]
+    fn large_epic_ready_cascade_includes_all_open_tasks() {
+        let mut rows = vec![serde_json::json!({
+            "id": "epic", "title": "Large Epic", "status": "open", "issue_type": "epic"
+        })];
+        rows.extend((0..100).map(|i| {
+            serde_json::json!({
+                "id": format!("task-{i}"), "title": "Task", "status": "open",
+                "issue_type": "task", "parent": "epic"
+            })
+        }));
+        let mut beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        let empty = std::collections::HashSet::new();
+        let marked = epic_ready_targets_in(&beads, "epic", true, &empty, &empty).unwrap();
+        assert_eq!(marked.len(), 101);
+        for bead in &mut beads {
+            bead.data["labels"] = serde_json::json!([READY_LABEL]);
+        }
+        let cleared = epic_ready_targets_in(&beads, "epic", false, &empty, &empty).unwrap();
+        assert_eq!(marked, cleared);
+    }
+
+    #[test]
     fn creation_and_edit_persist_harness_as_a_safe_label_argument() {
         let mut fields = create_input();
         fields.harness = Some("opencode".into());
