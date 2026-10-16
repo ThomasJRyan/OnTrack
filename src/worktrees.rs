@@ -98,12 +98,74 @@ pub enum WorktreeStatus {
     Unmerged,
     MergeQueued,
     MergeRequested,
+    MergeInProgress,
     NeedsResolution,
     Integrated,
     WorkspaceClosed,
     CheckoutRemoved,
     DirtyCheckout,
     NeedsAttention,
+}
+
+/// An agent's advisory activity report is scoped to the current managed checkout.
+/// It never participates in merge, cleanup, or Bead decisions.
+pub fn report_activity(cwd: &Path, state: &str, detail: Option<&str>) -> io::Result<()> {
+    if !matches!(state, "working" | "merging" | "blocked" | "clear") {
+        return Err(error("Status must be working, merging, blocked, or clear"));
+    }
+    if state == "clear" && detail.is_some() {
+        return Err(error("A cleared status cannot have a detail"));
+    }
+    if state == "blocked" && detail.is_none() {
+        return Err(error("A blocked status requires a brief reason"));
+    }
+    if detail.is_some_and(|text| {
+        text.len() > 200 || text.trim().is_empty() || text.chars().any(char::is_control)
+    }) {
+        return Err(error("Status detail must be 1-200 characters on one line"));
+    }
+    let root = PathBuf::from(git(cwd, &["rev-parse", "--show-toplevel"])?).canonicalize()?;
+    let repo = SystemExecutor.git_identity(&root)?;
+    if !repo
+        .common_dir
+        .join("ontrack-worktrees/registry.json")
+        .is_file()
+    {
+        return Err(error("Current checkout has no managed OnTrack handoff"));
+    }
+    let mut registry = LaunchJournal::open(cwd)?;
+    let matching: Vec<_> = registry
+        .entries
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry["path"].as_str() == root.to_str())
+        .map(|(index, _)| index)
+        .collect();
+    if matching.len() != 1 {
+        return Err(error(
+            "Current checkout is not exactly one managed OnTrack handoff",
+        ));
+    }
+    let index = matching[0];
+    let entry = &registry.entries[index];
+    if entry["phase"] != "active"
+        || entry["checkout_removed"] == true
+        || entry["workspace_closed"] == true
+        || entry["restarted"] == true
+    {
+        return Err(error("Managed handoff is not active"));
+    }
+    verify_identity(&registry.repo, entry)?;
+    registry.entries[index]["agent_report"] = if state == "clear" {
+        Value::Null
+    } else {
+        json!({
+            "state": state,
+            "detail": detail,
+            "reported_at": SystemTime::now().duration_since(UNIX_EPOCH).map_err(io::Error::other)?.as_secs(),
+        })
+    };
+    registry.save()
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -208,6 +270,19 @@ fn unfinished_operation(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn merge_head_exists(path: &Path) -> io::Result<bool> {
+    let metadata = git(
+        path,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--git-path",
+            "MERGE_HEAD",
+        ],
+    )?;
+    Ok(Path::new(&metadata).exists())
 }
 
 fn clean(path: &Path) -> io::Result<()> {
@@ -1043,6 +1118,24 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
             );
         }
     };
+    if !entry["merge_request"].is_object()
+        && clean(&verified.target).is_ok()
+        && merge_head_exists(&verified.source).unwrap_or(false)
+        && git(&verified.source, &["rev-parse", "MERGE_HEAD"])
+            .is_ok_and(|head| head == verified.target_tip)
+    {
+        let conflicts =
+            git(&verified.source, &["ls-files", "--unmerged"]).is_ok_and(|files| !files.is_empty());
+        return view(
+            entry,
+            MergeInProgress,
+            Some(if conflicts {
+                "Git merge in the source checkout has unresolved conflicts. Resolve and commit them before integration; agent activity is not proof of completion.".into()
+            } else {
+                "Git merge in the source checkout is unfinished. Commit or abort it before integration; agent activity is not proof of completion.".into()
+            }),
+        );
+    }
     let conflicts = entry["merge_request"].is_object()
         && git(&verified.source, &["ls-files", "--unmerged"]).is_ok_and(|files| !files.is_empty());
     if conflicts {
@@ -1347,6 +1440,46 @@ fn inspect_for_display(
     item
 }
 
+fn with_agent_report(mut item: ManagedWorktree, entry: &Value) -> ManagedWorktree {
+    if !matches!(
+        item.status,
+        WorktreeStatus::InProgress
+            | WorktreeStatus::Unmerged
+            | WorktreeStatus::MergeQueued
+            | WorktreeStatus::MergeRequested
+            | WorktreeStatus::MergeInProgress
+            | WorktreeStatus::NeedsResolution
+            | WorktreeStatus::DirtyCheckout
+    ) {
+        return item;
+    }
+    let report = &entry["agent_report"];
+    let Some(state @ ("working" | "merging" | "blocked")) = report["state"].as_str() else {
+        return item;
+    };
+    let Some(reported_at) = report["reported_at"].as_u64() else {
+        return item;
+    };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if reported_at > now || now.saturating_sub(reported_at) > 15 * 60 {
+        return item;
+    }
+    let mut text = format!("Agent report (advisory): {state}");
+    if let Some(detail) = report["detail"].as_str() {
+        text.push_str(" — ");
+        text.push_str(detail);
+    }
+    text.push_str(". This report does not authorize merge or cleanup.");
+    item.detail = Some(match item.detail.take() {
+        Some(existing) => format!("{existing}\n{text}"),
+        None => text,
+    });
+    item
+}
+
 /// Read-only with respect to Git/Herdr; only this repository's durable handoffs.
 pub fn list() -> io::Result<Vec<ManagedWorktree>> {
     list_with(&std::env::current_dir()?, &mut SystemExecutor)
@@ -1354,10 +1487,12 @@ pub fn list() -> io::Result<Vec<ManagedWorktree>> {
 
 fn list_with(cwd: &Path, executor: &mut impl Executor) -> io::Result<Vec<ManagedWorktree>> {
     let registry = Registry::open(cwd)?;
-    Ok(registry
-        .entries
+    let repo = registry.repo.clone();
+    let entries = registry.entries.clone();
+    drop(registry);
+    Ok(entries
         .iter()
-        .map(|entry| inspect_for_display(&registry.repo, entry, executor))
+        .map(|entry| with_agent_report(inspect_for_display(&repo, entry, executor), entry))
         .collect())
 }
 
@@ -1550,7 +1685,7 @@ fn request_merge(
     }
     let pane = field(entry, "pane_id")?.to_owned();
     let prompt = format!(
-        "OnTrack integration request. Work ONLY in the source checkout {} on branch {}. Requested source commit: {}. Verified target branch: {} (refs/heads/{}) in checkout {}, target commit: {}. Read project instructions. Merge the latest LOCAL target branch INTO THIS SOURCE BRANCH, resolve conflicts here and commit the resolution; run relevant checks and report blockers. Do not change/check out/merge in the target checkout {}, do not reset, force, delete branches/worktrees, or close workspaces. Do not change Beads status for this integration request. Leave the source clean and containing both requested commits. OnTrack independently verifies ancestry and performs ff-only integration. If the target advances again, stop and report rather than altering the target checkout.",
+        "OnTrack integration request. Work ONLY in the source checkout {} on branch {}. Requested source commit: {}. Verified target branch: {} (refs/heads/{}) in checkout {}, target commit: {}. Read project instructions. Report activity from this source checkout with `ontrack status merging`, or `ontrack status blocked 'brief reason'` if blocked; run `ontrack status clear` when finished. These reports are display-only. Merge the latest LOCAL target branch INTO THIS SOURCE BRANCH, resolve conflicts here and commit the resolution; run relevant checks and report blockers. Do not change/check out/merge in the target checkout {}, do not reset, force, delete branches/worktrees, or close workspaces. Do not change Beads status for this integration request. Leave the source clean and containing both requested commits. OnTrack independently verifies ancestry and performs ff-only integration. If the target advances again, stop and report rather than altering the target checkout.",
         verified.source.display(),
         field(entry, "branch")?,
         verified.source_tip,
@@ -2222,10 +2357,12 @@ fn reconcile_with(
         // request can unblock it after the underlying condition is fixed.
         let _ = e;
     }
-    Ok(registry
-        .entries
+    let repo = registry.repo.clone();
+    let entries = registry.entries.clone();
+    drop(registry);
+    Ok(entries
         .iter()
-        .map(|entry| inspect_for_display(&registry.repo, entry, executor))
+        .map(|entry| with_agent_report(inspect_for_display(&repo, entry, executor), entry))
         .collect())
 }
 
@@ -3556,6 +3693,101 @@ mod tests {
     }
 
     #[test]
+    fn source_merge_against_target_head_has_concrete_display_status_without_authorizing_merge() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "file", "source change\n");
+        Fixture::commit_at(&fixture.main, "file", "target change\n");
+        assert!(git(&fixture.source, &["merge", "--no-edit", "trunk"]).is_err());
+        let item = fixture.status();
+        assert_eq!(item.status, WorktreeStatus::MergeInProgress);
+        assert!(item.detail.unwrap().contains("unresolved conflicts"));
+        assert_eq!(
+            list_with(&fixture.main, &mut Fake::default()).unwrap()[0].status,
+            WorktreeStatus::MergeInProgress
+        );
+        assert!(
+            act_with(
+                &fixture.main,
+                ID,
+                Action::RequestMerge,
+                &mut Fake::default()
+            )
+            .is_err()
+        );
+
+        fs::write(fixture.main.join("uncommitted"), "target dirty\n").unwrap();
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        fs::remove_file(fixture.main.join("uncommitted")).unwrap();
+        Fixture::commit_at(&fixture.main, "later", "new target head\n");
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        git(&fixture.source, &["merge", "--abort"]).unwrap();
+        let cherry_pick = git(
+            &fixture.source,
+            &[
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-path",
+                "CHERRY_PICK_HEAD",
+            ],
+        )
+        .unwrap();
+        fs::write(&cherry_pick, tip(&fixture.main, "HEAD").unwrap()).unwrap();
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+    }
+
+    #[test]
+    fn activity_report_is_scoped_bounded_advisory_and_clearable() {
+        let fixture = Fixture::managed();
+        assert!(report_activity(&fixture.main, "working", None).is_err());
+        assert!(report_activity(&fixture.source, "invalid", None).is_err());
+        assert!(report_activity(&fixture.source, "blocked", None).is_err());
+        assert!(report_activity(&fixture.source, "working", Some("bad\nline")).is_err());
+        assert!(report_activity(&fixture.source, "working", Some(&"x".repeat(201))).is_err());
+        assert!(report_activity(&fixture.source, "clear", Some("unexpected")).is_err());
+
+        report_activity(
+            &fixture.source,
+            "merging",
+            Some("resolving target conflict"),
+        )
+        .unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["agent_report"]["state"], "merging");
+        let item = with_agent_report(
+            inspect(&registry.repo, &registry.entries[0]),
+            &registry.entries[0],
+        );
+        assert!(item.detail.unwrap().contains("resolving target conflict"));
+        drop(registry);
+        assert_eq!(fixture.status().status, WorktreeStatus::InProgress);
+        assert!(
+            list_with(&fixture.main, &mut Fake::default()).unwrap()[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("Agent report (advisory): merging")
+        );
+
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[0]["agent_report"]["reported_at"] = json!(0);
+        registry.save().unwrap();
+        assert!(
+            with_agent_report(
+                inspect(&registry.repo, &registry.entries[0]),
+                &registry.entries[0],
+            )
+            .detail
+            .as_deref()
+            .is_none_or(|detail| !detail.contains("Agent report"))
+        );
+        drop(registry);
+
+        report_activity(&fixture.source, "clear", None).unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert!(registry.entries[0]["agent_report"].is_null());
+    }
+
+    #[test]
     fn working_agent_keeps_advanced_target_pending() {
         let fixture = Fixture::managed();
         Fixture::commit_at(&fixture.source, "task", "implemented\n");
@@ -4560,6 +4792,28 @@ mod tests {
             list_with(&fixture.main, &mut finished).unwrap()[0].status,
             WorktreeStatus::Unmerged
         );
+    }
+
+    #[test]
+    fn display_checks_release_registry_lock_before_external_calls() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implementation\n");
+        for reconcile in [false, true] {
+            let main = fixture.main.clone();
+            let mut executor = Fake::default();
+            executor.json(fixture.agent(12, "done"));
+            executor.hook = Some(Box::new(move |_| {
+                // A new handoff must be able to record intent while this
+                // display-only Herdr lookup is in progress.
+                assert!(Registry::open(&main).is_ok());
+            }));
+            let rows = if reconcile {
+                reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap()
+            } else {
+                list_with(&fixture.main, &mut executor).unwrap()
+            };
+            assert_eq!(rows[0].status, WorktreeStatus::Unmerged);
+        }
     }
 
     #[test]

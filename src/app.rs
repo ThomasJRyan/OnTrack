@@ -5,22 +5,16 @@ use crate::{
     beads::{self, Bead, CreateBead, UpdateBead},
     event,
     hotkeys::{self, Help},
-    release, screenshots,
+    screenshots,
     settings::{self, DefaultAgent, Settings, Theme},
     ui,
-    update::{self, Available, Check},
-    updates,
 };
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    },
+    sync::{Arc, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -68,9 +62,6 @@ pub(super) enum Request {
     RestartWorktree(String),
     ReconcileWorktrees(CleanupPolicy),
     ObserveAgents,
-    CheckRelease,
-    PrepareUpdate,
-    InstallRelease(Available, Arc<AtomicBool>),
     ReadScreenshot(u64),
 }
 pub(super) enum Response {
@@ -91,11 +82,7 @@ pub(super) enum Response {
     WorktreeChanged(std::io::Result<ManagedWorktree>),
     WorktreeRestarted(std::io::Result<String>),
     AgentsObserved(std::io::Result<Vec<worktrees::AgentDisplay>>),
-    ReleaseChecked(Result<release::CheckResult, String>),
-    UpdatePrepared(std::io::Result<Check>),
-    ReleaseInstalled(std::io::Result<()>),
     ScreenshotRead(u64, std::io::Result<Vec<u8>>),
-    UpdateAvailable(Option<String>),
 }
 pub(super) enum WorktreeFocusFeedback {
     Success(String),
@@ -123,11 +110,6 @@ pub struct App {
     /// Accepted agent starts not yet acknowledged by a fresh durable scan.
     pub(crate) handoff_capacity: HashSet<String>,
     pub toast: Option<Toast>,
-    pub release_result: Option<Result<release::CheckResult, String>>,
-    pub release_inflight: bool,
-    pub update_preparing: bool,
-    pub release_cancel: Option<Arc<AtomicBool>>,
-    pub update_available: Option<String>,
     pub list_rect: Rect,
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
@@ -202,9 +184,6 @@ pub enum Modal {
         id: String,
         action: u8,
     },
-    Release,
-    ConfirmUpdate(Available),
-    InstallingUpdate(String),
 }
 #[derive(Debug, Clone)]
 pub struct Toast {
@@ -455,29 +434,6 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
         Request::RestartWorktree(id) => Response::WorktreeRestarted(worktrees::restart(&id)),
         Request::ReconcileWorktrees(policy) => Response::Worktrees(worktrees::reconcile(policy)),
         Request::ObserveAgents => Response::AgentsObserved(worktrees::observe_agents()),
-        Request::CheckRelease => {
-            let replies = out.clone();
-            thread::spawn(move || {
-                let _ = replies.send(Response::ReleaseChecked(release::check()));
-            });
-            return;
-        }
-        Request::PrepareUpdate => {
-            let replies = out.clone();
-            thread::spawn(move || {
-                let _ = replies.send(Response::UpdatePrepared(update::check()));
-            });
-            return;
-        }
-        Request::InstallRelease(release, cancel) => {
-            let replies = out.clone();
-            thread::spawn(move || {
-                let _ = replies.send(Response::ReleaseInstalled(update::install(
-                    &release, &cancel,
-                )));
-            });
-            return;
-        }
     };
     let _ = out.send(response);
 }
@@ -546,10 +502,7 @@ fn start_workers(
 
 impl App {
     fn new() -> Self {
-        let (tx, responses, out) = start_workers(execute_request);
-        thread::spawn(move || {
-            let _ = out.send(Response::UpdateAvailable(updates::available_version()));
-        });
+        let (tx, responses, _) = start_workers(execute_request);
         let (settings, settings_path, settings_error) = match settings::config_path() {
             Ok(path) => match settings::load_from(&path) {
                 Ok(value) => (value, Some(path), None),
@@ -587,11 +540,6 @@ impl App {
             handoff: HashMap::new(),
             handoff_capacity: HashSet::new(),
             toast: None,
-            release_result: None,
-            release_inflight: false,
-            update_preparing: false,
-            release_cancel: None,
-            update_available: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -833,7 +781,8 @@ impl App {
                 auto_close_workspace: self.settings.auto_close_workspace,
                 auto_remove_checkout: self.settings.auto_remove_checkout,
             };
-            let request = if !self.worktrees_discovered
+            let request = if !self.handoff.is_empty()
+                || !self.worktrees_discovered
                 || (self.worktrees_view && self.worktrees.is_empty())
             {
                 Request::ListWorktrees
@@ -924,7 +873,10 @@ impl App {
             .into_iter()
             .filter_map(|target| match target.row {
                 DisplayRow::Bead(index) => Some(DisplayRow::Bead(index)),
-                DisplayRow::Group(status) if self.collapsed.contains(&status) => {
+                DisplayRow::Group(status)
+                    if self.collapsed.contains(&status)
+                        || !self.beads.iter().any(|bead| display_status(bead) == status) =>
+                {
                     Some(DisplayRow::Group(status))
                 }
                 DisplayRow::Group(_) => None,
@@ -973,7 +925,7 @@ impl App {
         self.collapse_context = Some(status);
     }
     fn set_group_collapsed(&mut self, status: String, collapsed: bool) {
-        if !self.beads.iter().any(|b| display_status(b) == status) {
+        if !group_statuses(&self.beads).contains(&status) {
             return;
         }
         let is_collapsed = self.collapsed.contains(&status);
@@ -992,6 +944,8 @@ impl App {
             self.collapsed.remove(&status);
             if let Some(i) = self.beads.iter().position(|b| display_status(b) == status) {
                 self.select(i);
+            } else {
+                self.focus_collapsed_group(status);
             }
         }
     }
@@ -999,6 +953,8 @@ impl App {
         if self.collapsed.remove(&status) {
             if let Some(i) = self.beads.iter().position(|b| display_status(b) == status) {
                 self.select(i);
+            } else {
+                self.focus_collapsed_group(status);
             }
         } else {
             self.set_group_collapsed(status, true);
@@ -1010,7 +966,6 @@ impl App {
     fn receive_at(&mut self, now: Instant) {
         while let Ok(r) = self.responses.try_recv() {
             match r {
-                Response::UpdateAvailable(version) => self.update_available = version,
                 Response::List(res) => {
                     self.refresh_inflight = false;
                     self.next_refresh = now + REFRESH_INTERVAL;
@@ -1035,14 +990,12 @@ impl App {
                                     .then_with(|| a.status.cmp(&b.status))
                                     .then_with(|| a.id.cmp(&b.id))
                             });
-                            if self.closed_default_pending
-                                && self.beads.iter().any(|bead| bead.status == "closed")
-                            {
+                            if self.closed_default_pending {
                                 self.collapsed.insert("closed".into());
                                 self.closed_default_pending = false;
                             }
-                            self.collapsed
-                                .retain(|s| self.beads.iter().any(|b| &b.status == s));
+                            let groups = group_statuses(&self.beads);
+                            self.collapsed.retain(|s| groups.contains(s));
                             // An in-flight pre-mutation snapshot must not consume
                             // the new ID before the trailing refresh can see it.
                             let preferred = if self.refresh_pending {
@@ -1068,8 +1021,12 @@ impl App {
                                     self.select(i);
                                 }
                             } else if let Some(status) = collapse_context.filter(|status| {
-                                self.collapsed.contains(status)
-                                    && self.beads.iter().any(|bead| bead.status == *status)
+                                groups.contains(status)
+                                    && (self.collapsed.contains(status)
+                                        || !self
+                                            .beads
+                                            .iter()
+                                            .any(|bead| display_status(bead) == status))
                             }) {
                                 self.focus_collapsed_group(status);
                             } else if let Some(i) = same_id {
@@ -1172,8 +1129,10 @@ impl App {
                 Response::EpicLaunched(id, result) => match result {
                     Ok(session) => {
                         self.planning_epics.insert(id.clone());
-                        let message =
-                            format!("Planning {id} in Herdr workspace {}…", session.workspace_id);
+                        let message = format!(
+                            "Planning {id} in Herdr workspace {} tab {}…",
+                            session.workspace_id, session.tab_id
+                        );
                         self.notice = Some(message.clone());
                         self.toast = Some(Toast::progress(message));
                     }
@@ -1189,7 +1148,7 @@ impl App {
                     let (message, error) = match result {
                         Ok(children) => (
                             format!(
-                                "Epic {id}: {} child Beads created; planning workspace closed",
+                                "Epic {id}: {} child Beads created; planning tab closed",
                                 children.len()
                             ),
                             false,
@@ -1662,76 +1621,6 @@ impl App {
                         self.worktrees_next_refresh = now;
                     }
                 }
-                Response::ReleaseChecked(result) => {
-                    self.release_inflight = false;
-                    self.notice = Some(match &result {
-                        Ok(release::CheckResult::Available { version, .. }) => {
-                            format!("Update v{version} available · press u to review")
-                        }
-                        Ok(release::CheckResult::Current { .. }) => "OnTrack is up to date".into(),
-                        Ok(release::CheckResult::NoPublishedRelease) => {
-                            "No public OnTrack release is available".into()
-                        }
-                        Err(error) => format!("Update check failed: {error}"),
-                    });
-                    self.release_result = Some(result);
-                }
-                Response::UpdatePrepared(result) => {
-                    self.update_preparing = false;
-                    match result {
-                        Ok(Check::Available(release)) => {
-                            if matches!(self.modal, Some(Modal::Release)) {
-                                self.modal = Some(Modal::ConfirmUpdate(release));
-                                self.modal_ready = false;
-                            } else {
-                                self.notice = Some(
-                                    "Update is ready to review; press u, then i to continue".into(),
-                                );
-                            }
-                        }
-                        Ok(Check::Current) => {
-                            self.notice = Some("OnTrack is up to date".into());
-                            self.release_result = Some(Ok(release::CheckResult::Current {
-                                version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
-                            }));
-                        }
-                        Ok(Check::NoPublishedRelease) => {
-                            self.notice = Some("No public OnTrack release is available".into());
-                            self.release_result =
-                                Some(Ok(release::CheckResult::NoPublishedRelease));
-                        }
-                        Err(error) => {
-                            let message =
-                                format!("Update preparation failed: {error}. Press i to retry.");
-                            self.notice = Some(message.clone());
-                            self.toast = Some(Toast::result(message, true));
-                        }
-                    }
-                }
-                Response::ReleaseInstalled(result) => {
-                    self.release_cancel = None;
-                    self.modal = None;
-                    let toast = match result {
-                        Ok(()) => Toast::result(
-                            "OnTrack updated. Quit and restart to run the new version.".into(),
-                            false,
-                        ),
-                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                            Toast::result(
-                                "Update cancelled; existing executable is unchanged.".into(),
-                                false,
-                            )
-                        }
-                        Err(error) => Toast::result(
-                            format!(
-                                "Update failed: {error}. Existing executable remains usable; press u to retry."
-                            ),
-                            true,
-                        ),
-                    };
-                    self.notice = Some(toast.message.clone());
-                    self.toast = Some(toast);
-                }
             }
         }
     }
@@ -1827,7 +1716,6 @@ impl App {
                 self.poll_worktrees(Instant::now());
             }
             KeyCode::Char('r' | 'R') => self.toggle_ready(),
-            KeyCode::Char('u') => self.open_release(),
             KeyCode::Char('s') => {
                 let load_error = self
                     .settings_load_error
@@ -2022,36 +1910,9 @@ impl App {
         });
         self.modal_ready = false;
     }
-    fn open_release(&mut self) {
-        self.modal = Some(Modal::Release);
-        self.modal_ready = false;
-        if !self.release_inflight && self.release_result.is_none() {
-            self.start_release_check();
-        }
-    }
-    fn start_release_check(&mut self) {
-        if self.release_inflight {
-            return;
-        }
-        self.release_inflight = true;
-        self.release_result = None;
-        if self.requests.send(Request::CheckRelease).is_err() {
-            self.release_inflight = false;
-            self.release_result = Some(Err("Update check could not be queued".into()));
-        }
-    }
     fn modal_key(&mut self, key: KeyEvent) -> bool {
         use crossterm::event::KeyCode::*;
         if self.mutation_busy {
-            return false;
-        }
-        if matches!(self.modal, Some(Modal::InstallingUpdate(_))) {
-            if matches!(key.code, Esc | Char('c')) {
-                if let Some(cancel) = &self.release_cancel {
-                    cancel.store(true, Ordering::Relaxed);
-                }
-                self.toast = Some(Toast::progress("Cancelling update…".into()));
-            }
             return false;
         }
         if !self.modal_ready && key.code != Esc {
@@ -2088,51 +1949,6 @@ impl App {
         }
         if self.paste_pending {
             self.notice = Some("Wait for screenshot paste or press Esc to cancel".into());
-            return false;
-        }
-        if matches!(self.modal, Some(Modal::Release)) {
-            if key.code == KeyCode::Char('r') && !self.update_preparing {
-                self.start_release_check();
-            } else if key.code == KeyCode::Char('i')
-                && !self.update_preparing
-                && matches!(
-                    self.release_result,
-                    Some(Ok(release::CheckResult::Available { .. }))
-                )
-            {
-                self.update_preparing = true;
-                if self.requests.send(Request::PrepareUpdate).is_err() {
-                    self.update_preparing = false;
-                    self.notice = Some("Update preparation could not be queued".into());
-                }
-            }
-            return false;
-        }
-        if let Some(Modal::ConfirmUpdate(release)) = self.modal.as_ref() {
-            if matches!(key.code, Char('y') | Char('Y')) {
-                let release = release.clone();
-                let cancel = Arc::new(AtomicBool::new(false));
-                self.release_cancel = Some(cancel.clone());
-                self.modal = Some(Modal::InstallingUpdate(release.version.clone()));
-                self.toast = Some(Toast::progress(format!(
-                    "Downloading and verifying OnTrack {}…",
-                    release.version
-                )));
-                if self
-                    .requests
-                    .send(Request::InstallRelease(release, cancel))
-                    .is_err()
-                {
-                    self.release_cancel = None;
-                    self.modal = None;
-                    self.toast = Some(Toast::result(
-                        "Update could not be queued; press u to retry".into(),
-                        true,
-                    ));
-                }
-            } else if matches!(key.code, Char('n') | Char('N') | Enter) {
-                self.modal = None;
-            }
             return false;
         }
         if let Some(Modal::ConfirmWorktree { id, action }) = self.modal.as_ref() {
@@ -2774,6 +2590,7 @@ pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'stat
         Unmerged => "READY TO MERGE",
         MergeQueued => "MERGE QUEUED",
         MergeRequested => "MERGE PENDING",
+        MergeInProgress => "MERGE IN PROGRESS",
         NeedsResolution => "NEEDS RESOLUTION",
         Integrated => "INTEGRATED",
         WorkspaceClosed => "WORKSPACE CLOSED",
@@ -2814,10 +2631,18 @@ pub struct ListTarget {
     pub height: usize,
 }
 pub fn group_statuses(beads: &[Bead]) -> Vec<String> {
-    let mut groups = beads
-        .iter()
-        .map(|b| display_status(b).to_owned())
-        .collect::<Vec<_>>();
+    let mut groups = [
+        "open",
+        "ready",
+        "in_progress",
+        "blocked",
+        "deferred",
+        "closed",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(beads.iter().map(|b| display_status(b).to_owned()))
+    .collect::<Vec<_>>();
     groups.sort_by(|a, b| status_order(a).cmp(&status_order(b)).then_with(|| a.cmp(b)));
     groups.dedup();
     groups
@@ -2962,112 +2787,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn release_check_is_dismissible_and_late_result_remains_available() {
-        let (mut app, requests, replies) = connected_app();
+    fn update_key_no_longer_opens_browser_action() {
+        let (mut app, requests, _) = connected_app();
         app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
-        assert!(matches!(requests.try_recv(), Ok(Request::CheckRelease)));
-        assert!(app.release_inflight);
-        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.modal.is_none());
-        replies
-            .send(Response::ReleaseChecked(Ok(
-                release::CheckResult::Available {
-                    version: semver::Version::parse("1.2.0").unwrap(),
-                    url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
-                },
-            )))
-            .unwrap();
-        app.receive();
-        assert!(!app.release_inflight);
-        assert!(app.notice.as_deref().unwrap().contains("v1.2.0"));
-        assert!(matches!(
-            app.release_result,
-            Some(Ok(release::CheckResult::Available { .. }))
-        ));
-        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
-        assert!(matches!(app.modal, Some(Modal::Release)));
         assert!(requests.try_recv().is_err());
-    }
-
-    #[test]
-    fn release_install_requires_available_asset_and_explicit_confirmation() {
-        let (mut app, requests, replies) = connected_app();
-        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
-        assert!(matches!(requests.try_recv(), Ok(Request::CheckRelease)));
-        app.modal_ready = true;
-        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-        assert!(requests.try_recv().is_err());
-
-        replies
-            .send(Response::ReleaseChecked(Ok(
-                release::CheckResult::Available {
-                    version: semver::Version::parse("1.2.0").unwrap(),
-                    url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
-                },
-            )))
-            .unwrap();
-        app.receive();
-        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-        assert!(matches!(requests.try_recv(), Ok(Request::PrepareUpdate)));
-        assert!(app.update_preparing);
-        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-        assert!(requests.try_recv().is_err());
-
-        replies
-            .send(Response::UpdatePrepared(Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "no compatible asset",
-            ))))
-            .unwrap();
-        app.receive();
-        assert!(matches!(app.modal, Some(Modal::Release)));
         assert!(
-            app.notice
-                .as_deref()
-                .unwrap()
-                .contains("no compatible asset")
+            !hotkeys::Context::Issues
+                .entries()
+                .iter()
+                .any(|(key, _)| *key == "u")
         );
-        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
-        assert!(matches!(requests.try_recv(), Ok(Request::PrepareUpdate)));
-
-        let release = Available {
-            version: "1.2.0".into(),
-            page: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
-            asset_name: "ontrack-v1.2.0-x86_64-unknown-linux-gnu.tar.gz".into(),
-            asset_url: "https://github.com/ThomasJRyan/OnTrack/releases/download/v1.2.0/ontrack-v1.2.0-x86_64-unknown-linux-gnu.tar.gz".into(),
-            checksum_url: "https://github.com/ThomasJRyan/OnTrack/releases/download/v1.2.0/ontrack-v1.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256".into(),
-            digest: None,
-        };
-        replies
-            .send(Response::UpdatePrepared(Ok(Check::Available(
-                release.clone(),
-            ))))
-            .unwrap();
-        app.receive();
-        assert!(matches!(app.modal, Some(Modal::ConfirmUpdate(_))));
-        app.modal_ready = true;
-        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
-        assert!(app.modal.is_none());
-        assert!(requests.try_recv().is_err());
-
-        app.modal = Some(Modal::ConfirmUpdate(release.clone()));
-        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-        let Ok(Request::InstallRelease(chosen, cancel)) = requests.try_recv() else {
-            panic!("install was not queued")
-        };
-        assert_eq!(chosen, release);
-        assert!(!cancel.load(Ordering::Relaxed));
-        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(cancel.load(Ordering::Relaxed));
-        replies
-            .send(Response::ReleaseInstalled(Err(std::io::Error::new(
-                std::io::ErrorKind::Interrupted,
-                "cancelled",
-            ))))
-            .unwrap();
-        app.receive();
-        assert!(app.modal.is_none());
-        assert!(app.notice.as_deref().unwrap().contains("cancelled"));
     }
 
     #[test]
@@ -3222,11 +2952,6 @@ mod tests {
             handoff: HashMap::new(),
             handoff_capacity: HashSet::new(),
             toast: None,
-            release_result: None,
-            release_inflight: false,
-            update_preparing: false,
-            release_cancel: None,
-            update_available: None,
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,
@@ -3287,7 +3012,17 @@ mod tests {
         a.beads[0].data["issue_type"] = json!("task");
         a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
         assert_eq!(a.beads[0].status, "open");
-        assert_eq!(group_statuses(&a.beads), ["open", "ready"]);
+        assert_eq!(
+            group_statuses(&a.beads),
+            [
+                "open",
+                "ready",
+                "blocked",
+                "deferred",
+                "in_progress",
+                "closed"
+            ]
+        );
         let layout = list_layout(&a.beads, &HashSet::new());
         assert_eq!(layout.groups[1].indices, [0]);
         a.select(0);
@@ -4294,6 +4029,17 @@ mod tests {
         );
         assert_eq!(a.handoff.len(), 2);
     }
+
+    #[test]
+    fn worktree_poll_uses_short_read_scan_during_pending_handoff() {
+        let (mut a, requests, _) = connected_app();
+        a.worktrees
+            .push(observed_row("b3", worktrees::WorktreeStatus::InProgress));
+        press(&mut a, KeyCode::Char('h'));
+        assert!(matches!(requests.try_recv(), Ok(Request::Discover(_))));
+        a.poll_worktrees(Instant::now());
+        assert!(matches!(requests.try_recv(), Ok(Request::ListWorktrees)));
+    }
     #[test]
     fn handoff_requires_selection_and_ignores_stale_discovery() {
         let (mut a, rx, tx) = connected_app();
@@ -4986,7 +4732,7 @@ mod tests {
         a.beads[2].status = "open".into();
         a.beads[3].status = " \t ".into();
         let layout = list_layout(&a.beads, &HashSet::from(["blocked".into()]));
-        assert_eq!(layout.height, 14);
+        assert_eq!(layout.height, 20);
         assert_eq!(
             layout
                 .groups
@@ -4995,9 +4741,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("open", 0, 4, false),
-                ("blocked", 4, 2, true),
-                ("unknown", 6, 4, false),
-                ("closed", 10, 4, false)
+                ("ready", 4, 2, false),
+                ("blocked", 6, 2, true),
+                ("deferred", 8, 2, false),
+                ("in_progress", 10, 2, false),
+                ("unknown", 12, 4, false),
+                ("closed", 16, 4, false)
             ]
         );
         assert_eq!(
@@ -5006,7 +4755,7 @@ mod tests {
                 .iter()
                 .map(|g| g.indices.clone())
                 .collect::<Vec<_>>(),
-            [vec![2], vec![1], vec![3], vec![0]]
+            [vec![2], vec![], vec![1], vec![], vec![], vec![3], vec![0]]
         );
         assert_eq!(
             layout.targets,
@@ -5022,43 +4771,60 @@ mod tests {
                     height: 2
                 },
                 ListTarget {
-                    row: DisplayRow::Group("blocked".into()),
+                    row: DisplayRow::Group("ready".into()),
                     y: 4,
                     height: 1
                 },
                 ListTarget {
-                    row: DisplayRow::Group("unknown".into()),
+                    row: DisplayRow::Group("blocked".into()),
                     y: 6,
                     height: 1
                 },
                 ListTarget {
-                    row: DisplayRow::Bead(3),
-                    y: 7,
-                    height: 2
+                    row: DisplayRow::Group("deferred".into()),
+                    y: 8,
+                    height: 1
                 },
                 ListTarget {
-                    row: DisplayRow::Group("closed".into()),
+                    row: DisplayRow::Group("in_progress".into()),
                     y: 10,
                     height: 1
                 },
                 ListTarget {
+                    row: DisplayRow::Group("unknown".into()),
+                    y: 12,
+                    height: 1
+                },
+                ListTarget {
+                    row: DisplayRow::Bead(3),
+                    y: 13,
+                    height: 2
+                },
+                ListTarget {
+                    row: DisplayRow::Group("closed".into()),
+                    y: 16,
+                    height: 1
+                },
+                ListTarget {
                     row: DisplayRow::Bead(0),
-                    y: 11,
+                    y: 17,
                     height: 2
                 },
             ]
         );
-        assert_eq!(
-            list_layout(&[], &HashSet::new()),
-            ListLayout {
-                groups: vec![],
-                targets: vec![],
-                height: 0
-            }
+        let empty = list_layout(&[], &HashSet::new());
+        assert_eq!(empty.groups.len(), 6);
+        assert_eq!(empty.height, 12);
+        assert!(empty.groups.iter().all(|group| group.indices.is_empty()));
+        assert!(
+            empty
+                .targets
+                .iter()
+                .all(|target| matches!(target.row, DisplayRow::Group(_)))
         );
         a.beads[1].status = "unknown".into();
         assert_eq!(
-            list_layout(&a.beads, &HashSet::new()).groups[1].indices,
+            list_layout(&a.beads, &HashSet::new()).groups[5].indices,
             [1, 3]
         );
     }
@@ -5478,10 +5244,12 @@ mod tests {
         a.step(-1);
         assert_eq!(a.selected, Some(0));
         a.step(20);
-        assert_eq!(a.selected, Some(3));
+        assert_eq!(a.collapse_context.as_deref(), Some("closed"));
+        assert!(a.selected.is_none());
         a.beads.clear();
         a.step(1);
         assert_eq!(a.selected, None);
+        assert_eq!(a.collapse_context.as_deref(), Some("closed"));
     }
     #[test]
     fn status_groups_sort_open_middle_closed_and_unknown() {
@@ -5492,7 +5260,15 @@ mod tests {
         a.beads[3].status = "".into();
         assert_eq!(
             group_statuses(&a.beads),
-            ["open", "blocked", "unknown", "closed"]
+            [
+                "open",
+                "ready",
+                "blocked",
+                "deferred",
+                "in_progress",
+                "unknown",
+                "closed"
+            ]
         );
     }
     #[test]
@@ -5504,18 +5280,24 @@ mod tests {
         a.beads[3].status = "open".into();
         press(&mut a, KeyCode::Char(' '));
         assert_collapsed_header_selected(&a, "open");
-        press(&mut a, KeyCode::Down);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_bead(&a, "b1");
         press(&mut a, KeyCode::Char(' '));
         assert_eq!(a.collapsed.len(), 2);
         assert_collapsed_header_selected(&a, "closed");
-        press(&mut a, KeyCode::Up);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Up);
+        }
         assert_collapsed_header_selected(&a, "open");
         press(&mut a, KeyCode::Char(' '));
         assert_bead(&a, "b0");
         press(&mut a, KeyCode::Down);
         assert_bead(&a, "b3");
-        press(&mut a, KeyCode::Down);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_collapsed_header_selected(&a, "closed");
         press(&mut a, KeyCode::Right);
         assert_bead(&a, "b1");
@@ -5611,18 +5393,28 @@ mod tests {
         a.beads[3].status = "closed".into();
         a.select(1);
         press(&mut a, KeyCode::Down);
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        press(&mut a, KeyCode::Down);
         assert_bead(&a, "b2");
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
         press(&mut a, KeyCode::Up);
         assert_bead(&a, "b1");
-        press(&mut a, KeyCode::Down);
-        press(&mut a, KeyCode::Down);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_bead(&a, "b3");
         press(&mut a, KeyCode::Down);
         assert_bead(&a, "b3");
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.collapse_context.as_deref(), Some("in_progress"));
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.collapse_context.as_deref(), Some("deferred"));
         press(&mut a, KeyCode::Up);
         assert_bead(&a, "b2");
-        press(&mut a, KeyCode::Up);
-        press(&mut a, KeyCode::Up);
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Up);
+        }
         assert_bead(&a, "b0");
         press(&mut a, KeyCode::Up);
         assert_bead(&a, "b0");
@@ -5636,6 +5428,8 @@ mod tests {
         a.collapsed.insert("blocked".into());
         a.select(1);
         press(&mut a, KeyCode::Down);
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        press(&mut a, KeyCode::Down);
         assert_collapsed_header_selected(&a, "blocked");
         press(&mut a, KeyCode::Right);
         assert_bead(&a, "b2");
@@ -5646,12 +5440,18 @@ mod tests {
         press(&mut a, KeyCode::Up);
         assert_collapsed_header_selected(&a, "open");
         press(&mut a, KeyCode::Down);
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        press(&mut a, KeyCode::Down);
         assert_collapsed_header_selected(&a, "blocked");
-        press(&mut a, KeyCode::Down);
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_collapsed_header_selected(&a, "closed");
         press(&mut a, KeyCode::Down);
         assert_collapsed_header_selected(&a, "closed");
-        press(&mut a, KeyCode::Up);
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Up);
+        }
         assert_collapsed_header_selected(&a, "blocked");
         press(&mut a, KeyCode::Right);
         assert_bead(&a, "b2");
@@ -5706,7 +5506,7 @@ mod tests {
         let mut a = app();
         a.list_rect = Rect::new(0, 0, 30, 16);
         a.select(3);
-        for (x, y) in [(0, 0), (0, 3), (29, 3), (4, 9), (4, 10), (4, 15), (4, 16)] {
+        for (x, y) in [(0, 0), (0, 3), (29, 3), (4, 9), (4, 11), (4, 13), (4, 16)] {
             a.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
             assert_bead(&a, "b3");
             assert!(a.collapsed.is_empty());
@@ -5778,10 +5578,10 @@ mod tests {
         respond(&mut a, Response::List(Ok(items)));
         assert_bead(&a, "b0");
         let layout = list_layout(&a.beads, &a.collapsed);
-        assert_eq!(layout.groups.len(), 2);
+        assert_eq!(layout.groups.len(), 6);
         assert!(!layout.groups[0].collapsed);
-        assert!(layout.groups[1].collapsed);
-        assert_eq!(layout.groups[1].indices, vec![1]);
+        assert!(layout.groups[5].collapsed);
+        assert_eq!(layout.groups[5].indices, vec![1]);
         assert!(
             !layout
                 .targets
@@ -5789,7 +5589,9 @@ mod tests {
                 .any(|target| target.row == DisplayRow::Bead(1))
         );
 
-        press(&mut a, KeyCode::Down);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_collapsed_header_selected(&a, "closed");
         press(&mut a, KeyCode::Right);
         assert_bead(&a, "b1");
@@ -5801,16 +5603,17 @@ mod tests {
         assert_collapsed_header_selected(&a, "closed");
     }
     #[test]
-    fn closed_group_defaults_when_it_first_appears_after_an_empty_list() {
+    fn closed_group_defaults_on_first_empty_list_and_remains_collapsed() {
         let mut a = unloaded_app();
         respond(&mut a, Response::List(Ok(vec![])));
-        assert!(a.closed_default_pending);
-        assert!(a.collapsed.is_empty());
+        assert!(!a.closed_default_pending);
+        assert!(a.collapsed.contains("closed"));
 
         let mut items = app().beads;
         items.truncate(2);
         respond(&mut a, Response::List(Ok(items.clone())));
-        assert!(a.closed_default_pending);
+        assert!(!a.closed_default_pending);
+        assert!(a.collapsed.contains("closed"));
         assert_bead(&a, "b0");
 
         items[1].status = "closed".into();
@@ -5818,6 +5621,36 @@ mod tests {
         assert!(!a.closed_default_pending);
         assert!(a.collapsed.contains("closed"));
         assert_bead(&a, "b0");
+    }
+    #[test]
+    fn empty_group_headers_remain_keyboard_and_mouse_targets_without_issue_actions() {
+        let mut a = unloaded_app();
+        respond(&mut a, Response::List(Ok(vec![])));
+        let layout = list_layout(&a.beads, &a.collapsed);
+        assert_eq!(layout.groups.len(), 6);
+        assert!(layout.groups.iter().all(|group| group.indices.is_empty()));
+
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.collapse_context.as_deref(), Some("open"));
+        press(&mut a, KeyCode::Char(' '));
+        assert!(a.collapsed.contains("open"));
+        press(&mut a, KeyCode::Char(' '));
+        assert!(!a.collapsed.contains("open"));
+        assert_eq!(a.collapse_context.as_deref(), Some("open"));
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.modal.is_none());
+        assert!(a.selected.is_none());
+        assert!(a.detail.is_none());
+
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        respond(&mut a, Response::List(Ok(vec![])));
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        a.list_rect = Rect::new(0, 0, 30, 16);
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 2);
+        assert!(a.collapsed.contains("ready"));
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        assert!(a.selected.is_none());
     }
     #[test]
     fn closed_only_workspace_keeps_header_keyboard_accessible() {
@@ -5828,7 +5661,9 @@ mod tests {
         respond(&mut a, Response::List(Ok(items)));
         assert!(a.collapsed.contains("closed"));
         assert!(a.selected.is_none());
-        press(&mut a, KeyCode::Down);
+        for _ in 0..6 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_collapsed_header_selected(&a, "closed");
         press(&mut a, KeyCode::Right);
         assert_bead(&a, "b0");
@@ -5910,7 +5745,10 @@ mod tests {
         assert!(a.collapse_context.is_none());
         assert!(a.selected.is_none());
         assert!(a.detail.is_none());
-        assert!(a.collapsed.is_empty());
+        assert_eq!(
+            a.collapsed,
+            HashSet::from(["open".to_owned(), "closed".to_owned()])
+        );
     }
     #[test]
     fn preferred_id_expands_destination_and_selects_created_bead() {
@@ -6030,12 +5868,14 @@ mod tests {
             "b0".into(),
             Ok(crate::epic::Session {
                 workspace_id: "w1".into(),
+                tab_id: "w1:t2".into(),
                 pane_id: "w1:p1".into(),
             }),
         ))
         .unwrap();
         a.receive();
         assert!(a.planning_epics.contains("b0"));
+        assert!(a.notice.as_deref().unwrap().contains("tab w1:t2"));
         out.send(Response::EpicFinished("b0".into(), Ok(vec!["b0.1".into()])))
             .unwrap();
         a.receive();

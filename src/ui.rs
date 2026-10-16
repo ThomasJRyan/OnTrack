@@ -19,7 +19,7 @@ const GOLD: Color = Color::Rgb(239, 183, 99);
 fn status_color(status: &str) -> Color {
     match status {
         "open" => TEAL,
-        "ready" => Color::Rgb(130, 205, 135),
+        "ready" => Color::Rgb(125, 168, 235),
         "closed" | "blocked" => Color::Rgb(255, 123, 123),
         "in_progress" => GOLD,
         "deferred" => Color::Rgb(145, 170, 220),
@@ -287,32 +287,9 @@ fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
 }
 fn render_header(f: &mut Frame, area: Rect, left: Line<'static>, app: &App) {
     let palette = crate::theme::definition(app.theme).palette;
-    let mut left_area = area;
-    if let Some(version) = &app.update_available {
-        let full = format!(" UPDATE AVAILABLE · v{version} ");
-        let badge = if usize::from(area.width) > left.width() + Span::raw(&full).width() {
-            full.as_str()
-        } else {
-            " UPDATE "
-        };
-        let badge_width = Span::raw(badge).width() as u16;
-        if area.width > badge_width + 7 {
-            left_area.width = area.width - badge_width;
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    badge.to_owned(),
-                    Style::default()
-                        .fg(palette.warning)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .alignment(Alignment::Right),
-                Rect::new(area.x + left_area.width, area.y, badge_width, 1),
-            );
-        }
-    }
     f.render_widget(
         Paragraph::new(left).style(Style::default().fg(palette.foreground)),
-        left_area,
+        area,
     );
 }
 fn render_header_feedback(f: &mut Frame, area: Rect, message: Option<&str>, theme: Theme) {
@@ -716,7 +693,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         .as_ref()
         .and_then(|status| {
             layout.targets.iter().find(|target| {
-                target.row == DisplayRow::Group(status.clone()) && app.collapsed.contains(status)
+                target.row == DisplayRow::Group(status.clone())
+                    && (app.collapsed.contains(status)
+                        || !app
+                            .beads
+                            .iter()
+                            .any(|bead| crate::app::display_status(bead) == status))
             })
         })
         .or_else(|| {
@@ -761,8 +743,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 group.status.to_uppercase()
             };
             let marker = if group.collapsed { "▸" } else { "▾" };
-            let focused =
-                app.collapse_context.as_deref() == Some(group.status.as_str()) && group.collapsed;
+            let focused = app.collapse_context.as_deref() == Some(group.status.as_str())
+                && (group.collapsed || group.indices.is_empty());
             let title_style = if focused {
                 Style::default()
                     .fg(palette.selected_foreground)
@@ -987,7 +969,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 FORM_DESCRIPTION_WIDTH as u16 + 6
             }
             crate::app::Modal::Settings { .. } => 64,
-            crate::app::Modal::Release | crate::app::Modal::ConfirmUpdate(_) => 76,
             _ => 62,
         }
         .min(a.width.saturating_sub(2));
@@ -1063,9 +1044,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
             crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
-            crate::app::Modal::Release => 12,
-            crate::app::Modal::ConfirmUpdate(_) => 10,
-            crate::app::Modal::InstallingUpdate(_) => 8,
         };
         let min_width = if matches!(
             modal,
@@ -1074,10 +1052,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             70
         } else if matches!(
             modal,
-            crate::app::Modal::Settings { .. }
-                | crate::app::Modal::EditLoading { .. }
-                | crate::app::Modal::Release
-                | crate::app::Modal::ConfirmUpdate(_)
+            crate::app::Modal::Settings { .. } | crate::app::Modal::EditLoading { .. }
         ) {
             38
         } else {
@@ -1123,9 +1098,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 }
                 crate::app::Modal::ConfirmGenerateEpic { .. } => " GENERATE EPIC TASKS? ",
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
-                crate::app::Modal::Release => " ONTRACK RELEASE ",
-                crate::app::Modal::ConfirmUpdate(_) => " UPDATE ONTRACK? ",
-                crate::app::Modal::InstallingUpdate(_) => " INSTALLING ONTRACK ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
                 crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
                 _ => " DELETE BEAD? ",
@@ -1141,54 +1113,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             area.height.saturating_sub(2),
         );
         match modal {
-            crate::app::Modal::Release => {
-                let version = env!("CARGO_PKG_VERSION");
-                let result = if app.update_preparing {
-                    "Checking for a compatible release asset…".to_owned()
-                } else if app.release_inflight {
-                    "Checking GitHub for the latest release…".to_owned()
-                } else {
-                    match app.release_result.as_ref() {
-                        Some(Ok(crate::release::CheckResult::Available { version, url })) => {
-                            format!(
-                                "Update available: v{version}\n\nRelease link:\n{url}\n\nPress i to prepare installation."
-                            )
-                        }
-                        Some(Ok(crate::release::CheckResult::Current { .. })) => {
-                            "You are running the latest published release.".into()
-                        }
-                        Some(Ok(crate::release::CheckResult::NoPublishedRelease)) => {
-                            "No public OnTrack release is available.".into()
-                        }
-                        Some(Err(error)) => format!("Update check failed: {error}"),
-                        None => "Check not started.".into(),
-                    }
-                };
-                f.render_widget(
-                    Paragraph::new(format!(
-                        "Running version: v{version}\n\n{result}\n\nr check again · Esc return to browser"
-                    ))
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(ink)),
-                    inner,
-                );
-            }
-            crate::app::Modal::ConfirmUpdate(release) => {
-                f.render_widget(
-                    Paragraph::new(format!("OnTrack {} is available.\n\n{}\n\nInstall the verified release?\ny confirm · n / Esc cancel", release.version, release.page))
-                        .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(ink)),
-                    inner,
-                );
-            }
-            crate::app::Modal::InstallingUpdate(version) => {
-                f.render_widget(
-                    Paragraph::new(format!("Downloading and verifying OnTrack {version}…\n\nEsc or c cancels before replacement.\nKeep this session open until the result appears."))
-                        .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(ink)),
-                    inner,
-                );
-            }
             crate::app::Modal::EditLoading { id, error, .. } => {
                 let message = error.as_ref().map_or_else(
                     || format!("Loading {id}…"),
@@ -2008,7 +1932,6 @@ fn footer_text(width: usize, epic: bool) -> String {
         " · N child",
         " · s settings",
         " · w worktrees",
-        " · u update",
         " · Ctrl+? keys",
     ] {
         if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
@@ -2025,15 +1948,8 @@ fn worktree_footer_text(width: usize) -> String {
         " · c close",
         " · x remove",
         " · R restart",
-        " · r refresh",
-        " · w back",
-        " · ↑/↓ select",
         " · PgUp/PgDn scroll",
-        " · q quit",
         " · Ctrl+? keys",
-        " · k/j select",
-        " · Esc/Backspace back",
-        " · Ctrl+C quit",
     ] {
         if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
             footer.push_str(hint);
@@ -2424,11 +2340,6 @@ mod tests {
             handoff: Default::default(),
             handoff_capacity: Default::default(),
             toast: None,
-            release_result: None,
-            release_inflight: false,
-            update_preparing: false,
-            release_cancel: None,
-            update_available: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -2471,44 +2382,6 @@ mod tests {
             requests: tx,
             responses,
         }
-    }
-    #[test]
-    fn release_dialog_shows_version_link_and_error() {
-        let mut state = app();
-        state.modal = Some(crate::app::Modal::Release);
-        state.release_result = Some(Ok(crate::release::CheckResult::Available {
-            version: semver::Version::parse("1.2.0").unwrap(),
-            url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
-        }));
-        let screen = draw((100, 24), &mut state).0;
-        assert!(screen.contains("Update available: v1.2.0"));
-        assert!(screen.contains("https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0"));
-        assert!(screen.contains("Press i to prepare installation"));
-        state.release_result = Some(Err("offline".into()));
-        assert!(
-            draw((100, 24), &mut state)
-                .0
-                .contains("Update check failed: offline")
-        );
-    }
-    #[test]
-    fn update_confirmation_and_install_progress_show_actions() {
-        let mut state = app();
-        let release = crate::update::Available {
-            version: "1.2.0".into(),
-            page: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
-            asset_name: "archive.tar.gz".into(),
-            asset_url: String::new(),
-            checksum_url: String::new(),
-            digest: None,
-        };
-        state.modal = Some(crate::app::Modal::ConfirmUpdate(release));
-        let screen = draw((100, 24), &mut state).0;
-        assert!(screen.contains("Install the verified release?"));
-        assert!(screen.contains("y confirm"));
-        state.modal = Some(crate::app::Modal::InstallingUpdate("1.2.0".into()));
-        let screen = draw((100, 24), &mut state).0;
-        assert!(screen.contains("Esc or c cancels before replacement"));
     }
     fn draw(size: (u16, u16), a: &mut App) -> (String, Rect) {
         let mut t = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
@@ -2573,36 +2446,6 @@ mod tests {
         assert!(!help.contains(".-\"\"\"-."));
     }
     #[test]
-    fn update_badge_fits_headers_and_survives_a_handoff_toast() {
-        let mut app = app();
-        app.update_available = Some("0.2.0".into());
-        let wide = draw_at((100, 24), SPLASH_DURATION, &mut app);
-        assert!(wide.contains("UPDATE AVAILABLE · v0.2.0"));
-        assert!(wide.contains("ONTRACK  /  WORKSPACE ISSUES"));
-
-        let compact = draw_at((24, 7), SPLASH_DURATION, &mut app);
-        assert!(compact.contains("UPDATE"));
-        assert!(compact.contains("BEADS"));
-
-        app.worktrees_view = true;
-        let worktrees = draw_at((100, 24), SPLASH_DURATION, &mut app);
-        assert!(worktrees.contains("UPDATE AVAILABLE · v0.2.0"));
-        assert!(worktrees.contains("WORKTREES"));
-
-        app.toast = Some(crate::app::Toast {
-            message: "Agent started".into(),
-            error: false,
-            expires_at: None,
-        });
-        let with_toast = draw_at((100, 24), SPLASH_DURATION, &mut app);
-        assert!(with_toast.contains("HERDR"));
-        assert!(with_toast.contains("Agent started"));
-        app.toast = None;
-        assert!(
-            draw_at((100, 24), SPLASH_DURATION, &mut app).contains("UPDATE AVAILABLE · v0.2.0")
-        );
-    }
-    #[test]
     fn hotkey_reference_has_columns_and_scrolls_in_compact_terminals() {
         let mut a = app();
         a.help = Some(crate::hotkeys::Help {
@@ -2640,15 +2483,22 @@ mod tests {
                 .map(|x| buffer[(x, y)].symbol())
                 .collect::<String>()
         };
-        let bead_row = a.list_rect.y + 1;
+        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+        let closed = layout
+            .groups
+            .iter()
+            .find(|group| group.status == "closed")
+            .unwrap();
+        let header_row = a.list_rect.y + (closed.y - a.list_offset) as u16;
+        let bead_row = header_row + 1;
         assert!(line(bead_row).contains("task     P1  closed"));
         assert!(line(bead_row + 1).contains("Title is visible"));
-        assert_eq!(buffer[(a.list_rect.x, a.list_rect.y)].symbol(), "╭");
+        assert_eq!(buffer[(a.list_rect.x, header_row)].symbol(), "╭");
         assert_eq!(
-            buffer[(a.list_rect.x, a.list_rect.y)].fg,
+            buffer[(a.list_rect.x, header_row)].fg,
             status_color("closed")
         );
-        assert!(line(a.list_rect.y).contains("CLOSED"));
+        assert!(line(header_row).contains("CLOSED"));
         assert_eq!(
             buffer[(a.list_rect.x + 3, bead_row)].fg,
             row_type_color("task")
@@ -2756,14 +2606,49 @@ mod tests {
             .unwrap();
         let palette = crate::theme::definition(a.theme).palette;
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(a.list_rect.x, a.list_rect.y)].symbol(), "╭");
+        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+        let closed_y = a.list_rect.y
+            + (layout
+                .groups
+                .iter()
+                .find(|group| group.status == "closed")
+                .unwrap()
+                .y
+                - a.list_offset) as u16;
+        assert_eq!(buffer[(a.list_rect.x, closed_y)].symbol(), "╭");
         assert!(
             (a.list_rect.x + 1..a.list_rect.x + a.list_rect.width - 1)
-                .any(|x| buffer[(x, a.list_rect.y)].bg == palette.selected_background)
+                .any(|x| buffer[(x, closed_y)].bg == palette.selected_background)
         );
         assert!(a.selected.is_none());
         assert!(a.detail.is_none());
         assert!(a.modal.is_none());
+    }
+    #[test]
+    fn empty_standard_groups_render_zero_counts_and_scroll_in_small_viewports() {
+        let mut a = app();
+        a.beads.clear();
+        a.selected = None;
+        let (screen, _) = draw((100, 30), &mut a);
+        for status in [
+            "OPEN",
+            "READY",
+            "BLOCKED",
+            "DEFERRED",
+            "IN_PROGRESS",
+            "CLOSED",
+        ] {
+            assert!(
+                screen.contains(&format!("{status} · 0")),
+                "missing {status}"
+            );
+        }
+
+        a.collapsed.insert("closed".into());
+        a.collapse_context = Some("closed".into());
+        let (compact, _) = draw((60, 12), &mut a);
+        assert!(compact.contains("CLOSED · 0"));
+        assert!(a.list_offset > 0);
     }
     #[test]
     fn issue_type_fallback_priority_bounds_and_title_color_are_safe() {
@@ -2790,7 +2675,13 @@ mod tests {
         terminal
             .draw(|f| render(f, Duration::from_secs(2), &mut a))
             .unwrap();
-        let y = a.list_rect.y + 2;
+        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+        let closed = layout
+            .groups
+            .iter()
+            .find(|group| group.status == "closed")
+            .unwrap();
+        let y = a.list_rect.y + (closed.y + 2 - a.list_offset) as u16;
         assert_eq!(
             terminal.backend().buffer()[(a.list_rect.x + 3, y)].fg,
             crate::theme::definition(a.theme).palette.foreground
@@ -2852,6 +2743,7 @@ mod tests {
     fn stable_status_colors_and_scrolled_last_group_render_in_small_viewport() {
         assert_eq!(status_color("custom"), Color::Rgb(125, 168, 235));
         assert_eq!(status_color("open"), TEAL);
+        assert_eq!(status_color("ready"), Color::Rgb(125, 168, 235));
         assert_eq!(status_color("closed"), Color::Rgb(255, 123, 123));
         let mut a = app();
         a.beads = (0..15)
@@ -2868,6 +2760,42 @@ mod tests {
         assert!(shown.contains("CLOSED"));
         assert!(shown.contains("b14"));
         assert!(a.list_offset > 0);
+    }
+    #[test]
+    fn ready_group_and_row_use_blue_in_every_theme() {
+        for theme in Theme::ALL {
+            let mut a = app();
+            a.theme = theme;
+            a.beads[0].status = "open".into();
+            a.beads[0].data["labels"] = json!([crate::beads::READY_LABEL]);
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let layout = crate::app::list_layout(&a.beads, &a.collapsed);
+            let ready_group = layout
+                .groups
+                .iter()
+                .find(|group| group.status == "ready")
+                .unwrap();
+            let top = a.list_rect.y + (ready_group.y - a.list_offset) as u16;
+            let border_x = a.list_rect.x;
+            let ready = crate::theme::status_color(theme, "ready");
+            assert_eq!(buffer[(border_x, top)].fg, ready);
+            let row = top + 1;
+            let status_x = (0..96)
+                .find(|&x| {
+                    (x..x + 5)
+                        .map(|column| buffer[(column, row)].symbol())
+                        .collect::<String>()
+                        == "ready"
+                })
+                .expect("Ready row status is visible");
+            for x in status_x..status_x + 5 {
+                assert_eq!(buffer[(x, row)].fg, ready);
+            }
+        }
     }
     #[test]
     fn expanded_panes_enclose_rows_and_follow_status_order() {
@@ -2888,27 +2816,34 @@ mod tests {
                 .iter()
                 .map(|g| g.status.as_str())
                 .collect::<Vec<_>>(),
-            ["open", "closed"]
+            [
+                "open",
+                "ready",
+                "blocked",
+                "deferred",
+                "in_progress",
+                "closed"
+            ]
         );
         assert_eq!(
             layout.groups[0].height,
             2 + 2 * layout.groups[0].indices.len()
         );
         assert_eq!(
-            layout.groups[1].y,
-            layout.groups[0].y + layout.groups[0].height
+            layout.groups[5].y,
+            layout.groups[4].y + layout.groups[4].height
         );
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
             .draw(|f| render(f, Duration::from_secs(2), &mut a))
             .unwrap();
         let buf = terminal.backend().buffer();
-        let closed_y = a.list_rect.y + (layout.groups[1].y - a.list_offset) as u16;
+        let closed_y = a.list_rect.y + (layout.groups[5].y - a.list_offset) as u16;
         let line = (0..100)
             .map(|x| buf[(x, closed_y)].symbol())
             .collect::<String>();
         assert!(line.contains("CLOSED"));
-        let bottom = closed_y + layout.groups[1].height as u16 - 1;
+        let bottom = closed_y + layout.groups[5].height as u16 - 1;
         assert_eq!(buf[(a.list_rect.x, bottom)].symbol(), "╰");
         assert_eq!(buf[(a.list_rect.x, bottom)].fg, status_color("closed"));
         assert!(buf[(a.list_rect.x, closed_y + 1)].symbol() == "│");
@@ -3281,7 +3216,7 @@ mod tests {
             assert!(!footer.contains("READY"));
         }
         assert!(footer_text(120, false).contains("N child"));
-        assert!(footer_text(120, false).contains("u update"));
+        assert!(!footer_text(120, false).contains("u update"));
         assert!(footer_text(120, false).contains("Ctrl+? keys"));
         let mut app = app();
         let original = draw((120, 24), &mut app).0;
@@ -3355,7 +3290,7 @@ mod tests {
         assert_eq!(app.detail_rect.height, 13);
     }
     #[test]
-    fn worktree_footer_lists_all_view_actions_on_wide_terminal_and_fits_one_row() {
+    fn worktree_footer_shows_essential_actions_and_fits_one_row() {
         let hints = worktree_footer_text(200);
         for key in [
             "Enter switch",
@@ -3363,14 +3298,7 @@ mod tests {
             "c close",
             "x remove",
             "R restart",
-            "r refresh",
-            "w back",
-            "↑/↓ select",
             "PgUp/PgDn scroll",
-            "k/j select",
-            "Esc/Backspace back",
-            "q quit",
-            "Ctrl+C quit",
             "Ctrl+? keys",
         ] {
             assert!(hints.contains(key), "missing {key}: {hints}");
@@ -3379,6 +3307,9 @@ mod tests {
             let footer = worktree_footer_text(width);
             assert!(Span::raw(footer.as_str()).width() <= width);
             assert!(!footer.contains('\n'));
+            for hidden in ["refresh", "select", "quit", "back"] {
+                assert!(!footer.contains(hidden), "unexpected {hidden}: {footer}");
+            }
         }
     }
     #[test]
@@ -3394,6 +3325,7 @@ mod tests {
             WorktreeStatus::Unmerged,
             WorktreeStatus::MergeQueued,
             WorktreeStatus::MergeRequested,
+            WorktreeStatus::MergeInProgress,
             WorktreeStatus::NeedsResolution,
             WorktreeStatus::Integrated,
             WorktreeStatus::WorkspaceClosed,

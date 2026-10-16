@@ -328,10 +328,17 @@ pub fn find(id: &str) -> Option<Theme> {
 }
 
 pub fn status_color(theme: Theme, status: &str) -> Color {
-    let p = definition(theme).palette;
+    let definition = definition(theme);
+    let p = definition.palette;
     match status {
         "open" => p.success,
-        "ready" => p.accent,
+        "ready" => {
+            if definition.is_light {
+                rgb(0, 91, 172)
+            } else {
+                rgb(125, 168, 235)
+            }
+        }
         "closed" | "blocked" => p.danger,
         "in_progress" => p.warning,
         "deferred" => p.info,
@@ -347,7 +354,7 @@ pub fn worktree_status_color(theme: Theme, status: WorktreeStatus) -> Color {
         WorktreeStatus::InProgress => p.warning,
         WorktreeStatus::Unmerged => p.info,
         WorktreeStatus::MergeQueued => p.info,
-        WorktreeStatus::MergeRequested => p.warning,
+        WorktreeStatus::MergeRequested | WorktreeStatus::MergeInProgress => p.warning,
         WorktreeStatus::NeedsResolution | WorktreeStatus::NeedsAttention => p.danger,
         WorktreeStatus::Integrated => p.success,
         WorktreeStatus::WorkspaceClosed => p.accent_alt,
@@ -512,6 +519,32 @@ mod tests {
     }
 
     #[test]
+    fn ready_is_readable_blue_in_every_theme() {
+        for entry in CATALOG {
+            let ready = status_color(entry.theme, "ready");
+            let Color::Rgb(red, green, blue) = ready else {
+                panic!("Ready must have an RGB colour");
+            };
+            assert!(
+                blue > green && green > red,
+                "{} Ready is not blue",
+                entry.id
+            );
+            assert!(
+                contrast(ready, entry.palette.background) >= 3.0,
+                "{} Ready has insufficient background contrast",
+                entry.id
+            );
+            assert!(
+                contrast(ready, entry.palette.panel) >= 3.0,
+                "{} Ready has insufficient panel contrast",
+                entry.id
+            );
+            assert_ne!(ready, status_color(entry.theme, "open"));
+        }
+    }
+
+    #[test]
     fn worktree_statuses_keep_pending_and_attention_distinct_from_integration() {
         for theme in Theme::ALL {
             let color = |status| worktree_status_color(theme, status);
@@ -532,6 +565,7 @@ mod tests {
                 WorktreeStatus::Unmerged,
                 WorktreeStatus::MergeQueued,
                 WorktreeStatus::MergeRequested,
+                WorktreeStatus::MergeInProgress,
                 WorktreeStatus::NeedsResolution,
                 WorktreeStatus::Integrated,
                 WorktreeStatus::WorkspaceClosed,
