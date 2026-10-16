@@ -1173,8 +1173,10 @@ impl App {
                 Response::EpicLaunched(id, result) => match result {
                     Ok(session) => {
                         self.planning_epics.insert(id.clone());
-                        let message =
-                            format!("Planning {id} in Herdr workspace {}…", session.workspace_id);
+                        let message = format!(
+                            "Planning {id} in Herdr workspace {} tab {}…",
+                            session.workspace_id, session.tab_id
+                        );
                         self.notice = Some(message.clone());
                         self.toast = Some(Toast::progress(message));
                     }
@@ -1190,7 +1192,7 @@ impl App {
                     let (message, error) = match result {
                         Ok(children) => (
                             format!(
-                                "Epic {id}: {} child Beads created; planning workspace closed",
+                                "Epic {id}: {} child Beads created; planning tab closed",
                                 children.len()
                             ),
                             false,
@@ -6042,12 +6044,14 @@ mod tests {
             "b0".into(),
             Ok(crate::epic::Session {
                 workspace_id: "w1".into(),
+                tab_id: "w1:t2".into(),
                 pane_id: "w1:p1".into(),
             }),
         ))
         .unwrap();
         a.receive();
         assert!(a.planning_epics.contains("b0"));
+        assert!(a.notice.as_deref().unwrap().contains("tab w1:t2"));
         out.send(Response::EpicFinished("b0".into(), Ok(vec!["b0.1".into()])))
             .unwrap();
         a.receive();

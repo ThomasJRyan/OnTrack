@@ -17,7 +17,7 @@ To remove the installed executable and OnTrack user settings, run `ontrack unins
 - Browse open and closed Beads, with explicit create, edit, and permanent-delete actions.
 - Mark open Tasks Ready, or mark an Epic and all its open descendant Tasks Ready together. Press `r` again to unready an unsent Task; sent Tasks stay Ready until their Beads status becomes In Progress. The scheduler prepares a Ready Epic's checkout and hands eligible child Tasks to Herdr agents. Set a concurrent agent limit in Settings (five by default).
 - Press `Shift+N` on an open task to create a child task. Child issues appear indented beneath their parent within a status pane. Parent handoff waits for children, and completed child work automatically requests integration into the managed parent worktree by default; Settings can turn this off.
-- When creating an Epic, or later with `g` and confirmation, optionally generate child tasks with assessed P0–P4 priorities from its Description using a Herdr agent in a separate workspace at the same checkout.
+- When creating an Epic, or later with `g` and confirmation, optionally generate child tasks with assessed P0–P4 priorities from its Description using a Herdr agent in a planning tab inside the current workspace at the same checkout.
 - Two-pane browsing with scrollable, Markdown-rendered descriptions, notes, comments, relationships, and Beads details.
 - Paste PNG or JPEG screenshots into a Bead description with `Ctrl+V`; agent handoffs include the saved local image paths.
 - Automatic background refresh picks up external changes, with cached records and visible errors; no watcher setup required.
