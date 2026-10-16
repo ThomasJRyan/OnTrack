@@ -55,26 +55,36 @@ The OnTrack-specific role mapping and contrast choices are maintained in
 The file is a JSON object:
 
 ```json
-{"theme":"dark"}
+{"theme":"dark","auto_merge":false,"auto_close_workspace":false,"auto_remove_checkout":false}
 ```
 
 `theme` accepts one of the stable IDs above; existing `"dark"` and `"light"`
-files remain valid. An omitted theme uses OnTrack Dark; unknown additional keys
+files remain valid. Missing worktree preference fields default to false; old theme-only
+files therefore remain backward compatible. All automatic cleanup switches are
+off by default. Unknown additional keys
 are accepted for future expansion. Invalid JSON,
 non-object JSON, unknown themes, and non-string theme values are errors.
 
 ## Changing the theme
 
-Press `s` to open Settings. The Theme row starts focused. `Up` / `Down` moves
-between setting rows; Theme is currently the only row, so these keys leave its
-value unchanged and close an open options list. `Left` / `Right` cycles themes
+Press `s` to open Settings. `Up` / `Down` moves among Theme, automatic merge,
+workspace close, checkout removal, and Close. `Left` / `Right` cycles themes
 with wraparound and immediately saves the new choice, whether the list is open
 or closed. The bounded list scrolls to keep the current choice visible. `Enter`
 or `Space` opens the list; while it is open, either key saves the selected theme
 again and closes the list, which also lets you retry a failed save. `Esc` closes
 an open list without reverting a successful change; `Esc` again closes Settings.
-Use `Tab` / `Shift+Tab` to focus Close, then `Enter` or `Space` to close the
-dialog. Closing never writes settings or rolls back a successful change.
+`Enter` / `Space` toggles a cleanup preference. Every change saves all settings
+together. The removal preference is labeled “Remove checkout after integration”;
+removing the checkout also closes its Herdr workspace. Cleanup remains
+subject to backend integration checks and cannot force-remove a checkout.
+Use `Tab` / `Shift+Tab` to move focus; Close exits the dialog.
+
+When both cleanup switches are enabled, removal runs first and also closes the
+workspace. Closing first and enabling removal later is unsupported by the
+verified Herdr interface; OnTrack reports manual recovery guidance instead.
+Automatic operations defer when native agent evidence is missing, and untouched
+branches without task commits are never automatically cleaned up.
 
 Each theme change is saved immediately. On success, the active appearance and
 the saved settings update together, and any startup or save error clears. On
@@ -104,7 +114,8 @@ the containing directory is not explicitly synchronized.
 
 ## Developer interface
 
-`src/settings.rs` exposes `Theme`, `Settings`, `config_path()`, `load_from(path)`,
+`src/settings.rs` exposes `Theme`, `Settings` (theme and three false-by-default
+worktree cleanup preferences), `config_path()`, `load_from(path)`,
 and `save_to(path, settings)`. The filesystem functions return `io::Result`;
 invalid settings contents use `io::ErrorKind::InvalidData` with the file path and
 reason. Loading never writes. Saving serializes the current supported fields

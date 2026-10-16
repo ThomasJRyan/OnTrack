@@ -56,6 +56,9 @@ impl Theme {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Settings {
     pub theme: Theme,
+    pub auto_merge: bool,
+    pub auto_close_workspace: bool,
+    pub auto_remove_checkout: bool,
 }
 
 /// Resolve the user configuration location without using the current workspace.
@@ -106,7 +109,19 @@ pub fn load_from(path: &Path) -> io::Result<Settings> {
             .ok_or_else(|| invalid(&format!("unknown theme id '{theme}'")))?,
         Some(_) => return Err(invalid("theme must be a supported string ID")),
     };
-    Ok(Settings { theme })
+    let boolean = |key: &str| -> io::Result<bool> {
+        match object.get(key) {
+            None => Ok(false),
+            Some(serde_json::Value::Bool(value)) => Ok(*value),
+            Some(_) => Err(invalid(&format!("{key} must be a boolean"))),
+        }
+    };
+    Ok(Settings {
+        theme,
+        auto_merge: boolean("auto_merge")?,
+        auto_close_workspace: boolean("auto_close_workspace")?,
+        auto_remove_checkout: boolean("auto_remove_checkout")?,
+    })
 }
 
 /// Atomically replace settings using a uniquely created temporary sibling file.
@@ -126,7 +141,7 @@ pub fn save_to(path: &Path, settings: &Settings) -> io::Result<()> {
     let (temporary_path, mut file) = create_temporary_file(parent)?;
     let theme = settings.theme.id();
     let result = (|| {
-        writeln!(file, "{{\"theme\":\"{theme}\"}}")
+        writeln!(file, "{{\"theme\":\"{theme}\",\"auto_merge\":{},\"auto_close_workspace\":{},\"auto_remove_checkout\":{}}}", settings.auto_merge, settings.auto_close_workspace, settings.auto_remove_checkout)
             .and_then(|()| file.sync_all())
             .map_err(|error| io_error("write", &temporary_path, error))?;
         drop(file);
@@ -236,7 +251,10 @@ mod tests {
     fn every_theme_roundtrips_and_replaces_existing_settings() {
         let directory = TestDirectory::new();
         for theme in Theme::ALL.into_iter().chain([Theme::Dark]) {
-            let settings = Settings { theme };
+            let settings = Settings {
+                theme,
+                ..Settings::default()
+            };
             save_to(&directory.path(), &settings).unwrap();
             assert_eq!(load_from(&directory.path()).unwrap(), settings);
             let json: serde_json::Value =
@@ -260,6 +278,27 @@ mod tests {
         }
         directory.write(r#"{"theme":"light","future":[1,2,3]}"#);
         assert_eq!(load_from(&directory.path()).unwrap().theme, Theme::Light);
+    }
+
+    #[test]
+    fn legacy_theme_files_default_worktree_preferences_and_new_values_roundtrip() {
+        let directory = TestDirectory::new();
+        directory.write(r#"{"theme":"light"}"#);
+        assert_eq!(
+            load_from(&directory.path()).unwrap(),
+            Settings {
+                theme: Theme::Light,
+                ..Settings::default()
+            }
+        );
+        let settings = Settings {
+            theme: Theme::Nord,
+            auto_merge: true,
+            auto_close_workspace: true,
+            auto_remove_checkout: true,
+        };
+        save_to(&directory.path(), &settings).unwrap();
+        assert_eq!(load_from(&directory.path()).unwrap(), settings);
     }
 
     #[test]

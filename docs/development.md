@@ -7,10 +7,11 @@ ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime works
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Defines the terminal type, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
-| `src/settings.rs` | Loads and saves the small JSON appearance configuration under the user's XDG config directory. |
+| `src/settings.rs` | Loads and atomically saves theme and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
 | `src/beads.rs` | Builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/herdr.rs` | Discovers usable Codex/OpenCode integrations, maps the current checkout to a Herdr workspace, and explicitly creates a worktree and starts/prompts an agent. |
+| `src/worktrees.rs` | Journals OnTrack-created handoffs separately from Beads and verifies Git/Herdr evidence before merge finalization or cleanup. |
 | `src/app.rs` | Holds selection, focus, scrolling, modal form state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
 | `src/ui.rs` | Renders splash, issue list, wrapped Markdown details, and status; maintains list visibility and scroll bounds. |
@@ -23,7 +24,7 @@ Theme is explicit app state (`App::theme`) threaded into rendering; do not intro
 
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.
 
-The `s` settings dialog applies and saves theme changes immediately. Up / Down navigates setting rows, while Left / Right changes values. Its bounded dropdown scrolls to keep the selection visible. Esc closes an open dropdown before closing the dialog; closing never reverts successful changes or writes settings. Config read/write errors are presented in the UI and must not be reported as successful saves. See the [settings guide](settings.md) for stable theme IDs and instructions for extending the catalog.
+The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. See the [settings guide](settings.md) for details.
 
 ## Beads CLI contract
 
@@ -81,13 +82,13 @@ Focused tests (`cargo test herdr::tests`) inject command execution, Bead retriev
 
 ## Background work and cached state
 
-`App` uses standard-library channels, a serial browser worker, and independent Herdr jobs for blocking CLI calls. The UI loop receives available responses, draws, and polls input with a short timeout rather than waiting for subprocess completion.
+`App` uses standard-library channels, a serial browser worker, a separate serial managed-worktree worker, and independent Herdr jobs for blocking CLI calls. The UI loop receives available responses, draws, and polls input with a short timeout rather than waiting for subprocess completion.
 
 The request router keeps browser Beads list/show/create/delete operations on a serial worker. Each Herdr discovery, launch and poll runs as an independent detached job; a launch also calls `bd show` for its authoritative Bead snapshot from that job, concurrently with the serial browser worker and other Herdr tasks. Thus the serial guarantee applies to browser requests, not every invocation of `bd`. Handoff discovery, launch and task-status polling remain outside the input/render loop. The session-local task model is keyed by its monotonically increasing sequence and Bead ID; correlate every asynchronous completion/poll response to that identity so out-of-order or stale results cannot overwrite another task. Polls do not overlap per task and the next poll is scheduled about two seconds after the prior result. Keep task rows on failure: a polling error means current status is unknown, not that the agent or task disappeared. Accept `done` only with a newer completion counter than the pre-prompt snapshot, or observed post-prompt working/blocked activity when counters are unavailable; stale `done` remains unknown and polling continues. Preserve blocked as distinct from launch failure. Duplicate starts remain suppressed while a task is starting, running, blocked, error, or unknown; retry is permitted only for a typed known-safe launch failure or confirmed agent done. If an uncertain launch failure has no validated target, the UI may offer an explicit `ReleaseTask` confirmation to clear only session-local duplicate protection after manual inspection. It must never stop agents or remove worktrees; polling errors and tasks with targets are not release candidates. The UI exposes status/detail plus workspace, branch and pane recovery context when available. App shutdown drops local tracking but detached jobs/Herdr agents are not joined or cancelled.
 
 Automatic refresh uses the same public read-only list/show commands above. Schedule the next poll roughly one second after the previous refresh completes, including reloading the selected detail; do not accumulate timer-driven requests while refresh work is in flight. This is polling, not an event stream: slow CLI calls extend refresh latency. No watcher, extra dependency, configuration, or optional Beads events setup is required. Manual `r` and successful create/delete operations still request an immediate refresh.
 
-The Beads worker executes its requests in channel order; Herdr jobs are dispatched independently and can complete out of order. Responses carry task sequence IDs, while details carry selected Bead IDs and sequence IDs, so stale results can be ignored safely. Do not describe the whole backend as one sequential worker.
+The browser Beads worker executes its requests in channel order. Managed ListWorktrees/WorktreeAction/ReconcileWorktrees requests have their own ordered worker, so a slow management command cannot occupy the browser queue. Managed reconciliation may run its own authoritative read-only `bd show` outside that queue, just as launches do. Herdr jobs are dispatched independently and can complete out of order. Responses carry task sequence IDs, while details carry selected Bead IDs and sequence IDs, so stale results can be ignored safely. Do not describe the whole backend, or every `bd` invocation, as one sequential worker.
 
 Selection uses the issue's cached list JSON immediately, marks details as loading, and requests full details. Refresh keeps the prior list while loading and preserves selection by ID when possible. Automatic updates also retain group collapse state, focus, scroll positions within current bounds, and active form input. Failed list/detail refreshes retain the last loaded data or available snapshot, display errors in the footer, and retry automatically. The presentation layer renders narrative Markdown via `tui-markdown`; all remaining fields, including unknown nested values, remain represented. Rendered text drives both wrapping and scroll bounds.
 
@@ -135,3 +136,35 @@ Create and delete are explicit, asynchronous CLI operations. The create form use
 List results are sorted deterministically by status (open first, closed last, other statuses alphabetically), then ID. `list_layout` in `src/app.rs` is the shared geometry model for navigation, viewport scrolling, mouse hit-testing, and rendering. Expanded panes place the first bead directly below the header; keep the app geometry and renderer in sync if row spacing changes. Keyboard navigation targets visible bead rows and collapsed group headers in rendered order; expanded headers are skipped. A collapsed-header selection has no bead/detail/delete identity and must retain a clear rendered selection state. Refresh preserves that selection only while the same group remains collapsed. Keep selected IDs aligned with detail/delete actions when changing this view.
 
 The list row's first line derives issue type from the retained `Bead.data` (`issue_type`, with `type` as a fallback); it does not replace the internal bead ID. Type, priority, and status spans each have a semantic colour helper in `src/ui.rs`; the display-width-aware metadata columns are shared across the list. Preserve white title text independently of selection emphasis and keep missing/custom types safe to display.
+## Tracked worktree lifecycle
+
+The `t` task UI is session-local; the `w` managed-worktree view is backed by the durable `MAIN_ROOT/.git/ontrack-worktrees/registry.json` registry and survives application restart. Releasing session-local duplicate protection neither removes a durable managed entry nor certifies integration.
+
+Launch journals hold immutable repository/entry identity, not a long-lived registry lock or stale entry snapshot. Each update reacquires the latest registry, verifies its own intent, changes only its own entry, and atomically replaces the file under the exclusive advisory lock. The intent is persisted before creation; raw creation responses and returned handles precede validation; agent-start and initial-prompt possibly-sent fences precede those commands; start/readiness evidence precedes prompting; `active` follows a validated prompt response. Returned handles are saved and the lock released before created-checkout filesystem/Git verification, then a new transaction records `created_verified`. Distinct launches can therefore progress independently without overwriting one another's entries.
+
+Journal lock acquisition retries contention on a background thread for about two seconds, then fails closed. Existing managed actions/reconciliation still hold the registry lock across their Git/Herdr work and can delay or exhaust a launch transaction's retry window; this merge does not shorten those management critical sections. Post-creation journal/readiness/save failures remain typed uncertain errors with validated target identity where available. Failure-recording errors are appended rather than replacing the original uncertainty or declaring a retry safe; durable possibly-sent phases must be inspected before recovery.
+
+Regression coverage includes interleaved real journal handles, a first launch paused after durable intent while a second progresses, cross-process write exclusion without lifetime-long journal locks, bounded contention failure, post-create/post-prompt save failures, and managed-worker isolation from browser requests. Herdr boundaries remain faked; isolated filesystem Git fixtures exercise registry durability and actual worktree verification without controlling live Herdr agents.
+
+OnTrack records only worktrees created by its own confirmed Herdr handoffs; it
+does not adopt pre-existing Git worktrees. Outstanding work is a separate view
+from Beads: a closed or missing Bead does not remove the managed-worktree record.
+The verified repository target branch is shown to the user. A merge request is
+pending work, not a completed merge; Git ancestry/cleanliness checks decide
+integration. Conflicts and uncertain outcomes remain inspectable for manual
+recovery. Cleanup is permitted only after verified integration. Checkout removal
+is one confirmed operation that removes the checkout and closes its Herdr
+workspace; when both cleanup switches are enabled, removal runs instead of a
+separate close. It never force-removes a checkout or deletes a branch. Bead
+closure is an eligibility signal only, not evidence
+that an agent is idle or its changes safe to merge. Automatic merge may therefore
+defer; manual merge remains the user-controlled path.
+
+Manual merge provenance is persisted separately from automatic requests: optional
+agent-session metadata is not required for an explicitly confirmed manual merge,
+but current Git identity, cleanliness and ancestry checks still apply. Native
+idle/sequence evidence is not proof of a particular prompt turn completing.
+Cleanup revalidates the current Herdr workspace/path/branch mapping before any
+mutation. Untouched launch-base branches remain unmerged. Close-first/remove-later
+is explicitly unsupported; recovery guidance avoids guessing a closed workspace
+ID or invoking force removal.

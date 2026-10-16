@@ -8,6 +8,7 @@ license = "MIT"
 
 [dependencies]
 crossterm = "0.29"
+fs2 = "0.4"
 ratcn = { version = "0.0.6", features = ["crossterm"] }
 ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }
 ratatui-cheese = "0.7.0"
