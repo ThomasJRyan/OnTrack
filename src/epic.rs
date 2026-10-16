@@ -14,6 +14,7 @@ pub struct Session {
 
 trait Backend {
     fn herdr(&mut self, args: &[&str]) -> io::Result<Vec<u8>>;
+    fn codex_trust(&mut self, checkout: &Path) -> io::Result<String>;
     fn show(&mut self, id: &str) -> io::Result<Value>;
     fn children(&mut self, id: &str) -> io::Result<Vec<String>>;
 }
@@ -21,6 +22,10 @@ trait Backend {
 struct System;
 
 impl Backend for System {
+    fn codex_trust(&mut self, checkout: &Path) -> io::Result<String> {
+        herdr::codex_startup_trust(checkout)
+    }
+
     fn herdr(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
         let output = Command::new("herdr").args(args).output()?;
         if !output.status.success() {
@@ -110,6 +115,16 @@ fn launch_with(
         .find(|agent| agent.as_str() == "codex")
         .unwrap_or(&available[0]);
     let cwd = cwd.canonicalize()?;
+    // Planning shares this checkout; validate trust before creating anything.
+    let trust_override = if agent == "codex" {
+        Some(backend.codex_trust(&cwd).map_err(|error| {
+            invalid(format!(
+                "Codex repository trust validation failed; no workspace created: {error}"
+            ))
+        })?)
+    } else {
+        None
+    };
     let cwd = cwd
         .to_str()
         .ok_or_else(|| invalid("Current checkout path is not UTF-8"))?;
@@ -142,7 +157,7 @@ fn launch_with(
             .take(16)
             .collect::<String>()
     );
-    let started = backend.herdr(&[
+    let mut start_args = vec![
         "agent",
         "start",
         &name,
@@ -152,14 +167,24 @@ fn launch_with(
         &session.pane_id,
         "--timeout",
         "30000",
-    ]);
+    ];
+    if let Some(trust_override) = trust_override.as_deref() {
+        start_args.extend([
+            "--",
+            "-c",
+            trust_override,
+            "-c",
+            "check_for_update_on_startup=false",
+        ]);
+    }
+    let started = backend.herdr(&start_args);
     let started = started.and_then(|bytes| result(&bytes, "agent_started"));
     if started.as_ref().map_or(true, |value| {
         value["agent"]["pane_id"] != session.pane_id
             || value["agent"]["workspace_id"] != session.workspace_id
     }) {
         return Err(io::Error::other(format!(
-            "Agent start failed or identity changed in workspace {}. Inspect pane {} before retrying: {}",
+            "Agent start failed or identity changed in workspace {}. No planning prompt was sent. Inspect pane {} for login, policy, or other startup input and resolve it before retrying generation; the agent may still be running: {}",
             session.workspace_id,
             session.pane_id,
             started
@@ -309,6 +334,10 @@ mod tests {
     }
 
     impl Backend for Mock {
+        fn codex_trust(&mut self, _checkout: &Path) -> io::Result<String> {
+            unreachable!()
+        }
+
         fn herdr(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
             self.calls
                 .push(args.iter().map(|arg| (*arg).to_owned()).collect());
@@ -326,19 +355,41 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct LaunchMock {
         live: Value,
         step: usize,
         calls: Vec<Vec<String>>,
+        no_codex: bool,
+        trust_error: bool,
+        trust_calls: Vec<std::path::PathBuf>,
+        start_result: Option<io::Result<Value>>,
     }
 
     impl Backend for LaunchMock {
+        fn codex_trust(&mut self, checkout: &Path) -> io::Result<String> {
+            assert_eq!(self.calls.len(), 3, "trust must precede workspace creation");
+            self.trust_calls.push(checkout.to_path_buf());
+            if self.trust_error {
+                Err(invalid("metadata missing"))
+            } else {
+                Ok(r#"projects."/verified/main root".trust_level="trusted""#.into())
+            }
+        }
+
         fn herdr(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
             self.calls
                 .push(args.iter().map(|arg| (*arg).to_owned()).collect());
+            if self.step == 4
+                && let Some(started) = self.start_result.take()
+            {
+                self.step += 1;
+                return started.map(|value| json!({"result": value}).to_string().into_bytes());
+            }
             let bytes = match self.step {
                 0 => json!({"result":{"type":"workspace_list","workspaces":[{"workspace_id":"wSource"}]}}).to_string(),
                 1 => "--kind <KIND> [possible values: codex, opencode]".to_owned(),
+                2 if self.no_codex => "opencode: current (v1) (/tmp/opencode)".to_owned(),
                 2 => "codex: current (v1) (/tmp/codex)\nopencode: not installed".to_owned(),
                 3 => json!({"result":{"type":"workspace_created","workspace":{"workspace_id":"wEpic"},"root_pane":{"workspace_id":"wEpic","pane_id":"wEpic:p1"}}}).to_string(),
                 4 => json!({"result":{"type":"agent_started","agent":{"workspace_id":"wEpic","pane_id":"wEpic:p1"}}}).to_string(),
@@ -369,6 +420,7 @@ mod tests {
                 live,
                 step: 0,
                 calls: Vec::new(),
+                ..Default::default()
             };
             assert!(
                 launch_with(
@@ -389,10 +441,33 @@ mod tests {
             live: json!({"issue_type":"epic", "description":"A large proposal"}),
             step: 0,
             calls: Vec::new(),
+            ..Default::default()
         };
         let cwd = std::env::current_dir().unwrap();
         let session = launch_with(&mut backend, &cwd, "wSource", "epic-1").unwrap();
         assert_eq!(session.workspace_id, "wEpic");
+        assert_eq!(backend.trust_calls, [cwd.canonicalize().unwrap()]);
+        assert_eq!(
+            backend.calls[4],
+            [
+                "agent",
+                "start",
+                "epic-epic1",
+                "--kind",
+                "codex",
+                "--pane",
+                "wEpic:p1",
+                "--timeout",
+                "30000",
+                "--",
+                "-c",
+                r#"projects."/verified/main root".trust_level="trusted""#,
+                "-c",
+                "check_for_update_on_startup=false",
+            ]
+        );
+        assert_eq!(backend.calls.len(), 6);
+        assert_eq!(&backend.calls[5][..3], ["agent", "prompt", "wEpic:p1"]);
         assert_eq!(backend.calls[3][..2], ["workspace", "create"]);
         assert_eq!(
             backend.calls[3][3],
@@ -415,6 +490,95 @@ mod tests {
         assert!(backend.calls[5][3].contains("meaningful priority distinctions"));
         assert!(backend.calls[5][3].contains("Equal priorities are fine"));
         assert_eq!(&backend.calls[5][4..], ["--wait", "--until", "working"]);
+    }
+
+    #[test]
+    fn fallback_agent_has_no_codex_overrides_or_trust_requirement() {
+        let mut backend = LaunchMock {
+            live: json!({"issue_type":"epic", "description":"Proposal"}),
+            no_codex: true,
+            trust_error: true,
+            ..Default::default()
+        };
+        launch_with(
+            &mut backend,
+            &std::env::current_dir().unwrap(),
+            "wSource",
+            "epic-1",
+        )
+        .unwrap();
+        assert!(backend.trust_calls.is_empty());
+        assert_eq!(
+            backend.calls[4],
+            [
+                "agent",
+                "start",
+                "epic-epic1",
+                "--kind",
+                "opencode",
+                "--pane",
+                "wEpic:p1",
+                "--timeout",
+                "30000"
+            ]
+        );
+        assert_eq!(&backend.calls[5][..3], ["agent", "prompt", "wEpic:p1"]);
+        assert_eq!(backend.calls.len(), 6);
+    }
+
+    #[test]
+    fn codex_trust_failure_precedes_workspace_creation() {
+        let mut backend = LaunchMock {
+            live: json!({"issue_type":"epic", "description":"Proposal"}),
+            trust_error: true,
+            ..Default::default()
+        };
+        let error = launch_with(
+            &mut backend,
+            &std::env::current_dir().unwrap(),
+            "wSource",
+            "epic-1",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no workspace created"), "{error}");
+        assert!(error.contains("metadata missing"), "{error}");
+        assert_eq!(backend.calls.len(), 3);
+    }
+
+    #[test]
+    fn startup_errors_and_identity_mismatches_never_send_planning_prompt() {
+        for started in [
+            Err(io::Error::other("readiness timed out: login required")),
+            Ok(
+                json!({"type":"agent_started", "agent":{"workspace_id":"wOther","pane_id":"wEpic:p1"}}),
+            ),
+            Ok(
+                json!({"type":"agent_started", "agent":{"workspace_id":"wEpic","pane_id":"wEpic:p2"}}),
+            ),
+            Ok(json!({"type":"agent_info", "agent":{"workspace_id":"wEpic","pane_id":"wEpic:p1"}})),
+        ] {
+            let mut backend = LaunchMock {
+                live: json!({"issue_type":"epic", "description":"Proposal"}),
+                start_result: Some(started),
+                ..Default::default()
+            };
+            let error = launch_with(
+                &mut backend,
+                &std::env::current_dir().unwrap(),
+                "wSource",
+                "epic-1",
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains("No planning prompt was sent"), "{error}");
+            assert!(
+                error.contains("wEpic") && error.contains("wEpic:p1"),
+                "{error}"
+            );
+            assert!(error.contains("startup input"), "{error}");
+            assert_eq!(backend.calls.len(), 5);
+        }
     }
 
     #[test]

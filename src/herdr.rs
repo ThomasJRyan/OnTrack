@@ -511,6 +511,12 @@ fn canonical_git_path(bytes: &[u8]) -> io::Result<PathBuf> {
     path.canonicalize()
 }
 
+/// Invocation-only trust for the verified main repository, including when
+/// launching from a linked checkout. Shares the handoff's resolver and encoding.
+pub(crate) fn codex_startup_trust(checkout: &Path) -> io::Result<String> {
+    codex_trust_override(&SystemExecutor.git_identity(checkout)?.main_root)
+}
+
 fn codex_trust_override(root: &Path) -> io::Result<String> {
     if !root.is_absolute() {
         return Err(invalid("Codex trust root must be absolute"));
@@ -2371,6 +2377,48 @@ mod tests {
             _ => panic!("unexpected Git argv {args:?}"),
         };
         Ok(format!("{}\n", output.to_str().unwrap()).into_bytes())
+    }
+
+    #[test]
+    fn startup_trust_uses_real_main_repository_for_main_and_linked_checkouts() {
+        let fixture = MainCheckout::new();
+        let git = |args: &[&std::ffi::OsStr]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&fixture.0)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&[
+            "-c".as_ref(),
+            "user.name=Test".as_ref(),
+            "-c".as_ref(),
+            "user.email=test@example.invalid".as_ref(),
+            "commit".as_ref(),
+            "--quiet".as_ref(),
+            "--allow-empty".as_ref(),
+            "--no-verify".as_ref(),
+            "-m".as_ref(),
+            "fixture".as_ref(),
+        ]);
+        let linked = fixture.0.join("target/linked checkout");
+        git(&[
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "--quiet".as_ref(),
+            "--detach".as_ref(),
+            linked.as_os_str(),
+        ]);
+        let expected = codex_trust_override(&fixture.0.canonicalize().unwrap()).unwrap();
+        assert_eq!(codex_startup_trust(&fixture.0).unwrap(), expected);
+        assert_eq!(codex_startup_trust(&linked).unwrap(), expected);
+        assert!(codex_startup_trust(&fixture.0.join("src")).is_err());
     }
 
     #[test]
