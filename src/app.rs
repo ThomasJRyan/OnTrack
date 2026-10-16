@@ -833,7 +833,8 @@ impl App {
                 auto_close_workspace: self.settings.auto_close_workspace,
                 auto_remove_checkout: self.settings.auto_remove_checkout,
             };
-            let request = if !self.worktrees_discovered
+            let request = if !self.handoff.is_empty()
+                || !self.worktrees_discovered
                 || (self.worktrees_view && self.worktrees.is_empty())
             {
                 Request::ListWorktrees
@@ -4293,6 +4294,17 @@ mod tests {
             "a distinct selected bead can launch concurrently"
         );
         assert_eq!(a.handoff.len(), 2);
+    }
+
+    #[test]
+    fn worktree_poll_uses_short_read_scan_during_pending_handoff() {
+        let (mut a, requests, _) = connected_app();
+        a.worktrees
+            .push(observed_row("b3", worktrees::WorktreeStatus::InProgress));
+        press(&mut a, KeyCode::Char('h'));
+        assert!(matches!(requests.try_recv(), Ok(Request::Discover(_))));
+        a.poll_worktrees(Instant::now());
+        assert!(matches!(requests.try_recv(), Ok(Request::ListWorktrees)));
     }
     #[test]
     fn handoff_requires_selection_and_ignores_stale_discovery() {

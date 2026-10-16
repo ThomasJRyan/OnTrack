@@ -1354,10 +1354,12 @@ pub fn list() -> io::Result<Vec<ManagedWorktree>> {
 
 fn list_with(cwd: &Path, executor: &mut impl Executor) -> io::Result<Vec<ManagedWorktree>> {
     let registry = Registry::open(cwd)?;
-    Ok(registry
-        .entries
+    let repo = registry.repo.clone();
+    let entries = registry.entries.clone();
+    drop(registry);
+    Ok(entries
         .iter()
-        .map(|entry| inspect_for_display(&registry.repo, entry, executor))
+        .map(|entry| inspect_for_display(&repo, entry, executor))
         .collect())
 }
 
@@ -2222,10 +2224,12 @@ fn reconcile_with(
         // request can unblock it after the underlying condition is fixed.
         let _ = e;
     }
-    Ok(registry
-        .entries
+    let repo = registry.repo.clone();
+    let entries = registry.entries.clone();
+    drop(registry);
+    Ok(entries
         .iter()
-        .map(|entry| inspect_for_display(&registry.repo, entry, executor))
+        .map(|entry| inspect_for_display(&repo, entry, executor))
         .collect())
 }
 
@@ -4560,6 +4564,28 @@ mod tests {
             list_with(&fixture.main, &mut finished).unwrap()[0].status,
             WorktreeStatus::Unmerged
         );
+    }
+
+    #[test]
+    fn display_checks_release_registry_lock_before_external_calls() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implementation\n");
+        for reconcile in [false, true] {
+            let main = fixture.main.clone();
+            let mut executor = Fake::default();
+            executor.json(fixture.agent(12, "done"));
+            executor.hook = Some(Box::new(move |_| {
+                // A new handoff must be able to record intent while this
+                // display-only Herdr lookup is in progress.
+                assert!(Registry::open(&main).is_ok());
+            }));
+            let rows = if reconcile {
+                reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap()
+            } else {
+                list_with(&fixture.main, &mut executor).unwrap()
+            };
+            assert_eq!(rows[0].status, WorktreeStatus::Unmerged);
+        }
     }
 
     #[test]
