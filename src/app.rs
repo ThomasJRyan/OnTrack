@@ -925,7 +925,10 @@ impl App {
             .into_iter()
             .filter_map(|target| match target.row {
                 DisplayRow::Bead(index) => Some(DisplayRow::Bead(index)),
-                DisplayRow::Group(status) if self.collapsed.contains(&status) => {
+                DisplayRow::Group(status)
+                    if self.collapsed.contains(&status)
+                        || !self.beads.iter().any(|bead| display_status(bead) == status) =>
+                {
                     Some(DisplayRow::Group(status))
                 }
                 DisplayRow::Group(_) => None,
@@ -974,7 +977,7 @@ impl App {
         self.collapse_context = Some(status);
     }
     fn set_group_collapsed(&mut self, status: String, collapsed: bool) {
-        if !self.beads.iter().any(|b| display_status(b) == status) {
+        if !group_statuses(&self.beads).contains(&status) {
             return;
         }
         let is_collapsed = self.collapsed.contains(&status);
@@ -993,6 +996,8 @@ impl App {
             self.collapsed.remove(&status);
             if let Some(i) = self.beads.iter().position(|b| display_status(b) == status) {
                 self.select(i);
+            } else {
+                self.focus_collapsed_group(status);
             }
         }
     }
@@ -1000,6 +1005,8 @@ impl App {
         if self.collapsed.remove(&status) {
             if let Some(i) = self.beads.iter().position(|b| display_status(b) == status) {
                 self.select(i);
+            } else {
+                self.focus_collapsed_group(status);
             }
         } else {
             self.set_group_collapsed(status, true);
@@ -1036,14 +1043,12 @@ impl App {
                                     .then_with(|| a.status.cmp(&b.status))
                                     .then_with(|| a.id.cmp(&b.id))
                             });
-                            if self.closed_default_pending
-                                && self.beads.iter().any(|bead| bead.status == "closed")
-                            {
+                            if self.closed_default_pending {
                                 self.collapsed.insert("closed".into());
                                 self.closed_default_pending = false;
                             }
-                            self.collapsed
-                                .retain(|s| self.beads.iter().any(|b| &b.status == s));
+                            let groups = group_statuses(&self.beads);
+                            self.collapsed.retain(|s| groups.contains(s));
                             // An in-flight pre-mutation snapshot must not consume
                             // the new ID before the trailing refresh can see it.
                             let preferred = if self.refresh_pending {
@@ -1069,8 +1074,12 @@ impl App {
                                     self.select(i);
                                 }
                             } else if let Some(status) = collapse_context.filter(|status| {
-                                self.collapsed.contains(status)
-                                    && self.beads.iter().any(|bead| bead.status == *status)
+                                groups.contains(status)
+                                    && (self.collapsed.contains(status)
+                                        || !self
+                                            .beads
+                                            .iter()
+                                            .any(|bead| display_status(bead) == status))
                             }) {
                                 self.focus_collapsed_group(status);
                             } else if let Some(i) = same_id {
@@ -2815,10 +2824,18 @@ pub struct ListTarget {
     pub height: usize,
 }
 pub fn group_statuses(beads: &[Bead]) -> Vec<String> {
-    let mut groups = beads
-        .iter()
-        .map(|b| display_status(b).to_owned())
-        .collect::<Vec<_>>();
+    let mut groups = [
+        "open",
+        "ready",
+        "in_progress",
+        "blocked",
+        "deferred",
+        "closed",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .chain(beads.iter().map(|b| display_status(b).to_owned()))
+    .collect::<Vec<_>>();
     groups.sort_by(|a, b| status_order(a).cmp(&status_order(b)).then_with(|| a.cmp(b)));
     groups.dedup();
     groups
@@ -3288,7 +3305,17 @@ mod tests {
         a.beads[0].data["issue_type"] = json!("task");
         a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
         assert_eq!(a.beads[0].status, "open");
-        assert_eq!(group_statuses(&a.beads), ["open", "ready"]);
+        assert_eq!(
+            group_statuses(&a.beads),
+            [
+                "open",
+                "ready",
+                "blocked",
+                "deferred",
+                "in_progress",
+                "closed"
+            ]
+        );
         let layout = list_layout(&a.beads, &HashSet::new());
         assert_eq!(layout.groups[1].indices, [0]);
         a.select(0);
@@ -4998,7 +5025,7 @@ mod tests {
         a.beads[2].status = "open".into();
         a.beads[3].status = " \t ".into();
         let layout = list_layout(&a.beads, &HashSet::from(["blocked".into()]));
-        assert_eq!(layout.height, 14);
+        assert_eq!(layout.height, 20);
         assert_eq!(
             layout
                 .groups
@@ -5007,9 +5034,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 ("open", 0, 4, false),
-                ("blocked", 4, 2, true),
-                ("unknown", 6, 4, false),
-                ("closed", 10, 4, false)
+                ("ready", 4, 2, false),
+                ("blocked", 6, 2, true),
+                ("deferred", 8, 2, false),
+                ("in_progress", 10, 2, false),
+                ("unknown", 12, 4, false),
+                ("closed", 16, 4, false)
             ]
         );
         assert_eq!(
@@ -5018,7 +5048,7 @@ mod tests {
                 .iter()
                 .map(|g| g.indices.clone())
                 .collect::<Vec<_>>(),
-            [vec![2], vec![1], vec![3], vec![0]]
+            [vec![2], vec![], vec![1], vec![], vec![], vec![3], vec![0]]
         );
         assert_eq!(
             layout.targets,
@@ -5034,43 +5064,60 @@ mod tests {
                     height: 2
                 },
                 ListTarget {
-                    row: DisplayRow::Group("blocked".into()),
+                    row: DisplayRow::Group("ready".into()),
                     y: 4,
                     height: 1
                 },
                 ListTarget {
-                    row: DisplayRow::Group("unknown".into()),
+                    row: DisplayRow::Group("blocked".into()),
                     y: 6,
                     height: 1
                 },
                 ListTarget {
-                    row: DisplayRow::Bead(3),
-                    y: 7,
-                    height: 2
+                    row: DisplayRow::Group("deferred".into()),
+                    y: 8,
+                    height: 1
                 },
                 ListTarget {
-                    row: DisplayRow::Group("closed".into()),
+                    row: DisplayRow::Group("in_progress".into()),
                     y: 10,
                     height: 1
                 },
                 ListTarget {
+                    row: DisplayRow::Group("unknown".into()),
+                    y: 12,
+                    height: 1
+                },
+                ListTarget {
+                    row: DisplayRow::Bead(3),
+                    y: 13,
+                    height: 2
+                },
+                ListTarget {
+                    row: DisplayRow::Group("closed".into()),
+                    y: 16,
+                    height: 1
+                },
+                ListTarget {
                     row: DisplayRow::Bead(0),
-                    y: 11,
+                    y: 17,
                     height: 2
                 },
             ]
         );
-        assert_eq!(
-            list_layout(&[], &HashSet::new()),
-            ListLayout {
-                groups: vec![],
-                targets: vec![],
-                height: 0
-            }
+        let empty = list_layout(&[], &HashSet::new());
+        assert_eq!(empty.groups.len(), 6);
+        assert_eq!(empty.height, 12);
+        assert!(empty.groups.iter().all(|group| group.indices.is_empty()));
+        assert!(
+            empty
+                .targets
+                .iter()
+                .all(|target| matches!(target.row, DisplayRow::Group(_)))
         );
         a.beads[1].status = "unknown".into();
         assert_eq!(
-            list_layout(&a.beads, &HashSet::new()).groups[1].indices,
+            list_layout(&a.beads, &HashSet::new()).groups[5].indices,
             [1, 3]
         );
     }
@@ -5490,10 +5537,12 @@ mod tests {
         a.step(-1);
         assert_eq!(a.selected, Some(0));
         a.step(20);
-        assert_eq!(a.selected, Some(3));
+        assert_eq!(a.collapse_context.as_deref(), Some("closed"));
+        assert!(a.selected.is_none());
         a.beads.clear();
         a.step(1);
         assert_eq!(a.selected, None);
+        assert_eq!(a.collapse_context.as_deref(), Some("closed"));
     }
     #[test]
     fn status_groups_sort_open_middle_closed_and_unknown() {
@@ -5504,7 +5553,15 @@ mod tests {
         a.beads[3].status = "".into();
         assert_eq!(
             group_statuses(&a.beads),
-            ["open", "blocked", "unknown", "closed"]
+            [
+                "open",
+                "ready",
+                "blocked",
+                "deferred",
+                "in_progress",
+                "unknown",
+                "closed"
+            ]
         );
     }
     #[test]
@@ -5516,18 +5573,24 @@ mod tests {
         a.beads[3].status = "open".into();
         press(&mut a, KeyCode::Char(' '));
         assert_collapsed_header_selected(&a, "open");
-        press(&mut a, KeyCode::Down);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_bead(&a, "b1");
         press(&mut a, KeyCode::Char(' '));
         assert_eq!(a.collapsed.len(), 2);
         assert_collapsed_header_selected(&a, "closed");
-        press(&mut a, KeyCode::Up);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Up);
+        }
         assert_collapsed_header_selected(&a, "open");
         press(&mut a, KeyCode::Char(' '));
         assert_bead(&a, "b0");
         press(&mut a, KeyCode::Down);
         assert_bead(&a, "b3");
-        press(&mut a, KeyCode::Down);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_collapsed_header_selected(&a, "closed");
         press(&mut a, KeyCode::Right);
         assert_bead(&a, "b1");
@@ -5623,18 +5686,28 @@ mod tests {
         a.beads[3].status = "closed".into();
         a.select(1);
         press(&mut a, KeyCode::Down);
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        press(&mut a, KeyCode::Down);
         assert_bead(&a, "b2");
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
         press(&mut a, KeyCode::Up);
         assert_bead(&a, "b1");
-        press(&mut a, KeyCode::Down);
-        press(&mut a, KeyCode::Down);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_bead(&a, "b3");
         press(&mut a, KeyCode::Down);
         assert_bead(&a, "b3");
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.collapse_context.as_deref(), Some("in_progress"));
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.collapse_context.as_deref(), Some("deferred"));
         press(&mut a, KeyCode::Up);
         assert_bead(&a, "b2");
-        press(&mut a, KeyCode::Up);
-        press(&mut a, KeyCode::Up);
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Up);
+        }
         assert_bead(&a, "b0");
         press(&mut a, KeyCode::Up);
         assert_bead(&a, "b0");
@@ -5648,6 +5721,8 @@ mod tests {
         a.collapsed.insert("blocked".into());
         a.select(1);
         press(&mut a, KeyCode::Down);
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        press(&mut a, KeyCode::Down);
         assert_collapsed_header_selected(&a, "blocked");
         press(&mut a, KeyCode::Right);
         assert_bead(&a, "b2");
@@ -5658,12 +5733,18 @@ mod tests {
         press(&mut a, KeyCode::Up);
         assert_collapsed_header_selected(&a, "open");
         press(&mut a, KeyCode::Down);
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        press(&mut a, KeyCode::Down);
         assert_collapsed_header_selected(&a, "blocked");
-        press(&mut a, KeyCode::Down);
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_collapsed_header_selected(&a, "closed");
         press(&mut a, KeyCode::Down);
         assert_collapsed_header_selected(&a, "closed");
-        press(&mut a, KeyCode::Up);
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Up);
+        }
         assert_collapsed_header_selected(&a, "blocked");
         press(&mut a, KeyCode::Right);
         assert_bead(&a, "b2");
@@ -5718,7 +5799,7 @@ mod tests {
         let mut a = app();
         a.list_rect = Rect::new(0, 0, 30, 16);
         a.select(3);
-        for (x, y) in [(0, 0), (0, 3), (29, 3), (4, 9), (4, 10), (4, 15), (4, 16)] {
+        for (x, y) in [(0, 0), (0, 3), (29, 3), (4, 9), (4, 11), (4, 13), (4, 16)] {
             a.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
             assert_bead(&a, "b3");
             assert!(a.collapsed.is_empty());
@@ -5790,10 +5871,10 @@ mod tests {
         respond(&mut a, Response::List(Ok(items)));
         assert_bead(&a, "b0");
         let layout = list_layout(&a.beads, &a.collapsed);
-        assert_eq!(layout.groups.len(), 2);
+        assert_eq!(layout.groups.len(), 6);
         assert!(!layout.groups[0].collapsed);
-        assert!(layout.groups[1].collapsed);
-        assert_eq!(layout.groups[1].indices, vec![1]);
+        assert!(layout.groups[5].collapsed);
+        assert_eq!(layout.groups[5].indices, vec![1]);
         assert!(
             !layout
                 .targets
@@ -5801,7 +5882,9 @@ mod tests {
                 .any(|target| target.row == DisplayRow::Bead(1))
         );
 
-        press(&mut a, KeyCode::Down);
+        for _ in 0..5 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_collapsed_header_selected(&a, "closed");
         press(&mut a, KeyCode::Right);
         assert_bead(&a, "b1");
@@ -5813,16 +5896,17 @@ mod tests {
         assert_collapsed_header_selected(&a, "closed");
     }
     #[test]
-    fn closed_group_defaults_when_it_first_appears_after_an_empty_list() {
+    fn closed_group_defaults_on_first_empty_list_and_remains_collapsed() {
         let mut a = unloaded_app();
         respond(&mut a, Response::List(Ok(vec![])));
-        assert!(a.closed_default_pending);
-        assert!(a.collapsed.is_empty());
+        assert!(!a.closed_default_pending);
+        assert!(a.collapsed.contains("closed"));
 
         let mut items = app().beads;
         items.truncate(2);
         respond(&mut a, Response::List(Ok(items.clone())));
-        assert!(a.closed_default_pending);
+        assert!(!a.closed_default_pending);
+        assert!(a.collapsed.contains("closed"));
         assert_bead(&a, "b0");
 
         items[1].status = "closed".into();
@@ -5830,6 +5914,36 @@ mod tests {
         assert!(!a.closed_default_pending);
         assert!(a.collapsed.contains("closed"));
         assert_bead(&a, "b0");
+    }
+    #[test]
+    fn empty_group_headers_remain_keyboard_and_mouse_targets_without_issue_actions() {
+        let mut a = unloaded_app();
+        respond(&mut a, Response::List(Ok(vec![])));
+        let layout = list_layout(&a.beads, &a.collapsed);
+        assert_eq!(layout.groups.len(), 6);
+        assert!(layout.groups.iter().all(|group| group.indices.is_empty()));
+
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.collapse_context.as_deref(), Some("open"));
+        press(&mut a, KeyCode::Char(' '));
+        assert!(a.collapsed.contains("open"));
+        press(&mut a, KeyCode::Char(' '));
+        assert!(!a.collapsed.contains("open"));
+        assert_eq!(a.collapse_context.as_deref(), Some("open"));
+        press(&mut a, KeyCode::Char('d'));
+        assert!(a.modal.is_none());
+        assert!(a.selected.is_none());
+        assert!(a.detail.is_none());
+
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        respond(&mut a, Response::List(Ok(vec![])));
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        a.list_rect = Rect::new(0, 0, 30, 16);
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 2);
+        assert!(a.collapsed.contains("ready"));
+        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
+        assert!(a.selected.is_none());
     }
     #[test]
     fn closed_only_workspace_keeps_header_keyboard_accessible() {
@@ -5840,7 +5954,9 @@ mod tests {
         respond(&mut a, Response::List(Ok(items)));
         assert!(a.collapsed.contains("closed"));
         assert!(a.selected.is_none());
-        press(&mut a, KeyCode::Down);
+        for _ in 0..6 {
+            press(&mut a, KeyCode::Down);
+        }
         assert_collapsed_header_selected(&a, "closed");
         press(&mut a, KeyCode::Right);
         assert_bead(&a, "b0");
@@ -5922,7 +6038,10 @@ mod tests {
         assert!(a.collapse_context.is_none());
         assert!(a.selected.is_none());
         assert!(a.detail.is_none());
-        assert!(a.collapsed.is_empty());
+        assert_eq!(
+            a.collapsed,
+            HashSet::from(["open".to_owned(), "closed".to_owned()])
+        );
     }
     #[test]
     fn preferred_id_expands_destination_and_selects_created_bead() {
