@@ -774,7 +774,9 @@ impl App {
             && now >= self.worktrees_next_refresh
         {
             self.worktrees_inflight = true;
-            self.worktrees_loading = true;
+            // Only the initial scan hides empty-state guidance. A refresh or
+            // retry keeps the settled view visible while the request is in flight.
+            self.worktrees_loading = !self.worktrees_discovered && self.worktrees_error.is_none();
             let policy = CleanupPolicy {
                 auto_merge: self.settings.auto_merge,
                 auto_merge_children: self.settings.auto_merge_children,
@@ -6924,6 +6926,76 @@ mod tests {
         assert!(matches!(requests.try_recv(), Ok(Request::RestartWorktree(id)) if id == "wt-1"));
         assert!(app.mutation_busy);
     }
+    #[test]
+    fn empty_worktree_view_stays_rendered_through_refresh_and_error_retry() {
+        use ratatui::{Terminal, backend::TestBackend};
+
+        for (width, height) in [(120, 24), (64, 16)] {
+            let (mut app, requests, responses) = connected_app();
+            app.worktrees_view = true;
+            app.worktrees_discovered = false;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut frame = |app: &mut App| {
+                terminal
+                    .draw(|f| crate::ui::render(f, Duration::from_secs(2), app))
+                    .unwrap();
+                terminal.backend().buffer().clone()
+            };
+            let now = Instant::now();
+            app.poll_worktrees(now);
+            assert!(matches!(requests.try_recv(), Ok(Request::ListWorktrees)));
+            assert!(app.worktrees_loading, "initial discovery stays quiet");
+            let initial = frame(&mut app);
+            responses.send(Response::Worktrees(Ok(vec![]))).unwrap();
+            app.receive_at(now);
+            let settled = frame(&mut app);
+            assert_ne!(initial, settled, "completed discovery shows guidance");
+
+            for cycle in 1..=3 {
+                let now = now + REFRESH_INTERVAL * cycle;
+                app.poll_worktrees(now);
+                assert!(matches!(requests.try_recv(), Ok(Request::ListWorktrees)));
+                assert_eq!(frame(&mut app), settled, "background scan hides no text");
+                app.poll_worktrees(now + REFRESH_INTERVAL * 10);
+                assert!(requests.try_recv().is_err(), "requests remain bounded");
+                responses.send(Response::Worktrees(Ok(vec![]))).unwrap();
+                app.receive_at(now);
+                assert_eq!(frame(&mut app), settled);
+            }
+
+            press(&mut app, KeyCode::Char('r'));
+            assert!(matches!(requests.try_recv(), Ok(Request::ListWorktrees)));
+            assert_eq!(frame(&mut app), settled, "manual refresh hides no text");
+            responses
+                .send(Response::Worktrees(Err(std::io::Error::other(
+                    "registry unavailable",
+                ))))
+                .unwrap();
+            app.receive_at(now);
+            assert_eq!(app.worktrees_error.as_deref(), Some("registry unavailable"));
+            let failed = frame(&mut app);
+            assert_ne!(failed, settled, "scan errors render in the header");
+            app.poll_worktrees(now + REFRESH_INTERVAL);
+            assert!(matches!(requests.try_recv(), Ok(Request::ListWorktrees)));
+            assert_eq!(frame(&mut app), failed, "retry preserves empty guidance");
+            responses.send(Response::Worktrees(Ok(vec![]))).unwrap();
+            app.receive_at(now);
+            assert_eq!(frame(&mut app), settled, "success clears the error");
+
+            app.poll_worktrees(now + REFRESH_INTERVAL);
+            assert!(matches!(requests.try_recv(), Ok(Request::ListWorktrees)));
+            responses
+                .send(Response::Worktrees(Ok(vec![observed_row(
+                    "new-handoff",
+                    worktrees::WorktreeStatus::InProgress,
+                )])))
+                .unwrap();
+            app.receive_at(now);
+            assert_eq!(app.worktrees.len(), 1);
+            assert_ne!(frame(&mut app), settled, "new work replaces empty guidance");
+        }
+    }
+
     #[test]
     fn worktree_worker_polls_without_queue_growth_and_surfaces_errors() {
         let (mut a, rx, tx) = connected_app();

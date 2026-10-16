@@ -264,6 +264,13 @@ List results are sorted deterministically by status (open first, closed last, ot
 The list row's first line derives issue type from the retained `Bead.data` (`issue_type`, with `type` as a fallback); it does not replace the internal bead ID. Type, priority, and status spans each have a semantic colour helper in `src/ui.rs`; the display-width-aware metadata columns are shared across the list. Preserve white title text independently of selection emphasis and keep missing/custom types safe to display.
 ## Tracked worktree lifecycle
 
+`worktrees_inflight` bounds pending scans independently of `worktrees_loading`,
+which hides empty-state guidance only during initial discovery without a prior
+scan error. Background refreshes and retries retain the settled empty view.
+The refresh regression renders terminal buffers at normal and compact sizes
+across initial discovery, repeated polls, manual refresh, failure/retry, and
+the arrival of a new handoff to catch text disappearing between frames.
+
 OnTrack records only worktrees created by its own explicit Herdr actions; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
 from Beads: a closed or missing Bead does not remove the managed-worktree record.
