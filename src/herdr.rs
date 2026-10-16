@@ -437,7 +437,7 @@ fn handoff_with_mode(
             )
         } else {
             format!(
-                "Prompt sent to {} · workspace {} · pane {} · branch {}. Handoff is not proof the bead is complete.",
+                "Prompt sent to {} · workspace {} · pane {} · branch {}.",
                 agent.label, outcome.workspace_id, outcome.pane_id, outcome.branch
             )
         },
@@ -2266,9 +2266,10 @@ mod tests {
             NAME,
         )
         .unwrap();
-        assert!(outcome.message.contains("wNew:p1"));
-        assert!(outcome.message.contains(BRANCH));
-        assert!(outcome.message.contains("not proof"));
+        assert_eq!(
+            outcome.message,
+            format!("Prompt sent to Codex · workspace wNew · pane wNew:p1 · branch {BRANCH}.")
+        );
         let submitted = &executor.mutations()[2][3];
         assert!(
             submitted.contains("unknown_nested"),
