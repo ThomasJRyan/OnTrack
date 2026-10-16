@@ -437,12 +437,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             .worktree_offset
             .min(app.worktrees.len().saturating_sub(visible));
         let mut rows = Vec::new();
-        if app.worktrees.is_empty() {
-            rows.push(Line::from(if app.worktrees_loading {
-                "Checking tracked handoffs…"
-            } else {
-                "No outstanding OnTrack-tracked handoffs."
-            }));
+        if app.worktrees.is_empty() && !app.worktrees_loading {
+            rows.push(Line::from("No outstanding OnTrack-tracked handoffs."));
             rows.push(Line::from("Existing worktrees are not adopted."));
         }
         for (index, item) in app
