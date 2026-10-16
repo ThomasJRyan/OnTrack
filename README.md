@@ -12,6 +12,8 @@ curl -fsSLo install-ontrack.sh https://raw.githubusercontent.com/ThomasJRyan/OnT
 
 The installer puts `ontrack` in `~/.local/bin` by default. Add that directory to `PATH` if needed, then run `ontrack` from the Git workspace you want to browse. See the [installation guide](docs/installation.md) for supported architectures, updates, and troubleshooting.
 
+To remove the installed executable and OnTrack user settings, run `ontrack uninstall` and confirm the printed paths. Beads and Herdr remain installed; see [uninstall details](docs/installation.md#uninstall).
+
 - Browse open and closed Beads, with explicit create, edit, and permanent-delete actions.
 - Mark open Tasks Ready, or mark an Epic and all its open descendant Tasks Ready together. Press `r` again to unready an unsent Task; sent Tasks stay Ready until their Beads status becomes In Progress. The scheduler prepares a Ready Epic's checkout and hands eligible child Tasks to Herdr agents. Set a concurrent agent limit in Settings (five by default).
 - Press `Shift+N` on an open task to create a child task. Child issues appear indented beneath their parent within a status pane. Parent handoff waits for children, and completed child work automatically requests integration into the managed parent worktree by default; Settings can turn this off.

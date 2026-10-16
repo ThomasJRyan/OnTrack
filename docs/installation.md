@@ -76,14 +76,31 @@ curl -fsSL https://raw.githubusercontent.com/ThomasJRyan/OnTrack/main/scripts/in
 The replacement is staged in the destination directory and renamed only after
 download, SHA-256 verification, and extraction succeed. Restart any running
 OnTrack process to use the new executable. The installer refuses a destination
-symlink. To uninstall the default installation, remove only its executable:
+symlink.
+
+## Uninstall
+
+Run the installed executable from any directory, including one without a Beads
+workspace:
 
 ```sh
-rm "$HOME/.local/bin/ontrack"
+ontrack uninstall
 ```
 
-For a custom directory, remove `DIR/ontrack`. Removing the executable does not
-remove Beads databases, Herdr workspaces, or OnTrack settings.
+The command prints the path of the running executable and the OnTrack settings
+directory, then requires you to type `yes`. Use `ontrack uninstall --yes` in a
+script when you have already reviewed those paths. It removes the running
+`ontrack` executable, including one installed in a custom directory, and the
+`ontrack` directory under `$XDG_CONFIG_HOME` or `$HOME/.config`. An absent
+settings directory is fine. If either target is a symlink or has an unexpected
+type or name, it stops before removal. A failure deleting settings leaves the
+executable for a retry.
+
+Beads (`bd`) and Herdr remain installed. Project-local Beads records,
+screenshots, Git worktree registries, and Herdr workspaces are retained because
+they may contain project history or active work. Review those within each
+workspace before removing them separately. Other OnTrack processes already
+running will continue until they exit.
 
 ## Troubleshooting
 

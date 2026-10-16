@@ -12,6 +12,7 @@ mod startup;
 mod terminal;
 mod theme;
 mod ui;
+mod uninstall;
 mod update;
 mod updates;
 mod worktrees;
@@ -19,6 +20,24 @@ mod worktrees;
 use std::{error::Error, io};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    match std::env::args_os().skip(1).collect::<Vec<_>>().as_slice() {
+        [] => {}
+        [command] if command == "uninstall" => {
+            uninstall::run(false)?;
+            return Ok(());
+        }
+        [command, flag] if command == "uninstall" && flag == "--yes" => {
+            uninstall::run(true)?;
+            return Ok(());
+        }
+        [flag] if flag == "--help" || flag == "-h" => {
+            println!(
+                "Usage: ontrack [uninstall [--yes]]\n\nRun without arguments to browse the current Beads workspace.\nUninstall removes the running OnTrack executable and user settings after confirmation."
+            );
+            return Ok(());
+        }
+        _ => return Err("Usage: ontrack [uninstall [--yes]]".into()),
+    }
     if !startup::ensure_workspace()? {
         return Ok(());
     }
