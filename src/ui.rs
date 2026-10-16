@@ -287,32 +287,9 @@ fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
 }
 fn render_header(f: &mut Frame, area: Rect, left: Line<'static>, app: &App) {
     let palette = crate::theme::definition(app.theme).palette;
-    let mut left_area = area;
-    if let Some(version) = &app.update_available {
-        let full = format!(" UPDATE AVAILABLE · v{version} ");
-        let badge = if usize::from(area.width) > left.width() + Span::raw(&full).width() {
-            full.as_str()
-        } else {
-            " UPDATE "
-        };
-        let badge_width = Span::raw(badge).width() as u16;
-        if area.width > badge_width + 7 {
-            left_area.width = area.width - badge_width;
-            f.render_widget(
-                Paragraph::new(Span::styled(
-                    badge.to_owned(),
-                    Style::default()
-                        .fg(palette.warning)
-                        .add_modifier(Modifier::BOLD),
-                ))
-                .alignment(Alignment::Right),
-                Rect::new(area.x + left_area.width, area.y, badge_width, 1),
-            );
-        }
-    }
     f.render_widget(
         Paragraph::new(left).style(Style::default().fg(palette.foreground)),
-        left_area,
+        area,
     );
 }
 fn render_header_feedback(f: &mut Frame, area: Rect, message: Option<&str>, theme: Theme) {
@@ -991,7 +968,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 FORM_DESCRIPTION_WIDTH as u16 + 6
             }
             crate::app::Modal::Settings { .. } => 64,
-            crate::app::Modal::Release | crate::app::Modal::ConfirmUpdate(_) => 76,
             _ => 62,
         }
         .min(a.width.saturating_sub(2));
@@ -1067,9 +1043,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
             crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
-            crate::app::Modal::Release => 12,
-            crate::app::Modal::ConfirmUpdate(_) => 10,
-            crate::app::Modal::InstallingUpdate(_) => 8,
         };
         let min_width = if matches!(
             modal,
@@ -1078,10 +1051,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             70
         } else if matches!(
             modal,
-            crate::app::Modal::Settings { .. }
-                | crate::app::Modal::EditLoading { .. }
-                | crate::app::Modal::Release
-                | crate::app::Modal::ConfirmUpdate(_)
+            crate::app::Modal::Settings { .. } | crate::app::Modal::EditLoading { .. }
         ) {
             38
         } else {
@@ -1127,9 +1097,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 }
                 crate::app::Modal::ConfirmGenerateEpic { .. } => " GENERATE EPIC TASKS? ",
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
-                crate::app::Modal::Release => " ONTRACK RELEASE ",
-                crate::app::Modal::ConfirmUpdate(_) => " UPDATE ONTRACK? ",
-                crate::app::Modal::InstallingUpdate(_) => " INSTALLING ONTRACK ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
                 crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
                 _ => " DELETE BEAD? ",
@@ -1145,54 +1112,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             area.height.saturating_sub(2),
         );
         match modal {
-            crate::app::Modal::Release => {
-                let version = env!("CARGO_PKG_VERSION");
-                let result = if app.update_preparing {
-                    "Checking for a compatible release asset…".to_owned()
-                } else if app.release_inflight {
-                    "Checking GitHub for the latest release…".to_owned()
-                } else {
-                    match app.release_result.as_ref() {
-                        Some(Ok(crate::release::CheckResult::Available { version, url })) => {
-                            format!(
-                                "Update available: v{version}\n\nRelease link:\n{url}\n\nPress i to prepare installation."
-                            )
-                        }
-                        Some(Ok(crate::release::CheckResult::Current { .. })) => {
-                            "You are running the latest published release.".into()
-                        }
-                        Some(Ok(crate::release::CheckResult::NoPublishedRelease)) => {
-                            "No public OnTrack release is available.".into()
-                        }
-                        Some(Err(error)) => format!("Update check failed: {error}"),
-                        None => "Check not started.".into(),
-                    }
-                };
-                f.render_widget(
-                    Paragraph::new(format!(
-                        "Running version: v{version}\n\n{result}\n\nr check again · Esc return to browser"
-                    ))
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(ink)),
-                    inner,
-                );
-            }
-            crate::app::Modal::ConfirmUpdate(release) => {
-                f.render_widget(
-                    Paragraph::new(format!("OnTrack {} is available.\n\n{}\n\nInstall the verified release?\ny confirm · n / Esc cancel", release.version, release.page))
-                        .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(ink)),
-                    inner,
-                );
-            }
-            crate::app::Modal::InstallingUpdate(version) => {
-                f.render_widget(
-                    Paragraph::new(format!("Downloading and verifying OnTrack {version}…\n\nEsc or c cancels before replacement.\nKeep this session open until the result appears."))
-                        .wrap(Wrap { trim: false })
-                        .style(Style::default().fg(ink)),
-                    inner,
-                );
-            }
             crate::app::Modal::EditLoading { id, error, .. } => {
                 let message = error.as_ref().map_or_else(
                     || format!("Loading {id}…"),
@@ -2012,7 +1931,6 @@ fn footer_text(width: usize, epic: bool) -> String {
         " · N child",
         " · s settings",
         " · w worktrees",
-        " · u update",
         " · Ctrl+? keys",
     ] {
         if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
@@ -2421,11 +2339,6 @@ mod tests {
             handoff: Default::default(),
             handoff_capacity: Default::default(),
             toast: None,
-            release_result: None,
-            release_inflight: false,
-            update_preparing: false,
-            release_cancel: None,
-            update_available: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
@@ -2468,44 +2381,6 @@ mod tests {
             requests: tx,
             responses,
         }
-    }
-    #[test]
-    fn release_dialog_shows_version_link_and_error() {
-        let mut state = app();
-        state.modal = Some(crate::app::Modal::Release);
-        state.release_result = Some(Ok(crate::release::CheckResult::Available {
-            version: semver::Version::parse("1.2.0").unwrap(),
-            url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
-        }));
-        let screen = draw((100, 24), &mut state).0;
-        assert!(screen.contains("Update available: v1.2.0"));
-        assert!(screen.contains("https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0"));
-        assert!(screen.contains("Press i to prepare installation"));
-        state.release_result = Some(Err("offline".into()));
-        assert!(
-            draw((100, 24), &mut state)
-                .0
-                .contains("Update check failed: offline")
-        );
-    }
-    #[test]
-    fn update_confirmation_and_install_progress_show_actions() {
-        let mut state = app();
-        let release = crate::update::Available {
-            version: "1.2.0".into(),
-            page: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
-            asset_name: "archive.tar.gz".into(),
-            asset_url: String::new(),
-            checksum_url: String::new(),
-            digest: None,
-        };
-        state.modal = Some(crate::app::Modal::ConfirmUpdate(release));
-        let screen = draw((100, 24), &mut state).0;
-        assert!(screen.contains("Install the verified release?"));
-        assert!(screen.contains("y confirm"));
-        state.modal = Some(crate::app::Modal::InstallingUpdate("1.2.0".into()));
-        let screen = draw((100, 24), &mut state).0;
-        assert!(screen.contains("Esc or c cancels before replacement"));
     }
     fn draw(size: (u16, u16), a: &mut App) -> (String, Rect) {
         let mut t = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
@@ -2568,36 +2443,6 @@ mod tests {
         let help = draw_at((60, 18), Duration::ZERO, &mut app);
         assert!(help.contains("HOTKEYS"));
         assert!(!help.contains(".-\"\"\"-."));
-    }
-    #[test]
-    fn update_badge_fits_headers_and_survives_a_handoff_toast() {
-        let mut app = app();
-        app.update_available = Some("0.2.0".into());
-        let wide = draw_at((100, 24), SPLASH_DURATION, &mut app);
-        assert!(wide.contains("UPDATE AVAILABLE · v0.2.0"));
-        assert!(wide.contains("ONTRACK  /  WORKSPACE ISSUES"));
-
-        let compact = draw_at((24, 7), SPLASH_DURATION, &mut app);
-        assert!(compact.contains("UPDATE"));
-        assert!(compact.contains("BEADS"));
-
-        app.worktrees_view = true;
-        let worktrees = draw_at((100, 24), SPLASH_DURATION, &mut app);
-        assert!(worktrees.contains("UPDATE AVAILABLE · v0.2.0"));
-        assert!(worktrees.contains("WORKTREES"));
-
-        app.toast = Some(crate::app::Toast {
-            message: "Agent started".into(),
-            error: false,
-            expires_at: None,
-        });
-        let with_toast = draw_at((100, 24), SPLASH_DURATION, &mut app);
-        assert!(with_toast.contains("HERDR"));
-        assert!(with_toast.contains("Agent started"));
-        app.toast = None;
-        assert!(
-            draw_at((100, 24), SPLASH_DURATION, &mut app).contains("UPDATE AVAILABLE · v0.2.0")
-        );
     }
     #[test]
     fn hotkey_reference_has_columns_and_scrolls_in_compact_terminals() {
@@ -3278,7 +3123,7 @@ mod tests {
             assert!(!footer.contains("READY"));
         }
         assert!(footer_text(120, false).contains("N child"));
-        assert!(footer_text(120, false).contains("u update"));
+        assert!(!footer_text(120, false).contains("u update"));
         assert!(footer_text(120, false).contains("Ctrl+? keys"));
         let mut app = app();
         let original = draw((120, 24), &mut app).0;

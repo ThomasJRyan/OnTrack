@@ -8,7 +8,7 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Defines the terminal type, checks the Herdr launch context and Beads workspace, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
+| `src/main.rs` | Dispatches `update` and `uninstall` before checking the Herdr launch context and Beads workspace; initializes, runs, and restores the browser terminal. |
 | `src/startup.rs` | Requires the Herdr pane marker, then discovers the active workspace through Beads; prints manual initialization guidance and exits when none exists. |
 | `src/uninstall.rs` | Validates and removes the running executable and user settings after explicit CLI confirmation, before Beads discovery or terminal setup. |
 | `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, and worktree-cleanup preferences under the user's XDG config directory. |
@@ -20,7 +20,7 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 | `src/app.rs` | Holds selection, focus, scrolling, modal form and handoff toast state, cached data, loading/error state, and pane hit-test rectangles; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
 | `src/update.rs` | Reads the official GitHub release, selects a compatible asset, verifies SHA-256, and atomically replaces the executable. |
-| `src/updates.rs` | Checks the latest published GitHub release with a bounded `curl` request and compares its tag with the Cargo package version. |
+| `src/update_cli.rs` | Runs the explicit update command, reports release status, and confirms installation. |
 | `src/hotkeys.rs` | Maps the active pane or dialog to its keyboard command list and recognizes modified help-key reports. |
 | `src/ui.rs` | Renders splash, issue list, wrapped Markdown details, status, and top-right handoff toasts; maintains list visibility and scroll bounds. |
 | `src/detail.rs` | Presents complete issue records with Markdown rendering for narrative fields and readable structured fallbacks for metadata. |
@@ -28,7 +28,7 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 
 `src/ui.rs` renders the supplied centered ONTRACK wordmark and a terminal-drawn anime girl during the 1.2-second startup splash. `girl_frame` chooses the blink and wave pose from elapsed time supplied by `app::run`'s existing redraw loop, so the animation needs no separate timer or state. If the full wordmark and character do not fit, the renderer uses the compact ONTRACK title with the character when possible, then a text-only fallback. Width checks use terminal cell widths; preserve the wordmark verbatim, keep the splash centered and theme-aware, and ensure it yields to the normal browser view after startup.
 
-`App::new` starts a separate, one-shot update check thread so network delay cannot stall the Beads request worker or terminal startup. `updates::available_version` runs `curl` with a five-second limit against the repository's latest published release endpoint, parses its `tag_name`, and uses `semver` to compare it with `CARGO_PKG_VERSION`. Errors and absent/invalid release data yield no notice. The response stores only a newer version in app state. `ui::render_header` uses a full top-right badge where it fits and a compact badge in narrow headers; Herdr toasts render last and may temporarily cover it. Tests cover version comparisons, both headers, compact layout, and toast overlap.
+`ontrack update` handles release discovery before Herdr, Beads, or terminal browser initialization. Browser startup does not make a release request.
 
 In the managed-worktree view, Enter queues `herdr workspace focus WORKSPACE_ID` on the existing background worker. The ID comes from the selected OnTrack handoff, never global focus. The adapter passes arguments separately, rejects unsafe IDs, and requires Herdr's `workspace_focused` result to repeat the selected ID. Closed workspaces and removed checkouts are rejected before dispatch. Focus success and errors are shown in the view without changing Git, Beads, or the handoff registry.
 
@@ -164,7 +164,21 @@ Merge requests use the repository-wide registry lock and persist `merge_queue` o
 
 ## Background work and cached state
 
-The explicit `u` then `i` flow sends release checks, asset preparation, and installs from `App` to detached background tasks so downloads do not block input or Beads refresh. The initial release check is informational; asset preparation checks the latest release again and the confirmation shows the selected compatible version. The update module calls `curl` with fixed HTTPS endpoints and separate arguments, parses semantic versions, accepts `ontrack-vVERSION-TARGET.tar.gz` with a matching `.sha256` sidecar, and extracts only the `ontrack` entry from the archive. The selected target is one of glibc Linux or macOS on x86_64 or aarch64. Release URL and asset URL checks restrict downloads to the official tagged repository. Downloads and candidate executables are staged with unique names in the executable directory, and temporary files are removed on every error. SHA-256 is verified before extraction or replacement, including GitHub's API digest when present; the final rename is on the same filesystem. Failure before that rename leaves the original path untouched. The running process continues using its old image, so the UI instructs the user to restart. Cancellation is checked during the download and immediately before replacement; a request arriving after replacement has begun cannot undo a successful update. `curl` and `tar` are runtime prerequisites for this flow, while normal browsing does not need them.
+`ontrack update` calls `update::check` in the foreground, prints the running
+version and release status, and requires an explicit `y` or `yes` before calling
+`update::install`. The update module calls `curl` with fixed HTTPS endpoints and
+separate arguments, parses semantic versions, accepts
+`ontrack-vVERSION-TARGET.tar.gz` with a matching `.sha256` sidecar, and extracts
+only the `ontrack` entry from the archive. The selected target is one of glibc
+Linux or macOS on x86_64 or aarch64. Release URL and asset URL checks restrict
+downloads to the official tagged repository. Downloads and candidate
+executables are staged with unique names in the executable directory, and
+temporary files are removed on errors. SHA-256 is verified before extraction or
+replacement, including GitHub's API digest when present; the final rename is on
+the same filesystem. Failure before that rename leaves the original path
+untouched. A running browser process continues using its old image; restart it
+after success. `curl` and `tar` are runtime prerequisites for this command,
+while normal browsing does not need them.
 
 `App` uses standard-library channels with separate serial browser-Beads, Ready-mutation, and managed-work queues. Herdr discovery, harness discovery, manual/Ready launches, workspace focus, screenshot reads, and display-only agent observations are independent detached jobs. The UI loop receives available responses, draws, and polls input with a short timeout rather than waiting for subprocess completion. While any handoff is pending, worktree polling chooses the read-only list path instead of reconciliation. List and reconciliation display passes copy registry entries and release its lock before Git, Beads, or Herdr display checks; this lets another launch record its intent during a slow status lookup. Reconciliation still holds its lock while applying managed mutations, so launch journaling retains its bounded lock retry and recovery error.
 
@@ -182,9 +196,15 @@ Keep CLI calls off the input/render loop and preserve stale-response filtering w
 
 ## Release check
 
-`src/release.rs` queries the official `ThomasJRyan/OnTrack` GitHub Releases [`latest` endpoint](https://docs.github.com/en/rest/releases/releases#get-the-latest-release) with `curl`. GitHub's latest endpoint selects a published stable release; an HTTP 404 is reported as no public release available (which can also mean the repository is inaccessible). The response must have a semantic-version tag (an optional leading `v` is accepted) and an OnTrack GitHub release URL. The running version comes from `CARGO_PKG_VERSION`, and `semver` compares versions, including prerelease precedence. The HTTP request has connection and overall time limits and a response-size cap.
-
-Pressing `u` queues a check. The worker starts a separate request thread so a slow network call cannot hold the Beads request queue or terminal input loop. The result is kept in the app state and shown by the release dialog; closing the dialog does not cancel the check. `r` retries inside the dialog, and `i` prepares a compatible asset only when a newer release is shown. `check_with` accepts a controlled fetch function, allowing focused success, no-release, malformed-response, and network-error tests without GitHub access.
+`src/update.rs` queries the official `ThomasJRyan/OnTrack` GitHub Releases
+[`latest` endpoint](https://docs.github.com/en/rest/releases/releases#get-the-latest-release)
+with `curl`. It validates an official stable semantic-version tag and a
+compatible asset before offering installation. HTTP 404 yields a no-release
+result; unavailable assets and malformed metadata return errors. The running
+version comes from `CARGO_PKG_VERSION`; `semver` compares it with the release.
+`src/update_cli.rs` keeps the prompt and output separate from the browser;
+injected checker/installer tests cover current, no-release, error, decline, and
+confirmed-install paths without network access or executable replacement.
 
 ## Terminal cleanup invariants
 

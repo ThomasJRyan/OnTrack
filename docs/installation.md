@@ -68,15 +68,15 @@ discovery and prints guidance to open a Herdr workspace. See the
 
 ## Update and remove
 
-From a running OnTrack session, press `u` in the issue browser to check the
-latest stable release. When a newer version appears, press `i` to select an
-asset for this machine, then `y` to confirm installation. This path needs
-`curl`, `tar`, and write access to the directory containing the running
-executable. OnTrack verifies the published SHA-256 checksum before replacing
-it. `Esc` or `c` requests cancellation during download; network, permission,
-and verification failures leave the existing executable usable. Quit and
-restart OnTrack after success. See the [user guide](user-guide.md#update-ontrack)
-for the dialog and recovery steps.
+Run `ontrack update` from any terminal to check the latest stable release and
+install a compatible newer version after answering `y` or `yes` at its prompt.
+It does not open the browser or require Herdr or a Beads workspace. The command
+needs `curl` and `tar`, plus write access to the directory containing the
+running executable. It verifies the published SHA-256 checksum and stages the
+replacement beside the executable. A negative or empty answer leaves the
+executable unchanged; network, permission, and verification failures return an
+error before replacement. Restart any running OnTrack session after success.
+See the [user guide](user-guide.md#update-ontrack) for command output and recovery.
 
 An existing destination is left untouched unless `--replace` is explicit.
 Update by running the installer again with `--replace` and the same

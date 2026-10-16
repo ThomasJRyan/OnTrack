@@ -16,9 +16,6 @@ pub enum Context {
     Delete,
     GenerateEpic,
     WorktreeConfirm,
-    Release,
-    UpdateConfirm,
-    UpdateInstalling,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,9 +40,6 @@ impl Context {
             Some(Modal::ConfirmGenerateEpic { .. }) => Self::GenerateEpic,
             Some(Modal::ConfirmDelete { .. }) => Self::Delete,
             Some(Modal::ConfirmWorktree { .. }) => Self::WorktreeConfirm,
-            Some(Modal::Release) => Self::Release,
-            Some(Modal::ConfirmUpdate(_)) => Self::UpdateConfirm,
-            Some(Modal::InstallingUpdate(_)) => Self::UpdateInstalling,
             None if app.worktrees_view => Self::Worktrees,
             None if app.selected_is_epic() && app.focus_detail => Self::EpicDetails,
             None if app.selected_is_epic() => Self::EpicIssues,
@@ -67,9 +61,6 @@ impl Context {
             Self::GenerateEpic => "Generate Epic tasks",
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
-            Self::Release => "Release check",
-            Self::UpdateConfirm => "Update confirmation",
-            Self::UpdateInstalling => "Installing update",
         }
     }
 
@@ -92,7 +83,6 @@ impl Context {
                     "Toggle Ready for an open Task or Epic and its tasks",
                 ),
                 ("w", "Open outstanding worktrees"),
-                ("u", "Check for a newer OnTrack release"),
                 ("Esc", "Stay in the issue browser"),
             ],
             Self::Details | Self::EpicDetails => vec![
@@ -111,7 +101,6 @@ impl Context {
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
                 ("w", "Open outstanding worktrees"),
-                ("u", "Check for a newer OnTrack release"),
                 ("Esc", "Stay in the issue browser"),
             ],
             Self::Worktrees => vec![
@@ -173,16 +162,6 @@ impl Context {
                 ("n / N / Enter", "Cancel action"),
                 ("Esc", "Cancel action"),
             ],
-            Self::Release => vec![
-                ("r", "Check GitHub again"),
-                ("i", "Prepare a compatible release for installation"),
-                ("Esc", "Return to issue browser"),
-            ],
-            Self::UpdateConfirm => vec![
-                ("y / Y", "Install the verified release"),
-                ("n / N / Enter / Esc", "Cancel installation"),
-            ],
-            Self::UpdateInstalling => vec![("Esc / c", "Request cancellation before replacement")],
         };
         if matches!(self, Self::EpicIssues | Self::EpicDetails) {
             rows.push(("g", "Generate Epic child tasks after confirmation"));
