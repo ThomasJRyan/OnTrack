@@ -8,17 +8,23 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Output},
-    time::{Duration, Instant},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
 
-use crate::herdr::{Executor, RepositoryIdentity, SystemExecutor, envelope};
+use crate::herdr::{self, Executor, RepositoryIdentity, SystemExecutor, envelope};
 
 #[derive(Debug, Clone)]
 pub struct ManagedWorktree {
     pub id: String,
     pub bead_id: String,
+    pub parent_bead_id: Option<String>,
+    /// Herdr accepted the initial prompt and the active phase was persisted.
+    pub handoff_accepted: bool,
+    pub bead_title: Option<String>,
+    pub bead_description: Option<String>,
     pub branch: String,
     pub target_branch: String,
     pub workspace_id: String,
@@ -26,14 +32,77 @@ pub struct ManagedWorktree {
     pub detail: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AgentDisplay {
+    pub id: String,
+    pub workspace_id: String,
+    pub detail: String,
+}
+
+/// Read-only presentation evidence, never passed to merge/cleanup eligibility.
+pub(crate) fn observe_agents() -> io::Result<Vec<AgentDisplay>> {
+    observe_agents_with(&std::env::current_dir()?, &mut SystemExecutor)
+}
+
+fn observe_agents_with(cwd: &Path, executor: &mut impl Executor) -> io::Result<Vec<AgentDisplay>> {
+    let registry = LaunchJournal::open(cwd)?;
+    let entries = registry.entries.clone();
+    drop(registry);
+    Ok(entries.iter().filter(|entry| entry["workspace_closed"] != true && entry["checkout_removed"] != true && entry["phase"] != "reserved").map(|entry| {
+        let identity = format!("workspace {} · pane {} · branch {}", entry["workspace_id"].as_str().unwrap_or("unknown"), entry["pane_id"].as_str().unwrap_or("unknown"), entry["branch"].as_str().unwrap_or("unknown"));
+        let status = observe_entry(entry, executor).unwrap_or_else(|error| format!("unknown — {error}"));
+        AgentDisplay {
+            id: entry["id"].as_str().unwrap_or_default().into(),
+            workspace_id: entry["workspace_id"].as_str().unwrap_or_default().into(),
+            detail: format!("Agent observation (display only): {status} · {identity}. Not completion, retry, merge, or cleanup authorization."),
+        }
+    }).collect())
+}
+
+fn observe_entry(entry: &Value, executor: &mut impl Executor) -> io::Result<String> {
+    let pane = field(entry, "pane_id")?;
+    if pane.starts_with('-')
+        || !pane
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte))
+    {
+        return Err(error("Unsafe recorded pane identity"));
+    }
+    let result = envelope(&executor.run(&["agent", "get", pane])?)?;
+    let agent = &result["agent"];
+    if result["type"] != "agent_info"
+        || agent["pane_id"] != entry["pane_id"]
+        || agent["workspace_id"] != entry["workspace_id"]
+        || agent["agent"] != entry["agent"]
+    {
+        return Err(error("Agent pane/workspace/kind identity changed"));
+    }
+    if !entry["agent_session"].is_object() || agent["agent_session"] != entry["agent_session"] {
+        return Err(error("Recorded native agent session is missing or changed"));
+    }
+    if entry["initial_terminal_id"].is_string()
+        && agent["terminal_id"] != entry["initial_terminal_id"]
+    {
+        return Err(error("Recorded terminal identity changed"));
+    }
+    Ok(match agent["agent_status"].as_str() {
+        Some(status @ ("working" | "blocked" | "idle" | "done" | "error")) => status.to_owned(),
+        _ => "unknown".into(),
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorktreeStatus {
+    Reserved,
+    InProgress,
     Unmerged,
+    MergeQueued,
     MergeRequested,
     NeedsResolution,
     Integrated,
     WorkspaceClosed,
     CheckoutRemoved,
+    DirtyCheckout,
     NeedsAttention,
 }
 
@@ -44,11 +113,23 @@ pub enum Action {
     RemoveCheckout,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct CleanupPolicy {
     pub auto_merge: bool,
+    pub auto_merge_children: bool,
     pub auto_close_workspace: bool,
     pub auto_remove_checkout: bool,
+}
+
+impl Default for CleanupPolicy {
+    fn default() -> Self {
+        Self {
+            auto_merge: false,
+            auto_merge_children: true,
+            auto_close_workspace: false,
+            auto_remove_checkout: false,
+        }
+    }
 }
 
 fn error(message: impl Into<String>) -> io::Error {
@@ -101,14 +182,12 @@ fn ancestor(path: &Path, source: &str, target: &str) -> io::Result<bool> {
     }
 }
 
-fn clean(path: &Path) -> io::Result<()> {
-    if !git(path, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty() {
-        return Err(error(format!(
-            "Dirty checkout {}; commit/resolve changes first",
-            path.display()
-        )));
-    }
-    // Some in-progress operations can have a temporarily clean index/worktree.
+fn dirty(path: &Path) -> io::Result<bool> {
+    Ok(!git(path, &["status", "--porcelain=v1", "--untracked-files=all"])?.is_empty())
+}
+
+fn unfinished_operation(path: &Path) -> io::Result<()> {
+    // A clean-looking index can still be in the middle of an operation.
     for name in [
         "MERGE_HEAD",
         "CHERRY_PICK_HEAD",
@@ -129,6 +208,16 @@ fn clean(path: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn clean(path: &Path) -> io::Result<()> {
+    if dirty(path)? {
+        return Err(error(format!(
+            "Dirty checkout {}; commit/resolve changes first",
+            path.display()
+        )));
+    }
+    unfinished_operation(path)
 }
 
 /// Remote symbolic HEADs must agree. Without one, only the verified primary
@@ -348,15 +437,11 @@ fn field<'a>(entry: &'a Value, key: &str) -> io::Result<&'a str> {
 pub(crate) struct LaunchJournal {
     checkout: PathBuf,
     repo: RepositoryIdentity,
-    id: String,
     intent: Value,
-    #[cfg(test)]
-    fail_save_phase: Option<String>,
+    claim: String,
 }
 
 impl LaunchJournal {
-    // Managed reconciliation can hold the lock across external commands. Wait
-    // only on a background thread, boundedly, and never bypass its protection.
     fn open(checkout: &Path) -> io::Result<Registry> {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -371,18 +456,38 @@ impl LaunchJournal {
         }
     }
 
+    fn handle(checkout: &Path, registry: &Registry, intent: Value) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self {
+            checkout: checkout.to_path_buf(),
+            repo: registry.repo.clone(),
+            intent,
+            claim: format!(
+                "{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ),
+        }
+    }
+
     fn transaction<T>(&self, update: impl FnOnce(&mut Value) -> io::Result<T>) -> io::Result<T> {
         let mut registry = Self::open(&self.checkout)?;
         if registry.repo != self.repo {
             return Err(error("Launch journal repository identity changed"));
         }
-        let index = registry.index(&self.id)?;
+        let index = registry.index(field(&self.intent, "id")?)?;
         let entry = &mut registry.entries[index];
         for key in [
             "id",
             "bead_id",
             "branch",
             "target_branch",
+            "target_path",
+            "parent_bead_id",
             "common_dir",
             "main_root",
             "source_workspace",
@@ -393,34 +498,94 @@ impl LaunchJournal {
                 return Err(error(format!("Launch journal intent changed: {key}")));
             }
         }
-        let result = update(entry)?;
-        #[cfg(test)]
-        if self
-            .fail_save_phase
-            .as_ref()
-            .is_some_and(|phase| entry["phase"].as_str() == Some(phase))
+        if entry["launch_owner"] != self.intent["launch_owner"]
+            && entry["launch_owner"].as_str() != Some(&self.claim)
         {
-            return Err(error("Injected launch journal save failure"));
+            return Err(error(
+                "Reserved parent launch has been claimed by another handoff",
+            ));
         }
+        let result = update(entry)?;
         registry.save()?;
         Ok(result)
     }
-
     pub(crate) fn begin(
         checkout: &Path,
-        bead: &str,
-        branch: &str,
+        bead: &Value,
+        launch_branch: &str,
         agent: &str,
         name: &str,
         workspace: &str,
     ) -> io::Result<Self> {
-        let mut registry = Self::open(checkout)?;
-        let target = default_branch(&registry.repo)?;
-        clean(&registry.repo.main_root)?;
+        let bead_id = field(bead, "id")?;
+        let checkout = checkout.canonicalize()?;
+        let registry = Self::open(&checkout)?;
+        if let Some(index) = registry
+            .entries
+            .iter()
+            .position(|entry| entry["bead_id"] == bead_id && entry["phase"] == "reserved")
+        {
+            let entry = &registry.entries[index];
+            if field(entry, "id")? != name
+                || field(entry, "branch")? != launch_branch
+                || field(entry, "source_workspace")? != workspace
+            {
+                return Err(error("Reserved parent handoff identity changed"));
+            }
+            let journal = Self::handle(&checkout, &registry, entry.clone());
+            drop(registry);
+            // A snapshot is not authority to start: phase() atomically claims
+            // the still-reserved entry immediately before the start command.
+            verify(&journal.repo, &journal.intent)?;
+            return Ok(journal);
+        }
         if registry
             .entries
             .iter()
-            .any(|e| e["id"] == name || e["branch"] == branch)
+            .any(|entry| entry["bead_id"] == bead_id && entry["checkout_removed"] != true)
+        {
+            return Err(error("An OnTrack worktree already exists for this task"));
+        }
+        let repo = registry.repo.clone();
+        let entries = registry.entries.clone();
+        drop(registry);
+        let default = default_branch(&repo)?;
+        clean(&repo.main_root)?;
+        let parent_bead_id = bead["parent"].as_str();
+        let (target, target_path, base) = if let Some(parent_id) = parent_bead_id {
+            let parents: Vec<_> = entries
+                .iter()
+                .filter(|entry| {
+                    entry["bead_id"] == parent_id
+                        && matches!(entry["phase"].as_str(), Some("active" | "reserved"))
+                        && entry["checkout_removed"] != true
+                        && entry["workspace_closed"] != true
+                })
+                .collect();
+            if parents.len() != 1 {
+                return Err(error(
+                    "Child handoff requires one active, open OnTrack-managed parent worktree",
+                ));
+            }
+            let parent = parents[0];
+            let path = Path::new(field(parent, "path")?).canonicalize()?;
+            if path.to_str() != parent["path"].as_str()
+                || SystemExecutor.git_identity(&path)? != repo
+                || branch(&path)? != field(parent, "branch")?
+            {
+                return Err(error(
+                    "Parent worktree identity or branch changed; child launch refused",
+                ));
+            }
+            clean(&path)?;
+            let base = tip(&path, "HEAD")?;
+            (field(parent, "branch")?.to_owned(), Some(path), base)
+        } else {
+            (default, None, tip(&repo.main_root, "HEAD")?)
+        };
+        if entries
+            .iter()
+            .any(|e| e["id"] == name || e["branch"] == launch_branch)
         {
             return Err(error(
                 "Launch intent already recorded; inspect it instead of retrying creation",
@@ -428,49 +593,95 @@ impl LaunchJournal {
         }
         // Also catch branches without an open Herdr workspace.
         if git_output(
-            &registry.repo.main_root,
-            &["show-ref", "--verify", &format!("refs/heads/{branch}")],
+            &repo.main_root,
+            &[
+                "show-ref",
+                "--verify",
+                &format!("refs/heads/{launch_branch}"),
+            ],
         )?
         .status
         .success()
         {
             return Err(error("Launch branch already exists; refusing reuse"));
         }
-        let base = tip(&registry.repo.main_root, "HEAD")?;
+        // Reload after all Git verification; the short write transaction checks
+        // competing per-Bead intents and the parent snapshot before saving.
+        let mut registry = Self::open(&checkout)?;
+        if registry.repo != repo
+            || registry.entries.iter().any(|entry| {
+                (entry["bead_id"] == bead_id && entry["checkout_removed"] != true)
+                    || entry["id"] == name
+                    || entry["branch"] == launch_branch
+            })
+        {
+            return Err(error(
+                "An OnTrack worktree/launch intent already exists for this task or branch",
+            ));
+        }
+        if let Some(parent_id) = parent_bead_id {
+            let previous = entries
+                .iter()
+                .find(|entry| entry["bead_id"] == parent_id && entry["checkout_removed"] != true);
+            let current = registry
+                .entries
+                .iter()
+                .find(|entry| entry["bead_id"] == parent_id && entry["checkout_removed"] != true);
+            for key in [
+                "id",
+                "branch",
+                "path",
+                "phase",
+                "workspace_closed",
+                "checkout_removed",
+            ] {
+                if previous.map(|entry| &entry[key]) != current.map(|entry| &entry[key]) {
+                    return Err(error(
+                        "Parent handoff changed during child launch validation",
+                    ));
+                }
+            }
+        }
         let index = registry.entries.len();
         registry.entries.push(json!({
-            "id":name, "bead_id":bead, "branch":branch, "target_branch":target,
+            "id":name, "bead_id":bead_id,
+            "bead_title":bead["title"].as_str(),
+            "bead_description":bead["description"].as_str(),
+            "branch":launch_branch, "target_branch":target,
+            "target_path":target_path, "parent_bead_id":parent_bead_id,
             "common_dir":registry.repo.common_dir, "main_root":registry.repo.main_root,
             "source_workspace":workspace, "agent":agent, "base":base,
             "phase":"create_possibly_sent", "responses":{},
             "workspace_closed":false, "checkout_removed":false,
             "detail":"Launch intent persisted before Herdr creation. If interrupted, inspect the raw response and Herdr/Git before recovery; never blindly relaunch."
         }));
+        let journal = Self::handle(&checkout, &registry, registry.entries[index].clone());
+        registry.entries[index]["launch_owner"] = json!(journal.claim);
         registry.save()?;
         Ok(Self {
-            checkout: checkout.canonicalize()?,
-            repo: registry.repo.clone(),
-            id: name.to_owned(),
             intent: registry.entries[index].clone(),
-            #[cfg(test)]
-            fail_save_phase: None,
+            ..journal
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fail_save_phase(&mut self, phase: &str) {
-        self.fail_save_phase = Some(phase.to_owned());
     }
 
     pub(crate) fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()> {
         self.transaction(|entry| {
             entry["responses"][kind] = json!(String::from_utf8_lossy(bytes));
-            if let Ok(result) = envelope(bytes)
-                && result["agent"]["agent_session"].is_object()
-            {
-                entry["agent_session"] = result["agent"]["agent_session"].clone();
+            if let Ok(result) = envelope(bytes) {
+                if result["agent"]["agent_session"].is_object() {
+                    entry["agent_session"] = result["agent"]["agent_session"].clone();
+                }
                 if kind == "ready" {
-                    entry["initial_lifecycle_seq"] = result["agent"]["state_change_seq"].clone();
+                    if result["agent"]["state_change_seq"].is_u64() {
+                        entry["initial_lifecycle_seq"] =
+                            result["agent"]["state_change_seq"].clone();
+                    }
+                    if result["agent"]["terminal_id"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty())
+                    {
+                        entry["initial_terminal_id"] = result["agent"]["terminal_id"].clone();
+                    }
                 }
             }
             Ok(())
@@ -486,7 +697,6 @@ impl LaunchJournal {
             entry["phase"] = json!("created");
             Ok(entry.clone())
         })?;
-        // No registry lock is held during filesystem/Git verification.
         let source = Path::new(field(&entry, "path")?).canonicalize()?;
         if source == self.repo.main_root || source.to_str() != entry["path"].as_str() {
             return Err(error(
@@ -516,6 +726,19 @@ impl LaunchJournal {
 
     pub(crate) fn phase(&mut self, phase: &str) -> io::Result<()> {
         self.transaction(|entry| {
+            if self.intent["phase"] == "reserved" && phase == "agent_start_possibly_sent" {
+                if entry["phase"] != "reserved" {
+                    return Err(error(
+                        "Reserved parent is no longer available for agent start",
+                    ));
+                }
+                for key in ["workspace_id", "pane_id", "path"] {
+                    if entry[key] != self.intent[key] {
+                        return Err(error("Reserved parent target changed before start"));
+                    }
+                }
+                entry["launch_owner"] = json!(self.claim);
+            }
             entry["phase"] = json!(phase);
             if phase == "active" {
                 entry["detail"] = Value::Null;
@@ -530,12 +753,89 @@ impl LaunchJournal {
             Ok(())
         })
     }
+
+    pub(crate) fn base_branch(&self) -> Option<&str> {
+        self.intent["parent_bead_id"]
+            .as_str()
+            .and_then(|_| self.intent["target_branch"].as_str())
+    }
+
+    pub(crate) fn reserved_target(&self) -> Option<(String, String, String, PathBuf)> {
+        let entry = &self.intent;
+        if entry["phase"] != "reserved" {
+            return None;
+        }
+        Some((
+            entry["workspace_id"].as_str()?.to_owned(),
+            entry["pane_id"].as_str()?.to_owned(),
+            entry["branch"].as_str()?.to_owned(),
+            PathBuf::from(entry["path"].as_str()?),
+        ))
+    }
+}
+
+pub fn reserved_name(bead_id: &str) -> io::Result<Option<String>> {
+    let registry = LaunchJournal::open(&std::env::current_dir()?)?;
+    registry
+        .entries
+        .iter()
+        .find(|entry| entry["bead_id"] == bead_id && entry["phase"] == "reserved")
+        .map(|entry| field(entry, "id").map(str::to_owned))
+        .transpose()
 }
 
 struct Verified {
     source: PathBuf,
+    target: PathBuf,
     source_tip: String,
     target_tip: String,
+}
+
+fn target_checkout_identity(repo: &RepositoryIdentity, entry: &Value) -> io::Result<PathBuf> {
+    let default = default_branch(repo)?;
+    let Some(recorded) = entry["target_path"].as_str() else {
+        if field(entry, "target_branch")? != default {
+            return Err(error(
+                "Repository default branch changed; explicit registry recovery required",
+            ));
+        }
+        return Ok(repo.main_root.clone());
+    };
+    let target = Path::new(recorded).canonicalize()?;
+    if target == repo.main_root
+        || target.to_str() != Some(recorded)
+        || SystemExecutor.git_identity(&target)? != *repo
+        || branch(&target)? != field(entry, "target_branch")?
+    {
+        return Err(error("Parent target checkout identity or branch changed"));
+    }
+    Ok(target)
+}
+
+fn target_checkout(repo: &RepositoryIdentity, entry: &Value) -> io::Result<PathBuf> {
+    let target = target_checkout_identity(repo, entry)?;
+    clean(&target)?;
+    Ok(target)
+}
+
+/// A removed child's parent checkout may later be removed too. For historical
+/// status only, the retained parent branch still proves integration by ancestry.
+/// Live merge and cleanup paths continue to require the verified checkout.
+fn removed_checkout_target_tip(repo: &RepositoryIdentity, entry: &Value) -> io::Result<String> {
+    if entry["parent_bead_id"].is_string() {
+        let recorded = Path::new(field(entry, "target_path")?);
+        if !recorded.is_absolute() {
+            return Err(error("Recorded parent target path is not absolute"));
+        }
+        if matches!(fs::symlink_metadata(recorded), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+            return tip(
+                &repo.main_root,
+                &format!("refs/heads/{}", field(entry, "target_branch")?),
+            );
+        }
+    }
+    let target = target_checkout_identity(repo, entry)?;
+    tip(&target, "HEAD")
 }
 
 const NO_TASK_COMMITS: &str = "No task commits beyond the recorded launch base. No-op completion is not supported: inspect the task and keep the checkout; closing a Bead alone never authorizes integration or cleanup.";
@@ -554,7 +854,7 @@ fn task_commits(repo: &RepositoryIdentity, entry: &Value, source_tip: &str) -> i
     Ok(())
 }
 
-fn verify(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
+fn verify_identity(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
     let actual = SystemExecutor.git_identity(&repo.main_root)?;
     if actual != *repo
         || entry["common_dir"].as_str() != repo.common_dir.to_str()
@@ -562,16 +862,11 @@ fn verify(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
     {
         return Err(error("Repository identity changed"));
     }
-    let target = default_branch(repo)?;
-    if target != field(entry, "target_branch")? {
-        return Err(error(
-            "Repository default branch changed; explicit registry recovery required",
-        ));
-    }
-    clean(&repo.main_root)?;
+    let target = target_checkout_identity(repo, entry)?;
     let source = Path::new(field(entry, "path")?).canonicalize()?;
     if source.to_str() != entry["path"].as_str()
         || source == repo.main_root
+        || source == target
         || SystemExecutor.git_identity(&source)? != *repo
     {
         return Err(error(
@@ -581,19 +876,39 @@ fn verify(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
     if branch(&source)? != field(entry, "branch")? {
         return Err(error("Source checkout branch changed"));
     }
-    clean(&source)?;
     Ok(Verified {
         source_tip: tip(&source, "HEAD")?,
-        target_tip: tip(&repo.main_root, "HEAD")?,
+        target_tip: tip(&target, "HEAD")?,
         source,
+        target,
     })
 }
+
+fn verify(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
+    let verified = verify_identity(repo, entry)?;
+    clean(&verified.target)?;
+    clean(&verified.source)?;
+    Ok(verified)
+}
+
+fn inspection_dirty(verified: &Verified) -> io::Result<bool> {
+    unfinished_operation(&verified.target)?;
+    unfinished_operation(&verified.source)?;
+    Ok(dirty(&verified.target)? || dirty(&verified.source)?)
+}
+
+const DIRTY_CHECKOUT_DETAIL: &str =
+    "Uncommitted checkout changes are present; commit or resolve them before merge or cleanup.";
 
 fn view(entry: &Value, status: WorktreeStatus, detail: Option<String>) -> ManagedWorktree {
     let string = |key: &str| entry[key].as_str().unwrap_or_default().to_owned();
     ManagedWorktree {
         id: string("id"),
         bead_id: string("bead_id"),
+        parent_bead_id: entry["parent_bead_id"].as_str().map(str::to_owned),
+        handoff_accepted: entry["phase"] == "active",
+        bead_title: entry["bead_title"].as_str().map(str::to_owned),
+        bead_description: entry["bead_description"].as_str().map(str::to_owned),
         branch: string("branch"),
         target_branch: string("target_branch"),
         workspace_id: string("workspace_id"),
@@ -602,8 +917,50 @@ fn view(entry: &Value, status: WorktreeStatus, detail: Option<String>) -> Manage
     }
 }
 
+fn checkout_missing(entry: &Value) -> io::Result<bool> {
+    let path = Path::new(field(entry, "path")?);
+    if !path.is_absolute() {
+        return Err(error("Recorded checkout path is not absolute"));
+    }
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
 fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
     use WorktreeStatus::*;
+    if entry["restart_pending"] == true {
+        return view(entry, NeedsAttention, Some(entry["detail"].as_str().unwrap_or(
+            "Restart removal may have succeeded; inspect Git and Herdr before recovery."
+        ).to_owned()));
+    }
+    if entry["restarted"] == true {
+        if entry["restart_launch_pending"] == true || entry["restart_launch_error"].is_string() {
+            return view(entry, NeedsAttention, Some(entry["restart_launch_error"].as_str().unwrap_or(
+                "Old checkout removed; fresh launch may not have completed. Inspect tracked handoffs before recovery."
+            ).to_owned()));
+        }
+        if entry["path"]
+            .as_str()
+            .is_some_and(|path| Path::new(path).exists())
+        {
+            return view(
+                entry,
+                NeedsAttention,
+                Some("Restarted checkout path exists again; inspect identity".into()),
+            );
+        }
+        return view(entry, CheckoutRemoved, None);
+    }
+    if entry["phase"] == "reserved" {
+        return match verify_identity(repo, entry).and_then(|verified| inspection_dirty(&verified)) {
+            Ok(true) => view(entry, DirtyCheckout, Some(DIRTY_CHECKOUT_DETAIL.into())),
+            Ok(false) => view(entry, Reserved, Some("Parent worktree prepared; press h on the parent after its children close and integrate".into())),
+            Err(error) => view(entry, NeedsAttention, Some(error.to_string())),
+        };
+    }
     if entry["phase"] != "active" {
         return view(
             entry,
@@ -619,12 +976,22 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
         );
     }
     if entry["checkout_removed"] == true {
+        if entry["checkout_removed_externally"] == true {
+            return match checkout_missing(entry) {
+                Ok(true) => view(entry, CheckoutRemoved, None),
+                Ok(false) => view(
+                    entry,
+                    NeedsAttention,
+                    Some("Removed checkout path exists again; identity requires inspection".into()),
+                ),
+                Err(e) => view(entry, NeedsAttention, Some(e.to_string())),
+            };
+        }
         let check = (|| {
-            let target = default_branch(repo)?;
-            if target != field(entry, "target_branch")? {
-                return Err(error("Default branch changed after removal"));
-            }
-            clean(&repo.main_root)?;
+            // This is historical, read-only status inspection. A dirty target
+            // must block new merges and cleanup, but it cannot invalidate an
+            // already removed checkout whose branch is contained in the
+            // target history.
             let source = tip(
                 &repo.main_root,
                 &format!("refs/heads/{}", field(entry, "branch")?),
@@ -634,7 +1001,11 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
                     "Removed checkout path exists again; identity requires inspection",
                 ));
             }
-            if !ancestor(&repo.main_root, &source, &tip(&repo.main_root, "HEAD")?)? {
+            if !ancestor(
+                &repo.main_root,
+                &source,
+                &removed_checkout_target_tip(repo, entry)?,
+            )? {
                 return Err(error(
                     "Preserved source branch advanced after checkout removal; new work is outstanding",
                 ));
@@ -653,7 +1024,7 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
     if entry["cleanup_pending"].is_string() {
         return view(entry, NeedsAttention, Some(entry["detail"].as_str().unwrap_or("Cleanup possibly sent; reconciling read-only evidence, never blindly retrying.").to_owned()));
     }
-    let verified = match verify(repo, entry) {
+    let verified = match verify_identity(repo, entry) {
         Ok(verified) => verified,
         Err(e) => {
             let conflicts = entry["merge_request"].is_object()
@@ -672,19 +1043,43 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
             );
         }
     };
+    let conflicts = entry["merge_request"].is_object()
+        && git(&verified.source, &["ls-files", "--unmerged"]).is_ok_and(|files| !files.is_empty());
+    if conflicts {
+        return view(
+            entry,
+            NeedsResolution,
+            Some("Unresolved merge conflicts in the source checkout".into()),
+        );
+    }
+    let checkout_dirty = match inspection_dirty(&verified) {
+        Ok(dirty) => dirty,
+        Err(e) => return view(entry, NeedsAttention, Some(e.to_string())),
+    };
     if let Err(e) = task_commits(repo, entry, &verified.source_tip) {
         return view(
             entry,
             if verified.source_tip == entry["base"] {
-                Unmerged
+                if checkout_dirty {
+                    DirtyCheckout
+                } else {
+                    InProgress
+                }
             } else {
                 NeedsAttention
             },
-            Some(e.to_string()),
+            Some(if checkout_dirty && verified.source_tip == entry["base"] {
+                DIRTY_CHECKOUT_DETAIL.into()
+            } else {
+                e.to_string()
+            }),
         );
     }
     match ancestor(&repo.main_root, &verified.source_tip, &verified.target_tip) {
         Ok(true) => {
+            if checkout_dirty {
+                return view(entry, DirtyCheckout, Some(DIRTY_CHECKOUT_DETAIL.into()));
+            }
             return view(
                 entry,
                 if entry["workspace_closed"] == true {
@@ -708,23 +1103,313 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
         if entry["merge_request"]["target_tip"] != verified.target_tip {
             return view(entry, NeedsResolution, Some("Target advanced since the request; explicitly request another agent resolution. Never automatically resend.".into()));
         }
-        return view(entry, MergeRequested, Some(entry["detail"].as_str().unwrap_or("Merge prompt possibly sent; waiting for verified current Git ancestry. Native idle/sequence changes are not proof that this particular prompt completed. Never blindly resend.").to_owned()));
+        let detail = entry["detail"].as_str().unwrap_or("Merge prompt possibly sent; waiting for verified current Git ancestry. Native idle/sequence changes are not proof that this particular prompt completed. Never blindly resend.");
+        return view(
+            entry,
+            MergeRequested,
+            Some(if checkout_dirty {
+                format!("{detail} {DIRTY_CHECKOUT_DETAIL}")
+            } else {
+                detail.to_owned()
+            }),
+        );
+    }
+    if checkout_dirty {
+        return view(entry, DirtyCheckout, Some(DIRTY_CHECKOUT_DETAIL.into()));
+    }
+    if entry["merge_queue"].is_object() {
+        return view(
+            entry,
+            MergeQueued,
+            Some(
+                entry["detail"]
+                    .as_str()
+                    .unwrap_or("Merge queued; waiting for the active integration to finish.")
+                    .to_owned(),
+            ),
+        );
     }
     view(entry, Unmerged, entry["detail"].as_str().map(str::to_owned))
 }
 
+/// A confirmed restart abandons the old checkout and launches the live Bead
+/// from the current main HEAD. The old branch is deliberately retained.
+pub fn restart(id: &str) -> io::Result<String> {
+    restart_with(&std::env::current_dir()?, id, &mut SystemExecutor)
+}
+
+fn restart_with(cwd: &Path, id: &str, executor: &mut impl Executor) -> io::Result<String> {
+    let mut registry = Registry::open(cwd)?;
+    let index = registry.index(id)?;
+    let entry = &registry.entries[index];
+    if entry["phase"] != "active"
+        || entry["checkout_removed"] == true
+        || entry["restart_pending"] == true
+        || entry["restarted"] == true
+        || entry["cleanup_pending"].is_string()
+    {
+        return Err(error(
+            "This handoff cannot be restarted or may already have been removed",
+        ));
+    }
+    let main = registry.repo.main_root.clone();
+    if SystemExecutor.git_identity(&main)? != registry.repo
+        || default_branch(&registry.repo)? != field(entry, "target_branch")?
+        || branch(&main)? != field(entry, "target_branch")?
+    {
+        return Err(error(
+            "Main checkout identity or branch changed; restart cancelled",
+        ));
+    }
+    clean(&main)?;
+    let path = Path::new(field(entry, "path")?).canonicalize()?;
+    if path == main
+        || path.to_str() != entry["path"].as_str()
+        || SystemExecutor.git_identity(&path)? != registry.repo
+        || branch(&path)? != field(entry, "branch")?
+    {
+        return Err(error(
+            "Recorded checkout identity or branch changed; restart cancelled",
+        ));
+    }
+    verify_open_workspace(&registry.repo, entry, executor)?;
+    let workspace = field(entry, "workspace_id")?.to_owned();
+    let recorded_path = field(entry, "path")?.to_owned();
+    let source_workspace = field(entry, "source_workspace")?.to_owned();
+    let agent = field(entry, "agent")?.to_owned();
+    let bead_id = field(entry, "bead_id")?.to_owned();
+    let bead = executor.show_bead(&bead_id)?;
+    let title = if bead["id"] == bead_id {
+        field(&bead, "title")?.to_owned()
+    } else {
+        return Err(error("Live Bead identity changed; restart cancelled"));
+    };
+    herdr::validate_restart_source(executor, &main, &source_workspace, &agent)?;
+    // Recheck ownership immediately before the destructive command.
+    verify_open_workspace(&registry.repo, entry, executor)?;
+    if Path::new(field(entry, "path")?).canonicalize()? != path
+        || branch(&path)? != field(entry, "branch")?
+    {
+        return Err(error("Checkout changed during restart validation"));
+    }
+    registry.entries[index]["restart_pending"] = json!(true);
+    registry.entries[index]["detail"] = json!(
+        "Restart removal may have been sent. Inspect Herdr and Git before recovery; never retry blindly."
+    );
+    registry.save()?;
+    let bytes = executor.run(&["worktree", "remove", "--workspace", &workspace, "--force"])?;
+    registry.entries[index]["restart_remove_response"] = json!(String::from_utf8_lossy(&bytes));
+    registry.save()?;
+    envelope(&bytes)?;
+    let inventory = worktree_inventory(&registry.repo, &registry.entries[index], executor)?;
+    let rows = inventory["worktrees"]
+        .as_array()
+        .ok_or_else(|| error("Missing worktree rows"))?;
+    if path.exists()
+        || rows
+            .iter()
+            .any(|row| row["open_workspace_id"] == workspace || row["path"] == recorded_path)
+        || git(&main, &["worktree", "list", "--porcelain", "-z"])?
+            .split('\0')
+            .any(|line| line.strip_prefix("worktree ") == path.to_str())
+    {
+        return Err(error(
+            "Restart removal is unconfirmed; inspect Herdr and Git",
+        ));
+    }
+    registry.entries[index]["restart_pending"] = Value::Null;
+    registry.entries[index]["restarted"] = json!(true);
+    registry.entries[index]["checkout_removed"] = json!(true);
+    registry.entries[index]["workspace_closed"] = json!(true);
+    registry.entries[index]["restart_launch_pending"] = json!(true);
+    registry.entries[index]["detail"] = Value::Null;
+    registry.save()?;
+    drop(registry);
+    match herdr::relaunch_from(executor, &main, &source_workspace, &agent, &bead_id, &title) {
+        Ok(outcome) => {
+            let mut registry = Registry::open(&main)?;
+            let index = registry.index(id)?;
+            registry.entries[index]["restart_launch_pending"] = Value::Null;
+            registry.save()?;
+            Ok(outcome.message)
+        }
+        Err(cause) => {
+            let mut registry = Registry::open(&main)?;
+            let index = registry.index(id)?;
+            registry.entries[index]["restart_launch_pending"] = Value::Null;
+            registry.entries[index]["restart_launch_error"] = json!(format!(
+                "Old checkout removed; fresh launch failed: {cause}. Inspect any new handoff before recovery."
+            ));
+            registry.save()?;
+            Err(cause)
+        }
+    }
+}
+
+/// Older launch responses lacked a native session ID, but still recorded the
+/// pre-prompt agent observation. That observation can support a display hint;
+/// it never changes the stricter gate used by automatic merge and cleanup.
+fn legacy_settled_for_display(executor: &mut impl Executor, entry: &Value) -> io::Result<()> {
+    let ready = entry["responses"]["ready"]
+        .as_str()
+        .ok_or_else(|| error("No recorded pre-prompt Herdr observation"))?;
+    let ready = envelope(ready.as_bytes())?;
+    let before = ready["agent"]["state_change_seq"]
+        .as_u64()
+        .ok_or_else(|| error("No recorded pre-prompt lifecycle sequence"))?;
+    if ready["type"] != "agent_info"
+        || ready["agent"]["pane_id"] != entry["pane_id"]
+        || ready["agent"]["workspace_id"] != entry["workspace_id"]
+        || ready["agent"]["agent"] != entry["agent"]
+    {
+        return Err(error("Recorded pre-prompt agent identity does not match"));
+    }
+    let current = settled(executor, entry, false)?;
+    if current["state_change_seq"]
+        .as_u64()
+        .is_none_or(|now| now <= before)
+    {
+        return Err(error("No observed agent activity after the initial prompt"));
+    }
+    if ready["agent"]["terminal_id"].is_string()
+        && current["terminal_id"] != ready["agent"]["terminal_id"]
+    {
+        return Err(error("Recorded Herdr terminal changed"));
+    }
+    Ok(())
+}
+
+/// A conflict can be a transient part of the requested merge. Only a live,
+/// matching native agent observation changes its display state; Git safety
+/// decisions continue to use `inspect` and `verify`.
+fn inspect_for_display(
+    repo: &RepositoryIdentity,
+    entry: &Value,
+    executor: &mut impl Executor,
+) -> ManagedWorktree {
+    let mut item = inspect(repo, entry);
+    if item.status == WorktreeStatus::Unmerged {
+        // Git can identify outstanding commits, but cannot tell whether the
+        // original task is finished. A closed Bead plus a settled matching
+        // agent provides the display's completion evidence.
+        let closed = executor
+            .show_bead(&item.bead_id)
+            .is_ok_and(|bead| bead["id"] == item.bead_id && bead["status"] == "closed");
+        if !closed {
+            item.status = WorktreeStatus::InProgress;
+            item.detail = Some("The live Bead is open or could not be verified as closed.".into());
+        } else if entry["agent_session"].is_object() {
+            if settled(executor, entry, true).is_err() {
+                item.status = WorktreeStatus::InProgress;
+                item.detail = Some("The recorded agent has not been verified as finished.".into());
+            }
+        } else if legacy_settled_for_display(executor, entry).is_ok() {
+            item.detail = Some("Ready based on a closed Bead and observed agent activity. This launch did not record a native session at startup; automatic reconciliation can bind a later matching session. If that evidence is unavailable, confirm a manual merge when appropriate.".into());
+        } else {
+            item.status = WorktreeStatus::InProgress;
+            item.detail = Some("The recorded agent has not been verified as finished.".into());
+        }
+        return item;
+    }
+    if item.status != WorktreeStatus::NeedsResolution || !entry["merge_request"].is_object() {
+        return item;
+    }
+    let working = (|| -> io::Result<bool> {
+        let result = envelope(&executor.run(&["agent", "get", field(entry, "pane_id")?])?)?;
+        let agent = &result["agent"];
+        if result["type"] != "agent_info"
+            || agent["pane_id"] != entry["pane_id"]
+            || agent["workspace_id"] != entry["workspace_id"]
+            || agent["agent"] != entry["agent"]
+        {
+            return Ok(false);
+        }
+        let session = if entry["merge_request"]["agent_session"].is_object() {
+            &entry["merge_request"]["agent_session"]
+        } else {
+            &entry["agent_session"]
+        };
+        if session.is_object() && agent["agent_session"] != *session {
+            return Ok(false);
+        }
+        Ok(agent["agent_status"] == "working")
+    })()
+    .unwrap_or(false);
+    if working {
+        item.status = WorktreeStatus::MergeRequested;
+        item.detail = Some(format!(
+            "{} The recorded agent is still working; recheck Git when it settles.",
+            item.detail
+                .as_deref()
+                .unwrap_or("Merge request is pending.")
+        ));
+    }
+    item
+}
+
 /// Read-only with respect to Git/Herdr; only this repository's durable handoffs.
 pub fn list() -> io::Result<Vec<ManagedWorktree>> {
-    let registry = Registry::open(&std::env::current_dir()?)?;
+    list_with(&std::env::current_dir()?, &mut SystemExecutor)
+}
+
+fn list_with(cwd: &Path, executor: &mut impl Executor) -> io::Result<Vec<ManagedWorktree>> {
+    let registry = Registry::open(cwd)?;
     Ok(registry
         .entries
         .iter()
-        .map(|entry| inspect(&registry.repo, entry))
+        .map(|entry| inspect_for_display(&registry.repo, entry, executor))
+        .collect())
+}
+
+pub fn pending_child_handoffs(parent_id: &str) -> io::Result<Vec<String>> {
+    let registry = LaunchJournal::open(&std::env::current_dir()?)?;
+    let entries = registry.entries.clone();
+    let repo = registry.repo.clone();
+    drop(registry);
+    Ok(entries
+        .iter()
+        .map(|entry| inspect(&repo, entry))
+        .filter(|item| {
+            item.parent_bead_id.as_deref() == Some(parent_id)
+                && !matches!(
+                    item.status,
+                    WorktreeStatus::Integrated
+                        | WorktreeStatus::WorkspaceClosed
+                        | WorktreeStatus::CheckoutRemoved
+                )
+        })
+        .map(|item| item.bead_id)
         .collect())
 }
 
 /// Native lifecycle evidence is mandatory for automatic operations. It is not a
 /// completion claim: Git ancestry/cleanliness and a fresh closed Bead are separate gates.
+fn initial_agent_evidence(entry: &Value) -> io::Result<(u64, Option<String>)> {
+    // Older handoffs kept the raw readiness response but failed to copy these
+    // fields when Herdr had not yet attached the native session.
+    let ready = entry["responses"]["ready"]
+        .as_str()
+        .and_then(|raw| envelope(raw.as_bytes()).ok())
+        .filter(|result| {
+            result["type"] == "agent_info"
+                && result["agent"]["pane_id"] == entry["pane_id"]
+                && result["agent"]["workspace_id"] == entry["workspace_id"]
+                && result["agent"]["agent"] == entry["agent"]
+        });
+    let before = entry["initial_lifecycle_seq"]
+        .as_u64()
+        .or_else(|| ready.as_ref()?.pointer("/agent/state_change_seq")?.as_u64())
+        .ok_or_else(|| {
+            error("Automatic action deferred: no recorded native pre-prompt lifecycle sequence")
+        })?;
+    let terminal = entry["initial_terminal_id"]
+        .as_str()
+        .or_else(|| ready.as_ref()?.pointer("/agent/terminal_id")?.as_str())
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
+    Ok((before, terminal))
+}
+
 fn settled(
     executor: &mut impl Executor,
     entry: &Value,
@@ -753,14 +1438,24 @@ fn settled(
             return Err(error("Agent session changed; automation/merge deferred"));
         }
     } else if require_session {
-        return Err(error(
-            "Automatic action deferred: launch response did not record a native Herdr agent_session; idle alone cannot prove the original agent completed",
-        ));
+        let (_, terminal) = initial_agent_evidence(entry)?;
+        let terminal = terminal.ok_or_else(|| {
+            error("Automatic action deferred: no recorded launch terminal identity for late agent session")
+        })?;
+        if agent["terminal_id"] != terminal
+            || !agent["agent_session"].is_object()
+            || agent["agent_session"]["agent"] != entry["agent"]
+            || agent["agent_session"]["value"]
+                .as_str()
+                .is_none_or(str::is_empty)
+        {
+            return Err(error(
+                "Automatic action deferred: native agent session or terminal identity is unavailable or changed",
+            ));
+        }
     }
     if require_session {
-        let before = entry["initial_lifecycle_seq"].as_u64().ok_or_else(|| {
-            error("Automatic action deferred: no recorded native pre-prompt lifecycle sequence")
-        })?;
+        let (before, _) = initial_agent_evidence(entry)?;
         if agent["state_change_seq"]
             .as_u64()
             .is_none_or(|now| now <= before)
@@ -807,12 +1502,24 @@ fn settled(
     Ok(agent.clone())
 }
 
+fn bind_late_session(registry: &mut Registry, index: usize, agent: &Value) -> io::Result<()> {
+    if registry.entries[index]["agent_session"].is_null() {
+        let (before, terminal) = initial_agent_evidence(&registry.entries[index])?;
+        registry.entries[index]["agent_session"] = agent["agent_session"].clone();
+        registry.entries[index]["initial_lifecycle_seq"] = json!(before);
+        registry.entries[index]["initial_terminal_id"] = json!(terminal);
+        registry.save()?;
+    }
+    Ok(())
+}
+
 fn request_merge(
     registry: &mut Registry,
     index: usize,
     executor: &mut impl Executor,
     automatic: bool,
 ) -> io::Result<()> {
+    children_ready(registry, index, executor)?;
     let entry = &registry.entries[index];
     if entry["phase"] != "active"
         || entry["workspace_closed"] == true
@@ -843,15 +1550,19 @@ fn request_merge(
     }
     let pane = field(entry, "pane_id")?.to_owned();
     let prompt = format!(
-        "OnTrack integration request. Work ONLY in the source checkout {} on branch {}. Requested source commit: {}. Verified default branch: {} (refs/heads/{}), target commit: {}. Read project instructions. Merge the latest LOCAL target branch INTO THIS SOURCE BRANCH, resolve conflicts here and commit the resolution; run relevant checks and report blockers. Do not change/check out/merge in the primary/default checkout {}, do not reset, force, delete branches/worktrees, or close workspaces. Do not change Beads status for this integration request. Leave the source clean and containing both requested commits. OnTrack independently verifies ancestry and performs ff-only integration. If the target advances again, stop and report rather than altering the default checkout.",
+        "OnTrack integration request. Work ONLY in the source checkout {} on branch {}. Requested source commit: {}. Verified target branch: {} (refs/heads/{}) in checkout {}, target commit: {}. Read project instructions. Merge the latest LOCAL target branch INTO THIS SOURCE BRANCH, resolve conflicts here and commit the resolution; run relevant checks and report blockers. Do not change/check out/merge in the target checkout {}, do not reset, force, delete branches/worktrees, or close workspaces. Do not change Beads status for this integration request. Leave the source clean and containing both requested commits. OnTrack independently verifies ancestry and performs ff-only integration. If the target advances again, stop and report rather than altering the target checkout.",
         verified.source.display(),
         field(entry, "branch")?,
         verified.source_tip,
         field(entry, "target_branch")?,
         field(entry, "target_branch")?,
+        verified.target.display(),
         verified.target_tip,
-        registry.repo.main_root.display()
+        verified.target.display()
     );
+    if automatic {
+        bind_late_session(registry, index, &ready)?;
+    }
     registry.entries[index]["merge_request"] = json!({"source_tip":verified.source_tip, "target_tip":verified.target_tip, "possibly_sent":true, "provenance":if automatic {"automatic"} else {"manual"}, "lifecycle_seq":ready["state_change_seq"], "agent_session":ready["agent_session"]});
     registry.entries[index]["detail"] =
         json!("Merge prompt possibly sent; inspect agent before recovery, never blindly resend.");
@@ -872,7 +1583,171 @@ fn request_merge(
     registry.save()
 }
 
+/// Queue order is stored with each handoff under the repository-wide registry lock.
+/// Retaining order on dispatched requests keeps later enqueues monotonic.
+fn queue_merge(
+    registry: &mut Registry,
+    index: usize,
+    executor: &mut impl Executor,
+    automatic: bool,
+) -> io::Result<()> {
+    if registry.entries[index]["merge_queue"].is_object() {
+        return Ok(());
+    }
+    if registry.entries[index]["merge_request"].is_object() {
+        return Err(error(
+            "Merge already requested; inspect the active agent before retrying",
+        ));
+    }
+    children_ready(registry, index, executor)?;
+    let entry = &registry.entries[index];
+    if entry["phase"] != "active"
+        || entry["workspace_closed"] == true
+        || entry["checkout_removed"] == true
+    {
+        return Err(error("Cannot queue an incomplete/closed handoff"));
+    }
+    let verified = verify(&registry.repo, entry)?;
+    task_commits(&registry.repo, entry, &verified.source_tip)?;
+    let order = registry
+        .entries
+        .iter()
+        .filter_map(|entry| {
+            entry["merge_queue"]["order"]
+                .as_u64()
+                .or_else(|| entry["merge_request"]["queue_order"].as_u64())
+        })
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| error("Merge queue order exhausted"))?;
+    registry.entries[index]["merge_queue"] = json!({
+        "order": order,
+        "provenance": if automatic { "automatic" } else { "manual" },
+    });
+    registry.entries[index]["detail"] = Value::Null;
+    registry.save()
+}
+
+fn active_merge(registry: &mut Registry, executor: &mut impl Executor) -> io::Result<bool> {
+    for index in 0..registry.entries.len() {
+        let entry = &registry.entries[index];
+        if !entry["merge_request"].is_object() || entry["merge_request"]["queue_released"] == true {
+            continue;
+        }
+        match inspect(&registry.repo, entry).status {
+            WorktreeStatus::WorkspaceClosed | WorktreeStatus::CheckoutRemoved => {}
+            WorktreeStatus::Integrated => {
+                // Git may have been integrated externally while the prompted
+                // agent is still working, or after an uncertain prompt. Keep
+                // its slot until prompt acceptance and agent settlement are
+                // both known.
+                if !merge_prompt_confirmed(entry) {
+                    return Ok(true);
+                }
+                if settled(
+                    executor,
+                    entry,
+                    entry["merge_request"]["provenance"] != "manual",
+                )
+                .is_err()
+                {
+                    return Ok(true);
+                }
+            }
+            _ => return Ok(true),
+        }
+        // Once released, a later agent exit cannot hold unrelated requests.
+        registry.entries[index]["merge_request"]["queue_released"] = json!(true);
+        registry.save()?;
+    }
+    Ok(false)
+}
+
+fn merge_prompt_confirmed(entry: &Value) -> bool {
+    entry["merge_response"]
+        .as_str()
+        .and_then(|raw| envelope(raw.as_bytes()).ok())
+        .is_some_and(|result| {
+            result["type"] == "agent_prompted"
+                && result["agent"]["pane_id"] == entry["pane_id"]
+                && result["agent"]["workspace_id"] == entry["workspace_id"]
+        })
+}
+
+fn dispatch_next_merge(registry: &mut Registry, executor: &mut impl Executor) -> io::Result<()> {
+    if !registry
+        .entries
+        .iter()
+        .any(|entry| entry["merge_queue"].is_object())
+    {
+        return Ok(());
+    }
+    if active_merge(registry, executor)? {
+        return Ok(());
+    }
+    loop {
+        let Some((index, _)) = registry
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                entry["merge_queue"]["order"]
+                    .as_u64()
+                    .map(|order| (index, order))
+            })
+            .min_by_key(|(_, order)| *order)
+        else {
+            return Ok(());
+        };
+        if registry.entries[index]["merge_queue"]["blocked"] == true {
+            return Ok(());
+        }
+        if matches!(
+            inspect(&registry.repo, &registry.entries[index]).status,
+            WorktreeStatus::Integrated
+                | WorktreeStatus::WorkspaceClosed
+                | WorktreeStatus::CheckoutRemoved
+        ) {
+            registry.entries[index]["merge_queue"] = Value::Null;
+            registry.entries[index]["detail"] = Value::Null;
+            registry.save()?;
+            continue;
+        }
+        let automatic = registry.entries[index]["merge_queue"]["provenance"] == "automatic";
+        let order = registry.entries[index]["merge_queue"]["order"].clone();
+        let result = (|| {
+            if automatic {
+                let entry = &registry.entries[index];
+                let bead = executor.show_bead(field(entry, "bead_id")?)?;
+                if bead["id"] != entry["bead_id"] || bead["status"] != "closed" {
+                    return Err(error("Queued automatic merge deferred: Bead is not closed"));
+                }
+            }
+            request_merge(registry, index, executor, automatic)
+        })();
+        if registry.entries[index]["merge_request"].is_object() {
+            registry.entries[index]["merge_request"]["queue_order"] = order;
+            registry.entries[index]["merge_queue"] = Value::Null;
+            registry.save()?;
+        } else if result.is_ok() {
+            // Git may have integrated the branch between queue inspection and
+            // dispatch; no prompt is needed for that completed request.
+            registry.entries[index]["merge_queue"] = Value::Null;
+            registry.entries[index]["detail"] = Value::Null;
+            registry.save()?;
+        } else if let Err(error) = &result {
+            registry.entries[index]["merge_queue"]["blocked"] = json!(true);
+            registry.entries[index]["detail"] =
+                json!(format!("Queued merge needs review before retry: {error}"));
+            registry.save()?;
+        }
+        return result;
+    }
+}
+
 fn finalize(registry: &mut Registry, index: usize, executor: &mut impl Executor) -> io::Result<()> {
+    children_ready(registry, index, executor)?;
     let entry = &registry.entries[index];
     let verified = verify(&registry.repo, entry)?;
     task_commits(&registry.repo, entry, &verified.source_tip)?;
@@ -943,7 +1818,7 @@ fn finalize(registry: &mut Registry, index: usize, executor: &mut impl Executor)
         json!("ff-only integration possibly in progress; ancestry will be reverified on restart");
     registry.save()?;
     git(
-        &registry.repo.main_root,
+        &verified.target,
         &["merge", "--ff-only", "--no-edit", &verified.source_tip],
     )?;
     let after = verify(&registry.repo, &registry.entries[index])?;
@@ -960,6 +1835,42 @@ fn finalize(registry: &mut Registry, index: usize, executor: &mut impl Executor)
     registry.save()
 }
 
+fn children_ready(
+    registry: &Registry,
+    index: usize,
+    executor: &mut impl Executor,
+) -> io::Result<()> {
+    let parent_id = field(&registry.entries[index], "bead_id")?;
+    let open = executor.open_descendants(parent_id)?;
+    if !open.is_empty() {
+        return Err(error(format!(
+            "Child tasks still open: {}",
+            open.join(", ")
+        )));
+    }
+    let pending: Vec<_> = registry
+        .entries
+        .iter()
+        .filter(|entry| entry["parent_bead_id"] == parent_id)
+        .filter(|entry| {
+            !matches!(
+                inspect(&registry.repo, entry).status,
+                WorktreeStatus::Integrated
+                    | WorktreeStatus::WorkspaceClosed
+                    | WorktreeStatus::CheckoutRemoved
+            )
+        })
+        .filter_map(|entry| entry["bead_id"].as_str())
+        .collect();
+    if !pending.is_empty() {
+        return Err(error(format!(
+            "Child worktrees still need integration: {}",
+            pending.join(", ")
+        )));
+    }
+    Ok(())
+}
+
 fn cleanup(
     registry: &mut Registry,
     index: usize,
@@ -967,6 +1878,13 @@ fn cleanup(
     executor: &mut impl Executor,
 ) -> io::Result<()> {
     let entry = &registry.entries[index];
+    if registry.entries.iter().any(|child| {
+        child["parent_bead_id"] == entry["bead_id"] && child["checkout_removed"] != true
+    }) {
+        return Err(error(
+            "Parent worktree still has a tracked child checkout; clean up children first",
+        ));
+    }
     if entry["phase"] != "active" {
         return Err(error("Incomplete launch cannot be cleaned automatically"));
     }
@@ -1057,7 +1975,7 @@ fn worktree_inventory(
         .filter(|row| row["open_workspace_id"] == entry["source_workspace"])
         .collect();
     if main_rows.len() != 1
-        || main_rows[0]["branch"] != entry["target_branch"]
+        || main_rows[0]["branch"] != default_branch(repo)?
         || Path::new(field(main_rows[0], "path")?).canonicalize()? != repo.main_root
     {
         return Err(error(
@@ -1129,14 +2047,11 @@ fn confirm_cleanup(
     let source_ref = format!("refs/heads/{}", field(entry, "branch")?);
     let current_source = tip(&registry.repo.main_root, &source_ref)?;
     task_commits(&registry.repo, entry, &current_source)?;
-    if default_branch(&registry.repo)? != field(entry, "target_branch")? {
-        return Err(error("Default changed during cleanup"));
-    }
-    clean(&registry.repo.main_root)?;
+    let target = target_checkout(&registry.repo, entry)?;
     if !ancestor(
         &registry.repo.main_root,
         &current_source,
-        &tip(&registry.repo.main_root, "HEAD")?,
+        &tip(&target, "HEAD")?,
     )? {
         return Err(error(
             "Source advanced during cleanup; new work is outstanding",
@@ -1182,7 +2097,23 @@ fn act_with(
     let mut registry = Registry::open(cwd)?;
     let index = registry.index(id)?;
     let result = match action {
-        Action::RequestMerge => request_merge(&mut registry, index, executor, false),
+        Action::RequestMerge => {
+            if registry.entries[index]["merge_request"].is_object() {
+                // An explicit retry of the active request may be needed after
+                // the target advances. It retains the active queue slot.
+                request_merge(&mut registry, index, executor, false)
+            } else {
+                if registry.entries[index]["merge_queue"].is_object() {
+                    registry.entries[index]["merge_queue"]["blocked"] = Value::Null;
+                    registry.entries[index]["merge_queue"]["provenance"] = json!("manual");
+                    registry.entries[index]["detail"] = Value::Null;
+                    registry.save()?;
+                } else {
+                    queue_merge(&mut registry, index, executor, false)?;
+                }
+                dispatch_next_merge(&mut registry, executor)
+            }
+        }
         _ => cleanup(&mut registry, index, action, executor),
     };
     if let Err(e) = result {
@@ -1207,6 +2138,7 @@ fn reconcile_with(
         let result = (|| {
             if registry.entries[index]["phase"] != "active"
                 || registry.entries[index]["checkout_removed"] == true
+                || registry.entries[index]["restart_pending"] == true
             {
                 return Ok(());
             }
@@ -1215,12 +2147,25 @@ fn reconcile_with(
             if registry.entries[index]["cleanup_pending"].is_string() {
                 return confirm_cleanup(&mut registry, index, executor);
             }
+            // External removal is a checkout-existence observation, not a
+            // claim that the preserved source branch was integrated.
+            if checkout_missing(&registry.entries[index])? {
+                registry.entries[index]["checkout_removed"] = json!(true);
+                registry.entries[index]["checkout_removed_externally"] = json!(true);
+                registry.save()?;
+                return Ok(());
+            }
             let status = inspect(&registry.repo, &registry.entries[index]).status;
             if matches!(status, WorktreeStatus::MergeRequested) {
                 finalize(&mut registry, index, executor)?;
             }
             let status = inspect(&registry.repo, &registry.entries[index]).status;
-            if !(policy.auto_merge || policy.auto_close_workspace || policy.auto_remove_checkout) {
+            let auto_merge = if registry.entries[index]["parent_bead_id"].as_str().is_some() {
+                policy.auto_merge_children
+            } else {
+                policy.auto_merge
+            };
+            if !(auto_merge || policy.auto_close_workspace || policy.auto_remove_checkout) {
                 return Ok(());
             }
             if !matches!(
@@ -1231,7 +2176,7 @@ fn reconcile_with(
             ) {
                 return Ok(());
             }
-            if (status == WorktreeStatus::Unmerged && !policy.auto_merge)
+            if (status == WorktreeStatus::Unmerged && !auto_merge)
                 || (status == WorktreeStatus::Integrated
                     && !(policy.auto_close_workspace || policy.auto_remove_checkout))
                 || (status == WorktreeStatus::WorkspaceClosed && !policy.auto_remove_checkout)
@@ -1250,10 +2195,14 @@ fn reconcile_with(
             }
             // Only open workspaces reach this gate. A closed workspace has no
             // documented Herdr removal path and must not query a departed agent.
-            settled(executor, entry, true)?;
+            let agent = settled(executor, entry, true)?;
+            bind_late_session(&mut registry, index, &agent)?;
             if status == WorktreeStatus::Unmerged {
-                if policy.auto_merge && entry["merge_request"].is_null() {
-                    request_merge(&mut registry, index, executor, true)?;
+                if auto_merge
+                    && registry.entries[index]["merge_request"].is_null()
+                    && registry.entries[index]["merge_queue"].is_null()
+                {
+                    queue_merge(&mut registry, index, executor, true)?;
                 }
             } else if policy.auto_remove_checkout {
                 // Removal closes the workspace too. Never close first when both enabled.
@@ -1268,10 +2217,15 @@ fn reconcile_with(
             registry.save()?;
         }
     }
+    if let Err(e) = dispatch_next_merge(&mut registry, executor) {
+        // The queued entry carries the recovery detail. A later explicit
+        // request can unblock it after the underlying condition is fixed.
+        let _ = e;
+    }
     Ok(registry
         .entries
         .iter()
-        .map(|entry| inspect(&registry.repo, entry))
+        .map(|entry| inspect_for_display(&registry.repo, entry, executor))
         .collect())
 }
 
@@ -1281,10 +2235,726 @@ mod tests {
     use std::{
         collections::VecDeque,
         sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     const ID: &str = "ot-test";
     const BRANCH: &str = "ontrack/ot-test";
+
+    #[test]
+    fn manual_merges_wait_in_durable_order_and_dispatch_after_integration() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        fixture.request();
+
+        let mut no_prompt = Fake::default();
+        let queued = act_with(
+            &fixture.main,
+            "ot-second",
+            Action::RequestMerge,
+            &mut no_prompt,
+        )
+        .unwrap();
+        assert_eq!(queued.status, WorktreeStatus::MergeQueued);
+        assert!(no_prompt.calls.is_empty());
+        // Reopening the registry models an OnTrack restart.
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[1]["merge_queue"]["order"], 2);
+        assert_eq!(registry.entries[0]["merge_request"]["queue_order"], 1);
+        drop(registry);
+
+        let mut next = Fake::default();
+        next.json(fixture.agent(14, "done"));
+        next.json(fixture.agent(14, "done"));
+        next.json(fixture.second_agent(&second, 12, "done"));
+        next.json(json!({"result":{"type":"agent_prompted", "agent":{
+            "pane_id":"wSecond:p1", "workspace_id":"wSecond"}}}));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut next).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::Integrated);
+        assert_eq!(rows[1].status, WorktreeStatus::MergeRequested);
+        let prompts: Vec<_> = next
+            .calls
+            .iter()
+            .filter(|args| args.get(1).is_some_and(|s| s == "prompt"))
+            .collect();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0][2], "wSecond:p1");
+        let current_target = tip(&fixture.main, "HEAD").unwrap();
+        assert!(prompts[0][3].contains(&current_target));
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["merge_request"]["queue_released"], true);
+    }
+
+    #[test]
+    fn automatic_reconciliation_queues_multiple_ready_merges_but_prompts_one() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        let mut executor = Fake::default();
+        executor.json(fixture.agent(12, "done"));
+        executor.json(fixture.second_agent(&second, 12, "done"));
+        executor.json(fixture.agent(12, "done"));
+        executor.json(fixture.prompt_result());
+        let rows = reconcile_with(
+            &fixture.main,
+            CleanupPolicy {
+                auto_merge: true,
+                ..CleanupPolicy::default()
+            },
+            &mut executor,
+        )
+        .unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
+        assert_eq!(rows[1].status, WorktreeStatus::MergeQueued);
+        assert_eq!(
+            executor
+                .calls
+                .iter()
+                .filter(|args| args.get(1).is_some_and(|s| s == "prompt"))
+                .count(),
+            1
+        );
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            registry.entries[1]["merge_queue"]["provenance"],
+            "automatic"
+        );
+    }
+
+    #[test]
+    fn unresolved_active_merge_holds_later_queue_without_reprompting() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        fixture.request();
+        act_with(
+            &fixture.main,
+            "ot-second",
+            Action::RequestMerge,
+            &mut Fake::default(),
+        )
+        .unwrap();
+        Fixture::commit_at(&fixture.main, "target-change", "advanced\n");
+        let mut executor = Fake::default();
+        executor.json(fixture.agent(13, "working"));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
+        assert_eq!(rows[1].status, WorktreeStatus::MergeQueued);
+        assert!(
+            !executor
+                .calls
+                .iter()
+                .any(|args| args.get(1).is_some_and(|s| s == "prompt"))
+        );
+    }
+
+    #[test]
+    fn externally_integrated_branch_waits_for_prompted_agent_to_settle() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        fixture.request();
+        act_with(
+            &fixture.main,
+            "ot-second",
+            Action::RequestMerge,
+            &mut Fake::default(),
+        )
+        .unwrap();
+        git(&fixture.main, &["merge", "--ff-only", BRANCH]).unwrap();
+        let mut working = Fake::default();
+        working.json(fixture.agent(13, "working"));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut working).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::Integrated);
+        assert_eq!(rows[1].status, WorktreeStatus::MergeQueued);
+        assert!(
+            !working
+                .calls
+                .iter()
+                .any(|args| args.get(1).is_some_and(|s| s == "prompt"))
+        );
+    }
+
+    #[test]
+    fn uncertain_prompt_holds_queue_even_if_git_was_integrated_externally() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        let mut uncertain = Fake::default();
+        uncertain.json(fixture.agent(12, "idle"));
+        uncertain.outputs.push_back(Err(error("prompt timed out")));
+        assert!(act_with(&fixture.main, ID, Action::RequestMerge, &mut uncertain).is_err());
+        git(&fixture.main, &["merge", "--ff-only", BRANCH]).unwrap();
+        let queued = act_with(
+            &fixture.main,
+            "ot-second",
+            Action::RequestMerge,
+            &mut Fake::default(),
+        )
+        .unwrap();
+        assert_eq!(queued.status, WorktreeStatus::MergeQueued);
+        let mut no_prompt = Fake::default();
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut no_prompt).unwrap();
+        assert_eq!(rows[1].status, WorktreeStatus::MergeQueued);
+        assert!(no_prompt.calls.is_empty());
+    }
+
+    #[test]
+    fn child_handoff_targets_parent_checkout_and_never_default_branch() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "parent-task", "parent work\n");
+        let child = json!({"id":"Bead-1.1", "title":"Child", "parent":"Bead-1"});
+        let child_branch = "ontrack/child-task";
+        let child_path = fixture.directory.join("child");
+        let mut journal = LaunchJournal::begin(
+            &fixture.main,
+            &child,
+            child_branch,
+            "opencode",
+            "child-task",
+            "wMain",
+        )
+        .unwrap();
+        assert_eq!(journal.base_branch(), Some(BRANCH));
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                child_branch,
+                child_path.to_str().unwrap(),
+                BRANCH,
+            ],
+        )
+        .unwrap();
+        let created = json!({"workspace":{"workspace_id":"wChild"},
+            "root_pane":{"pane_id":"wChild:p1"},
+            "worktree":{"path":child_path,"branch":child_branch}});
+        journal.created(&created).unwrap();
+        journal.phase("active").unwrap();
+        drop(journal);
+        Fixture::commit_at(&child_path, "child-task", "child work\n");
+        let default_tip = tip(&fixture.main, "HEAD").unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        let entry = &registry.entries[1];
+        assert_eq!(entry["target_branch"], BRANCH);
+        assert_eq!(entry["target_path"], json!(fixture.source));
+        assert_eq!(
+            inspect(&registry.repo, entry).status,
+            WorktreeStatus::Unmerged
+        );
+        drop(registry);
+        let parent_merge = act_with(
+            &fixture.main,
+            ID,
+            Action::RequestMerge,
+            &mut Fake::default(),
+        )
+        .err()
+        .unwrap();
+        assert!(
+            parent_merge
+                .to_string()
+                .contains("Child worktrees still need integration"),
+            "{parent_merge}"
+        );
+        let agent = json!({"result":{"type":"agent_info", "agent":{
+            "pane_id":"wChild:p1", "workspace_id":"wChild", "agent":"opencode",
+            "agent_status":"idle", "cwd":child_path, "foreground_cwd":child_path,
+            "state_change_seq":12
+        }}});
+        let mut request = Fake::default();
+        request.json(agent.clone());
+        request.json(json!({"result":{"type":"agent_prompted", "agent":{
+            "pane_id":"wChild:p1", "workspace_id":"wChild"}}}));
+        assert_eq!(
+            act_with(
+                &fixture.main,
+                "child-task",
+                Action::RequestMerge,
+                &mut request
+            )
+            .unwrap()
+            .status,
+            WorktreeStatus::MergeRequested
+        );
+        let mut finish = Fake {
+            bead: Some(json!({"id":"Bead-1","status":"open"})),
+            ..Fake::default()
+        };
+        finish.json(agent);
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut finish).unwrap();
+        assert_eq!(rows[1].status, WorktreeStatus::Integrated);
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::Integrated
+        );
+        assert_eq!(tip(&fixture.main, "HEAD").unwrap(), default_tip);
+    }
+
+    #[test]
+    fn removed_child_stays_removed_after_parent_checkout_is_removed() {
+        let fixture = Fixture::managed();
+        let child_path = fixture.directory.join("child");
+        let child_branch = "ontrack/child-task";
+        let child = json!({"id":"Bead-1.1", "title":"Child", "parent":"Bead-1"});
+        let mut journal = LaunchJournal::begin(
+            &fixture.main,
+            &child,
+            child_branch,
+            "opencode",
+            "child-task",
+            "wMain",
+        )
+        .unwrap();
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                child_branch,
+                child_path.to_str().unwrap(),
+                BRANCH,
+            ],
+        )
+        .unwrap();
+        let created = json!({"workspace":{"workspace_id":"wChild"},
+            "root_pane":{"pane_id":"wChild:p1"},
+            "worktree":{"path":child_path,"branch":child_branch}});
+        journal.created(&created).unwrap();
+        journal.phase("active").unwrap();
+        drop(journal);
+
+        Fixture::commit_at(&child_path, "child-task", "child work\n");
+        git(&fixture.source, &["merge", "--ff-only", child_branch]).unwrap();
+        git(
+            &fixture.main,
+            &["worktree", "remove", child_path.to_str().unwrap()],
+        )
+        .unwrap();
+        let child_tip = tip(&fixture.main, &format!("refs/heads/{child_branch}")).unwrap();
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[1]["checkout_removed"] = json!(true);
+        registry.entries[1]["workspace_closed"] = json!(true);
+        registry.save().unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::CheckoutRemoved
+        );
+        drop(registry);
+
+        Fixture::commit_at(&fixture.source, "parent-task", "parent work\n");
+        git(&fixture.main, &["merge", "--ff-only", BRANCH]).unwrap();
+        git(
+            &fixture.main,
+            &["worktree", "remove", fixture.source.to_str().unwrap()],
+        )
+        .unwrap();
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[0]["checkout_removed"] = json!(true);
+        registry.entries[0]["workspace_closed"] = json!(true);
+        registry.save().unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::CheckoutRemoved
+        );
+        drop(registry);
+        assert_eq!(
+            list_with(&fixture.main, &mut Fake::default()).unwrap()[1].status,
+            WorktreeStatus::CheckoutRemoved
+        );
+
+        let advanced_path = fixture.directory.join("advanced-child");
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                advanced_path.to_str().unwrap(),
+                child_branch,
+            ],
+        )
+        .unwrap();
+        Fixture::commit_at(&advanced_path, "later-child", "new work\n");
+        git(
+            &fixture.main,
+            &["worktree", "remove", advanced_path.to_str().unwrap()],
+        )
+        .unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::NeedsAttention
+        );
+        drop(registry);
+
+        git(
+            &fixture.main,
+            &[
+                "update-ref",
+                &format!("refs/heads/{child_branch}"),
+                &child_tip,
+            ],
+        )
+        .unwrap();
+        fs::create_dir(&child_path).unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::NeedsAttention
+        );
+        drop(registry);
+
+        fs::remove_dir(&child_path).unwrap();
+        git(&fixture.main, &["branch", "-D", BRANCH]).unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn active_child_cannot_merge_without_parent_checkout() {
+        let fixture = Fixture::managed();
+        let child_path = fixture.directory.join("child");
+        let child_branch = "ontrack/child-task";
+        let child = json!({"id":"Bead-1.1", "title":"Child", "parent":"Bead-1"});
+        let mut journal = LaunchJournal::begin(
+            &fixture.main,
+            &child,
+            child_branch,
+            "opencode",
+            "child-task",
+            "wMain",
+        )
+        .unwrap();
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                child_branch,
+                child_path.to_str().unwrap(),
+                BRANCH,
+            ],
+        )
+        .unwrap();
+        let created = json!({"workspace":{"workspace_id":"wChild"},
+            "root_pane":{"pane_id":"wChild:p1"},
+            "worktree":{"path":child_path,"branch":child_branch}});
+        journal.created(&created).unwrap();
+        journal.phase("active").unwrap();
+        drop(journal);
+        Fixture::commit_at(&child_path, "child-task", "child work\n");
+
+        git(
+            &fixture.main,
+            &["worktree", "remove", fixture.source.to_str().unwrap()],
+        )
+        .unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[1]).status,
+            WorktreeStatus::NeedsAttention
+        );
+        drop(registry);
+        let mut executor = Fake::default();
+        assert!(
+            act_with(
+                &fixture.main,
+                "child-task",
+                Action::RequestMerge,
+                &mut executor
+            )
+            .is_err()
+        );
+        assert!(executor.calls.is_empty());
+    }
+
+    #[test]
+    fn child_launch_requires_managed_parent_worktree() {
+        let fixture = Fixture::new();
+        let child = json!({"id":"Bead-1.1", "title":"Child", "parent":"Bead-1"});
+        let error = LaunchJournal::begin(
+            &fixture.main,
+            &child,
+            "ontrack/child",
+            "codex",
+            "child",
+            "wMain",
+        )
+        .err()
+        .unwrap();
+        assert!(error.to_string().contains("parent worktree"));
+    }
+
+    #[test]
+    fn reserved_parent_can_host_child_then_resume_without_second_worktree() {
+        let fixture = Fixture::new();
+        let mut journal =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                BRANCH,
+                fixture.source.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let created = json!({"workspace":{"workspace_id":"wTask"},
+            "root_pane":{"pane_id":"wTask:p1"},
+            "worktree":{"path":fixture.source,"branch":BRANCH}});
+        journal.created(&created).unwrap();
+        journal.phase("reserved").unwrap();
+        drop(journal);
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            inspect(&registry.repo, &registry.entries[0]).status,
+            WorktreeStatus::Reserved
+        );
+        drop(registry);
+        let child = json!({"id":"Bead-1.1", "title":"Child", "parent":"Bead-1"});
+        let child_journal = LaunchJournal::begin(
+            &fixture.main,
+            &child,
+            "ontrack/child",
+            "opencode",
+            "child",
+            "wMain",
+        )
+        .unwrap();
+        assert_eq!(child_journal.base_branch(), Some(BRANCH));
+        drop(child_journal);
+        let resumed =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        assert_eq!(resumed.reserved_target().unwrap().0, "wTask");
+    }
+
+    fn test_bead() -> Value {
+        json!({
+            "id": "Bead-1",
+            "title": "Fix the selected handoff",
+            "description": "First line\nSecond line"
+        })
+    }
+
+    #[test]
+    fn interleaved_journals_preserve_both_latest_entries_and_captured_context() {
+        let fixture = Fixture::new();
+        let mut first =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        let mut second = LaunchJournal::begin(
+            &fixture.main,
+            &json!({"id":"Bead-2","title":"Second"}),
+            "ontrack/second",
+            "codex",
+            "second",
+            "wMain",
+        )
+        .unwrap();
+        first.capture("create", b"first response").unwrap();
+        second.phase("agent_start_possibly_sent").unwrap();
+        first.failed("first recovery").unwrap();
+        second.capture("start", b"second response").unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries.len(), 2);
+        assert_eq!(registry.entries[0]["responses"]["create"], "first response");
+        assert_eq!(
+            registry.entries[0]["bead_description"],
+            test_bead()["description"]
+        );
+        assert_eq!(registry.entries[0]["detail"], "first recovery");
+        assert_eq!(registry.entries[1]["responses"]["start"], "second response");
+        assert_eq!(registry.entries[1]["phase"], "agent_start_possibly_sent");
+    }
+
+    #[test]
+    fn paused_real_launch_intent_does_not_prevent_second_journal_progress() {
+        use std::sync::{Arc, Barrier, mpsc};
+        let fixture = Fixture::new();
+        let main = fixture.main.clone();
+        let (tx, rx) = mpsc::channel();
+        let gate = Arc::new(Barrier::new(2));
+        let worker_gate = gate.clone();
+        let first = std::thread::spawn(move || {
+            let mut journal =
+                LaunchJournal::begin(&main, &test_bead(), BRANCH, "opencode", ID, "wMain").unwrap();
+            tx.send(()).unwrap();
+            worker_gate.wait();
+            journal.capture("create", b"first resumes").unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut second = LaunchJournal::begin(
+            &fixture.main,
+            &json!({"id":"Bead-2"}),
+            "ontrack/second",
+            "opencode",
+            "second",
+            "wMain",
+        )
+        .unwrap();
+        second.capture("create", b"second progressed").unwrap();
+        gate.wait();
+        first.join().unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["responses"]["create"], "first resumes");
+        assert_eq!(
+            registry.entries[1]["responses"]["create"],
+            "second progressed"
+        );
+    }
+
+    #[test]
+    fn journal_contention_exhaustion_is_bounded_and_preserves_the_last_durable_phase() {
+        let fixture = Fixture::new();
+        let mut journal =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            journal
+                .phase("agent_start_possibly_sent")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(registry.entries[0]["phase"], "create_possibly_sent");
+        drop(registry);
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["phase"], "create_possibly_sent");
+    }
+
+    #[test]
+    fn two_reserved_parent_resumes_have_exactly_one_atomic_start_claim() {
+        use std::sync::{Arc, Barrier};
+        let fixture = Fixture::new();
+        let mut initial =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                BRANCH,
+                fixture.source.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        initial.created(&json!({"workspace":{"workspace_id":"wTask"},"root_pane":{"pane_id":"wTask:p1"},"worktree":{"path":fixture.source,"branch":BRANCH}})).unwrap();
+        initial.phase("reserved").unwrap();
+        let first =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        let second =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        let gate = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = [first, second]
+            .into_iter()
+            .map(|mut journal| {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    if journal.phase("agent_start_possibly_sent").is_ok() {
+                        journal
+                            .capture("start", b"only the winning handoff started")
+                            .unwrap();
+                        true
+                    } else {
+                        assert!(journal.failed("loser must not overwrite winner").is_err());
+                        false
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(
+            workers
+                .into_iter()
+                .map(|worker| usize::from(worker.join().unwrap()))
+                .sum::<usize>(),
+            1
+        );
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries.len(), 1);
+        assert_eq!(registry.entries[0]["phase"], "agent_start_possibly_sent");
+        assert_eq!(
+            registry.entries[0]["responses"]["start"],
+            "only the winning handoff started"
+        );
+        assert_ne!(
+            registry.entries[0]["detail"],
+            "loser must not overwrite winner"
+        );
+    }
+
+    #[test]
+    fn display_observations_validate_session_and_never_mutate_durable_status() {
+        let fixture = Fixture::managed();
+        let before = fs::read(fixture.main.join(".git/ontrack-worktrees/registry.json")).unwrap();
+        for mode in [
+            "working",
+            "blocked",
+            "idle",
+            "done",
+            "error",
+            "unknown",
+            "missing",
+            "session",
+            "pane",
+            "poll_error",
+        ] {
+            let mut executor = Fake::default();
+            let mut agent = fixture.agent(12, mode);
+            match mode {
+                "missing" => agent["result"]["agent"]["agent_status"] = Value::Null,
+                "session" => {
+                    agent["result"]["agent"]["agent_session"]["value"] = json!("replacement")
+                }
+                "pane" => agent["result"]["agent"]["pane_id"] = json!("other"),
+                _ => {}
+            }
+            if mode == "poll_error" {
+                executor.outputs.push_back(Err(error("offline")));
+            } else {
+                executor.json(agent);
+            }
+            let rows = observe_agents_with(&fixture.main, &mut executor).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, ID);
+            assert!(rows[0].detail.contains("workspace wTask"));
+            assert!(rows[0].detail.contains("pane wTask:p1"));
+            assert!(rows[0].detail.contains(
+                if matches!(mode, "missing" | "session" | "pane" | "poll_error") {
+                    "unknown"
+                } else {
+                    mode
+                }
+            ));
+            assert_eq!(
+                fs::read(fixture.main.join(".git/ontrack-worktrees/registry.json")).unwrap(),
+                before
+            );
+        }
+    }
 
     struct Fixture {
         directory: PathBuf,
@@ -1301,13 +2971,24 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             static NEXT: AtomicU64 = AtomicU64::new(0);
-            let directory = PathBuf::from("/tmp/opencode").join(format!(
-                "ontrack-worktrees-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
+            let directory = loop {
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos();
+                let path = std::env::temp_dir().join(format!(
+                    "ontrack-worktrees-{}-{nanos}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match fs::create_dir(&path) {
+                    Ok(()) => break path,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("Cannot create worktree test fixture: {error}"),
+                }
+            };
             let main = directory.join("main");
-            fs::create_dir_all(&main).unwrap();
+            fs::create_dir(&main).unwrap();
             git(&main, &["init", "--initial-branch=trunk"]).unwrap();
             for (key, value) in [
                 ("user.name", "OnTrack Test"),
@@ -1336,7 +3017,7 @@ mod tests {
         fn managed() -> Self {
             let fixture = Self::new();
             let mut journal =
-                LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain")
+                LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
                     .unwrap();
             git(
                 &fixture.main,
@@ -1365,6 +3046,51 @@ mod tests {
             fixture
         }
 
+        fn second_managed(&self) -> PathBuf {
+            let source = self.directory.join("second");
+            let mut journal = LaunchJournal::begin(
+                &self.main,
+                &json!({"id":"Bead-2", "title":"Second task"}),
+                "ontrack/ot-second",
+                "opencode",
+                "ot-second",
+                "wMain",
+            )
+            .unwrap();
+            git(
+                &self.main,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    "ontrack/ot-second",
+                    source.to_str().unwrap(),
+                ],
+            )
+            .unwrap();
+            let created = json!({"workspace":{"workspace_id":"wSecond"}, "root_pane":{"pane_id":"wSecond:p1"}, "worktree":{"path":source,"branch":"ontrack/ot-second"}});
+            journal.created(&created).unwrap();
+            journal
+                .capture(
+                    "ready",
+                    self.second_agent(&source, 10, "idle")
+                        .to_string()
+                        .as_bytes(),
+                )
+                .unwrap();
+            journal.phase("active").unwrap();
+            source
+        }
+
+        fn second_agent(&self, source: &Path, seq: u64, state: &str) -> Value {
+            json!({"result":{"type":"agent_info", "agent":{
+                "pane_id":"wSecond:p1", "workspace_id":"wSecond", "agent":"opencode",
+                "agent_status":state, "cwd":source, "foreground_cwd":source,
+                "agent_session":{"agent":"opencode", "kind":"id", "source":"herdr:opencode", "value":"session-2"},
+                "state_change_seq":seq
+            }}})
+        }
+
         fn agent(&self, seq: u64, state: &str) -> Value {
             json!({"result":{"type":"agent_info", "agent":{
                 "pane_id":"wTask:p1", "workspace_id":"wTask", "agent":"opencode",
@@ -1372,6 +3098,26 @@ mod tests {
                 "agent_session":{"agent":"opencode", "kind":"id", "source":"herdr:opencode", "value":"session-1"},
                 "state_change_seq":seq
             }}})
+        }
+
+        fn late_session_agent(&self, seq: u64, state: &str) -> Value {
+            let mut agent = self.agent(seq, state);
+            agent["result"]["agent"]["terminal_id"] = json!("term-task");
+            agent
+        }
+
+        fn simulate_legacy_late_session(&self) {
+            let mut registry = Registry::open(&self.main).unwrap();
+            let mut ready = self.late_session_agent(10, "idle");
+            ready["result"]["agent"]
+                .as_object_mut()
+                .unwrap()
+                .remove("agent_session");
+            registry.entries[0]["responses"]["ready"] = json!(ready.to_string());
+            registry.entries[0]["agent_session"] = Value::Null;
+            registry.entries[0]["initial_lifecycle_seq"] = Value::Null;
+            registry.entries[0]["initial_terminal_id"] = Value::Null;
+            registry.save().unwrap();
         }
 
         fn prompt_result(&self) -> Value {
@@ -1452,10 +3198,11 @@ mod tests {
     }
 
     #[test]
-    fn intent_is_durable_but_only_registry_transactions_hold_the_exclusive_lock() {
+    fn intent_is_durable_and_only_write_transactions_hold_the_exclusive_lock() {
         let fixture = Fixture::new();
         let journal =
-            LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain").unwrap();
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
         let persisted: Value = serde_json::from_slice(
             &fs::read(
                 journal
@@ -1468,6 +3215,14 @@ mod tests {
         .unwrap();
         assert_eq!(persisted["version"], 1);
         assert_eq!(persisted["entries"][0]["phase"], "create_possibly_sent");
+        assert_eq!(
+            persisted["entries"][0]["bead_title"],
+            "Fix the selected handoff"
+        );
+        assert_eq!(
+            persisted["entries"][0]["bead_description"],
+            "First line\nSecond line"
+        );
         assert!(!fixture.source.exists());
         let registry = Registry::open(&fixture.main).unwrap();
         let child = Command::new(std::env::current_exe().unwrap())
@@ -1481,9 +3236,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&child.stdout)
         );
-        assert!(registry.entries[0]["cross_process_write"].is_null());
         drop(registry);
-        // A live journal handle does not lock out a different process's write.
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "worktrees::tests::registry_lock_child"])
             .env("ONTRACK_TEST_LOCK_REPOSITORY", &fixture.main)
@@ -1499,9 +3252,47 @@ mod tests {
         drop(registry);
         drop(journal);
         assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
-        assert!(
-            LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain").is_err()
+        assert!(!fixture.status().handoff_accepted);
+        assert_eq!(
+            fixture.status().bead_title.as_deref(),
+            Some("Fix the selected handoff")
         );
+        assert_eq!(
+            fixture.status().bead_description.as_deref(),
+            Some("First line\nSecond line")
+        );
+        assert!(
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn older_registry_entries_without_bead_context_remain_viewable() {
+        let fixture = Fixture::managed();
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("bead_title");
+        registry.entries[0]
+            .as_object_mut()
+            .unwrap()
+            .remove("bead_description");
+        registry.save().unwrap();
+        drop(registry);
+        let item = fixture.status();
+        assert_eq!(item.bead_id, "Bead-1");
+        assert!(item.bead_title.is_none());
+        assert!(item.bead_description.is_none());
+    }
+
+    #[test]
+    fn accepted_handoff_is_derived_from_durable_active_phase() {
+        let pending = json!({"id":"wt", "bead_id":"bead", "phase":"initial_prompt_possibly_sent"});
+        let active = json!({"id":"wt", "bead_id":"bead", "phase":"active"});
+        assert!(!view(&pending, WorktreeStatus::NeedsAttention, None).handoff_accepted);
+        assert!(view(&active, WorktreeStatus::Unmerged, None).handoff_accepted);
     }
 
     #[test]
@@ -1519,116 +3310,11 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_journal_handles_update_only_their_latest_durable_entry() {
-        let fixture = Fixture::new();
-        let mut first =
-            LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain").unwrap();
-        let mut second = LaunchJournal::begin(
-            &fixture.main,
-            "Bead-2",
-            "ontrack/second",
-            "opencode",
-            "second",
-            "wMain",
-        )
-        .unwrap();
-        first.capture("create", b"first response").unwrap();
-        second.phase("agent_start_possibly_sent").unwrap();
-        first.failed("first recovery").unwrap();
-        second.capture("start", b"second response").unwrap();
-        first.capture("ready", b"first ready").unwrap();
-        let mut registry = Registry::open(&fixture.main).unwrap();
-        assert_eq!(registry.entries.len(), 2);
-        assert_eq!(registry.entries[0]["responses"]["create"], "first response");
-        assert_eq!(registry.entries[0]["responses"]["ready"], "first ready");
-        assert_eq!(registry.entries[0]["detail"], "first recovery");
-        assert_eq!(registry.entries[1]["phase"], "agent_start_possibly_sent");
-        assert_eq!(registry.entries[1]["responses"]["start"], "second response");
-        registry.entries[0]["base"] = json!("changed-by-another-process");
-        registry.save().unwrap();
-        drop(registry);
-        assert!(
-            first
-                .phase("active")
-                .unwrap_err()
-                .to_string()
-                .contains("intent changed: base")
-        );
-        second.failed("second recovery").unwrap();
-        let registry = Registry::open(&fixture.main).unwrap();
-        assert_eq!(registry.entries[0]["base"], "changed-by-another-process");
-        assert_eq!(registry.entries[1]["detail"], "second recovery");
-    }
-
-    #[test]
-    fn paused_launch_after_durable_intent_does_not_block_a_second_real_journal() {
-        use std::sync::{Arc, Barrier, mpsc};
-        let fixture = Fixture::new();
-        let main = fixture.main.clone();
-        let (persisted, ready) = mpsc::channel();
-        let gate = Arc::new(Barrier::new(2));
-        let worker_gate = gate.clone();
-        let first = std::thread::spawn(move || {
-            let mut journal =
-                LaunchJournal::begin(&main, "Bead-1", BRANCH, "opencode", ID, "wMain").unwrap();
-            persisted.send(()).unwrap();
-            worker_gate.wait();
-            journal
-                .capture("create", b"first finished after second")
-                .unwrap();
-        });
-        ready.recv_timeout(Duration::from_secs(5)).unwrap();
-        let mut second = LaunchJournal::begin(
-            &fixture.main,
-            "Bead-2",
-            "ontrack/second",
-            "opencode",
-            "second",
-            "wMain",
-        )
-        .unwrap();
-        second
-            .capture("create", b"second progressed while first paused")
-            .unwrap();
-        let registry = Registry::open(&fixture.main).unwrap();
-        assert_eq!(registry.entries.len(), 2);
-        assert_eq!(
-            registry.entries[1]["responses"]["create"],
-            "second progressed while first paused"
-        );
-        drop(registry);
-        gate.wait();
-        first.join().unwrap();
-        let registry = Registry::open(&fixture.main).unwrap();
-        assert_eq!(
-            registry.entries[0]["responses"]["create"],
-            "first finished after second"
-        );
-        assert_eq!(
-            registry.entries[1]["responses"]["create"],
-            "second progressed while first paused"
-        );
-    }
-
-    #[test]
-    fn journal_lock_retry_exhaustion_fails_closed_without_changing_durable_phase() {
-        let fixture = Fixture::new();
-        let mut journal =
-            LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain").unwrap();
-        let registry = Registry::open(&fixture.main).unwrap();
-        let error = journal.phase("agent_start_possibly_sent").unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-        assert_eq!(registry.entries[0]["phase"], "create_possibly_sent");
-        drop(registry);
-        let registry = Registry::open(&fixture.main).unwrap();
-        assert_eq!(registry.entries[0]["phase"], "create_possibly_sent");
-    }
-
-    #[test]
     fn partial_launch_response_and_failure_survive_restart() {
         let fixture = Fixture::new();
         let mut journal =
-            LaunchJournal::begin(&fixture.main, "Bead-1", BRANCH, "opencode", ID, "wMain").unwrap();
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
         journal
             .capture(
                 "create",
@@ -1818,11 +3504,83 @@ mod tests {
         Fixture::commit_at(&fixture.main, "target", "advanced after prompt\n");
         let before = tip(&fixture.main, "HEAD").unwrap();
         let mut executor = Fake::default();
+        executor.json(fixture.agent(13, "idle"));
         let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
         assert_eq!(rows[0].status, WorktreeStatus::NeedsResolution);
-        assert!(executor.calls.is_empty());
+        assert_eq!(executor.calls, vec![vec!["agent", "get", "wTask:p1"]]);
         assert_eq!(tip(&fixture.main, "HEAD").unwrap(), before);
         fixture.request();
+    }
+
+    #[test]
+    fn working_agent_keeps_unresolved_merge_pending_in_worktree_list() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "file", "source change\n");
+        Fixture::commit_at(&fixture.main, "file", "target change\n");
+        fixture.request();
+        assert!(git(&fixture.source, &["merge", "--no-edit", "trunk"]).is_err());
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsResolution);
+
+        let mut working = Fake::default();
+        working.json(fixture.agent(13, "working"));
+        let rows = list_with(&fixture.main, &mut working).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
+        assert!(rows[0].detail.as_deref().unwrap().contains("still working"));
+        assert_eq!(working.calls, vec![vec!["agent", "get", "wTask:p1"]]);
+
+        for state in ["idle", "done", "blocked"] {
+            let mut executor = Fake::default();
+            executor.json(fixture.agent(14, state));
+            assert_eq!(
+                list_with(&fixture.main, &mut executor).unwrap()[0].status,
+                WorktreeStatus::NeedsResolution,
+                "{state}"
+            );
+        }
+        let mut mismatched = fixture.agent(14, "working");
+        mismatched["result"]["agent"]["agent_session"]["value"] = json!("replacement");
+        let mut executor = Fake::default();
+        executor.json(mismatched);
+        assert_eq!(
+            list_with(&fixture.main, &mut executor).unwrap()[0].status,
+            WorktreeStatus::NeedsResolution
+        );
+        let mut unavailable = Fake::default();
+        unavailable
+            .outputs
+            .push_back(Err(error("Herdr unavailable")));
+        assert_eq!(
+            list_with(&fixture.main, &mut unavailable).unwrap()[0].status,
+            WorktreeStatus::NeedsResolution
+        );
+    }
+
+    #[test]
+    fn working_agent_keeps_advanced_target_pending() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implemented\n");
+        fixture.request();
+        Fixture::commit_at(&fixture.main, "target", "advanced after prompt\n");
+        let mut executor = Fake::default();
+        executor.json(fixture.agent(13, "working"));
+        let rows = list_with(&fixture.main, &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
+        assert!(
+            rows[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("Target advanced")
+        );
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsResolution);
+
+        let before = tip(&fixture.main, "HEAD").unwrap();
+        let mut reconcile = Fake::default();
+        reconcile.json(fixture.agent(13, "working"));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut reconcile).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
+        assert_eq!(tip(&fixture.main, "HEAD").unwrap(), before);
+        assert_eq!(reconcile.calls, vec![vec!["agent", "get", "wTask:p1"]]);
     }
 
     #[test]
@@ -1871,7 +3629,11 @@ mod tests {
             }
             assert_eq!(
                 fixture.status().status,
-                WorktreeStatus::NeedsAttention,
+                if matches!(mode, "target" | "source") {
+                    WorktreeStatus::DirtyCheckout
+                } else {
+                    WorktreeStatus::NeedsAttention
+                },
                 "{mode}"
             );
             let mut executor = Fake::default();
@@ -1881,6 +3643,51 @@ mod tests {
             );
             assert!(executor.calls.is_empty());
         }
+    }
+
+    #[test]
+    fn uncommitted_changes_in_active_checkouts_do_not_claim_merge_readiness() {
+        for (location, file) in [
+            ("source", "in-progress"),
+            ("target", "in-progress"),
+            ("source", "file"),
+            ("target", "file"),
+        ] {
+            let fixture = Fixture::managed();
+            let path = if location == "source" {
+                &fixture.source
+            } else {
+                &fixture.main
+            };
+            fs::write(path.join(file), "uncommitted").unwrap();
+            let status = fixture.status();
+            assert_eq!(status.status, WorktreeStatus::DirtyCheckout, "{location}");
+            assert!(
+                status
+                    .detail
+                    .unwrap()
+                    .contains("Uncommitted checkout changes")
+            );
+            let rows = list_with(&fixture.main, &mut Fake::default()).unwrap();
+            assert_eq!(rows[0].status, WorktreeStatus::DirtyCheckout, "{location}");
+            let mut executor = Fake::default();
+            assert!(
+                act_with(&fixture.main, ID, Action::RequestMerge, &mut executor).is_err(),
+                "{location}"
+            );
+            assert!(executor.calls.is_empty());
+        }
+    }
+
+    #[test]
+    fn merge_request_with_ordinary_changes_stays_pending() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implemented\n");
+        fixture.request();
+        fs::write(fixture.source.join("in-progress"), "uncommitted").unwrap();
+        let status = fixture.status();
+        assert_eq!(status.status, WorktreeStatus::MergeRequested);
+        assert!(status.detail.unwrap().contains(DIRTY_CHECKOUT_DETAIL));
     }
 
     #[test]
@@ -1907,12 +3714,17 @@ mod tests {
         Fixture::commit_at(&fixture.source, "task", "implemented\n");
         fixture.request();
         let main = fixture.main.clone();
+        let mut advanced = false;
         let mut executor = Fake {
             hook: Some(Box::new(move |_| {
-                Fixture::commit_at(&main, "race", "advanced concurrently\n")
+                if !advanced {
+                    Fixture::commit_at(&main, "race", "advanced concurrently\n");
+                    advanced = true;
+                }
             })),
             ..Fake::default()
         };
+        executor.json(fixture.agent(14, "done"));
         executor.json(fixture.agent(14, "done"));
         let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
         assert_eq!(rows[0].status, WorktreeStatus::NeedsResolution);
@@ -1939,6 +3751,102 @@ mod tests {
         assert_eq!(executor.calls[1], ["workspace", "close", "wTask"]);
         assert!(fixture.source.exists());
         assert!(tip(&fixture.main, &format!("refs/heads/{BRANCH}")).is_ok());
+    }
+
+    #[test]
+    fn restart_checks_ownership_before_any_mutation() {
+        let fixture = Fixture::managed();
+        let mut wrong = fixture.inventory(true, true);
+        wrong["result"]["worktrees"][1]["branch"] = json!("other-branch");
+        let mut executor = Fake::default();
+        executor.json(wrong);
+        assert!(restart_with(&fixture.main, ID, &mut executor).is_err());
+        assert_eq!(executor.calls.len(), 1);
+        assert_eq!(executor.calls[0][..2], ["worktree", "list"]);
+        assert!(fixture.source.exists());
+        assert!(Registry::open(&fixture.main).unwrap().entries[0]["restart_pending"].is_null());
+    }
+
+    #[test]
+    fn restart_force_removal_is_journaled_and_never_blindly_retried() {
+        let fixture = Fixture::managed();
+        fs::write(
+            fixture.source.join("uncommitted"),
+            "discard on confirmed restart",
+        )
+        .unwrap();
+        let mut executor = Fake {
+            bead: Some(test_bead()),
+            ..Default::default()
+        };
+        executor.json(fixture.inventory(true, true));
+        executor.json(fixture.inventory(true, true));
+        executor
+            .outputs
+            .push_back(Ok(b"--kind <KIND> [possible values: opencode]".to_vec()));
+        executor
+            .outputs
+            .push_back(Ok(b"opencode: current (v1) (/tmp/opencode)".to_vec()));
+        executor.json(fixture.inventory(true, true));
+        executor
+            .outputs
+            .push_back(Err(error("Herdr timed out after removal may have started")));
+        assert!(restart_with(&fixture.main, ID, &mut executor).is_err());
+        assert_eq!(
+            executor.calls.last().unwrap(),
+            &["worktree", "remove", "--workspace", "wTask", "--force"]
+        );
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["restart_pending"], true);
+        drop(registry);
+        let mut retry = Fake::default();
+        assert!(restart_with(&fixture.main, ID, &mut retry).is_err());
+        assert!(retry.calls.is_empty());
+    }
+
+    #[test]
+    fn restart_verifies_forced_removal_and_exposes_failed_relaunch() {
+        let fixture = Fixture::managed();
+        fs::write(fixture.source.join("uncommitted"), "discard me").unwrap();
+        let main = fixture.main.clone();
+        let source = fixture.source.clone();
+        let mut executor = Fake {
+            bead: Some(test_bead()),
+            hook: Some(Box::new(move |args| {
+                if args.starts_with(&["worktree", "remove"]) {
+                    git(
+                        &main,
+                        &["worktree", "remove", "--force", source.to_str().unwrap()],
+                    )
+                    .unwrap();
+                }
+            })),
+            ..Default::default()
+        };
+        executor.json(fixture.inventory(true, true));
+        executor.json(fixture.inventory(true, true));
+        executor
+            .outputs
+            .push_back(Ok(b"[possible values: opencode]".to_vec()));
+        executor
+            .outputs
+            .push_back(Ok(b"opencode: current (v1) (/tmp/opencode)".to_vec()));
+        executor.json(fixture.inventory(true, true));
+        executor.json(json!({"result":{"type":"worktree_removed"}}));
+        executor.json(fixture.inventory(false, false));
+        executor
+            .outputs
+            .push_back(Err(error("discovery unavailable")));
+        assert!(restart_with(&fixture.main, ID, &mut executor).is_err());
+        assert!(!fixture.source.exists());
+        assert!(tip(&fixture.main, &format!("refs/heads/{BRANCH}")).is_ok());
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["checkout_removed"], true);
+        assert_eq!(registry.entries[0]["restarted"], true);
+        assert!(registry.entries[0]["restart_launch_error"].is_string());
+        assert!(registry.entries[0]["restart_launch_pending"].is_null());
     }
 
     #[test]
@@ -1984,6 +3892,7 @@ mod tests {
         executor.json(fixture.inventory(false, false));
         let policy = CleanupPolicy {
             auto_merge: true,
+            auto_merge_children: true,
             auto_close_workspace: true,
             auto_remove_checkout: true,
         };
@@ -2001,6 +3910,107 @@ mod tests {
                 .any(|s| s == "--force" || s == "--group" || s == "close")
         );
         assert!(tip(&fixture.main, &format!("refs/heads/{BRANCH}")).is_ok());
+    }
+
+    #[test]
+    fn reconcile_records_externally_removed_checkout_without_cleanup_commands() {
+        for git_removal in [true, false] {
+            let fixture = Fixture::managed();
+            Fixture::commit_at(&fixture.source, "task", "unmerged work\n");
+            let source_tip = tip(&fixture.source, "HEAD").unwrap();
+            if git_removal {
+                git(
+                    &fixture.main,
+                    &["worktree", "remove", fixture.source.to_str().unwrap()],
+                )
+                .unwrap();
+            } else {
+                fs::remove_dir_all(&fixture.source).unwrap();
+            }
+
+            let mut executor = Fake::default();
+            let rows =
+                reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+            assert_eq!(rows[0].status, WorktreeStatus::CheckoutRemoved);
+            assert!(executor.calls.is_empty());
+            assert_eq!(
+                tip(&fixture.main, &format!("refs/heads/{BRANCH}")).unwrap(),
+                source_tip
+            );
+            let registry = Registry::open(&fixture.main).unwrap();
+            assert_eq!(registry.entries[0]["checkout_removed"], true);
+            assert_eq!(registry.entries[0]["checkout_removed_externally"], true);
+            drop(registry);
+
+            assert_eq!(fixture.status().status, WorktreeStatus::CheckoutRemoved);
+            assert_eq!(
+                reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap()[0]
+                    .status,
+                WorktreeStatus::CheckoutRemoved
+            );
+            fs::create_dir(&fixture.source).unwrap();
+            assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        }
+    }
+
+    #[test]
+    fn removed_integrated_checkout_stays_removed_when_target_is_dirty() {
+        let fixture = Fixture::managed();
+        fixture.integrated();
+        git(
+            &fixture.main,
+            &["worktree", "remove", fixture.source.to_str().unwrap()],
+        )
+        .unwrap();
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[0]["checkout_removed"] = json!(true);
+        registry.entries[0]["workspace_closed"] = json!(true);
+        registry.save().unwrap();
+        drop(registry);
+
+        fs::write(fixture.main.join("local-export-change"), "uncommitted\n").unwrap();
+
+        assert_eq!(fixture.status().status, WorktreeStatus::CheckoutRemoved);
+    }
+
+    #[test]
+    fn reconcile_keeps_present_or_invalid_checkout_paths_visible() {
+        let fixture = Fixture::managed();
+        let mut executor = Fake::default();
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::InProgress);
+        assert!(executor.calls.is_empty());
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["checkout_removed"], false);
+        registry.entries[0]["path"] = json!("relative/checkout");
+        registry.save().unwrap();
+        drop(registry);
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::NeedsAttention);
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["checkout_removed"], false);
+    }
+
+    #[test]
+    fn reconcile_keeps_uncertain_restart_visible_when_checkout_is_missing() {
+        let fixture = Fixture::managed();
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[0]["restart_pending"] = json!(true);
+        registry.save().unwrap();
+        drop(registry);
+        git(
+            &fixture.main,
+            &["worktree", "remove", fixture.source.to_str().unwrap()],
+        )
+        .unwrap();
+
+        let mut executor = Fake::default();
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::NeedsAttention);
+        assert!(executor.calls.is_empty());
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["checkout_removed"], false);
+        assert!(registry.entries[0]["checkout_removed_externally"].is_null());
     }
 
     #[test]
@@ -2041,6 +4051,7 @@ mod tests {
                 &fixture.main,
                 CleanupPolicy {
                     auto_merge: true,
+                    auto_merge_children: true,
                     auto_close_workspace: true,
                     auto_remove_checkout: true,
                 },
@@ -2071,6 +4082,156 @@ mod tests {
             WorktreeStatus::Integrated
         );
         assert!(executor.calls.is_empty());
+    }
+
+    #[test]
+    fn readiness_without_native_session_still_records_initial_lifecycle_and_terminal() {
+        let fixture = Fixture::new();
+        let mut journal =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        let mut ready = fixture.late_session_agent(10, "idle");
+        ready["result"]["agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_session");
+        journal
+            .capture("ready", ready.to_string().as_bytes())
+            .unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["initial_lifecycle_seq"], 10);
+        assert_eq!(registry.entries[0]["initial_terminal_id"], "term-task");
+        assert!(registry.entries[0]["agent_session"].is_null());
+    }
+
+    #[test]
+    fn late_native_session_recovers_legacy_handoff_and_completes_automatic_lifecycle() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implemented\n");
+        fixture.simulate_legacy_late_session();
+        let policy = CleanupPolicy {
+            auto_merge: true,
+            auto_merge_children: true,
+            auto_close_workspace: true,
+            auto_remove_checkout: true,
+        };
+        let mut request = Fake::default();
+        request.json(fixture.late_session_agent(12, "done"));
+        request.json(fixture.late_session_agent(12, "done"));
+        request.json(fixture.prompt_result());
+        assert_eq!(
+            reconcile_with(&fixture.main, policy, &mut request).unwrap()[0].status,
+            WorktreeStatus::MergeRequested
+        );
+        assert_eq!(
+            request
+                .calls
+                .iter()
+                .filter(|args| args.starts_with(&["agent".into(), "prompt".into()]))
+                .count(),
+            1
+        );
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["initial_lifecycle_seq"], 10);
+        assert_eq!(registry.entries[0]["initial_terminal_id"], "term-task");
+        assert_eq!(registry.entries[0]["agent_session"]["value"], "session-1");
+        drop(registry);
+
+        let main = fixture.main.clone();
+        let source = fixture.source.clone();
+        let mut finish = Fake {
+            hook: Some(Box::new(move |args| {
+                if args.starts_with(&["worktree", "remove"]) {
+                    git(&main, &["worktree", "remove", source.to_str().unwrap()]).unwrap();
+                }
+            })),
+            ..Fake::default()
+        };
+        finish.json(fixture.late_session_agent(14, "done"));
+        finish.json(fixture.late_session_agent(14, "done"));
+        finish.json(fixture.inventory(true, true));
+        finish.json(json!({"result":{"type":"worktree_removed"}}));
+        finish.json(fixture.inventory(false, false));
+        assert_eq!(
+            reconcile_with(&fixture.main, policy, &mut finish).unwrap()[0].status,
+            WorktreeStatus::CheckoutRemoved
+        );
+        assert!(!fixture.source.exists());
+        assert!(
+            finish
+                .calls
+                .iter()
+                .any(|args| { args == &["worktree", "remove", "--workspace", "wTask"] })
+        );
+    }
+
+    #[test]
+    fn late_native_session_on_changed_terminal_never_triggers_automatic_cleanup() {
+        let fixture = Fixture::managed();
+        fixture.integrated();
+        fixture.simulate_legacy_late_session();
+        let mut agent = fixture.late_session_agent(12, "done");
+        agent["result"]["agent"]["terminal_id"] = json!("term-replaced");
+        let mut executor = Fake::default();
+        executor.json(agent);
+        let rows = reconcile_with(
+            &fixture.main,
+            CleanupPolicy {
+                auto_merge: true,
+                auto_merge_children: true,
+                auto_close_workspace: true,
+                auto_remove_checkout: true,
+            },
+            &mut executor,
+        )
+        .unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::Integrated);
+        assert!(
+            rows[0]
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("terminal identity")
+        );
+        assert_eq!(executor.calls.len(), 2);
+        assert!(fixture.source.exists());
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert!(registry.entries[0]["agent_session"].is_null());
+    }
+
+    #[test]
+    fn late_native_session_closes_integrated_workspace_when_only_close_is_enabled() {
+        let fixture = Fixture::managed();
+        fixture.integrated();
+        fixture.simulate_legacy_late_session();
+        let mut executor = Fake::default();
+        executor.json(fixture.late_session_agent(12, "done"));
+        executor.json(fixture.inventory(true, true));
+        executor.json(json!({"result":{"type":"workspace_closed"}}));
+        executor.json(fixture.inventory(false, true));
+        let rows = reconcile_with(
+            &fixture.main,
+            CleanupPolicy {
+                auto_close_workspace: true,
+                ..CleanupPolicy::default()
+            },
+            &mut executor,
+        )
+        .unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::WorkspaceClosed);
+        assert!(fixture.source.exists());
+        assert!(
+            executor
+                .calls
+                .iter()
+                .any(|args| { args == &["workspace", "close", "wTask"] })
+        );
+        assert!(
+            !executor
+                .calls
+                .iter()
+                .any(|args| args.starts_with(&["worktree".into(), "remove".into()]))
+        );
     }
 
     #[test]
@@ -2110,6 +4271,131 @@ mod tests {
                 .calls
                 .iter()
                 .any(|args| args.get(1).is_some_and(|s| s == "prompt"))
+        );
+    }
+
+    #[test]
+    fn child_auto_merge_uses_its_own_preference_and_parent_target() {
+        for (auto_merge, auto_merge_children, should_request) in
+            [(false, true, true), (true, false, false)]
+        {
+            let fixture = Fixture::managed();
+            let child_path = fixture.directory.join("child");
+            let child_branch = "ontrack/child";
+            let child = json!({"id":"Bead-1.1", "title":"Child", "parent":"Bead-1"});
+            let mut journal = LaunchJournal::begin(
+                &fixture.main,
+                &child,
+                child_branch,
+                "opencode",
+                "child",
+                "wMain",
+            )
+            .unwrap();
+            git(
+                &fixture.main,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    child_branch,
+                    child_path.to_str().unwrap(),
+                    BRANCH,
+                ],
+            )
+            .unwrap();
+            let created = json!({"workspace":{"workspace_id":"wChild"},
+                "root_pane":{"pane_id":"wChild:p1"},
+                "worktree":{"path":child_path,"branch":child_branch}});
+            journal.created(&created).unwrap();
+            let child_agent = |seq| {
+                json!({"result":{"type":"agent_info", "agent":{
+                    "pane_id":"wChild:p1", "workspace_id":"wChild", "agent":"opencode",
+                    "agent_status":"done", "cwd":child_path, "foreground_cwd":child_path,
+                    "agent_session":{"agent":"opencode", "kind":"id", "source":"herdr:opencode", "value":"child-session"},
+                    "state_change_seq":seq
+                }}})
+            };
+            journal
+                .capture("ready", child_agent(10).to_string().as_bytes())
+                .unwrap();
+            journal.phase("active").unwrap();
+            drop(journal);
+            Fixture::commit_at(&child_path, "child-task", "completed work\n");
+
+            let mut executor = Fake::default();
+            executor.json(child_agent(12));
+            if should_request {
+                executor.json(child_agent(12));
+                executor.json(json!({"result":{"type":"agent_prompted", "agent":{
+                    "pane_id":"wChild:p1", "workspace_id":"wChild"}}}));
+            }
+            let rows = reconcile_with(
+                &fixture.main,
+                CleanupPolicy {
+                    auto_merge,
+                    auto_merge_children,
+                    ..CleanupPolicy::default()
+                },
+                &mut executor,
+            )
+            .unwrap();
+            assert_eq!(
+                rows[1].status,
+                if should_request {
+                    WorktreeStatus::MergeRequested
+                } else {
+                    WorktreeStatus::Unmerged
+                }
+            );
+            assert_eq!(
+                executor
+                    .calls
+                    .iter()
+                    .filter(|args| args.get(1).is_some_and(|s| s == "prompt"))
+                    .count(),
+                usize::from(should_request)
+            );
+            let registry = Registry::open(&fixture.main).unwrap();
+            assert_eq!(registry.entries[1]["target_branch"], BRANCH);
+            assert_eq!(registry.entries[1]["target_path"], json!(fixture.source));
+            drop(registry);
+            if should_request {
+                let main_tip = tip(&fixture.main, "HEAD").unwrap();
+                let child_tip = tip(&child_path, "HEAD").unwrap();
+                let mut finish = Fake::default();
+                finish.json(child_agent(14));
+                finish.json(fixture.agent(12, "done"));
+                let rows = reconcile_with(
+                    &fixture.main,
+                    CleanupPolicy {
+                        auto_merge,
+                        auto_merge_children,
+                        ..CleanupPolicy::default()
+                    },
+                    &mut finish,
+                )
+                .unwrap();
+                assert_eq!(rows[1].status, WorktreeStatus::Integrated);
+                assert_eq!(tip(&fixture.source, "HEAD").unwrap(), child_tip);
+                assert_eq!(tip(&fixture.main, "HEAD").unwrap(), main_tip);
+            }
+        }
+    }
+
+    #[test]
+    fn child_default_does_not_auto_merge_top_level_handoff() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "completed work\n");
+        let mut executor = Fake::default();
+        executor.json(fixture.agent(12, "done"));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::Unmerged);
+        assert!(
+            !executor
+                .calls
+                .iter()
+                .any(|args| args.get(1).is_some_and(|arg| arg == "prompt"))
         );
     }
 
@@ -2232,6 +4518,111 @@ mod tests {
     }
 
     #[test]
+    fn active_worktree_requires_closed_bead_and_finished_recorded_agent_for_ready_label() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implementation\n");
+        assert_eq!(fixture.status().status, WorktreeStatus::Unmerged);
+
+        let mut open = Fake {
+            bead: Some(json!({"id":"Bead-1","status":"in_progress"})),
+            ..Fake::default()
+        };
+        let rows = list_with(&fixture.main, &mut open).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::InProgress);
+        assert_eq!(open.calls, vec![vec!["show_bead", "Bead-1"]]);
+
+        let mut working = Fake::default();
+        working.json(fixture.agent(12, "working"));
+        assert_eq!(
+            list_with(&fixture.main, &mut working).unwrap()[0].status,
+            WorktreeStatus::InProgress
+        );
+
+        let mut changed_session = Fake::default();
+        let mut agent = fixture.agent(12, "done");
+        agent["result"]["agent"]["agent_session"]["value"] = json!("another-session");
+        changed_session.json(agent);
+        assert_eq!(
+            list_with(&fixture.main, &mut changed_session).unwrap()[0].status,
+            WorktreeStatus::InProgress
+        );
+
+        let mut idle_before_task_activity = Fake::default();
+        idle_before_task_activity.json(fixture.agent(10, "idle"));
+        assert_eq!(
+            list_with(&fixture.main, &mut idle_before_task_activity).unwrap()[0].status,
+            WorktreeStatus::InProgress
+        );
+
+        let mut finished = Fake::default();
+        finished.json(fixture.agent(12, "done"));
+        assert_eq!(
+            list_with(&fixture.main, &mut finished).unwrap()[0].status,
+            WorktreeStatus::Unmerged
+        );
+    }
+
+    #[test]
+    fn legacy_handoff_uses_recorded_agent_activity_for_ready_display_only() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implementation\n");
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        let entry = &mut registry.entries[0];
+        entry.as_object_mut().unwrap().remove("agent_session");
+        entry
+            .as_object_mut()
+            .unwrap()
+            .remove("initial_lifecycle_seq");
+        let mut ready: Value =
+            serde_json::from_str(entry["responses"]["ready"].as_str().unwrap()).unwrap();
+        ready["result"]["agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("agent_session");
+        ready["result"]["agent"]["terminal_id"] = json!("original-terminal");
+        entry["responses"]["ready"] = json!(ready.to_string());
+        registry.save().unwrap();
+        drop(registry);
+
+        let observed = |seq, state, terminal| {
+            let mut agent = fixture.agent(seq, state);
+            agent["result"]["agent"]["terminal_id"] = json!(terminal);
+            let mut executor = Fake::default();
+            executor.json(agent);
+            list_with(&fixture.main, &mut executor).unwrap()[0].clone()
+        };
+        let ready = observed(12, "idle", "original-terminal");
+        assert_eq!(ready.status, WorktreeStatus::Unmerged);
+        assert!(
+            ready
+                .detail
+                .unwrap()
+                .contains("automatic reconciliation can bind a later matching session")
+        );
+        assert_eq!(
+            observed(10, "idle", "original-terminal").status,
+            WorktreeStatus::InProgress
+        );
+        assert_eq!(
+            observed(12, "working", "original-terminal").status,
+            WorktreeStatus::InProgress
+        );
+        assert_eq!(
+            observed(12, "idle", "replacement-terminal").status,
+            WorktreeStatus::InProgress
+        );
+
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry.entries[0]["responses"]["ready"] = Value::Null;
+        registry.save().unwrap();
+        drop(registry);
+        assert_eq!(
+            observed(12, "idle", "original-terminal").status,
+            WorktreeStatus::InProgress
+        );
+    }
+
+    #[test]
     fn immediately_closed_bead_does_not_complete_or_clean_untouched_checkout() {
         let fixture = Fixture::managed();
         let before = tip(&fixture.main, "HEAD").unwrap();
@@ -2241,13 +4632,14 @@ mod tests {
             &fixture.main,
             CleanupPolicy {
                 auto_merge: true,
+                auto_merge_children: true,
                 auto_close_workspace: true,
                 auto_remove_checkout: true,
             },
             &mut executor,
         )
         .unwrap();
-        assert_eq!(rows[0].status, WorktreeStatus::Unmerged);
+        assert_eq!(rows[0].status, WorktreeStatus::InProgress);
         assert!(rows[0].detail.as_ref().unwrap().contains("No task commits"));
         assert!(executor.calls.is_empty());
         assert!(fixture.source.exists());
@@ -2288,6 +4680,7 @@ mod tests {
             &fixture.main,
             CleanupPolicy {
                 auto_merge: true,
+                auto_merge_children: true,
                 auto_close_workspace: true,
                 auto_remove_checkout: true,
             },
@@ -2365,6 +4758,7 @@ mod tests {
                 &fixture.main,
                 CleanupPolicy {
                     auto_merge: true,
+                    auto_merge_children: true,
                     auto_close_workspace: true,
                     auto_remove_checkout: true,
                 },
@@ -2519,6 +4913,7 @@ mod tests {
                     &fixture.main,
                     CleanupPolicy {
                         auto_merge: true,
+                        auto_merge_children: true,
                         auto_close_workspace: true,
                         auto_remove_checkout: true,
                     },

@@ -1,7 +1,7 @@
-//! Read-only browsing and explicit create/delete operations through the Beads CLI.
+//! Workspace initialization, read-only browsing, and explicit mutations through the Beads CLI.
 
-use std::io;
 use std::process::{Command, Output};
+use std::{io, path::Path};
 
 use serde_json::Value;
 
@@ -16,6 +16,35 @@ pub const BEAD_TYPES: &[&str] = &[
     "story",
     "milestone",
 ];
+pub const READY_LABEL: &str = "ontrack:ready";
+pub const HARNESS_PREFIX: &str = "ontrack:agent:";
+pub const UNASSIGNED_LABEL: &str = "ontrack:unassigned";
+pub const HARNESSES: &[&str] = &[
+    "pi",
+    "claude",
+    "codex",
+    "gemini",
+    "cursor",
+    "devin",
+    "agy",
+    "cline",
+    "omp",
+    "mastracode",
+    "opencode",
+    "copilot",
+    "kimi",
+    "kiro",
+    "droid",
+    "amp",
+    "grok",
+    "hermes",
+    "kilo",
+    "qodercli",
+    "qwen",
+    "letta",
+    "maki",
+    "muse",
+];
 
 #[derive(Debug, Clone)]
 pub struct CreateBead {
@@ -23,6 +52,14 @@ pub struct CreateBead {
     pub description: String,
     pub issue_type: String,
     pub priority: u8,
+    pub harness: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct UpdateBead {
+    pub id: String,
+    pub fields: CreateBead,
+    pub previous_harness: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -44,6 +81,56 @@ const LIST_ARGS: &[&str] = &[
     "--json",
 ];
 
+const INIT_ARGS: &[&str] = &[
+    "--no-color",
+    "init",
+    "--init-if-missing",
+    "--non-interactive",
+    "--skip-agents",
+    "--skip-hooks",
+    "--quiet",
+];
+const DISABLE_EXPORT_ARGS: &[&str] = &["--no-color", "config", "set", "export.auto", "false"];
+
+/// Ensure the launch directory can use Beads before the terminal enters raw mode.
+pub fn ensure_workspace() -> io::Result<()> {
+    ensure_workspace_in(&std::env::current_dir()?)
+}
+
+fn ensure_workspace_in(directory: &Path) -> io::Result<()> {
+    ensure_workspace_in_with(directory, |directory, args| {
+        Command::new("bd")
+            .args(args)
+            .current_dir(directory)
+            .output()
+    })
+}
+
+fn ensure_workspace_in_with(
+    directory: &Path,
+    mut execute: impl FnMut(&Path, &[&str]) -> io::Result<Output>,
+) -> io::Result<()> {
+    run_bd_with(INIT_ARGS, |args| execute(directory, args)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Could not initialize Beads for {}: {error}. Install or check bd, then retry",
+                directory.display()
+            ),
+        )
+    })?;
+    run_bd_with(DISABLE_EXPORT_ARGS, |args| execute(directory, args)).map_err(|error| {
+        io::Error::new(
+            error.kind(),
+            format!(
+                "Could not disable Beads issue export for {}: {error}. Check bd and workspace permissions, then retry",
+                directory.display()
+            ),
+        )
+    })?;
+    Ok(())
+}
+
 pub fn list_beads() -> io::Result<Vec<Bead>> {
     parse_list(&run_bd(LIST_ARGS)?)
 }
@@ -61,6 +148,188 @@ pub fn create_bead(input: &CreateBead) -> io::Result<String> {
     parse_created_id(&run_bd(&args)?)
 }
 
+pub fn create_child(input: &CreateBead, parent_id: &str) -> io::Result<String> {
+    validate_id(parent_id)?;
+    let parent = show_bead(parent_id)?;
+    let inherited = labels(&parent)
+        .filter(|label| {
+            *label != READY_LABEL
+                && *label != UNASSIGNED_LABEL
+                && !label.starts_with(HARNESS_PREFIX)
+        })
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let args = create_child_args(input, parent_id, &inherited)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    parse_created_id(&run_bd(&args)?)
+}
+
+fn create_child_args(
+    input: &CreateBead,
+    parent_id: &str,
+    inherited: &[String],
+) -> io::Result<Vec<String>> {
+    validate_id(parent_id)?;
+    let mut args = create_args(input)?;
+    args.push(format!("--parent={parent_id}"));
+    args.push("--no-inherit-labels".into());
+    for label in inherited {
+        if label == READY_LABEL || label == UNASSIGNED_LABEL || label.starts_with(HARNESS_PREFIX) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "OnTrack parent state cannot be inherited by child",
+            ));
+        }
+        args.push(format!("--labels={label}"));
+    }
+    Ok(args)
+}
+
+/// Beads cannot add a blocking edge from a parent to its descendant: that
+/// would cascade the blocked status back to the child. Check the hierarchy
+/// itself before handing a parent to an agent.
+pub fn open_descendants(parent_id: &str) -> io::Result<Vec<String>> {
+    validate_id(parent_id)?;
+    Ok(open_descendants_in(&list_beads()?, parent_id))
+}
+
+pub(crate) fn open_descendants_in(beads: &[Bead], parent_id: &str) -> Vec<String> {
+    let mut descendants = Vec::new();
+    let mut frontier = vec![parent_id];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(parent) = frontier.pop() {
+        if !visited.insert(parent) {
+            continue;
+        }
+        for bead in beads {
+            if bead.data["parent"].as_str() == Some(parent) {
+                frontier.push(&bead.id);
+                if bead.status != "closed" {
+                    descendants.push(bead.id.clone());
+                }
+            }
+        }
+    }
+    descendants
+}
+
+pub fn update_bead(input: &UpdateBead) -> io::Result<()> {
+    let args = update_args(input)?;
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_bd(&args)?;
+    Ok(())
+}
+
+pub fn set_ready(id: &str, ready: bool) -> io::Result<()> {
+    set_ready_many(&[id.to_owned()], ready)
+}
+
+fn set_ready_many(ids: &[String], ready: bool) -> io::Result<()> {
+    for id in ids {
+        validate_id(id)?;
+    }
+    let flag = if ready {
+        "--add-label"
+    } else {
+        "--remove-label"
+    };
+    let mut args = vec!["--no-color", "update", flag, READY_LABEL];
+    if ready {
+        args.extend(["--if-status", "open", "--status", "open"]);
+    }
+    args.push("--");
+    args.extend(ids.iter().map(String::as_str));
+    run_bd(&args)?;
+    Ok(())
+}
+
+/// Change an Epic and its open descendant Tasks in one CLI invocation.
+/// Beads applies updates per ID, so callers must refresh after any error.
+pub fn set_epic_ready(
+    epic_id: &str,
+    ready: bool,
+    known_handoffs: &std::collections::HashSet<String>,
+    protected_handoffs: &std::collections::HashSet<String>,
+) -> io::Result<Vec<String>> {
+    validate_id(epic_id)?;
+    let beads = list_beads()?;
+    let ids = epic_ready_targets_in(&beads, epic_id, ready, known_handoffs, protected_handoffs)?;
+    set_ready_many(&ids, ready)?;
+    Ok(ids)
+}
+
+fn epic_ready_targets_in(
+    beads: &[Bead],
+    epic_id: &str,
+    ready: bool,
+    known_handoffs: &std::collections::HashSet<String>,
+    protected_handoffs: &std::collections::HashSet<String>,
+) -> io::Result<Vec<String>> {
+    let epic = beads
+        .iter()
+        .find(|bead| bead.id == epic_id)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "Selected Epic is no longer listed")
+        })?;
+    if epic.status != "open" || epic.data["issue_type"] != "epic" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Only open Epics can change descendant Ready markers",
+        ));
+    }
+    let descendants: std::collections::HashSet<_> =
+        open_descendants_in(beads, epic_id).into_iter().collect();
+    let mut ids = vec![epic_id.to_owned()];
+    ids.extend(
+        beads
+            .iter()
+            .filter(|bead| {
+                descendants.contains(&bead.id)
+                    && bead.status == "open"
+                    && bead.data["issue_type"] == "task"
+                    && (!ready || !known_handoffs.contains(&bead.id))
+                    && (ready || !protected_handoffs.contains(&bead.id))
+                    && (ready != is_ready(bead))
+            })
+            .map(|bead| bead.id.clone()),
+    );
+    Ok(ids)
+}
+
+pub fn is_ready(bead: &Bead) -> bool {
+    bead.status == "open"
+        && (bead.data["issue_type"] == "task" || bead.data["issue_type"] == "epic")
+        && labels(&bead.data).any(|label| label == READY_LABEL)
+}
+
+pub fn ready_record(data: &Value) -> bool {
+    data["status"] == "open"
+        && data["issue_type"] == "task"
+        && labels(data).any(|label| label == READY_LABEL)
+}
+
+pub fn harness(data: &Value) -> Option<&str> {
+    labels(data)
+        .filter_map(|label| label.strip_prefix(HARNESS_PREFIX))
+        .find(|kind| HARNESSES.contains(kind))
+}
+
+pub fn explicitly_unassigned(data: &Value) -> bool {
+    labels(data).any(|label| label == UNASSIGNED_LABEL)
+}
+
+pub fn has_harness_label(data: &Value) -> bool {
+    labels(data).any(|label| label.starts_with(HARNESS_PREFIX))
+}
+
+fn labels(data: &Value) -> impl Iterator<Item = &str> {
+    data.get("labels")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+}
+
 /// Permanently delete only this issue, never cascading to dependent issues.
 pub fn delete_bead(id: &str) -> io::Result<()> {
     run_bd(&delete_args(id)?)?;
@@ -68,6 +337,55 @@ pub fn delete_bead(id: &str) -> io::Result<()> {
 }
 
 fn create_args(input: &CreateBead) -> io::Result<Vec<String>> {
+    let title = validated_title(input)?;
+    let mut args = vec![
+        "--no-color".to_owned(),
+        "create".to_owned(),
+        format!("--title={title}"),
+        format!("--description={}", input.description),
+        format!("--type={}", input.issue_type),
+        format!("--priority={}", input.priority),
+        "--json".to_owned(),
+    ];
+    if input.issue_type == "task" {
+        args.push(match &input.harness {
+            Some(harness) => format!("--labels={HARNESS_PREFIX}{harness}"),
+            None => format!("--labels={UNASSIGNED_LABEL}"),
+        });
+    }
+    Ok(args)
+}
+
+fn update_args(input: &UpdateBead) -> io::Result<Vec<String>> {
+    validate_id(&input.id)?;
+    let title = validated_title(&input.fields)?;
+    let mut args = vec![
+        "--no-color".to_owned(),
+        "update".to_owned(),
+        format!("--title={title}"),
+        format!("--description={}", input.fields.description),
+        format!("--type={}", input.fields.issue_type),
+        format!("--priority={}", input.fields.priority),
+        "--json".to_owned(),
+    ];
+    if input.fields.harness != input.previous_harness {
+        if let Some(old) = &input.previous_harness {
+            args.push(format!("--remove-label={HARNESS_PREFIX}{old}"));
+        }
+        if let Some(new) = &input.fields.harness {
+            args.push(format!("--add-label={HARNESS_PREFIX}{new}"));
+        }
+    }
+    if input.fields.issue_type == "task" && input.fields.harness.is_none() {
+        args.push(format!("--add-label={UNASSIGNED_LABEL}"));
+    } else {
+        args.push(format!("--remove-label={UNASSIGNED_LABEL}"));
+    }
+    args.extend(["--".to_owned(), input.id.clone()]);
+    Ok(args)
+}
+
+fn validated_title(input: &CreateBead) -> io::Result<&str> {
     let title = input.title.trim();
     if title.is_empty()
         || input
@@ -91,15 +409,17 @@ fn create_args(input: &CreateBead) -> io::Result<Vec<String>> {
             "Unsupported Beads issue type",
         ));
     }
-    Ok(vec![
-        "--no-color".to_owned(),
-        "create".to_owned(),
-        format!("--title={title}"),
-        format!("--description={}", input.description),
-        format!("--type={}", input.issue_type),
-        format!("--priority={}", input.priority),
-        "--json".to_owned(),
-    ])
+    if input
+        .harness
+        .as_deref()
+        .is_some_and(|h| !HARNESSES.contains(&h))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Unsupported agent harness",
+        ));
+    }
+    Ok(title)
 }
 
 fn delete_args(id: &str) -> io::Result<[&str; 6]> {
@@ -233,6 +553,232 @@ fn parse_show(bytes: &[u8], id: &str) -> io::Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[cfg(unix)]
+    use std::collections::HashMap;
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_initializes_missing_workspace_and_preserves_existing_one() {
+        struct Fixture(std::path::PathBuf);
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                std::fs::remove_dir_all(&self.0).ok();
+            }
+        }
+
+        let directory = std::env::temp_dir().join(format!(
+            "ontrack-beads-init-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let _fixture = Fixture(directory.clone());
+
+        let mut config = HashMap::new();
+        ensure_workspace_in_with(&directory, |workspace, args| {
+            fake_bd(&mut config, workspace, args)
+        })
+        .unwrap();
+        assert!(directory.join(".beads").is_dir());
+        assert!(!directory.join("AGENTS.md").exists());
+        assert_eq!(config_value(&config, &directory, "export.auto"), "false");
+
+        let marker = directory.join(".beads/ontrack-marker");
+        std::fs::write(&marker, b"keep").unwrap();
+        set_config(&mut config, &directory, "export.auto", "true");
+        set_config(&mut config, &directory, "list.limit", "17");
+        ensure_workspace_in_with(&directory, |workspace, args| {
+            fake_bd(&mut config, workspace, args)
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&marker).unwrap(), b"keep");
+        assert_eq!(config_value(&config, &directory, "export.auto"), "false");
+        assert_eq!(config_value(&config, &directory, "list.limit"), "17");
+
+        let nested = directory.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        set_config(&mut config, &directory, "export.auto", "true");
+        ensure_workspace_in_with(&nested, |workspace, args| {
+            fake_bd(&mut config, workspace, args)
+        })
+        .unwrap();
+        assert!(!nested.join(".beads").exists());
+        assert_eq!(config_value(&config, &directory, "export.auto"), "false");
+    }
+
+    #[cfg(unix)]
+    fn fake_bd(
+        config: &mut HashMap<(std::path::PathBuf, String), String>,
+        workspace: &Path,
+        args: &[&str],
+    ) -> io::Result<Output> {
+        use std::os::unix::process::ExitStatusExt;
+
+        if args == INIT_ARGS {
+            let already_initialized = workspace
+                .ancestors()
+                .any(|ancestor| ancestor.join(".beads").is_dir());
+            if !already_initialized {
+                std::fs::create_dir(workspace.join(".beads"))?;
+            }
+        } else if args == DISABLE_EXPORT_ARGS {
+            let beads_root = workspace
+                .ancestors()
+                .find(|ancestor| ancestor.join(".beads").is_dir())
+                .expect("init should make a Beads workspace available");
+            config.insert(
+                (beads_root.to_path_buf(), "export.auto".to_owned()),
+                "false".to_owned(),
+            );
+        } else {
+            panic!("unexpected bd arguments: {args:?}");
+        }
+
+        Ok(Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })
+    }
+
+    #[cfg(unix)]
+    fn config_root(directory: &Path) -> std::path::PathBuf {
+        directory
+            .ancestors()
+            .find(|ancestor| ancestor.join(".beads").is_dir())
+            .expect("directory should have a Beads workspace")
+            .to_path_buf()
+    }
+
+    #[cfg(unix)]
+    fn config_value(
+        config: &HashMap<(std::path::PathBuf, String), String>,
+        directory: &Path,
+        key: &str,
+    ) -> String {
+        config
+            .get(&(config_root(directory), key.to_owned()))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    fn set_config(
+        config: &mut HashMap<(std::path::PathBuf, String), String>,
+        directory: &Path,
+        key: &str,
+        value: &str,
+    ) {
+        config.insert((config_root(directory), key.to_owned()), value.to_owned());
+    }
+
+    #[test]
+    fn startup_failure_is_reported_before_terminal_setup() {
+        let directory = Path::new("/missing-workspace");
+        let error = ensure_workspace_in_with(directory, |actual_directory, args| {
+            assert_eq!(actual_directory, directory);
+            assert_eq!(args, INIT_ARGS);
+            Err(io::Error::new(io::ErrorKind::NotFound, "bd not installed"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(error.to_string().contains("/missing-workspace"));
+        assert!(error.to_string().contains("Install or check bd"));
+    }
+
+    #[test]
+    fn startup_does_not_configure_export_when_init_fails() {
+        let directory = Path::new("/missing-workspace");
+        let mut calls = 0;
+        let error = ensure_workspace_in_with(directory, |actual_directory, args| {
+            calls += 1;
+            assert_eq!(actual_directory, directory);
+            assert_eq!(args, INIT_ARGS);
+            Err(io::Error::other("init denied"))
+        })
+        .unwrap_err();
+        assert_eq!(calls, 1);
+        assert!(error.to_string().contains("init denied"));
+    }
+
+    #[test]
+    fn startup_reports_export_config_failure() {
+        let directory = Path::new("/read-only-workspace");
+        let mut calls = 0;
+        let error = ensure_workspace_in_with(directory, |actual_directory, args| {
+            calls += 1;
+            assert_eq!(actual_directory, directory);
+            match calls {
+                1 => assert_eq!(args, INIT_ARGS),
+                2 => assert_eq!(args, DISABLE_EXPORT_ARGS),
+                _ => panic!("unexpected bd invocation"),
+            }
+            if calls == 2 {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "config denied",
+                ))
+            } else {
+                Command::new("true").output()
+            }
+        })
+        .unwrap_err();
+        assert_eq!(calls, 2);
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("/read-only-workspace"));
+        assert!(error.to_string().contains("config denied"));
+        assert!(error.to_string().contains("workspace permissions"));
+    }
+
+    #[test]
+    fn child_creation_keeps_parent_and_user_text_in_separate_arguments() {
+        let args = create_child_args(
+            &CreateBead {
+                title: "$(touch /tmp/unwanted)".into(),
+                description: "--priority=0\nsecond line".into(),
+                issue_type: "task".into(),
+                priority: 2,
+                harness: None,
+            },
+            "ontrack-parent",
+            &[],
+        )
+        .unwrap();
+        assert!(args.contains(&"--parent=ontrack-parent".to_owned()));
+        assert!(args.contains(&"--no-inherit-labels".to_owned()));
+        assert!(args.contains(&"--title=$(touch /tmp/unwanted)".to_owned()));
+        assert!(args.contains(&"--description=--priority=0\nsecond line".to_owned()));
+        assert!(create_child_args(&create_input(), "--help", &[]).is_err());
+        let inherited = vec!["team:core".to_owned()];
+        let args = create_child_args(&create_input(), "ontrack-parent", &inherited).unwrap();
+        assert!(args.contains(&"--labels=team:core".to_owned()));
+        assert!(
+            create_child_args(&create_input(), "ontrack-parent", &[READY_LABEL.into()]).is_err()
+        );
+        assert!(
+            create_child_args(
+                &create_input(),
+                "ontrack-parent",
+                &[UNASSIGNED_LABEL.into()]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn open_descendants_follow_beads_hierarchy_through_closed_intermediates() {
+        let rows = json!([
+            {"id":"parent","title":"Parent","status":"open"},
+            {"id":"child","title":"Child","status":"closed","parent":"parent"},
+            {"id":"grandchild","title":"Grandchild","status":"open","parent":"child"},
+            {"id":"unrelated","title":"Elsewhere","status":"open"}
+        ]);
+        let beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        assert_eq!(open_descendants_in(&beads, "parent"), vec!["grandchild"]);
+    }
 
     fn create_input() -> CreateBead {
         CreateBead {
@@ -240,7 +786,104 @@ mod tests {
             description: "First line\n\nSecond line\r\n  indented  \n".to_owned(),
             issue_type: "task".to_owned(),
             priority: 2,
+            harness: None,
         }
+    }
+
+    #[test]
+    fn ready_and_harness_labels_are_app_state_without_changing_beads_status() {
+        let data = json!({"issue_type":"task", "labels":["team:core", READY_LABEL, "ontrack:agent:opencode"]});
+        let bead = Bead {
+            id: "b1".into(),
+            title: "Task".into(),
+            status: "open".into(),
+            priority: 2,
+            data: data.clone(),
+        };
+        assert!(is_ready(&bead));
+        assert_eq!(harness(&data), Some("opencode"));
+        assert!(!is_ready(&Bead {
+            status: "closed".into(),
+            ..bead.clone()
+        }));
+        assert!(!is_ready(&Bead {
+            data: json!({"issue_type":"feature", "labels":[READY_LABEL]}),
+            ..bead
+        }));
+        assert!(is_ready(&Bead {
+            id: "epic".into(),
+            title: "Epic".into(),
+            status: "open".into(),
+            priority: 2,
+            data: json!({"issue_type":"epic", "labels":[READY_LABEL]}),
+        }));
+    }
+
+    #[test]
+    fn epic_ready_targets_include_nested_open_tasks_and_skip_existing_handoffs() {
+        let rows = json!([
+            {"id":"epic","title":"Epic","status":"open","issue_type":"epic"},
+            {"id":"direct","title":"Direct","status":"open","issue_type":"task","parent":"epic"},
+            {"id":"ready","title":"Ready","status":"open","issue_type":"task","parent":"epic","labels":[READY_LABEL]},
+            {"id":"reserved","title":"Reserved","status":"open","issue_type":"task","parent":"epic","labels":[READY_LABEL]},
+            {"id":"closed","title":"Closed","status":"closed","issue_type":"task","parent":"epic"},
+            {"id":"group","title":"Group","status":"closed","issue_type":"feature","parent":"epic"},
+            {"id":"nested","title":"Nested","status":"open","issue_type":"task","parent":"group"},
+            {"id":"sent","title":"Sent","status":"open","issue_type":"task","parent":"epic","labels":[READY_LABEL]},
+            {"id":"other","title":"Other","status":"open","issue_type":"task"}
+        ]);
+        let beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        let handoffs = std::collections::HashSet::from(["sent".to_owned(), "reserved".to_owned()]);
+        let accepted = std::collections::HashSet::from(["sent".to_owned()]);
+        assert_eq!(
+            epic_ready_targets_in(&beads, "epic", true, &handoffs, &accepted).unwrap(),
+            ["epic", "direct", "nested"]
+        );
+        assert_eq!(
+            epic_ready_targets_in(&beads, "epic", false, &handoffs, &accepted).unwrap(),
+            ["epic", "ready", "reserved"]
+        );
+        assert!(epic_ready_targets_in(&beads, "other", true, &handoffs, &accepted).is_err());
+    }
+
+    #[test]
+    fn creation_and_edit_persist_harness_as_a_safe_label_argument() {
+        let mut fields = create_input();
+        fields.harness = Some("opencode".into());
+        let args = create_args(&fields).unwrap();
+        assert!(args.contains(&"--labels=ontrack:agent:opencode".into()));
+        let update = UpdateBead {
+            id: "b1".into(),
+            fields,
+            previous_harness: Some("codex".into()),
+        };
+        let args = update_args(&update).unwrap();
+        assert!(args.contains(&"--remove-label=ontrack:agent:codex".into()));
+        assert!(args.contains(&"--add-label=ontrack:agent:opencode".into()));
+        assert!(args.contains(&"--remove-label=ontrack:unassigned".into()));
+        assert_eq!(&args[args.len() - 2..], ["--", "b1"]);
+    }
+
+    #[test]
+    fn unassigned_marker_distinguishes_new_choice_from_legacy_missing_label() {
+        let legacy = json!({"labels": [READY_LABEL]});
+        let unassigned = json!({"labels": [READY_LABEL, UNASSIGNED_LABEL]});
+        assert!(!explicitly_unassigned(&legacy));
+        assert!(explicitly_unassigned(&unassigned));
+        assert!(harness(&legacy).is_none());
+        assert!(harness(&unassigned).is_none());
+        let args = create_args(&create_input()).unwrap();
+        assert!(args.contains(&"--labels=ontrack:unassigned".into()));
+        let mut selected = create_input();
+        selected.harness = Some("codex".into());
+        let args = update_args(&UpdateBead {
+            id: "b1".into(),
+            fields: selected,
+            previous_harness: None,
+        })
+        .unwrap();
+        assert!(args.contains(&"--remove-label=ontrack:unassigned".into()));
+        assert!(args.contains(&"--add-label=ontrack:agent:codex".into()));
     }
 
     #[test]
@@ -255,6 +898,7 @@ mod tests {
                 "--type=task",
                 "--priority=2",
                 "--json",
+                "--labels=ontrack:unassigned",
             ]
         );
     }
@@ -265,10 +909,56 @@ mod tests {
         input.title = "--force $(touch ignored); 'quoted'".to_owned();
         input.description = "--cascade\n\"; $(touch ignored)".to_owned();
         let args = create_args(&input).unwrap();
-        assert_eq!(args.len(), 7);
+        assert_eq!(args.len(), 8);
         assert_eq!(args[2], format!("--title={}", input.title));
         assert_eq!(args[3], format!("--description={}", input.description));
         assert!(!args.iter().any(|arg| arg == "--readonly"));
+    }
+
+    #[test]
+    fn update_targets_one_id_and_keeps_user_text_in_argument_values() {
+        let mut fields = create_input();
+        fields.title = "--force $(touch ignored); 'quoted'".into();
+        fields.description = "First line\n--status=closed; $(touch ignored)".into();
+        let input = UpdateBead {
+            id: "ontrack-70t".into(),
+            fields,
+            previous_harness: None,
+        };
+        assert_eq!(
+            update_args(&input).unwrap(),
+            [
+                "--no-color",
+                "update",
+                "--title=--force $(touch ignored); 'quoted'",
+                "--description=First line\n--status=closed; $(touch ignored)",
+                "--type=task",
+                "--priority=2",
+                "--json",
+                "--add-label=ontrack:unassigned",
+                "--",
+                "ontrack-70t",
+            ]
+        );
+    }
+
+    #[test]
+    fn update_rejects_invalid_id_and_title_before_running_bd() {
+        let mut input = UpdateBead {
+            id: "--force".into(),
+            fields: create_input(),
+            previous_harness: None,
+        };
+        assert_eq!(
+            update_bead(&input).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        input.id = "ontrack-70t".into();
+        input.fields.title = "first\nsecond".into();
+        assert_eq!(
+            update_bead(&input).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
     }
 
     #[test]

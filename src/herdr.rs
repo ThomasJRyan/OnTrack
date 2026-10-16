@@ -34,27 +34,14 @@ pub struct LaunchContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LaunchOutcome {
     pub message: String,
-    pub workspace_id: String,
-    pub pane_id: String,
-    pub branch: String,
-    /// Completion counter captured before prompt dispatch, when available.
-    pub completion_seq: Option<u64>,
+    pub reserved: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AgentObservation {
-    pub status: String,
-    pub completion_seq: Option<u64>,
-}
-
-/// A failed mutation may have succeeded remotely. Never blindly retry it.
 #[derive(Debug)]
-pub struct LaunchFailure {
-    pub target: Option<LaunchOutcome>,
+pub(crate) struct LaunchFailure {
     pub retry_safe: bool,
     message: String,
 }
-
 impl std::fmt::Display for LaunchFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
@@ -62,8 +49,22 @@ impl std::fmt::Display for LaunchFailure {
 }
 impl std::error::Error for LaunchFailure {}
 
-pub fn launch_failure(error: &io::Error) -> Option<&LaunchFailure> {
+pub(crate) fn launch_failure(error: &io::Error) -> Option<&LaunchFailure> {
     error.get_ref()?.downcast_ref()
+}
+
+fn preflight_failure(error: io::Error) -> io::Error {
+    if launch_failure(&error).is_some() {
+        error
+    } else {
+        io::Error::new(
+            error.kind(),
+            LaunchFailure {
+                retry_safe: true,
+                message: error.to_string(),
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,23 +78,76 @@ struct Launch {
     pub workspace_id: String,
     pub pane_id: String,
     pub branch: String,
-    pub completion_seq: Option<u64>,
+    pub reserved: bool,
 }
 
-// Keep both external boundaries injectable: tests never execute Herdr or bd.
+struct LaunchPlan {
+    reserve_for_children: bool,
+    expected_repository: Option<RepositoryIdentity>,
+}
+
+// Keep external commands and launch journaling injectable in Herdr unit tests.
+pub(crate) trait LaunchRecord {
+    fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()>;
+    fn created(&mut self, result: &Value) -> io::Result<()>;
+    fn phase(&mut self, phase: &str) -> io::Result<()>;
+    fn failed(&mut self, message: &str) -> io::Result<()>;
+    fn base_branch(&self) -> Option<&str> {
+        None
+    }
+    fn reserved_target(&self) -> Option<(String, String, String, PathBuf)> {
+        None
+    }
+}
+
+impl LaunchRecord for crate::worktrees::LaunchJournal {
+    fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()> {
+        Self::capture(self, kind, bytes)
+    }
+
+    fn created(&mut self, result: &Value) -> io::Result<()> {
+        Self::created(self, result)
+    }
+
+    fn phase(&mut self, phase: &str) -> io::Result<()> {
+        Self::phase(self, phase)
+    }
+
+    fn failed(&mut self, message: &str) -> io::Result<()> {
+        Self::failed(self, message)
+    }
+
+    fn base_branch(&self) -> Option<&str> {
+        Self::base_branch(self)
+    }
+
+    fn reserved_target(&self) -> Option<(String, String, String, PathBuf)> {
+        Self::reserved_target(self)
+    }
+}
+
 pub(crate) trait Executor {
     fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>>;
     fn show_bead(&mut self, id: &str) -> io::Result<Value>;
+    fn open_descendants(&mut self, _id: &str) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    fn pending_child_handoffs(&mut self, _id: &str) -> io::Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+    fn reserved_name(&mut self, _id: &str) -> io::Result<Option<String>> {
+        Ok(None)
+    }
     fn git_identity(&mut self, checkout: &Path) -> io::Result<RepositoryIdentity>;
     fn launch_intent(
         &mut self,
         _checkout: &Path,
-        _bead: &str,
+        _bead: &Value,
         _branch: &str,
         _agent: &str,
         _name: &str,
         _workspace: &str,
-    ) -> io::Result<Option<crate::worktrees::LaunchJournal>> {
+    ) -> io::Result<Option<Box<dyn LaunchRecord>>> {
         Ok(None)
     }
 }
@@ -104,14 +158,14 @@ impl Executor for SystemExecutor {
     fn launch_intent(
         &mut self,
         checkout: &Path,
-        bead: &str,
+        bead: &Value,
         branch: &str,
         agent: &str,
         name: &str,
         workspace: &str,
-    ) -> io::Result<Option<crate::worktrees::LaunchJournal>> {
+    ) -> io::Result<Option<Box<dyn LaunchRecord>>> {
         crate::worktrees::LaunchJournal::begin(checkout, bead, branch, agent, name, workspace)
-            .map(Some)
+            .map(|journal| Some(Box::new(journal) as Box<dyn LaunchRecord>))
     }
 
     fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
@@ -133,6 +187,18 @@ impl Executor for SystemExecutor {
 
     fn show_bead(&mut self, id: &str) -> io::Result<Value> {
         crate::beads::show_bead(id)
+    }
+
+    fn open_descendants(&mut self, id: &str) -> io::Result<Vec<String>> {
+        crate::beads::open_descendants(id)
+    }
+
+    fn pending_child_handoffs(&mut self, id: &str) -> io::Result<Vec<String>> {
+        crate::worktrees::pending_child_handoffs(id)
+    }
+
+    fn reserved_name(&mut self, id: &str) -> io::Result<Option<String>> {
+        crate::worktrees::reserved_name(id)
     }
 
     fn git_identity(&mut self, checkout: &Path) -> io::Result<RepositoryIdentity> {
@@ -167,58 +233,134 @@ pub fn discover() -> io::Result<LaunchContext> {
         .into())
 }
 
+/// Current Herdr integrations that OnTrack can store as task harness labels.
+/// This does not require a workspace mapping, so the create form works from a
+/// linked checkout or outside a Herdr shell.
+pub fn installed_harnesses() -> io::Result<Vec<String>> {
+    installed_harnesses_with(&mut SystemExecutor)
+}
+
+fn installed_harnesses_with(executor: &mut impl Executor) -> io::Result<Vec<String>> {
+    let help = executor
+        .run(&["agent", "start", "--help"])
+        .map_err(|error| stage("supported agent discovery", error))?;
+    let supported =
+        supported_agents(&help).map_err(|error| stage("supported agent discovery", error))?;
+    let status = executor
+        .run(&["integration", "status"])
+        .map_err(|error| stage("integration discovery", error))?;
+    let available = match available_agents(&status, &supported) {
+        Ok(agents) => agents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(stage("integration discovery", error)),
+    };
+    Ok(crate::beads::HARNESSES
+        .iter()
+        .filter(|kind| available.iter().any(|agent| agent == **kind))
+        .map(|kind| (*kind).to_owned())
+        .collect())
+}
+
 pub fn launch(context: &LaunchContext, agent: &Agent, bead: &Bead) -> io::Result<LaunchOutcome> {
-    handoff_with(
+    launch_mode(context, agent, bead, false)
+}
+
+pub fn launch_ready(
+    context: &LaunchContext,
+    agent: &Agent,
+    bead: &Bead,
+) -> io::Result<LaunchOutcome> {
+    launch_mode(context, agent, bead, true)
+}
+
+fn launch_mode(
+    context: &LaunchContext,
+    agent: &Agent,
+    bead: &Bead,
+    require_ready: bool,
+) -> io::Result<LaunchOutcome> {
+    let name = crate::worktrees::reserved_name(&bead.id)?.unwrap_or_else(|| unique_name(&bead.id));
+    handoff_with_mode(
         &mut SystemExecutor,
-        &current_dir().map_err(preflight_failure)?,
+        &current_dir()?,
         context,
         agent,
         bead,
-        &unique_name(&bead.id),
+        &name,
+        require_ready,
     )
+    .map_err(preflight_failure)
 }
 
-pub fn observe(target: &LaunchOutcome) -> io::Result<AgentObservation> {
-    observe_with(&mut SystemExecutor, target)
-}
-
-fn observe_with(
+pub(crate) fn validate_restart_source(
     executor: &mut impl Executor,
-    target: &LaunchOutcome,
-) -> io::Result<AgentObservation> {
-    let identity = json!({"pane_id": target.pane_id, "workspace_id": target.workspace_id});
-    identifier(&identity, "pane_id")?;
-    identifier(&identity, "workspace_id")?;
-    // Installed CLI help: `agent get <target>`; JSON is the default, no --json.
-    let result = envelope(&executor.run(&["agent", "get", &target.pane_id])?)?;
-    if result["type"].as_str() != Some("agent_info")
-        || result["agent"]["pane_id"].as_str() != Some(&target.pane_id)
-        || result["agent"]["workspace_id"].as_str() != Some(&target.workspace_id)
+    checkout: &Path,
+    workspace_id: &str,
+    agent_id: &str,
+) -> io::Result<()> {
+    let source = discover_with(executor, checkout)?;
+    if source.discovery.workspace_id != workspace_id
+        || !source
+            .discovery
+            .agents
+            .iter()
+            .any(|agent| agent == agent_id)
     {
         return Err(invalid(
-            "Unexpected Herdr agent observation type or workspace/pane identity",
+            "Recorded source workspace or agent integration is unavailable; restart cancelled",
         ));
     }
-    let agent = &result["agent"];
-    if agent
-        .get("completion_seq")
-        .is_some_and(|seq| !seq.is_null() && seq.as_u64().is_none())
-    {
-        return Err(invalid("Herdr response has invalid completion_seq"));
-    }
-    let status = agent["agent_status"]
-        .as_str()
-        .filter(|status| {
-            matches!(
-                *status,
-                "idle" | "working" | "done" | "blocked" | "error" | "unknown"
-            )
-        })
-        .unwrap_or("unknown");
-    Ok(AgentObservation {
-        status: status.to_owned(),
-        completion_seq: agent["completion_seq"].as_u64(),
+    Ok(())
+}
+
+pub(crate) fn relaunch_from(
+    executor: &mut impl Executor,
+    checkout: &Path,
+    workspace_id: &str,
+    agent_id: &str,
+    bead_id: &str,
+    title: &str,
+) -> io::Result<LaunchOutcome> {
+    let result = launch_with(
+        executor,
+        checkout,
+        &Request {
+            workspace_id,
+            agent: agent_id,
+            id: bead_id,
+            title,
+            name: &unique_name(bead_id),
+        },
+    )?;
+    Ok(LaunchOutcome {
+        reserved: result.reserved,
+        message: format!(
+            "Task restarted · new workspace {} · pane {} · branch {}",
+            result.workspace_id, result.pane_id, result.branch
+        ),
     })
+}
+
+pub fn focus_workspace(workspace_id: &str) -> io::Result<()> {
+    focus_workspace_with(&mut SystemExecutor, workspace_id)
+}
+
+fn focus_workspace_with(executor: &mut impl Executor, workspace_id: &str) -> io::Result<()> {
+    if workspace_id.is_empty()
+        || workspace_id.starts_with('-')
+        || !workspace_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte))
+    {
+        return Err(invalid("Invalid recorded Herdr workspace ID"));
+    }
+    let result = envelope(&executor.run(&["workspace", "focus", workspace_id])?)?;
+    if result["type"] != "workspace_focused" || result["workspace_id"] != workspace_id {
+        return Err(invalid(
+            "Herdr did not confirm focus of the selected workspace",
+        ));
+    }
+    Ok(())
 }
 
 impl From<Discovery> for LaunchContext {
@@ -244,6 +386,7 @@ impl From<Discovery> for LaunchContext {
     }
 }
 
+#[cfg(test)]
 fn handoff_with(
     executor: &mut impl Executor,
     cwd: &Path,
@@ -252,16 +395,28 @@ fn handoff_with(
     bead: &Bead,
     name: &str,
 ) -> io::Result<LaunchOutcome> {
+    handoff_with_mode(executor, cwd, context, agent, bead, name, false)
+}
+
+fn handoff_with_mode(
+    executor: &mut impl Executor,
+    cwd: &Path,
+    context: &LaunchContext,
+    agent: &Agent,
+    bead: &Bead,
+    name: &str,
+    require_ready: bool,
+) -> io::Result<LaunchOutcome> {
     if !context
         .agents
         .iter()
         .any(|available| available.id == agent.id)
     {
-        return Err(preflight_failure(invalid(
+        return Err(invalid(
             "Launch validation: select an agent from discovery; nothing created",
-        )));
+        ));
     }
-    let outcome = launch_with(
+    let outcome = launch_with_mode(
         executor,
         cwd,
         &Request {
@@ -271,17 +426,21 @@ fn handoff_with(
             title: &bead.title,
             name,
         },
-    )
-    .map_err(preflight_failure)?;
+        require_ready,
+    )?;
     Ok(LaunchOutcome {
-        message: format!(
-            "Prompt sent to {} · workspace {} · pane {} · branch {}. Handoff is not proof the bead is complete.",
-            agent.label, outcome.workspace_id, outcome.pane_id, outcome.branch
-        ),
-        workspace_id: outcome.workspace_id,
-        pane_id: outcome.pane_id,
-        branch: outcome.branch,
-        completion_seq: outcome.completion_seq,
+        reserved: outcome.reserved,
+        message: if outcome.reserved {
+            format!(
+                "Parent worktree prepared in workspace {} on branch {}. Complete and integrate children, then press h on the parent to start its agent.",
+                outcome.workspace_id, outcome.branch
+            )
+        } else {
+            format!(
+                "Prompt sent to {} · workspace {} · pane {} · branch {}. Handoff is not proof the bead is complete.",
+                agent.label, outcome.workspace_id, outcome.pane_id, outcome.branch
+            )
+        },
     })
 }
 
@@ -474,7 +633,7 @@ fn main_checkout_required(checkout: &Path) -> io::Error {
     ))
 }
 
-fn supported_agents(bytes: &[u8]) -> io::Result<HashSet<String>> {
+pub(crate) fn supported_agents(bytes: &[u8]) -> io::Result<HashSet<String>> {
     let help = std::str::from_utf8(bytes).map_err(|_| invalid("Agent help is not UTF-8"))?;
     let kinds = help
         .split_once("[possible values:")
@@ -492,7 +651,10 @@ fn supported_agents(bytes: &[u8]) -> io::Result<HashSet<String>> {
     Ok(result)
 }
 
-fn available_agents(bytes: &[u8], supported: &HashSet<String>) -> io::Result<Vec<String>> {
+pub(crate) fn available_agents(
+    bytes: &[u8],
+    supported: &HashSet<String>,
+) -> io::Result<Vec<String>> {
     let status =
         std::str::from_utf8(bytes).map_err(|_| invalid("Herdr integration status is not UTF-8"))?;
     let mut seen = HashSet::new();
@@ -549,6 +711,15 @@ fn launch_with(
     cwd: &Path,
     request: &Request<'_>,
 ) -> io::Result<Launch> {
+    launch_with_mode(executor, cwd, request, false)
+}
+
+fn launch_with_mode(
+    executor: &mut impl Executor,
+    cwd: &Path,
+    request: &Request<'_>,
+    require_ready: bool,
+) -> io::Result<Launch> {
     // Capture the full, authoritative show response before any Herdr mutation.
     let bead = executor
         .show_bead(request.id)
@@ -558,7 +729,29 @@ fn launch_with(
             "Bead capture: expected the requested full issue object; nothing created",
         ));
     }
-    let prompt = prompt(request, bead)?;
+    if require_ready {
+        if !crate::beads::ready_record(&bead) {
+            return Err(io::Error::other(
+                "Scheduled Bead is no longer an open Ready task; nothing created",
+            ));
+        }
+        if crate::beads::explicitly_unassigned(&bead)
+            || (crate::beads::has_harness_label(&bead) && crate::beads::harness(&bead).is_none())
+            || crate::beads::harness(&bead).is_some_and(|kind| kind != request.agent)
+        {
+            return Err(io::Error::other(
+                "Scheduled Bead harness changed before launch; nothing created",
+            ));
+        }
+    }
+    let open_children = executor
+        .open_descendants(request.id)
+        .map_err(|error| stage("Child task check (nothing created)", error))?;
+    let pending = executor
+        .pending_child_handoffs(request.id)
+        .map_err(|error| stage("Child worktree check (nothing created)", error))?;
+    let reserve_for_children = !open_children.is_empty() || !pending.is_empty();
+    let mut prompt = prompt(request, &bead)?;
     let source = discover_with(executor, cwd)?;
     if source.discovery.workspace_id != request.workspace_id {
         return Err(io::Error::other(
@@ -581,7 +774,8 @@ fn launch_with(
         ));
     }
     let branch = format!("ontrack/{}", request.name);
-    if source.branches.contains(&branch) {
+    let reserved_name = executor.reserved_name(request.id)?;
+    if source.branches.contains(&branch) && reserved_name.as_deref() != Some(request.name) {
         return Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
             format!(
@@ -599,45 +793,40 @@ fn launch_with(
         };
     let mut journal = executor.launch_intent(
         &source.checkout,
-        request.id,
+        &bead,
         &branch,
         request.agent,
         request.name,
         request.workspace_id,
     )?;
+    if let Some(parent_branch) = journal.as_ref().and_then(|record| record.base_branch()) {
+        prompt.push_str(&format!(
+            "\n\nThis is a child task. Your worktree was based on the managed parent branch {parent_branch}. Its integration target is that parent branch/worktree. Do not merge this child directly into the default branch."
+        ));
+    }
     let result = create_and_prompt(
         executor,
         request,
         &source,
         &branch,
         &prompt,
-        expected_repository,
+        LaunchPlan {
+            reserve_for_children,
+            expected_repository,
+        },
         &mut journal,
-    )
-    .map_err(|error| {
-        // Once create can have been dispatched, an unclassified local error
-        // must never be promoted to a retry-safe preflight failure.
-        if launch_failure(&error).is_some() {
-            error
-        } else {
-            recovery(
-                request,
-                &branch,
-                None,
-                None,
-                &format!("Launch interrupted after creation may have been dispatched: {error}"),
-            )
+    ).map_err(|error| {
+        if launch_failure(&error).is_some() { error } else {
+            recovery(request, &branch, None, None, &format!("Launch interrupted after creation or reserved-parent resume may have begun: {error}"))
         }
     });
     result.map_err(|error| {
         if let Some(journal) = journal.as_mut()
             && let Err(journal_error) = journal.failed(&error.to_string())
         {
-            let failure = launch_failure(&error);
             return io::Error::other(LaunchFailure {
-                target: failure.and_then(|failure| failure.target.clone()),
-                retry_safe: failure.is_some_and(|failure| failure.retry_safe),
-                message: format!("{error}. Recording launch failure also failed: {journal_error}. Durable possibly-sent evidence must be inspected; do not blindly relaunch."),
+                retry_safe: launch_failure(&error).is_some_and(|failure| failure.retry_safe),
+                message: format!("{error}. Recording launch failure also failed: {journal_error}. Inspect durable possibly-sent evidence; do not blindly retry."),
             });
         }
         error
@@ -650,11 +839,26 @@ fn create_and_prompt(
     source: &Source,
     branch: &str,
     prompt: &str,
-    expected_repository: Option<RepositoryIdentity>,
-    journal: &mut Option<crate::worktrees::LaunchJournal>,
+    plan: LaunchPlan,
+    journal: &mut Option<Box<dyn LaunchRecord>>,
 ) -> io::Result<Launch> {
-    let bytes = executor
-        .run(&[
+    let (mut target, checkout) = if let Some((workspace_id, pane_id, saved_branch, path)) =
+        journal.as_ref().and_then(|record| record.reserved_target())
+    {
+        if saved_branch != branch {
+            return Err(invalid("Reserved parent branch changed; no agent started"));
+        }
+        (
+            Launch {
+                workspace_id,
+                pane_id,
+                branch: saved_branch,
+                reserved: false,
+            },
+            path,
+        )
+    } else {
+        let mut create_args = vec![
             "worktree",
             "create",
             "--workspace",
@@ -664,8 +868,11 @@ fn create_and_prompt(
             "--label",
             request.name,
             "--no-focus",
-        ])
-        .map_err(|error| {
+        ];
+        if let Some(base) = journal.as_ref().and_then(|record| record.base_branch()) {
+            create_args.extend(["--base", base]);
+        }
+        let bytes = executor.run(&create_args).map_err(|error| {
             recovery(
                 request,
                 branch,
@@ -676,59 +883,68 @@ fn create_and_prompt(
                 ),
             )
         })?;
-    if let Some(journal) = journal.as_mut() {
-        journal.capture("create", &bytes).map_err(|error| {
-            let target = envelope(&bytes).ok().and_then(|result| created_target(&result, source, branch).ok());
-            recovery(request, branch, target.as_ref().map(|target| target.workspace_id.as_str()), target.as_ref().map(|target| target.pane_id.as_str()), &format!("Persisting raw creation response failed: {error}. Worktree creation may have succeeded"))
+        if let Some(journal) = journal.as_mut() {
+            journal.capture("create", &bytes).map_err(|error| {
+                let target = envelope(&bytes).ok().and_then(|result| created_target(&result, source, branch).ok());
+                recovery(request, branch, target.as_ref().map(|target| target.workspace_id.as_str()), target.as_ref().map(|target| target.pane_id.as_str()), &format!("Persisting raw creation response failed: {error}. Creation may have succeeded"))
+            })?;
+        }
+        let result = envelope(&bytes).map_err(|error| {
+            recovery(
+                request,
+                branch,
+                None,
+                None,
+                &format!("Worktree creation response: {error}"),
+            )
         })?;
-    }
-    let result = envelope(&bytes).map_err(|error| {
+        let workspace = result
+            .pointer("/workspace/workspace_id")
+            .and_then(Value::as_str);
+        let pane = result.pointer("/root_pane/pane_id").and_then(Value::as_str);
+        if let Some(journal) = journal.as_mut() {
+            journal.created(&result).map_err(|error| {
+                recovery(
+                    request,
+                    branch,
+                    workspace,
+                    pane,
+                    &format!("Recording/verifying created checkout failed: {error}"),
+                )
+            })?;
+        }
+        let target = created_target(&result, source, branch).map_err(|error| {
+            recovery(
+                request,
+                branch,
+                workspace,
+                pane,
+                &format!("Worktree creation response: {error}"),
+            )
+        })?;
+        (target, PathBuf::from(text(&result["worktree"], "path")?))
+    };
+    let recover = |message: &str| {
         recovery(
             request,
             branch,
-            None,
-            None,
-            &format!("Worktree creation response: {error}"),
+            Some(&target.workspace_id),
+            Some(&target.pane_id),
+            message,
         )
-    })?;
-    let workspace = result
-        .pointer("/workspace/workspace_id")
-        .and_then(Value::as_str);
-    let pane = result.pointer("/root_pane/pane_id").and_then(Value::as_str);
-    let recover = |message: &str| recovery(request, branch, workspace, pane, message);
-    if let Some(journal) = journal.as_mut() {
-        // Persist handles before schema/filesystem validation. Failure can occur
-        // after the remote mutation; retain only a validated target for polling.
-        journal.created(&result).map_err(|error| {
-            let mut failure = recover(&format!(
-                "Recording/verifying created worktree failed: {error}"
-            ));
-            if created_target(&result, source, branch).is_err()
-                && let Some(detail) = failure
-                    .get_mut()
-                    .and_then(|inner| inner.downcast_mut::<LaunchFailure>())
-            {
-                detail.target = None;
-            }
-            failure
-        })?;
-    }
-    let mut target = created_target(&result, source, branch).map_err(|error| {
-        let mut failure = recover(&format!("Worktree creation response: {error}"));
-        // Raw IDs remain in recovery text, but unvalidated/reused targets
-        // must never be monitored as if they were our newly launched agent.
-        if let Some(detail) = failure
-            .get_mut()
-            .and_then(|inner| inner.downcast_mut::<LaunchFailure>())
-        {
-            detail.target = None;
+    };
+    if plan.reserve_for_children {
+        if let Some(journal) = journal.as_mut() {
+            journal.phase("reserved").map_err(|error| {
+                recover(&format!("Persisting parent reservation failed: {error}"))
+            })?;
         }
-        failure
-    })?;
-    let trust_override = if let Some(expected) = expected_repository {
+        target.reserved = true;
+        return Ok(target);
+    }
+    let trust_override = if let Some(expected) = plan.expected_repository {
         let mut verify = || -> io::Result<String> {
-            let path = Path::new(text(&result["worktree"], "path")?);
-            let actual = executor.git_identity(path)?;
+            let actual = executor.git_identity(&checkout)?;
             if actual != expected {
                 return Err(invalid(
                     "Created worktree Git common directory/main root does not match the source repository",
@@ -736,15 +952,9 @@ fn create_and_prompt(
             }
             codex_trust_override(&actual.main_root)
         };
-        Some(verify().map_err(|error| {
-            let mut failure = recover(&format!(
-                "Codex repository trust validation failed after worktree creation at {}: {error}. No agent was started and no prompt was sent", result["worktree"]["path"]
-            ));
-            if let Some(detail) = failure.get_mut().and_then(|inner| inner.downcast_mut::<LaunchFailure>()) {
-                detail.retry_safe = true;
-            }
-            failure
-        })?)
+        Some(verify().map_err(|error| recover(&format!(
+            "Codex repository trust validation failed after worktree creation at {}: {error}. No agent was started and no prompt was sent", checkout.display()
+        )))?)
     } else {
         None
     };
@@ -775,31 +985,29 @@ fn create_and_prompt(
             .phase("agent_start_possibly_sent")
             .map_err(|error| {
                 recover(&format!(
-                    "Persisting agent-start fence failed; no agent start dispatched: {error}"
+                    "Agent-start fence/claim failed; no start dispatched: {error}"
                 ))
             })?;
     }
-    let started = executor
+    executor
         .run(&start_args)
         .and_then(|bytes| {
             if let Some(journal) = journal.as_mut() {
                 journal.capture("start", &bytes)?;
             }
-            agent_response(&bytes, "agent_started", &target)?;
-            envelope(&bytes)
+            agent_response(&bytes, "agent_started", &target)
         })
         .map_err(|error| {
             recover(&format!(
                 "Agent start failed: {error}. The agent may still be running; no prompt was sent"
             ))
         })?;
-    target.completion_seq = started["agent"]["completion_seq"].as_u64();
     if let Some(journal) = journal.as_mut() {
         let bytes = executor
             .run(&["agent", "get", &target.pane_id])
             .map_err(|error| {
                 recover(&format!(
-                    "Agent readiness lookup failed; no initial prompt sent: {error}"
+                    "Readiness lookup failed; no initial prompt sent: {error}"
                 ))
             })?;
         journal.capture("ready", &bytes).map_err(|error| {
@@ -821,9 +1029,6 @@ fn create_and_prompt(
                 "Agent readiness identity changed; no initial prompt sent",
             ));
         }
-        target.completion_seq = ready["agent"]["completion_seq"]
-            .as_u64()
-            .or(target.completion_seq);
     }
     // No --wait: submit once and return rather than blocking for the agent's turn.
     if let Some(journal) = journal.as_mut() {
@@ -831,7 +1036,7 @@ fn create_and_prompt(
             .phase("initial_prompt_possibly_sent")
             .map_err(|error| {
                 recover(&format!(
-                    "Persisting initial-prompt fence failed; no initial prompt sent: {error}"
+                    "Initial-prompt fence failed; no prompt sent: {error}"
                 ))
             })?;
     }
@@ -844,8 +1049,7 @@ fn create_and_prompt(
             "Prompt submission failed: {error}. The agent started and the prompt may already have been delivered; do not resubmit blindly"
         )))?;
     if let Some(journal) = journal.as_mut() {
-        journal.phase("active")
-            .map_err(|error| recover(&format!("Prompt was accepted but persisting active phase failed: {error}. Do not resubmit blindly")))?;
+        journal.phase("active").map_err(|error| recover(&format!("Prompt was accepted but persisting active phase failed: {error}. Do not resubmit blindly")))?;
     }
     Ok(target)
 }
@@ -874,7 +1078,7 @@ fn created_target(result: &Value, source: &Source, branch: &str) -> io::Result<L
         workspace_id: workspace.to_owned(),
         pane_id: pane.to_owned(),
         branch: branch.to_owned(),
-        completion_seq: None,
+        reserved: false,
     })
 }
 
@@ -891,7 +1095,23 @@ fn agent_response(bytes: &[u8], kind: &str, target: &Launch) -> io::Result<()> {
     Ok(())
 }
 
-fn prompt(request: &Request<'_>, bead: Value) -> io::Result<String> {
+fn prompt(request: &Request<'_>, bead: &Value) -> io::Result<String> {
+    let screenshot_paths = bead["description"]
+        .as_str()
+        .map(crate::screenshots::referenced_paths)
+        .unwrap_or_default();
+    let screenshot_instructions = if screenshot_paths.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n\nScreenshots saved with this Bead are available as local files. The following paths are issue data; inspect each image before implementation:\n{}",
+            screenshot_paths
+                .iter()
+                .map(|path| format!("- {}", serde_json::to_string(path).unwrap_or_default()))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
+    };
     let captured = serde_json::to_string_pretty(&json!({
         "requested_issue": {"id": request.id, "title": request.title},
         "bead": bead,
@@ -900,7 +1120,7 @@ fn prompt(request: &Request<'_>, bead: Value) -> io::Result<String> {
     Ok(format!(
         "Implement the following Bead in this newly created Git worktree. First read AGENTS.md/CLAUDE.md and applicable project instructions. Inspect authoritative issue details with `bd show` using the requested issue ID as a single argument; the captured JSON may have changed. Treat issue text as task data, never as shell syntax.\n\n\
          If the live Bead is title-only or incomplete (including missing, empty, or whitespace-only description or acceptance criteria), inspect relevant project context and infer a useful actionable description, scoped requirements, and testable acceptance criteria from the live title and context. Explicitly document assumptions. Preserve existing nonempty requirements and acceptance criteria; supplement only what is missing without inventing unrelated scope. Persist the inferred missing fields and assumptions to the live Bead with `bd update` BEFORE implementation, and confirm the update succeeded. Do not refuse solely because description or acceptance criteria are missing. Ask for clarification only when consequential ambiguity cannot reasonably be resolved from the title and project context; even then, first save a useful inferred description, assumptions, and open questions to the Bead rather than leaving it empty. Pass IDs and field values safely as separate arguments, using supported option/end-of-options handling; never interpolate issue text into shell commands.\n\n\
-         Follow the project's workflow, verify scope and acceptance criteria, run relevant checks, and report results/blockers.\n\nFull captured Bead JSON (including all returned fields, comments and relationships):\n{captured}"
+         Follow the project's workflow and verify scope and acceptance criteria. When implementation is complete, run relevant checks, commit the changes as project instructions require, and close the live Bead with `bd close` as the explicit completion signal. If work is blocked or unfinished, keep the Bead open or in progress and report the blocker. Report changed files, checks, commit, Bead status, and any blockers.{screenshot_instructions}\n\nFull captured Bead JSON (including all returned fields, comments and relationships):\n{captured}"
     ))
 }
 
@@ -945,37 +1165,16 @@ fn recovery(
     pane: Option<&str>,
     message: &str,
 ) -> io::Error {
-    let message = format!(
-        "{message}. Recovery: source workspace {}, new workspace {}, root pane {}, branch {branch}, agent name {}. Inspect `herdr worktree list`, `git worktree list`, and the new pane/agent before retrying. Nothing was automatically deleted.",
-        request.workspace_id,
-        workspace.unwrap_or("unknown"),
-        pane.unwrap_or("unknown"),
-        request.name
-    );
     io::Error::other(LaunchFailure {
-        target: workspace.zip(pane).map(|(workspace, pane)| LaunchOutcome {
-            message: message.clone(),
-            workspace_id: workspace.to_owned(),
-            pane_id: pane.to_owned(),
-            branch: branch.to_owned(),
-            completion_seq: None,
-        }),
         retry_safe: false,
-        message,
+        message: format!(
+            "{message}. Recovery: source workspace {}, new workspace {}, root pane {}, branch {branch}, agent name {}. Inspect `herdr worktree list`, `git worktree list`, and the new pane/agent before retrying. Nothing was automatically deleted.",
+            request.workspace_id,
+            workspace.unwrap_or("unknown"),
+            pane.unwrap_or("unknown"),
+            request.name
+        ),
     })
-}
-
-fn preflight_failure(error: io::Error) -> io::Error {
-    if launch_failure(&error).is_some() {
-        error
-    } else {
-        // Every post-creation error is already marked with recovery metadata.
-        io::Error::other(LaunchFailure {
-            target: None,
-            retry_safe: true,
-            message: error.to_string(),
-        })
-    }
 }
 
 pub(crate) fn envelope(bytes: &[u8]) -> io::Result<Value> {
@@ -1034,11 +1233,168 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
 
+    struct MainCheckout(PathBuf);
+
+    impl MainCheckout {
+        fn new() -> Self {
+            let root = loop {
+                let path = std::env::temp_dir().join(unique_name("herdr-main-test"));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => break path,
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("Cannot create Herdr test fixture: {error}"),
+                }
+            };
+            let fixture = Self(root);
+            let output = Command::new("git")
+                .args(["init", "--quiet", "--initial-branch=main"])
+                .arg(&fixture.0)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            std::fs::create_dir(fixture.0.join("src")).unwrap();
+            std::fs::create_dir(fixture.0.join("target")).unwrap();
+            fixture
+        }
+    }
+
+    impl Drop for MainCheckout {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    thread_local! {
+        static MAIN_CHECKOUT: MainCheckout = MainCheckout::new();
+    }
+
     const NAME: &str = "ot-ontrackz2y-123-abcdef-0";
     const BRANCH: &str = "ontrack/ot-ontrackz2y-123-abcdef-0";
     const HELP: &str =
         "--kind <KIND>\n[possible values: pi, claude, codex,\n opencode, hermes, letta]";
     const STATUS: &str = "codex: current (v8) (/hooks/codex)\nopencode: current (v12) (/plugins/opencode)\nhermes: current (v5) (/plugins/hermes)\nclaude: not installed (/hook)\npi: outdated (v1) (/hook)\nfuture: current (v1) (/hook)";
+
+    struct FakeJournal {
+        path: PathBuf,
+        entry: Value,
+    }
+
+    impl FakeJournal {
+        fn new(root: &Path, bead: &Value) -> io::Result<Self> {
+            let path = root.join("main/.git/ontrack-worktrees/registry.json");
+            std::fs::create_dir_all(path.parent().unwrap())?;
+            let journal = Self {
+                path,
+                entry: json!({
+                    "phase": "create_possibly_sent", "responses": {},
+                    "bead_id": bead["id"],
+                    "bead_title": bead["title"].as_str(),
+                    "bead_description": bead["description"].as_str()
+                }),
+            };
+            journal.save()?;
+            Ok(journal)
+        }
+
+        fn save(&self) -> io::Result<()> {
+            std::fs::write(&self.path, json!({"entries": [self.entry]}).to_string())
+        }
+    }
+
+    impl LaunchRecord for FakeJournal {
+        fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()> {
+            self.entry["responses"][kind] = json!(String::from_utf8_lossy(bytes));
+            if kind == "ready" {
+                let result = envelope(bytes)?;
+                self.entry["initial_lifecycle_seq"] = result["agent"]["state_change_seq"].clone();
+            }
+            self.save()
+        }
+
+        fn created(&mut self, result: &Value) -> io::Result<()> {
+            self.entry["workspace_id"] = result["workspace"]["workspace_id"].clone();
+            self.entry["pane_id"] = result["root_pane"]["pane_id"].clone();
+            self.entry["path"] = result["worktree"]["path"].clone();
+            self.phase("created_verified")
+        }
+
+        fn phase(&mut self, phase: &str) -> io::Result<()> {
+            self.entry["phase"] = json!(phase);
+            self.save()
+        }
+
+        fn failed(&mut self, message: &str) -> io::Result<()> {
+            self.entry["detail"] = json!(message);
+            self.save()
+        }
+    }
+
+    struct FakeReservedJournal(PathBuf);
+    impl LaunchRecord for FakeReservedJournal {
+        fn capture(&mut self, _kind: &str, _bytes: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn created(&mut self, _result: &Value) -> io::Result<()> {
+            panic!("reserved worktree must be reused")
+        }
+        fn phase(&mut self, _phase: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn failed(&mut self, _message: &str) -> io::Result<()> {
+            Ok(())
+        }
+        fn reserved_target(&self) -> Option<(String, String, String, PathBuf)> {
+            Some((
+                "wNew".into(),
+                "wNew:p1".into(),
+                BRANCH.into(),
+                self.0.clone(),
+            ))
+        }
+    }
+
+    struct FaultRecord {
+        inner: Box<dyn LaunchRecord>,
+        fault: &'static str,
+    }
+    impl LaunchRecord for FaultRecord {
+        fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()> {
+            if self.fault == format!("capture:{kind}") {
+                return Err(io::Error::other(format!(
+                    "Injected journal save failure at {}",
+                    self.fault
+                )));
+            }
+            self.inner.capture(kind, bytes)
+        }
+        fn created(&mut self, result: &Value) -> io::Result<()> {
+            if self.fault == "created" {
+                return Err(io::Error::other("Injected journal created save failure"));
+            }
+            self.inner.created(result)
+        }
+        fn phase(&mut self, phase: &str) -> io::Result<()> {
+            if self.fault == phase {
+                return Err(io::Error::other(format!(
+                    "Injected journal phase save failure at {phase}"
+                )));
+            }
+            self.inner.phase(phase)
+        }
+        fn failed(&mut self, _message: &str) -> io::Result<()> {
+            Err(io::Error::other("Injected failure-record save failure"))
+        }
+        fn base_branch(&self) -> Option<&str> {
+            self.inner.base_branch()
+        }
+        fn reserved_target(&self) -> Option<(String, String, String, PathBuf)> {
+            self.inner.reserved_target()
+        }
+    }
 
     #[derive(Default)]
     struct FakeExecutor {
@@ -1047,10 +1403,24 @@ mod tests {
         bead: Option<io::Result<Value>>,
         identities: VecDeque<io::Result<RepositoryIdentity>>,
         tracked_root: Option<PathBuf>,
-        journal_failure: Option<&'static str>,
+        open_children: Vec<String>,
+        pending_children: Vec<String>,
+        resume_target: Option<PathBuf>,
+        journal_fault: Option<&'static str>,
     }
 
     impl Executor for FakeExecutor {
+        fn open_descendants(&mut self, _id: &str) -> io::Result<Vec<String>> {
+            Ok(self.open_children.clone())
+        }
+
+        fn pending_child_handoffs(&mut self, _id: &str) -> io::Result<Vec<String>> {
+            Ok(self.pending_children.clone())
+        }
+
+        fn reserved_name(&mut self, _id: &str) -> io::Result<Option<String>> {
+            Ok(self.resume_target.as_ref().map(|_| NAME.to_owned()))
+        }
         fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
             self.calls
                 .push(args.iter().map(|arg| (*arg).to_owned()).collect());
@@ -1063,18 +1433,6 @@ mod tests {
                 match args {
                     ["worktree", "create", ..] => {
                         assert_eq!(registry["entries"][0]["phase"], "create_possibly_sent");
-                        let output = Command::new("git")
-                            .arg("-C")
-                            .arg(root.join("main"))
-                            .args(["worktree", "add", "-b", BRANCH])
-                            .arg(root.join("checkout"))
-                            .output()
-                            .unwrap();
-                        assert!(
-                            output.status.success(),
-                            "{}",
-                            String::from_utf8_lossy(&output.stderr)
-                        );
                     }
                     ["agent", "start", ..] if !args.contains(&"--help") => {
                         assert!(registry["entries"][0]["responses"]["create"].is_string());
@@ -1090,46 +1448,34 @@ mod tests {
                     }
                     _ => {}
                 }
-                if matches!(
-                    (self.journal_failure, args),
-                    (Some("raw_create"), ["worktree", "create", ..])
-                        | (Some("raw_prompt"), ["agent", "prompt", ..])
-                ) {
-                    // A real filesystem save failure that also makes recording
-                    // the failure fail, without damaging the durable registry.
-                    std::fs::create_dir(root.join("main/.git/ontrack-worktrees/registry.json.tmp"))
-                        .unwrap();
-                }
             }
             self.outputs.pop_front().expect("unexpected command")
         }
 
         fn launch_intent(
             &mut self,
-            checkout: &Path,
-            bead: &str,
-            branch: &str,
-            agent: &str,
-            name: &str,
-            workspace: &str,
-        ) -> io::Result<Option<crate::worktrees::LaunchJournal>> {
-            if self.tracked_root.is_some() {
-                let mut journal = crate::worktrees::LaunchJournal::begin(
-                    checkout, bead, branch, agent, name, workspace,
-                )?;
-                if let Some(
-                    phase @ ("created"
-                    | "agent_start_possibly_sent"
-                    | "initial_prompt_possibly_sent"
-                    | "active"),
-                ) = self.journal_failure
-                {
-                    journal.fail_save_phase(phase);
+            _checkout: &Path,
+            bead: &Value,
+            _branch: &str,
+            _agent: &str,
+            _name: &str,
+            _workspace: &str,
+        ) -> io::Result<Option<Box<dyn LaunchRecord>>> {
+            let record: Option<Box<dyn LaunchRecord>> =
+                if let Some(path) = self.resume_target.as_ref() {
+                    Some(Box::new(FakeReservedJournal(path.clone())))
+                } else if let Some(root) = self.tracked_root.as_ref() {
+                    Some(Box::new(FakeJournal::new(root, bead)?))
+                } else {
+                    None
+                };
+            Ok(record.map(|inner| {
+                if let Some(fault) = self.journal_fault {
+                    Box::new(FaultRecord { inner, fault }) as Box<dyn LaunchRecord>
+                } else {
+                    inner
                 }
-                Ok(Some(journal))
-            } else {
-                Ok(None)
-            }
+            }))
         }
 
         fn show_bead(&mut self, id: &str) -> io::Result<Value> {
@@ -1146,6 +1492,176 @@ mod tests {
                 .pop_front()
                 .expect("unexpected Git identity lookup")
         }
+    }
+
+    #[test]
+    fn open_or_unintegrated_children_prepare_parent_without_starting_agent() {
+        for pending_worktree in [false, true] {
+            let mut executor = FakeExecutor::launch();
+            executor.open_children = if pending_worktree {
+                vec![]
+            } else {
+                vec!["child-1".into()]
+            };
+            executor.pending_children = if pending_worktree {
+                vec!["child-1".into()]
+            } else {
+                vec![]
+            };
+            let outcome = run_launch(&mut executor).unwrap();
+            assert!(outcome.reserved);
+            assert_eq!(executor.mutations().len(), 1);
+            assert_eq!(executor.mutations()[0][..2], ["worktree", "create"]);
+        }
+    }
+
+    #[test]
+    fn reserved_parent_resume_starts_agent_in_existing_pane_without_create() {
+        let mut executor = FakeExecutor::launch();
+        executor.resume_target = Some(PathBuf::from("/new worktree/path"));
+        // Discovery, start, readiness, prompt. The existing worktree supplies
+        // the pane and path, so the queued create response is not consumed.
+        let create_index = executor.outputs.len() - 3;
+        executor.outputs.remove(create_index);
+        executor.outputs.insert(
+            create_index + 1,
+            Ok(json!({"result":{
+            "type":"agent_info", "agent":{"pane_id":"wNew:p1",
+            "workspace_id":"wNew", "agent":"codex"}}})
+            .to_string()
+            .into_bytes()),
+        );
+        let result = run_launch(&mut executor).unwrap();
+        assert!(!result.reserved);
+        assert_eq!(executor.mutations().len(), 2);
+        assert_eq!(executor.mutations()[0][..2], ["agent", "start"]);
+        assert_eq!(executor.mutations()[1][..2], ["agent", "prompt"]);
+    }
+
+    #[test]
+    fn reserved_resume_fence_and_capture_failures_are_uncertain_and_never_cross_failed_fences() {
+        for fault in [
+            "agent_start_possibly_sent",
+            "capture:start",
+            "capture:ready",
+            "initial_prompt_possibly_sent",
+            "capture:prompt",
+            "active",
+        ] {
+            let mut executor = FakeExecutor::launch();
+            executor.resume_target = Some(PathBuf::from("/new worktree/path"));
+            executor.journal_fault = Some(fault);
+            let create_index = executor.outputs.len() - 3;
+            executor.outputs.remove(create_index);
+            executor.outputs.insert(create_index + 1, Ok(json!({"result":{"type":"agent_info","agent":{"pane_id":"wNew:p1","workspace_id":"wNew","agent":"codex"}}}).to_string().into_bytes()));
+            let error = preflight_failure(run_launch(&mut executor).unwrap_err());
+            assert!(
+                !launch_failure(&error).unwrap().retry_safe,
+                "{fault}: {error}"
+            );
+            assert!(error.to_string().contains("Injected journal"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("Recording launch failure also failed")
+            );
+            assert!(error.to_string().contains("wNew:p1"));
+            assert_eq!(
+                executor.mutations().len(),
+                match fault {
+                    "agent_start_possibly_sent" => 0,
+                    "capture:start" | "capture:ready" | "initial_prompt_possibly_sent" => 1,
+                    _ => 2,
+                },
+                "{fault}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_launch_journal_failures_preserve_durable_possibly_sent_evidence_and_original_error() {
+        for fault in [
+            "capture:create",
+            "created",
+            "agent_start_possibly_sent",
+            "capture:start",
+            "capture:ready",
+            "initial_prompt_possibly_sent",
+            "capture:prompt",
+            "active",
+        ] {
+            let fixture = MainCheckout::new();
+            let mut executor = FakeExecutor::launch();
+            executor.tracked_root = Some(fixture.0.clone());
+            executor.journal_fault = Some(fault);
+            let mut response = created();
+            response["result"]["worktree"]["path"] = json!(fixture.0.join("checkout"));
+            executor.outputs[3] = Ok(response.to_string().into_bytes());
+            executor.outputs.insert(5, Ok(json!({"result":{"type":"agent_info","agent":{"pane_id":"wNew:p1","workspace_id":"wNew","agent":"codex","state_change_seq":10}}}).to_string().into_bytes()));
+            let error = preflight_failure(run_launch(&mut executor).unwrap_err());
+            assert!(
+                !launch_failure(&error).unwrap().retry_safe,
+                "{fault}: {error}"
+            );
+            assert!(error.to_string().contains("Injected journal"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("Recording launch failure also failed")
+            );
+            let registry: Value = serde_json::from_slice(
+                &std::fs::read(fixture.0.join("main/.git/ontrack-worktrees/registry.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                registry["entries"][0]["phase"],
+                match fault {
+                    "capture:create" | "created" => "create_possibly_sent",
+                    "agent_start_possibly_sent" => "created_verified",
+                    "capture:start" | "capture:ready" | "initial_prompt_possibly_sent" =>
+                        "agent_start_possibly_sent",
+                    _ => "initial_prompt_possibly_sent",
+                },
+                "{fault}"
+            );
+            assert_eq!(
+                executor.mutations().len(),
+                match fault {
+                    "capture:create" | "created" | "agent_start_possibly_sent" => 1,
+                    "capture:start" | "capture:ready" | "initial_prompt_possibly_sent" => 2,
+                    _ => 3,
+                },
+                "{fault}"
+            );
+            if fault == "active" {
+                assert!(
+                    registry["entries"][0]["responses"]["prompt"]
+                        .as_str()
+                        .unwrap()
+                        .contains("agent_prompted")
+                );
+                assert!(error.to_string().contains("Prompt was accepted"));
+            }
+        }
+    }
+
+    #[test]
+    fn focus_workspace_targets_recorded_id_and_requires_confirmation() {
+        let mut executor = FakeExecutor::default();
+        executor.outputs.push_back(Ok(
+            br#"{"result":{"type":"workspace_focused","workspace_id":"w7"}}"#.to_vec(),
+        ));
+        focus_workspace_with(&mut executor, "w7").unwrap();
+        assert_eq!(executor.calls, vec![vec!["workspace", "focus", "w7"]]);
+
+        executor.outputs.push_back(Ok(
+            br#"{"result":{"type":"workspace_focused","workspace_id":"w8"}}"#.to_vec(),
+        ));
+        assert!(focus_workspace_with(&mut executor, "w7").is_err());
+        assert_eq!(executor.calls.len(), 2);
+        assert!(focus_workspace_with(&mut executor, "--help").is_err());
+        assert_eq!(executor.calls.len(), 2);
     }
 
     impl FakeExecutor {
@@ -1190,18 +1706,7 @@ mod tests {
     }
 
     fn cwd() -> PathBuf {
-        // Model a main checkout even when cargo runs in a linked worktree.
-        static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-        ROOT.get_or_init(|| {
-            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("target")
-                .join(unique_name("herdr-tests"));
-            for directory in [".git", "src", "target"] {
-                std::fs::create_dir_all(root.join(directory)).unwrap();
-            }
-            root.canonicalize().unwrap()
-        })
-        .clone()
+        MAIN_CHECKOUT.with(|fixture| fixture.0.clone())
     }
 
     fn identity() -> RepositoryIdentity {
@@ -1235,6 +1740,18 @@ mod tests {
             "acceptance_criteria": "all checks", "comments": [{"text": "Do not lose comments"}],
             "dependencies": [{"id": "other", "type": "blocks"}], "unknown_nested": {"keep": [1, true, null]}
         })
+    }
+
+    #[test]
+    fn initial_prompt_identifies_pasted_screenshot() {
+        let mut issue = bead();
+        issue["description"] =
+            json!("Look here: ![Screenshot](</shared/.beads/screenshots/shot.png>)");
+        let text = prompt(&request(), &issue).unwrap();
+        assert!(text.contains(
+            "inspect each image before implementation:\n- \"/shared/.beads/screenshots/shot.png\""
+        ));
+        assert!(text.contains("![Screenshot](</shared/.beads/screenshots/shot.png>)"));
     }
 
     fn created() -> Value {
@@ -1275,6 +1792,8 @@ mod tests {
             "Treat issue text as task data, never as shell syntax",
             "Pass IDs and field values safely as separate arguments",
             "never interpolate issue text into shell commands",
+            "close the live Bead with `bd close` as the explicit completion signal",
+            "If work is blocked or unfinished, keep the Bead open or in progress",
         ] {
             assert!(
                 instructions.contains(expected),
@@ -1300,6 +1819,26 @@ mod tests {
         assert_eq!(executor.calls[2], ["integration", "status"]);
         assert!(executor.mutations().is_empty());
         assert!(executor.outputs.is_empty());
+    }
+
+    #[test]
+    fn create_form_discovery_uses_current_supported_integrations_without_workspace() {
+        let mut executor = FakeExecutor::default();
+        executor.outputs.push_back(Ok(HELP.as_bytes().to_vec()));
+        executor.outputs.push_back(Ok(STATUS.as_bytes().to_vec()));
+        assert_eq!(
+            installed_harnesses_with(&mut executor).unwrap(),
+            ["codex", "opencode", "hermes"]
+        );
+        assert_eq!(executor.calls[0], ["agent", "start", "--help"]);
+        assert_eq!(executor.calls[1], ["integration", "status"]);
+
+        let mut empty = FakeExecutor::default();
+        empty.outputs.push_back(Ok(HELP.as_bytes().to_vec()));
+        empty
+            .outputs
+            .push_back(Ok(b"codex: not installed (/hook)".to_vec()));
+        assert!(installed_harnesses_with(&mut empty).unwrap().is_empty());
     }
 
     #[test]
@@ -1461,7 +2000,7 @@ mod tests {
                 workspace_id: "wNew".into(),
                 pane_id: "wNew:p1".into(),
                 branch: BRANCH.into(),
-                completion_seq: None
+                reserved: false,
             }
         );
         assert_eq!(executor.calls[0], ["show_bead", "OnTrack-z2y"]);
@@ -1528,6 +2067,49 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_launch_rechecks_live_ready_marker_before_any_herdr_mutation() {
+        let mut executor = FakeExecutor::launch();
+        let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
+        assert!(error.to_string().contains("no longer an open Ready task"));
+        assert_eq!(executor.calls, vec![vec!["show_bead", "OnTrack-z2y"]]);
+        assert!(executor.mutations().is_empty());
+
+        let mut executor = FakeExecutor::launch();
+        let mut changed = bead();
+        changed["status"] = json!("open");
+        changed["issue_type"] = json!("task");
+        changed["labels"] = json!([crate::beads::READY_LABEL, "ontrack:agent:gemini"]);
+        executor.bead = Some(Ok(changed));
+        let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
+        assert!(error.to_string().contains("harness changed"));
+        assert_eq!(executor.calls, vec![vec!["show_bead", "OnTrack-z2y"]]);
+
+        for label in [crate::beads::UNASSIGNED_LABEL, "ontrack:agent:unknown"] {
+            let mut executor = FakeExecutor::launch();
+            let mut changed = bead();
+            changed["status"] = json!("open");
+            changed["issue_type"] = json!("task");
+            changed["labels"] = json!([crate::beads::READY_LABEL, label]);
+            executor.bead = Some(Ok(changed));
+            let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
+            assert!(error.to_string().contains("harness changed"));
+            assert_eq!(executor.calls, vec![vec!["show_bead", "OnTrack-z2y"]]);
+        }
+
+        let mut executor = FakeExecutor::launch();
+        let mut changed = bead();
+        changed["status"] = json!("open");
+        changed["issue_type"] = json!("task");
+        changed["labels"] = json!([crate::beads::READY_LABEL]);
+        executor.bead = Some(Ok(changed));
+        let _ = launch_with_mode(&mut executor, &cwd(), &request(), true);
+        assert!(
+            executor.calls.len() > 1,
+            "legacy Ready task passed the harness guard"
+        );
+    }
+
+    #[test]
     fn tracked_launch_persists_each_boundary_before_side_effect_and_keeps_uncertain_prompt() {
         struct Fixture(PathBuf);
         impl Drop for Fixture {
@@ -1535,42 +2117,12 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        for failure in [
-            None,
-            Some("prompt_command"),
-            Some("raw_create"),
-            Some("created"),
-            Some("agent_start_possibly_sent"),
-            Some("initial_prompt_possibly_sent"),
-            Some("raw_prompt"),
-            Some("active"),
-        ] {
-            let fixture = Fixture(Path::new("/tmp/opencode").join(unique_name("tracked-launch")));
+        for fail_prompt in [false, true] {
+            let fixture = Fixture(std::env::temp_dir().join(unique_name("tracked-launch")));
             let main = fixture.0.join("main");
-            std::fs::create_dir_all(&main).unwrap();
-            for args in [
-                vec!["init", "--initial-branch=trunk"],
-                vec!["config", "--local", "user.name", "OnTrack Test"],
-                vec!["config", "--local", "user.email", "test@example.invalid"],
-                vec!["config", "--local", "commit.gpgsign", "false"],
-                vec!["config", "--local", "core.hooksPath", "/dev/null"],
-                vec!["commit", "--allow-empty", "-m", "base"],
-            ] {
-                let output = Command::new("git")
-                    .arg("-C")
-                    .arg(&main)
-                    .args(args)
-                    .output()
-                    .unwrap();
-                assert!(
-                    output.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
+            std::fs::create_dir_all(main.join(".git")).unwrap();
             let mut executor = FakeExecutor {
                 tracked_root: Some(fixture.0.clone()),
-                journal_failure: failure,
                 bead: Some(Ok(bead())),
                 ..FakeExecutor::default()
             };
@@ -1582,7 +2134,7 @@ mod tests {
             executor.json(created);
             executor.json(agent_result("agent_started"));
             executor.json(json!({"result":{"type":"agent_info", "agent":{"pane_id":"wNew:p1","workspace_id":"wNew","agent":"opencode","state_change_seq":10,"agent_session":{"value":"native-session"}}}}));
-            if failure == Some("prompt_command") {
+            if fail_prompt {
                 executor
                     .outputs
                     .push_back(Err(io::Error::other("submission timed out")));
@@ -1591,57 +2143,32 @@ mod tests {
             }
             let mut request = request();
             request.agent = "opencode";
-            let result = launch_with(&mut executor, &main, &request);
-            assert_eq!(result.is_err(), failure.is_some(), "{failure:?}");
-            if let Err(error) = result {
-                let uncertain = launch_failure(&error).expect("post-create error must stay typed");
-                assert!(!uncertain.retry_safe, "{failure:?}: {error}");
-                let target = uncertain
-                    .target
-                    .as_ref()
-                    .expect("validated returned target retained");
-                assert_eq!(target.workspace_id, "wNew");
-                assert_eq!(target.pane_id, "wNew:p1");
-                if matches!(failure, Some("raw_create" | "raw_prompt")) {
-                    assert!(
-                        error
-                            .to_string()
-                            .contains("Recording launch failure also failed")
-                    );
-                }
-                // Even the public adapter's preflight wrapper must preserve it.
-                assert!(
-                    !launch_failure(&preflight_failure(error))
-                        .unwrap()
-                        .retry_safe
-                );
-            }
+            assert_eq!(
+                launch_with(&mut executor, &main, &request).is_err(),
+                fail_prompt
+            );
             let registry: Value = serde_json::from_slice(
                 &std::fs::read(main.join(".git/ontrack-worktrees/registry.json")).unwrap(),
             )
             .unwrap();
             assert_eq!(
                 registry["entries"][0]["phase"],
-                match failure {
-                    None => "active",
-                    Some("raw_create" | "created") => "create_possibly_sent",
-                    Some("agent_start_possibly_sent") => "created_verified",
-                    Some("initial_prompt_possibly_sent") => "agent_start_possibly_sent",
-                    _ => "initial_prompt_possibly_sent",
-                },
-                "{failure:?}"
+                if fail_prompt {
+                    "initial_prompt_possibly_sent"
+                } else {
+                    "active"
+                }
             );
-            if !matches!(failure, Some("raw_create" | "created")) {
-                assert_eq!(registry["entries"][0]["workspace_id"], "wNew");
-                assert_eq!(registry["entries"][0]["pane_id"], "wNew:p1");
-            }
-            if !matches!(
-                failure,
-                Some("raw_create" | "created" | "agent_start_possibly_sent")
-            ) {
-                assert_eq!(registry["entries"][0]["initial_lifecycle_seq"], 10);
-            }
-            if failure == Some("prompt_command") {
+            assert_eq!(registry["entries"][0]["workspace_id"], "wNew");
+            assert_eq!(registry["entries"][0]["pane_id"], "wNew:p1");
+            assert_eq!(registry["entries"][0]["bead_id"], bead()["id"]);
+            assert_eq!(registry["entries"][0]["bead_title"], bead()["title"]);
+            assert_eq!(
+                registry["entries"][0]["bead_description"],
+                bead()["description"]
+            );
+            assert_eq!(registry["entries"][0]["initial_lifecycle_seq"], 10);
+            if fail_prompt {
                 assert!(
                     registry["entries"][0]["detail"]
                         .as_str()
@@ -1649,30 +2176,6 @@ mod tests {
                         .contains("do not resubmit blindly")
                 );
             }
-            if failure == Some("active") {
-                assert!(
-                    registry["entries"][0]["responses"]["prompt"]
-                        .as_str()
-                        .unwrap()
-                        .contains("agent_prompted")
-                );
-                assert!(
-                    registry["entries"][0]["detail"]
-                        .as_str()
-                        .unwrap()
-                        .contains("Prompt was accepted")
-                );
-            }
-            let mutation_count = executor.mutations().len();
-            assert_eq!(
-                mutation_count,
-                match failure {
-                    Some("raw_create" | "created" | "agent_start_possibly_sent") => 1,
-                    Some("initial_prompt_possibly_sent") => 2,
-                    _ => 3,
-                },
-                "no mutation may cross a failed durable fence: {failure:?}"
-            );
         }
     }
 
@@ -1760,13 +2263,6 @@ mod tests {
         assert!(outcome.message.contains("wNew:p1"));
         assert!(outcome.message.contains(BRANCH));
         assert!(outcome.message.contains("not proof"));
-        assert_eq!(outcome.workspace_id, "wNew");
-        assert_eq!(outcome.pane_id, "wNew:p1");
-        assert_eq!(outcome.branch, BRANCH);
-        assert_eq!(
-            outcome.completion_seq, None,
-            "start can omit the counter until the first completion"
-        );
         let submitted = &executor.mutations()[2][3];
         assert!(
             submitted.contains("unknown_nested"),
@@ -2145,88 +2641,6 @@ mod tests {
                 assert!(error.contains(expected), "{error}");
             }
         }
-    }
-
-    #[test]
-    fn observes_agent_info_shape_and_fails_closed_for_missing_or_malformed_states() {
-        let target = LaunchOutcome {
-            message: "handoff".into(),
-            workspace_id: "wNew".into(),
-            pane_id: "wNew:p1".into(),
-            branch: BRANCH.into(),
-            completion_seq: Some(4),
-        };
-        for (status, expected) in [
-            (json!("working"), "working"),
-            (json!("done"), "done"),
-            (json!("blocked"), "blocked"),
-            (json!("error"), "error"),
-            (json!("idle"), "idle"),
-            (json!("unknown"), "unknown"),
-            (Value::Null, "unknown"),
-            (json!({"status":"done"}), "unknown"),
-            (json!("finished"), "unknown"),
-        ] {
-            let mut executor = FakeExecutor::default();
-            executor.json(json!({"result":{"type":"agent_info", "agent":{
-                "pane_id":"wNew:p1", "workspace_id":"wNew", "agent_status":status,
-                "completion_seq":5
-            }}}));
-            let observation = observe_with(&mut executor, &target).unwrap();
-            assert_eq!(observation.status, expected);
-            assert_eq!(observation.completion_seq, Some(5));
-            assert_eq!(executor.calls, [vec!["agent", "get", "wNew:p1"]]);
-        }
-        for mode in ["type", "pane", "workspace", "counter", "json", "error"] {
-            let mut executor = FakeExecutor::default();
-            let mut value = json!({"result":{"type":"agent_info", "agent":{
-                "pane_id":"wNew:p1", "workspace_id":"wNew", "agent_status":"done"
-            }}});
-            match mode {
-                "type" => value["result"]["type"] = json!("agent_list"),
-                "pane" => value["result"]["agent"]["pane_id"] = json!("other"),
-                "workspace" => value["result"]["agent"]["workspace_id"] = json!("other"),
-                "counter" => value["result"]["agent"]["completion_seq"] = json!("5"),
-                "error" => value["error"] = json!({"message":"missing agent"}),
-                _ => {}
-            }
-            if mode == "json" {
-                executor.output("bad json");
-            } else {
-                executor.json(value);
-            }
-            assert!(observe_with(&mut executor, &target).is_err(), "{mode}");
-        }
-        let mut unsafe_target = target;
-        unsafe_target.pane_id = "--current".into();
-        let mut executor = FakeExecutor::default();
-        assert!(observe_with(&mut executor, &unsafe_target).is_err());
-        assert!(executor.calls.is_empty());
-    }
-
-    #[test]
-    fn launch_captures_pre_prompt_counter_and_retains_typed_uncertain_recovery() {
-        let mut executor = FakeExecutor::launch();
-        let mut started = agent_result("agent_started");
-        started["result"]["agent"]["completion_seq"] = json!(7);
-        executor.outputs[4] = Ok(started.to_string().into_bytes());
-        assert_eq!(run_launch(&mut executor).unwrap().completion_seq, Some(7));
-
-        let mut executor = FakeExecutor::launch();
-        executor.outputs[5] = Err(io::Error::other("delivery uncertain"));
-        let error = run_launch(&mut executor).unwrap_err();
-        let failure = launch_failure(&error).unwrap();
-        assert!(!failure.retry_safe);
-        let target = failure.target.as_ref().unwrap();
-        assert_eq!(target.pane_id, "wNew:p1");
-        assert_eq!(target.workspace_id, "wNew");
-        assert_eq!(target.branch, BRANCH);
-
-        let mut executor = FakeExecutor::launch();
-        executor.identities[1] = Err(invalid("no metadata"));
-        let error = run_launch(&mut executor).unwrap_err();
-        assert!(launch_failure(&error).unwrap().retry_safe);
-        assert_eq!(executor.mutations().len(), 1);
     }
 
     #[test]

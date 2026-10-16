@@ -189,12 +189,9 @@ fn relationships(v: &Value, width: u16) -> Vec<Line<'static>> {
     output
 }
 
-/// Human-readable presentation of the complete Beads response, retaining unrecognized fields.
-pub fn render(
-    value: &Value,
-    selected: Option<(&str, &str, &str, i64)>,
-    width: u16,
-) -> Text<'static> {
+/// Human-readable presentation of the Beads response, retaining unrecognized fields.
+/// The top-level revision is hidden because it is not useful in the details pane.
+pub fn render(value: &Value, selected_title: Option<&str>, width: u16) -> Text<'static> {
     let mut out = Vec::new();
     let object = value.as_object();
     let narrative = ["description", "notes", "design", "acceptance_criteria"];
@@ -204,25 +201,15 @@ pub fn render(
         "dependents",
         "blocks",
         "blocked_by",
+        "revision",
     ];
-    if let Some((id, title, status, priority)) = selected {
+    if let Some(title) = selected_title {
         let field = |name: &str| object.and_then(|o| o.get(name));
         let shown_title = field("title").and_then(Value::as_str).unwrap_or(title);
         out.push(Line::from(Span::styled(
             shown_title.to_owned(),
             Style::default().fg(GOLD).add_modifier(Modifier::BOLD),
         )));
-        for (key, fallback) in [
-            ("id", id.to_owned()),
-            ("status", status.to_owned()),
-            ("priority", format!("P{priority}")),
-        ] {
-            if let Some(v) = field(key) {
-                out.extend(metadata(key, v));
-            } else {
-                out.extend(metadata(key, &Value::String(fallback)));
-            }
-        }
     }
     if let Some(obj) = object {
         for key in narrative {
@@ -268,7 +255,7 @@ pub fn render(
             .filter(|(k, _)| {
                 !(narrative.contains(&k.as_str())
                     || excluded.contains(&k.as_str())
-                    || selected.is_some()
+                    || selected_title.is_some()
                         && (["id", "status", "priority"].contains(&k.as_str())
                             || k.as_str() == "title"
                                 && obj.get("title").and_then(Value::as_str).is_some()))
@@ -304,7 +291,7 @@ mod tests {
             "dependencies": [{"id": "other-1", "type": "blocks"}],
             "unknown": {"nested": [true, null, 5]}
         });
-        let text = render(&value, Some(("demo-1", "Title", "open", 2)), 50);
+        let text = render(&value, Some("Title"), 50);
         let plain = text.to_string();
         assert!(plain.contains("Plan"));
         assert!(plain.contains("bold") && !plain.contains("**bold**"));
@@ -318,7 +305,6 @@ mod tests {
             "true",
             "null",
             "5",
-            "demo-1",
             "Title",
         ] {
             assert!(plain.contains(expected), "missing {expected}: {plain}");
@@ -342,7 +328,7 @@ mod tests {
             "acceptance_criteria": "",
             "unknown": {"nested": ["line one", "line two", "FINAL_SENTINEL"]}
         });
-        for selected in [Some(("cached", "Cached", "open", 1)), None] {
+        for selected in [Some("Cached"), None] {
             let rendered = render(&value, selected, 18);
             let plain = rendered.to_string();
             for expected in [
@@ -362,6 +348,52 @@ mod tests {
                 assert!(plain.contains(expected), "missing {expected}: {plain}");
             }
             assert!(rendered.lines.len() > 8);
+        }
+    }
+
+    #[test]
+    fn hides_top_level_revision_but_keeps_other_details() {
+        let value = json!({
+            "id": "demo-1",
+            "title": "Title",
+            "revision": "stale-revision",
+            "created_at": "today",
+            "unknown": {"revision": "nested-revision"}
+        });
+
+        for selected in [Some("Title"), None] {
+            let plain = render(&value, selected, 50).to_string();
+            assert!(!plain.contains("stale-revision"), "{plain}");
+            assert!(plain.contains("created_at: today"), "{plain}");
+            assert!(plain.contains("nested-revision"), "{plain}");
+        }
+        assert_eq!(value["revision"], "stale-revision");
+    }
+
+    #[test]
+    fn selected_issue_omits_repeated_header_metadata() {
+        let value = json!({
+            "id": "demo-1",
+            "title": "Live title",
+            "status": "in_progress",
+            "priority": 3,
+            "description": "Useful description",
+            "owner": "Ada",
+            "comments": [{"body": "Keep this comment"}],
+            "dependencies": [{"id": "other-1", "type": "blocks"}]
+        });
+        let plain = render(&value, Some("Cached title"), 50).to_string();
+        for expected in [
+            "Live title",
+            "Useful description",
+            "owner: Ada",
+            "Keep this comment",
+            "other-1",
+        ] {
+            assert!(plain.contains(expected), "missing {expected}: {plain}");
+        }
+        for omitted in ["id: demo-1", "status: in_progress", "priority: 3"] {
+            assert!(!plain.contains(omitted), "unexpected {omitted}: {plain}");
         }
     }
 

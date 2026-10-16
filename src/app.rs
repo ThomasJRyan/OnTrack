@@ -1,149 +1,90 @@
-use crate::herdr::{Agent, AgentObservation, LaunchContext, LaunchOutcome};
+use crate::herdr::{Agent, LaunchContext, LaunchOutcome};
 use crate::worktrees::{self, Action as WorktreeAction, CleanupPolicy, ManagedWorktree};
 use crate::{
     Tui,
-    beads::{self, Bead, CreateBead},
+    beads::{self, Bead, CreateBead, UpdateBead},
     event,
-    settings::{self, Settings, Theme},
+    hotkeys::{self, Help},
+    release, screenshots,
+    settings::{self, DefaultAgent, Settings, Theme},
     ui,
+    update::{self, Available, Check},
+    updates,
 };
-use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
 use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
-    sync::{Arc, mpsc},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
-const TASK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 pub(super) enum Request {
     List,
     Show(String, u64),
+    LoadEdit(String, u64),
     Create(CreateBead),
+    CreateEpic(CreateBead, Option<String>),
+    CreateChild(CreateBead, String),
+    Update(UpdateBead),
+    SetReady(String, bool),
+    SetEpicReady(String, bool, HashSet<String>, HashSet<String>),
     Delete(String),
+    DiscoverHarnesses(u64),
     Discover(u64),
     Launch(u64, LaunchContext, Agent, Bead),
-    PollTask(u64, LaunchOutcome),
+    LaunchReady(u64, LaunchContext, Agent, Bead),
     ListWorktrees,
+    FocusWorkspace(String),
     WorktreeAction(String, WorktreeAction),
+    RestartWorktree(String),
     ReconcileWorktrees(CleanupPolicy),
+    ObserveAgents,
+    CheckRelease,
+    PrepareUpdate,
+    InstallRelease(Available, Arc<AtomicBool>),
+    ReadScreenshot(u64),
 }
 pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
     Show(String, u64, std::io::Result<serde_json::Value>),
+    EditLoaded(String, u64, std::io::Result<serde_json::Value>),
     Created(std::io::Result<String>),
+    EpicLaunched(String, std::io::Result<crate::epic::Session>),
+    EpicFinished(String, std::io::Result<Vec<String>>),
+    Updated(String, std::io::Result<()>),
+    ReadySet(String, bool, std::io::Result<Vec<String>>),
     Deleted(std::io::Result<()>),
+    HarnessesDiscovered(u64, std::io::Result<Vec<String>>),
     Discovered(u64, std::io::Result<LaunchContext>),
     Launched(u64, std::io::Result<LaunchOutcome>),
-    TaskPolled(u64, std::io::Result<AgentObservation>),
     Worktrees(std::io::Result<Vec<ManagedWorktree>>),
+    WorkspaceFocused(String, std::io::Result<()>),
     WorktreeChanged(std::io::Result<ManagedWorktree>),
+    WorktreeRestarted(std::io::Result<String>),
+    AgentsObserved(std::io::Result<Vec<worktrees::AgentDisplay>>),
+    ReleaseChecked(Result<release::CheckResult, String>),
+    UpdatePrepared(std::io::Result<Check>),
+    ReleaseInstalled(std::io::Result<()>),
+    ScreenshotRead(u64, std::io::Result<Vec<u8>>),
+    UpdateAvailable(Option<String>),
 }
-
-#[derive(Debug, Clone)]
-pub struct BackgroundTask {
-    pub seq: u64,
-    pub bead_id: String,
-    pub title: String,
-    pub agent: String,
-    pub status: String,
-    pub detail: String,
-    /// Unresolved work (including unknown/blocked) prevents duplicate launch.
-    pub active: bool,
-}
-
-pub(super) struct TaskState {
-    target: Option<LaunchOutcome>,
-    poll_inflight: bool,
-    next_poll: Instant,
-    observed_activity: bool,
-    recovery: Option<String>,
-}
-
-fn execute_request(request: Request) -> Response {
-    match request {
-        Request::List => Response::List(beads::list_beads()),
-        Request::Show(id, seq) => Response::Show(id.clone(), seq, beads::show_bead(&id)),
-        Request::Create(input) => Response::Created(beads::create_bead(&input)),
-        Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
-        Request::Discover(seq) => Response::Discovered(seq, crate::herdr::discover()),
-        Request::Launch(seq, context, agent, bead) => {
-            Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
-        }
-        Request::PollTask(seq, target) => Response::TaskPolled(seq, crate::herdr::observe(&target)),
-        Request::ListWorktrees => Response::Worktrees(worktrees::list()),
-        Request::WorktreeAction(id, action) => {
-            Response::WorktreeChanged(worktrees::act(&id, action))
-        }
-        Request::ReconcileWorktrees(policy) => Response::Worktrees(worktrees::reconcile(policy)),
-    }
-}
-
-/// The router never performs IO. Browser bd and managed-work operations each
-/// have a separate serial lane; Herdr discovery/launch/polls are independent.
-/// Threads are detached: leaving OnTrack neither waits nor cancels agents.
-fn start_workers(
-    execute: impl Fn(Request) -> Response + Send + Sync + 'static,
-) -> (mpsc::Sender<Request>, mpsc::Receiver<Response>) {
-    let execute = Arc::new(execute);
-    let (requests, incoming) = mpsc::channel();
-    let (out, responses) = mpsc::channel();
-    let (bd_requests, bd_incoming) = mpsc::channel();
-    let (managed_requests, managed_incoming) = mpsc::channel();
-    let bd_execute = execute.clone();
-    let bd_out = out.clone();
-    thread::spawn(move || {
-        while let Ok(request) = bd_incoming.recv() {
-            if bd_out.send(bd_execute(request)).is_err() {
-                break;
-            }
-        }
-    });
-    let managed_execute = execute.clone();
-    let managed_out = out.clone();
-    thread::spawn(move || {
-        while let Ok(request) = managed_incoming.recv() {
-            if managed_out.send(managed_execute(request)).is_err() {
-                break;
-            }
-        }
-    });
-    thread::spawn(move || {
-        while let Ok(request) = incoming.recv() {
-            if matches!(
-                request,
-                Request::Discover(_) | Request::Launch(..) | Request::PollTask(..)
-            ) {
-                let execute = execute.clone();
-                let out = out.clone();
-                thread::spawn(move || {
-                    let _ = out.send(execute(request));
-                });
-            } else if matches!(
-                request,
-                Request::ListWorktrees
-                    | Request::WorktreeAction(..)
-                    | Request::ReconcileWorktrees(_)
-            ) {
-                if managed_requests.send(request).is_err() {
-                    break;
-                }
-            } else if bd_requests.send(request).is_err() {
-                break;
-            }
-        }
-    });
-    (requests, responses)
+pub(super) enum WorktreeFocusFeedback {
+    Success(String),
+    Error(String),
 }
 pub struct App {
-    pub tasks: Vec<BackgroundTask>,
-    pub(super) task_states: HashMap<u64, TaskState>,
     pub beads: Vec<Bead>,
     pub collapsed: HashSet<String>,
+    pub(crate) closed_default_pending: bool,
     pub collapse_context: Option<String>,
     pub selected: Option<usize>,
     pub detail: Option<serde_json::Value>,
@@ -155,27 +96,52 @@ pub struct App {
     pub list_error: Option<String>,
     pub detail_error: Option<String>,
     pub(super) detail_seq: u64,
+    pub(super) edit_seq: u64,
+    pub(super) harness_seq: u64,
     pub(super) launch_seq: u64,
+    pub(super) handoff: HashMap<u64, PendingHandoff>,
+    /// Accepted agent starts not yet acknowledged by a fresh durable scan.
+    pub(crate) handoff_capacity: HashSet<String>,
+    pub toast: Option<Toast>,
+    pub release_result: Option<Result<release::CheckResult, String>>,
+    pub release_inflight: bool,
+    pub update_preparing: bool,
+    pub release_cancel: Option<Arc<AtomicBool>>,
+    pub update_available: Option<String>,
     pub list_rect: Rect,
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
+    pub help: Option<Help>,
     pub settings: Settings,
     pub theme: Theme,
     pub settings_path: Option<PathBuf>,
     pub settings_load_error: Option<String>,
     pub worktrees: Vec<ManagedWorktree>,
+    /// Accepted handoffs include removed checkouts, which are hidden from `worktrees`.
+    pub accepted_handoffs: HashSet<String>,
+    pub(crate) known_handoffs: HashSet<String>,
+    pub(crate) scheduler_attempted: HashSet<String>,
     pub selected_worktree: usize,
     pub worktree_offset: usize,
+    pub worktree_detail_offset: u16,
     pub worktrees_view: bool,
     pub worktrees_loading: bool,
     pub worktrees_error: Option<String>,
+    pub(super) worktrees_focus_feedback: Option<WorktreeFocusFeedback>,
+    pub(super) worktrees_focus_pending: bool,
     pub worktrees_inflight: bool,
     pub worktrees_discovered: bool,
+    pub worktrees_refresh_pending: bool,
     pub worktree_action_pending: bool,
     pub worktrees_next_refresh: Instant,
+    pub(crate) agent_observation_inflight: bool,
+    pub(crate) next_agent_observation: Instant,
     pub notice: Option<String>,
     pub mutation_busy: bool,
     pub modal_ready: bool,
+    pub(crate) paste_seq: u64,
+    pub(crate) paste_pending: bool,
+    pub(crate) created_screenshots: Vec<PathBuf>,
     pub preferred_id: Option<String>,
     pub(super) refresh_inflight: bool,
     pub(super) refresh_pending: bool,
@@ -185,17 +151,19 @@ pub struct App {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
-    Tasks {
-        scroll: u16,
-    },
     Create(CreateForm),
+    EditLoading {
+        id: String,
+        seq: u64,
+        error: Option<String>,
+    },
+    Edit {
+        id: String,
+        form: CreateForm,
+    },
     ConfirmDelete {
         id: String,
         title: String,
-    },
-    ReleaseTask {
-        seq: u64,
-        bead_id: String,
     },
     Settings {
         draft: Settings,
@@ -203,60 +171,168 @@ pub enum Modal {
         dropdown_open: bool,
         focus: usize,
     },
-    Launch(LaunchModal),
     ConfirmWorktree {
         id: String,
         action: u8,
     },
+    Release,
+    ConfirmUpdate(Available),
+    InstallingUpdate(String),
 }
 #[derive(Debug, Clone)]
-pub struct LaunchModal {
-    pub bead: Bead,
-    pub seq: u64,
-    pub context: Option<LaunchContext>,
-    pub selected_agent: usize,
-    pub error: Option<String>,
-    pub scroll: u16,
-    pub finished: bool,
+pub struct Toast {
+    pub message: String,
+    pub error: bool,
+    pub expires_at: Option<Instant>,
 }
-impl PartialEq for LaunchModal {
-    fn eq(&self, other: &Self) -> bool {
-        self.bead.id == other.bead.id
-            && self.seq == other.seq
-            && self.context == other.context
-            && self.selected_agent == other.selected_agent
-            && self.error == other.error
-            && self.scroll == other.scroll
-            && self.finished == other.finished
+impl Toast {
+    fn progress(message: String) -> Self {
+        Self {
+            message,
+            error: false,
+            expires_at: None,
+        }
+    }
+    fn result(message: String, error: bool) -> Self {
+        Self {
+            message,
+            error,
+            expires_at: Some(Instant::now() + Duration::from_secs(if error { 15 } else { 7 })),
+        }
+    }
+    pub fn visible(&self, now: Instant) -> bool {
+        self.expires_at.is_none_or(|expires| now < expires)
     }
 }
-impl Eq for LaunchModal {}
+#[derive(Debug, Clone)]
+pub(super) struct PendingHandoff {
+    seq: u64,
+    bead: Bead,
+    launch_queued: bool,
+    scheduled: bool,
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreateForm {
+    pub parent_id: Option<String>,
     pub title: String,
     pub description: String,
     pub issue_type: usize,
     pub priority: usize,
+    pub harness: usize,
+    pub harnesses: Vec<String>,
+    pub harness_loading: bool,
+    pub harness_error: Option<String>,
+    pub harness_seq: u64,
+    pub previous_harness: Option<String>,
+    pub generate_children: bool,
     pub focus: usize,
     pub cursor: usize,
     pub description_cursor: usize,
+    pub description_preferred_col: Option<usize>,
     pub dropdown: Option<usize>,
     pub dropdown_original: Option<usize>,
 }
 impl Default for CreateForm {
     fn default() -> Self {
         Self {
+            parent_id: None,
             title: String::new(),
             description: String::new(),
             issue_type: 0,
             priority: 2,
+            harness: 0,
+            harnesses: Vec::new(),
+            harness_loading: false,
+            harness_error: None,
+            harness_seq: 0,
+            previous_harness: None,
+            generate_children: false,
             focus: 0,
             cursor: 0,
             description_cursor: 0,
+            description_preferred_col: None,
             dropdown: None,
             dropdown_original: None,
         }
     }
+}
+
+impl CreateForm {
+    fn insert_screenshot(&mut self, path: &std::path::Path) {
+        let reference = screenshots::markdown_reference(path);
+        let cursor = self.description_cursor.min(self.description.len());
+        self.description.insert_str(cursor, &reference);
+        self.description_cursor = cursor + reference.len();
+        self.description_preferred_col = None;
+    }
+
+    fn set_harnesses(&mut self, harnesses: Vec<String>, preferred: DefaultAgent) {
+        self.harnesses = harnesses;
+        self.harness = match preferred {
+            DefaultAgent::Unassigned => 0,
+            DefaultAgent::Kind(kind) => self
+                .harnesses
+                .iter()
+                .position(|available| available == kind)
+                .map(|index| index + 1)
+                .unwrap_or_else(|| self.automatic_harness()),
+            DefaultAgent::Automatic => self.automatic_harness(),
+        };
+        self.harness_loading = false;
+        self.harness_error = None;
+        self.dropdown = None;
+        self.dropdown_original = None;
+    }
+
+    fn automatic_harness(&self) -> usize {
+        self.harnesses
+            .iter()
+            .position(|kind| kind == "codex")
+            .map_or_else(
+                || usize::from(!self.harnesses.is_empty()),
+                |index| index + 1,
+            )
+    }
+}
+
+fn edit_form(record: &serde_json::Value) -> Result<CreateForm, String> {
+    let title = record
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .filter(|title| !title.trim().is_empty())
+        .ok_or("Bead has no editable title")?;
+    let issue_type = record
+        .get("issue_type")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|kind| beads::BEAD_TYPES.iter().position(|known| *known == kind))
+        .ok_or("Bead type is missing or unsupported by the edit form")?;
+    let priority = record
+        .get("priority")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|priority| *priority <= 4)
+        .ok_or("Bead priority is missing or outside P0–P4")? as usize;
+    let description = match record.get("description") {
+        None | Some(serde_json::Value::Null) => String::new(),
+        Some(serde_json::Value::String(value)) => value.clone(),
+        _ => return Err("Bead description is not text".into()),
+    };
+    Ok(CreateForm {
+        title: title.into(),
+        cursor: title.len(),
+        description_cursor: description.len(),
+        description,
+        issue_type,
+        priority,
+        harness: beads::harness(record)
+            .and_then(|kind| beads::HARNESSES.iter().position(|known| *known == kind))
+            .map_or(0, |index| index + 1),
+        harnesses: beads::HARNESSES
+            .iter()
+            .map(|kind| (*kind).to_owned())
+            .collect(),
+        previous_harness: beads::harness(record).map(str::to_owned),
+        ..Default::default()
+    })
 }
 fn previous_boundary(s: &str, cursor: usize) -> usize {
     s[..cursor.min(s.len())]
@@ -271,28 +347,6 @@ fn next_boundary(s: &str, cursor: usize) -> usize {
         .nth(1)
         .map_or(s.len(), |(i, _)| cursor + i)
 }
-fn move_vertical(s: &str, cursor: usize, down: bool) -> usize {
-    let cursor = cursor.min(s.len());
-    let line_start = s[..cursor].rfind('\n').map_or(0, |i| i + 1);
-    let column = s[line_start..cursor].chars().count();
-    let target_start = if down {
-        s[cursor..].find('\n').map(|i| cursor + i + 1)
-    } else if line_start > 0 {
-        Some(s[..line_start - 1].rfind('\n').map_or(0, |i| i + 1))
-    } else {
-        None
-    };
-    let Some(start) = target_start else {
-        return cursor;
-    };
-    let end = s[start..].find('\n').map_or(s.len(), |i| start + i);
-    start
-        + s[start..end]
-            .char_indices()
-            .nth(column)
-            .map_or(end - start, |(i, _)| i)
-}
-
 /// Return the next choice index, wrapping in either direction.
 fn cycle_choice(index: usize, choices: usize, forward: bool) -> usize {
     assert!(
@@ -313,9 +367,169 @@ fn cycle_theme(theme: Theme, forward: bool) -> Theme {
         .unwrap_or(0);
     Theme::ALL[cycle_choice(index, Theme::ALL.len(), forward)]
 }
+fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
+    let response = match request {
+        Request::List => Response::List(beads::list_beads()),
+        Request::Show(id, seq) => Response::Show(id.clone(), seq, beads::show_bead(&id)),
+        Request::LoadEdit(id, seq) => Response::EditLoaded(id.clone(), seq, beads::show_bead(&id)),
+        Request::Create(input) => Response::Created(beads::create_bead(&input)),
+        Request::CreateEpic(input, parent) => match parent.as_deref().map_or_else(
+            || beads::create_bead(&input),
+            |id| beads::create_child(&input, id),
+        ) {
+            Ok(id) => {
+                if out.send(Response::Created(Ok(id.clone()))).is_err() {
+                    return;
+                }
+                let replies = out.clone();
+                thread::spawn(move || {
+                    let session = match crate::epic::launch(&id) {
+                        Ok(session) => session,
+                        Err(error) => {
+                            let _ = replies.send(Response::EpicLaunched(id, Err(error)));
+                            return;
+                        }
+                    };
+                    if replies
+                        .send(Response::EpicLaunched(id.clone(), Ok(session.clone())))
+                        .is_ok()
+                    {
+                        let result = crate::epic::finish(&session, &id);
+                        let _ = replies.send(Response::EpicFinished(id, result));
+                    }
+                });
+                return;
+            }
+            Err(error) => Response::Created(Err(error)),
+        },
+        Request::CreateChild(input, parent) => {
+            Response::Created(beads::create_child(&input, &parent))
+        }
+        Request::Update(input) => Response::Updated(input.id.clone(), beads::update_bead(&input)),
+        Request::ReadScreenshot(seq) => {
+            Response::ScreenshotRead(seq, screenshots::read_clipboard())
+        }
+        Request::SetReady(id, ready) => Response::ReadySet(
+            id.clone(),
+            ready,
+            beads::set_ready(&id, ready).map(|()| vec![id]),
+        ),
+        Request::SetEpicReady(id, ready, known_handoffs, protected_handoffs) => Response::ReadySet(
+            id.clone(),
+            ready,
+            beads::set_epic_ready(&id, ready, &known_handoffs, &protected_handoffs),
+        ),
+        Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
+        Request::DiscoverHarnesses(seq) => {
+            Response::HarnessesDiscovered(seq, crate::herdr::installed_harnesses())
+        }
+        Request::Discover(seq) => Response::Discovered(seq, crate::herdr::discover()),
+        Request::Launch(seq, context, agent, bead) => {
+            Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
+        }
+        Request::LaunchReady(seq, context, agent, bead) => {
+            Response::Launched(seq, crate::herdr::launch_ready(&context, &agent, &bead))
+        }
+        Request::ListWorktrees => Response::Worktrees(worktrees::list()),
+        Request::FocusWorkspace(id) => {
+            Response::WorkspaceFocused(id.clone(), crate::herdr::focus_workspace(&id))
+        }
+        Request::WorktreeAction(id, action) => {
+            Response::WorktreeChanged(worktrees::act(&id, action))
+        }
+        Request::RestartWorktree(id) => Response::WorktreeRestarted(worktrees::restart(&id)),
+        Request::ReconcileWorktrees(policy) => Response::Worktrees(worktrees::reconcile(policy)),
+        Request::ObserveAgents => Response::AgentsObserved(worktrees::observe_agents()),
+        Request::CheckRelease => {
+            let replies = out.clone();
+            thread::spawn(move || {
+                let _ = replies.send(Response::ReleaseChecked(release::check()));
+            });
+            return;
+        }
+        Request::PrepareUpdate => {
+            let replies = out.clone();
+            thread::spawn(move || {
+                let _ = replies.send(Response::UpdatePrepared(update::check()));
+            });
+            return;
+        }
+        Request::InstallRelease(release, cancel) => {
+            let replies = out.clone();
+            thread::spawn(move || {
+                let _ = replies.send(Response::ReleaseInstalled(update::install(
+                    &release, &cancel,
+                )));
+            });
+            return;
+        }
+    };
+    let _ = out.send(response);
+}
+
+/// Browser bd, managed work, and independent Herdr jobs never share a FIFO.
+/// Detached jobs are not joined or cancelled when the terminal app exits.
+fn start_workers(
+    execute: impl Fn(Request, &mpsc::Sender<Response>) + Send + Sync + 'static,
+) -> (
+    mpsc::Sender<Request>,
+    mpsc::Receiver<Response>,
+    mpsc::Sender<Response>,
+) {
+    let execute = Arc::new(execute);
+    let (requests, incoming) = mpsc::channel();
+    let (out, responses) = mpsc::channel();
+    let (browser, browser_in) = mpsc::channel();
+    let (managed, managed_in) = mpsc::channel();
+    for lane in [browser_in, managed_in] {
+        let execute = execute.clone();
+        let out = out.clone();
+        thread::spawn(move || {
+            while let Ok(request) = lane.recv() {
+                execute(request, &out);
+            }
+        });
+    }
+    let replies = out.clone();
+    thread::spawn(move || {
+        while let Ok(request) = incoming.recv() {
+            if matches!(
+                request,
+                Request::Discover(_)
+                    | Request::DiscoverHarnesses(_)
+                    | Request::Launch(..)
+                    | Request::LaunchReady(..)
+                    | Request::FocusWorkspace(_)
+                    | Request::ReadScreenshot(_)
+                    | Request::ObserveAgents
+            ) {
+                let execute = execute.clone();
+                let out = replies.clone();
+                thread::spawn(move || execute(request, &out));
+            } else if matches!(
+                request,
+                Request::ListWorktrees
+                    | Request::WorktreeAction(..)
+                    | Request::RestartWorktree(_)
+                    | Request::ReconcileWorktrees(_)
+            ) {
+                if managed.send(request).is_err() {
+                    break;
+                }
+            } else if browser.send(request).is_err() {
+                break;
+            }
+        }
+    });
+    (requests, responses, out)
+}
+
 impl App {
     fn new() -> Self {
-        let (tx, responses) = start_workers(execute_request);
+        let (tx, responses, out) = start_workers(execute_request);
+        thread::spawn(move || {
+            let _ = out.send(Response::UpdateAvailable(updates::available_version()));
+        });
         let (settings, settings_path, settings_error) = match settings::config_path() {
             Ok(path) => match settings::load_from(&path) {
                 Ok(value) => (value, Some(path), None),
@@ -333,10 +547,9 @@ impl App {
         };
         let theme = settings.theme;
         let mut a = Self {
-            tasks: Vec::new(),
-            task_states: HashMap::new(),
             beads: vec![],
             collapsed: HashSet::new(),
+            closed_default_pending: true,
             collapse_context: None,
             selected: None,
             detail: None,
@@ -348,27 +561,50 @@ impl App {
             list_error: None,
             detail_error: None,
             detail_seq: 0,
+            edit_seq: 0,
+            harness_seq: 0,
             launch_seq: 0,
+            handoff: HashMap::new(),
+            handoff_capacity: HashSet::new(),
+            toast: None,
+            release_result: None,
+            release_inflight: false,
+            update_preparing: false,
+            release_cancel: None,
+            update_available: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
             modal: None,
+            help: None,
             settings,
             theme,
             settings_path,
             settings_load_error: settings_error.clone(),
             worktrees: Vec::new(),
+            accepted_handoffs: HashSet::new(),
+            known_handoffs: HashSet::new(),
+            scheduler_attempted: HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
+            worktree_detail_offset: 0,
             worktrees_view: false,
             worktrees_loading: false,
             worktrees_error: None,
+            worktrees_focus_feedback: None,
+            worktrees_focus_pending: false,
             worktrees_inflight: false,
             worktrees_discovered: false,
+            worktrees_refresh_pending: false,
             worktree_action_pending: false,
             worktrees_next_refresh: Instant::now(),
+            agent_observation_inflight: false,
+            next_agent_observation: Instant::now(),
             notice: settings_error,
             mutation_busy: false,
             modal_ready: true,
+            paste_seq: 0,
+            paste_pending: false,
+            created_screenshots: Vec::new(),
             preferred_id: None,
             refresh_inflight: false,
             refresh_pending: false,
@@ -395,6 +631,165 @@ impl App {
             self.start_refresh(now);
         }
     }
+    fn poll_scheduler(&mut self) {
+        if !self.worktrees_discovered || self.mutation_busy {
+            return;
+        }
+        // A child must branch from its managed parent checkout. Preparing an
+        // Epic only reserves that checkout; it does not occupy an agent slot.
+        if let Some(epic) = self
+            .beads
+            .iter()
+            .find(|bead| {
+                if !beads::is_ready(bead)
+                    || bead.data["issue_type"] != "epic"
+                    || self.scheduler_attempted.contains(&bead.id)
+                    || self.known_handoffs.contains(&bead.id)
+                    || self.worktrees.iter().any(|item| item.bead_id == bead.id)
+                    || self
+                        .handoff
+                        .values()
+                        .any(|pending| pending.bead.id == bead.id)
+                {
+                    return false;
+                }
+                let descendants = beads::open_descendants_in(&self.beads, &bead.id);
+                self.beads.iter().any(|child| {
+                    beads::is_ready(child)
+                        && child.data["issue_type"] == "task"
+                        && !beads::explicitly_unassigned(&child.data)
+                        && (!beads::has_harness_label(&child.data)
+                            || beads::harness(&child.data).is_some())
+                        && !self.known_handoffs.contains(&child.id)
+                        && descendants.contains(&child.id)
+                })
+            })
+            .cloned()
+        {
+            self.scheduler_attempted.insert(epic.id.clone());
+            self.start_launch(epic, false);
+            return;
+        }
+        let active_agents =
+            self.worktrees
+                .iter()
+                .filter(|item| {
+                    item.handoff_accepted
+                        && matches!(
+                            item.status,
+                            worktrees::WorktreeStatus::InProgress
+                                | worktrees::WorktreeStatus::DirtyCheckout
+                        )
+                })
+                .count()
+                + self
+                    .handoff_capacity
+                    .iter()
+                    .filter(|id| {
+                        !self
+                            .worktrees
+                            .iter()
+                            .any(|item| &item.bead_id == *id && item.handoff_accepted)
+                    })
+                    .count()
+                + self
+                    .handoff
+                    .values()
+                    .filter(|pending| {
+                        // Reserving a parent checkout for open descendants starts no
+                        // agent. Resuming that reserved parent after its children does.
+                        !self.reserves_parent(&pending.bead)
+                            && !self.worktrees.iter().any(|item| {
+                                item.bead_id == pending.bead.id && item.handoff_accepted
+                            })
+                    })
+                    .count();
+        if !self.settings.agent_limit.allows(active_agents) {
+            return;
+        }
+        let next = self
+            .beads
+            .iter()
+            .filter(|bead| {
+                beads::is_ready(bead)
+                    && bead.data["issue_type"] == "task"
+                    && self.scheduler_eligible(bead)
+                    && !self.scheduler_attempted.contains(&bead.id)
+            })
+            .min_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.id.cmp(&b.id)))
+            .cloned();
+        if let Some(bead) = next {
+            self.scheduler_attempted.insert(bead.id.clone());
+            if beads::explicitly_unassigned(&bead.data) {
+                let message = format!(
+                    "{} is Ready but explicitly Unassigned; edit it to select an agent",
+                    bead.id
+                );
+                self.notice = Some(message.clone());
+                self.toast = Some(Toast::result(message, true));
+            } else if beads::has_harness_label(&bead.data) && beads::harness(&bead.data).is_none() {
+                let message = format!(
+                    "{} has an unsupported agent harness; edit it to select one",
+                    bead.id
+                );
+                self.notice = Some(message.clone());
+                self.toast = Some(Toast::result(message, true));
+            } else {
+                self.start_launch(bead, true);
+            }
+        }
+    }
+    fn scheduler_eligible(&self, bead: &Bead) -> bool {
+        if self
+            .handoff
+            .values()
+            .any(|pending| pending.bead.id == bead.id)
+        {
+            return false;
+        }
+        if let Some(parent) = bead.data["parent"].as_str()
+            && !self.worktrees.iter().any(|item| {
+                item.bead_id == parent
+                    && matches!(
+                        item.status,
+                        worktrees::WorktreeStatus::Reserved | worktrees::WorktreeStatus::InProgress
+                    )
+            })
+        {
+            return false;
+        }
+        if !self.known_handoffs.contains(&bead.id) {
+            return true;
+        }
+        let Some(reserved) = self.worktrees.iter().find(|item| {
+            item.bead_id == bead.id && item.status == worktrees::WorktreeStatus::Reserved
+        }) else {
+            return false;
+        };
+        beads::open_descendants_in(&self.beads, &bead.id).is_empty()
+            && !self.worktrees.iter().any(|item| {
+                item.parent_bead_id.as_deref() == Some(bead.id.as_str())
+                    && !matches!(
+                        item.status,
+                        worktrees::WorktreeStatus::Integrated
+                            | worktrees::WorktreeStatus::WorkspaceClosed
+                            | worktrees::WorktreeStatus::CheckoutRemoved
+                    )
+            })
+            && !reserved.workspace_id.is_empty()
+    }
+    fn reserves_parent(&self, bead: &Bead) -> bool {
+        !beads::open_descendants_in(&self.beads, &bead.id).is_empty()
+            || self.worktrees.iter().any(|item| {
+                item.parent_bead_id.as_deref() == Some(bead.id.as_str())
+                    && !matches!(
+                        item.status,
+                        worktrees::WorktreeStatus::Integrated
+                            | worktrees::WorktreeStatus::WorkspaceClosed
+                            | worktrees::WorktreeStatus::CheckoutRemoved
+                    )
+            })
+    }
     fn poll_worktrees(&mut self, now: Instant) {
         let automatic = self.settings.auto_merge
             || self.settings.auto_close_workspace
@@ -412,6 +807,7 @@ impl App {
             self.worktrees_loading = true;
             let policy = CleanupPolicy {
                 auto_merge: self.settings.auto_merge,
+                auto_merge_children: self.settings.auto_merge_children,
                 auto_close_workspace: self.settings.auto_close_workspace,
                 auto_remove_checkout: self.settings.auto_remove_checkout,
             };
@@ -428,6 +824,19 @@ impl App {
                 self.worktrees_error = Some("Worktree refresh could not be queued".into());
                 self.worktrees_next_refresh = now + REFRESH_INTERVAL;
             }
+        }
+    }
+    fn poll_agent_observations(&mut self, now: Instant) {
+        if self.agent_observation_inflight
+            || self.worktrees.is_empty()
+            || now < self.next_agent_observation
+        {
+            return;
+        }
+        self.agent_observation_inflight = true;
+        if self.requests.send(Request::ObserveAgents).is_err() {
+            self.agent_observation_inflight = false;
+            self.next_agent_observation = now + Duration::from_secs(2);
         }
     }
     fn start_refresh(&mut self, now: Instant) {
@@ -462,7 +871,7 @@ impl App {
             return;
         }
         let index = index.min(self.beads.len() - 1);
-        let status = normalized_status(&self.beads[index].status).to_owned();
+        let status = display_status(&self.beads[index]).to_owned();
         if self.collapsed.contains(&status) {
             self.clear_selection();
             return;
@@ -534,7 +943,7 @@ impl App {
     fn focused_status(&self) -> Option<String> {
         self.selected
             .and_then(|i| self.beads.get(i))
-            .map(|b| normalized_status(&b.status).to_owned())
+            .map(|b| display_status(b).to_owned())
             .or_else(|| self.collapse_context.clone())
     }
     fn focus_collapsed_group(&mut self, status: String) {
@@ -542,11 +951,7 @@ impl App {
         self.collapse_context = Some(status);
     }
     fn set_group_collapsed(&mut self, status: String, collapsed: bool) {
-        if !self
-            .beads
-            .iter()
-            .any(|b| normalized_status(&b.status) == status)
-        {
+        if !self.beads.iter().any(|b| display_status(b) == status) {
             return;
         }
         let is_collapsed = self.collapsed.contains(&status);
@@ -555,7 +960,7 @@ impl App {
         }
         let selected_in_group = self
             .selected
-            .is_some_and(|i| normalized_status(&self.beads[i].status) == status);
+            .is_some_and(|i| display_status(&self.beads[i]) == status);
         if collapsed {
             self.collapsed.insert(status.clone());
             if selected_in_group {
@@ -563,22 +968,14 @@ impl App {
             }
         } else {
             self.collapsed.remove(&status);
-            if let Some(i) = self
-                .beads
-                .iter()
-                .position(|b| normalized_status(&b.status) == status)
-            {
+            if let Some(i) = self.beads.iter().position(|b| display_status(b) == status) {
                 self.select(i);
             }
         }
     }
     fn toggle_group(&mut self, status: String) {
         if self.collapsed.remove(&status) {
-            if let Some(i) = self
-                .beads
-                .iter()
-                .position(|b| normalized_status(&b.status) == status)
-            {
+            if let Some(i) = self.beads.iter().position(|b| display_status(b) == status) {
                 self.select(i);
             }
         } else {
@@ -588,170 +985,10 @@ impl App {
     fn receive(&mut self) {
         self.receive_at(Instant::now());
     }
-    fn launched(&mut self, seq: u64, result: std::io::Result<LaunchOutcome>, now: Instant) {
-        let Some(task) = self.tasks.iter_mut().find(|task| task.seq == seq) else {
-            return;
-        };
-        let Some(state) = self.task_states.get_mut(&seq) else {
-            return;
-        };
-        // A duplicate/stale launch response must not resurrect terminal work.
-        if !task.active || task.status != "starting" || state.target.is_some() {
-            return;
-        }
-        state.next_poll = now;
-        match result {
-            Ok(outcome) => {
-                task.status = "unknown".into();
-                task.detail = format!(
-                    "{} Waiting for observed agent activity/status.",
-                    outcome.message
-                );
-                self.notice = Some(outcome.message.clone());
-                state.target = Some(outcome);
-            }
-            Err(error) => {
-                let failure = crate::herdr::launch_failure(&error);
-                let retry_safe = failure.is_some_and(|failure| failure.retry_safe);
-                state.target = failure.and_then(|failure| failure.target.clone());
-                state.recovery = Some(error.to_string());
-                task.status = if retry_safe {
-                    "launch failed"
-                } else {
-                    "unknown"
-                }
-                .into();
-                task.active = !retry_safe;
-                task.detail = format!(
-                    "Launch failed: {error}. {}",
-                    if retry_safe {
-                        "No work was submitted; retry is safe."
-                    } else {
-                        "Remote state is uncertain; inspect before retrying."
-                    }
-                );
-                self.notice = Some(task.detail.clone());
-            }
-        }
-    }
-    fn poll_tasks(&mut self, now: Instant) {
-        for task in &mut self.tasks {
-            let Some(state) = self.task_states.get_mut(&task.seq) else {
-                continue;
-            };
-            if !task.active || state.poll_inflight || now < state.next_poll {
-                continue;
-            }
-            let Some(target) = state.target.clone() else {
-                continue;
-            };
-            state.poll_inflight = true;
-            if self
-                .requests
-                .send(Request::PollTask(task.seq, target))
-                .is_err()
-            {
-                state.poll_inflight = false;
-                state.next_poll = now + TASK_POLL_INTERVAL;
-                task.status = "unknown".into();
-                let target = state.target.as_ref().unwrap();
-                task.detail = format!(
-                    "workspace {} · pane {} · branch {}. Status poll could not be queued; retrying.",
-                    target.workspace_id, target.pane_id, target.branch
-                );
-                if let Some(recovery) = &state.recovery {
-                    task.detail
-                        .push_str(&format!(" Launch recovery: {recovery}"));
-                }
-            }
-        }
-    }
-    fn task_polled(&mut self, seq: u64, result: std::io::Result<AgentObservation>, now: Instant) {
-        let Some(task) = self.tasks.iter_mut().find(|task| task.seq == seq) else {
-            return;
-        };
-        let Some(state) = self.task_states.get_mut(&seq) else {
-            return;
-        };
-        // Exactly one poll per task, so unsolicited/late responses are ignored.
-        if !task.active || !state.poll_inflight {
-            return;
-        }
-        state.poll_inflight = false;
-        state.next_poll = now + TASK_POLL_INTERVAL;
-        let Some(target) = &state.target else {
-            return;
-        };
-        let identity = format!(
-            "workspace {} · pane {} · branch {}",
-            target.workspace_id, target.pane_id, target.branch
-        );
-        let detail = match result {
-            Err(error) => {
-                task.status = "unknown".into();
-                format!("Status poll failed: {error}. Retrying; completion is not known.")
-            }
-            Ok(observation) => {
-                if matches!(observation.status.as_str(), "working" | "blocked") {
-                    state.observed_activity = true;
-                }
-                // A newly started idle agent may still show an earlier `done`
-                // before the submitted prompt begins. Counters fence that state;
-                // a counter first appearing after a validated successful handoff
-                // to our new pane is fresh even if its working turn was too fast
-                // to poll. Uncertain launches cannot use that shortcut. Servers
-                // without counters still need observed activity first.
-                let fresh_done = match (target.completion_seq, observation.completion_seq) {
-                    (Some(before), Some(after)) => after > before,
-                    (Some(_), None) => false,
-                    (None, Some(_)) if state.recovery.is_none() => true,
-                    (None, _) => state.observed_activity,
-                };
-                match observation.status.as_str() {
-                    "done" if fresh_done => {
-                        task.status = "done".into();
-                        task.active = false;
-                        "Herdr observed done; this is agent lifecycle state, not proof the bead is complete.".into()
-                    }
-                    "done" => {
-                        task.status = "unknown".into();
-                        "Herdr reports done, but no post-prompt activity/new completion is confirmed; still monitoring.".into()
-                    }
-                    "working" => {
-                        task.status = "running".into();
-                        "Herdr observed working.".into()
-                    }
-                    "blocked" => {
-                        task.status = "blocked".into();
-                        "Herdr observed blocked; inspect the agent for approval or a question."
-                            .into()
-                    }
-                    "error" => {
-                        task.status = "error".into();
-                        "Herdr observed error; inspect the agent. Completion is not known; monitoring continues.".into()
-                    }
-                    "idle" => {
-                        task.status = "idle".into();
-                        "Herdr observed idle; completion is not confirmed; monitoring continues."
-                            .into()
-                    }
-                    _ => {
-                        task.status = "unknown".into();
-                        "Herdr status is unknown, missing, or unsupported; monitoring continues."
-                            .into()
-                    }
-                }
-            }
-        };
-        task.detail = format!("{identity}. {detail}");
-        if let Some(recovery) = &state.recovery {
-            task.detail
-                .push_str(&format!(" Launch recovery: {recovery}"));
-        }
-    }
     fn receive_at(&mut self, now: Instant) {
         while let Ok(r) = self.responses.try_recv() {
             match r {
+                Response::UpdateAvailable(version) => self.update_available = version,
                 Response::List(res) => {
                     self.refresh_inflight = false;
                     self.next_refresh = now + REFRESH_INTERVAL;
@@ -771,11 +1008,17 @@ impl App {
                                 })
                                 .collect();
                             self.beads.sort_by(|a, b| {
-                                status_order(&a.status)
-                                    .cmp(&status_order(&b.status))
+                                status_order(display_status(a))
+                                    .cmp(&status_order(display_status(b)))
                                     .then_with(|| a.status.cmp(&b.status))
                                     .then_with(|| a.id.cmp(&b.id))
                             });
+                            if self.closed_default_pending
+                                && self.beads.iter().any(|bead| bead.status == "closed")
+                            {
+                                self.collapsed.insert("closed".into());
+                                self.closed_default_pending = false;
+                            }
                             self.collapsed
                                 .retain(|s| self.beads.iter().any(|b| &b.status == s));
                             // An in-flight pre-mutation snapshot must not consume
@@ -795,7 +1038,7 @@ impl App {
                             self.selected = None;
                             if let Some(i) = preferred {
                                 self.collapse_context = None;
-                                self.collapsed.remove(&self.beads[i].status);
+                                self.collapsed.remove(display_status(&self.beads[i]));
                                 if Some(i) == same_id {
                                     self.selected = Some(i);
                                     self.refresh_detail();
@@ -809,7 +1052,7 @@ impl App {
                                 self.focus_collapsed_group(status);
                             } else if let Some(i) = same_id {
                                 self.collapse_context = None;
-                                if self.collapsed.contains(&self.beads[i].status) {
+                                if self.collapsed.contains(display_status(&self.beads[i])) {
                                     self.clear_selection();
                                     if let Some(visible) = list_layout(&self.beads, &self.collapsed)
                                         .targets
@@ -864,17 +1107,156 @@ impl App {
                         }
                     }
                 }
+                Response::EditLoaded(id, seq, result) => {
+                    if let Some(Modal::EditLoading {
+                        id: pending,
+                        seq: active,
+                        error,
+                    }) = self.modal.as_mut()
+                        && *pending == id
+                        && *active == seq
+                    {
+                        match result
+                            .map_err(|e| e.to_string())
+                            .and_then(|v| edit_form(&v))
+                        {
+                            Ok(form) => self.modal = Some(Modal::Edit { id, form }),
+                            Err(message) => *error = Some(message),
+                        }
+                    }
+                }
                 Response::Created(result) => {
                     self.mutation_busy = false;
                     match result {
                         Ok(id) => {
+                            if matches!(&self.modal, Some(Modal::Create(form)) if form.generate_children && beads::BEAD_TYPES[form.issue_type] == "epic")
+                            {
+                                self.toast = Some(Toast::progress(format!(
+                                    "Created Epic {id}; starting sub-task agent…"
+                                )));
+                            }
                             self.notice = Some(format!("Created {id}"));
+                            self.created_screenshots.clear();
                             self.modal = None;
                             self.preferred_id = Some(id);
                             self.refresh_at(now);
                         }
                         Err(e) => {
                             self.notice = Some(format!("Create failed: {e}"));
+                        }
+                    }
+                }
+                Response::EpicLaunched(id, result) => match result {
+                    Ok(session) => {
+                        let message =
+                            format!("Planning {id} in Herdr workspace {}…", session.workspace_id);
+                        self.notice = Some(message.clone());
+                        self.toast = Some(Toast::progress(message));
+                    }
+                    Err(error) => {
+                        let message =
+                            format!("Epic {id} created; automatic planning failed: {error}");
+                        self.notice = Some(message.clone());
+                        self.toast = Some(Toast::result(message, true));
+                    }
+                },
+                Response::EpicFinished(id, result) => {
+                    let (message, error) = match result {
+                        Ok(children) => (
+                            format!(
+                                "Epic {id}: {} child Beads created; planning workspace closed",
+                                children.len()
+                            ),
+                            false,
+                        ),
+                        Err(error) => (
+                            format!("Epic {id}: planning needs attention: {error}"),
+                            true,
+                        ),
+                    };
+                    self.notice = Some(message.clone());
+                    self.toast = Some(Toast::result(message, error));
+                    self.refresh_at(now);
+                }
+                Response::Updated(id, result) => {
+                    self.mutation_busy = false;
+                    match result {
+                        Ok(()) => {
+                            self.notice = Some(format!("Updated {id}"));
+                            self.created_screenshots.clear();
+                            self.modal = None;
+                            self.preferred_id = Some(id);
+                            self.refresh_at(now);
+                        }
+                        Err(e) => self.notice = Some(format!("Update failed: {e}")),
+                    }
+                }
+                Response::ScreenshotRead(seq, result) => {
+                    if seq != self.paste_seq {
+                        continue;
+                    }
+                    self.paste_pending = false;
+                    if let Some(Modal::Create(form) | Modal::Edit { form, .. }) =
+                        self.modal.as_mut()
+                    {
+                        match result.and_then(|bytes| screenshots::save(&bytes)) {
+                            Ok(path) => {
+                                form.insert_screenshot(&path);
+                                self.notice = Some(format!("Screenshot saved: {}", path.display()));
+                                self.created_screenshots.push(path);
+                            }
+                            Err(error) => {
+                                self.notice = Some(format!("Screenshot paste failed: {error}"))
+                            }
+                        }
+                    }
+                }
+                Response::ReadySet(id, ready, result) => {
+                    self.mutation_busy = false;
+                    match result {
+                        Ok(ids) => {
+                            for changed_id in &ids {
+                                if ready {
+                                    self.scheduler_attempted.remove(changed_id);
+                                } else {
+                                    self.scheduler_attempted.insert(changed_id.clone());
+                                }
+                            }
+                            for bead in self.beads.iter_mut().filter(|bead| ids.contains(&bead.id))
+                            {
+                                let labels = bead.data["labels"].as_array_mut();
+                                if ready {
+                                    if let Some(labels) = labels {
+                                        if !labels.iter().any(|label| label == beads::READY_LABEL) {
+                                            labels.push(serde_json::Value::String(
+                                                beads::READY_LABEL.into(),
+                                            ));
+                                        }
+                                    } else {
+                                        bead.data["labels"] =
+                                            serde_json::json!([beads::READY_LABEL]);
+                                    }
+                                } else if let Some(labels) = labels {
+                                    labels.retain(|label| label != beads::READY_LABEL);
+                                }
+                            }
+                            self.notice = Some(format!(
+                                "{id} {} Ready",
+                                if ready { "marked" } else { "removed from" }
+                            ));
+                            if self
+                                .selected
+                                .and_then(|i| self.beads.get(i))
+                                .is_some_and(|bead| bead.id == id)
+                            {
+                                self.preferred_id = Some(id.clone());
+                                self.collapsed.remove(if ready { "ready" } else { "open" });
+                            }
+                            self.refresh_at(now);
+                        }
+                        Err(error) => {
+                            self.notice = Some(format!("Could not update Ready for {id}: {error}"));
+                            self.refresh_at(now);
                         }
                     }
                 }
@@ -889,48 +1271,314 @@ impl App {
                         Err(e) => self.notice = Some(format!("Delete failed: {e}")),
                     }
                 }
+                Response::HarnessesDiscovered(seq, result) => {
+                    if let Some(Modal::Create(form)) = self.modal.as_mut()
+                        && form.harness_seq == seq
+                    {
+                        match result {
+                            Ok(harnesses) => {
+                                form.set_harnesses(harnesses, self.settings.default_agent)
+                            }
+                            Err(error) => {
+                                form.set_harnesses(Vec::new(), self.settings.default_agent);
+                                form.harness_error =
+                                    Some(format!("Herdr integration discovery failed: {error}"));
+                            }
+                        }
+                        if self.notice.as_deref().is_some_and(|message| {
+                            message.starts_with("Checking Herdr integrations;")
+                        }) {
+                            self.notice = None;
+                        }
+                    }
+                }
                 Response::Discovered(seq, result) => {
-                    if let Some(Modal::Launch(modal)) = self.modal.as_mut()
-                        && modal.seq == seq
+                    if let Some(pending) = self
+                        .handoff
+                        .get(&seq)
+                        .filter(|item| item.seq == seq && !item.launch_queued)
+                        .cloned()
                     {
                         match result {
                             Ok(context) => {
-                                modal.selected_agent = 0;
-                                modal.error = None;
-                                modal.context = Some(context);
+                                let chosen = beads::harness(&pending.bead.data);
+                                let agent = if let Some(kind) = chosen {
+                                    context.agents.iter().find(|agent| agent.id == kind)
+                                } else if pending.scheduled {
+                                    match self.settings.default_agent {
+                                        DefaultAgent::Kind(kind) => context
+                                            .agents
+                                            .iter()
+                                            .find(|agent| agent.id == kind)
+                                            .or_else(|| {
+                                                context
+                                                    .agents
+                                                    .iter()
+                                                    .find(|agent| agent.id == "codex")
+                                            })
+                                            .or_else(|| context.agents.first()),
+                                        DefaultAgent::Automatic | DefaultAgent::Unassigned => {
+                                            context
+                                                .agents
+                                                .iter()
+                                                .find(|agent| agent.id == "codex")
+                                                .or_else(|| context.agents.first())
+                                        }
+                                    }
+                                } else {
+                                    context
+                                        .agents
+                                        .iter()
+                                        .find(|agent| agent.id == "codex")
+                                        .or_else(|| context.agents.first())
+                                }
+                                .cloned();
+                                if let Some(agent) = agent {
+                                    let bead = pending.bead.clone();
+                                    self.handoff.get_mut(&seq).unwrap().launch_queued = true;
+                                    if seq == self.launch_seq {
+                                        self.toast = Some(Toast::progress(format!(
+                                            "Handing {} to {} in Herdr…",
+                                            bead.id, agent.label
+                                        )));
+                                    }
+                                    let request = if pending.scheduled {
+                                        Request::LaunchReady(seq, context, agent, bead)
+                                    } else {
+                                        Request::Launch(seq, context, agent, bead)
+                                    };
+                                    if self.requests.send(request).is_err() {
+                                        self.handoff.remove(&seq);
+                                        let message =
+                                            "Handoff could not be queued; try again".to_owned();
+                                        self.handoff_feedback(seq, message, true);
+                                    }
+                                } else {
+                                    self.handoff.remove(&seq);
+                                    let message = if let Some(kind) = chosen {
+                                        format!(
+                                            "Harness {kind} for {} is unavailable; change it or toggle Ready to retry",
+                                            pending.bead.id
+                                        )
+                                    } else if pending.scheduled {
+                                        format!(
+                                            "Selected harness for {} is unavailable; change it or toggle Ready to retry",
+                                            pending.bead.id
+                                        )
+                                    } else {
+                                        "No Herdr agents are available in this workspace".to_owned()
+                                    };
+                                    self.handoff_feedback(seq, message, true);
+                                }
                             }
-                            Err(error) => modal.error = Some(error.to_string()),
+                            Err(error) => {
+                                self.handoff.remove(&seq);
+                                let message = format!("Handoff discovery failed: {error}");
+                                self.handoff_feedback(seq, message, true);
+                            }
                         }
                     }
                 }
                 Response::Launched(seq, result) => {
-                    self.launched(seq, result, now);
+                    if self
+                        .handoff
+                        .get(&seq)
+                        .is_some_and(|item| item.launch_queued)
+                    {
+                        let ready_id = self
+                            .handoff
+                            .get(&seq)
+                            .filter(|item| beads::is_ready(&item.bead))
+                            .map(|item| item.bead.id.clone());
+                        let bead_id = self.handoff[&seq].bead.id.clone();
+                        self.handoff.remove(&seq);
+                        match result {
+                            Ok(outcome) => {
+                                self.known_handoffs.insert(bead_id.clone());
+                                if !outcome.reserved {
+                                    self.handoff_capacity.insert(bead_id);
+                                }
+                                if let Some(id) = ready_id {
+                                    self.known_handoffs.insert(id.clone());
+                                    if outcome.reserved {
+                                        self.scheduler_attempted.remove(&id);
+                                    } else {
+                                        self.accepted_handoffs.insert(id);
+                                    }
+                                }
+                                self.handoff_feedback(seq, outcome.message, false);
+                                // The launch journal is now active. Reload it even if the
+                                // initial worktree scan found no managed handoffs.
+                                if self.worktrees_inflight {
+                                    self.worktrees_refresh_pending = true;
+                                } else {
+                                    self.worktrees_discovered = false;
+                                    self.worktrees_next_refresh = now;
+                                }
+                            }
+                            Err(error) => {
+                                let message = format!("Handoff failed: {error}");
+                                self.handoff_feedback(seq, message, true);
+                                // A failed launch can still have a durable partial
+                                // intent/remote worktree. Always inspect it again.
+                                if self.worktrees_inflight {
+                                    self.worktrees_refresh_pending = true;
+                                } else {
+                                    self.worktrees_discovered = false;
+                                    self.worktrees_next_refresh = now;
+                                }
+                            }
+                        }
+                    }
                 }
-                Response::TaskPolled(seq, result) => self.task_polled(seq, result, now),
                 Response::Worktrees(result) => {
                     self.worktrees_inflight = false;
                     self.worktrees_loading = false;
                     self.worktrees_next_refresh = now + REFRESH_INTERVAL;
-                    self.worktrees_discovered = true;
+                    self.worktrees_discovered = result.is_ok();
                     if !self.worktree_action_pending {
                         match result {
-                            Ok(items) => {
+                            Ok(mut items) => {
+                                for item in &mut items {
+                                    if matches!(
+                                        item.status,
+                                        worktrees::WorktreeStatus::Reserved
+                                            | worktrees::WorktreeStatus::WorkspaceClosed
+                                            | worktrees::WorktreeStatus::CheckoutRemoved
+                                    ) {
+                                        continue;
+                                    }
+                                    if let Some(line) = self
+                                        .worktrees
+                                        .iter()
+                                        .find(|previous| {
+                                            previous.id == item.id
+                                                && previous.workspace_id == item.workspace_id
+                                        })
+                                        .and_then(|previous| previous.detail.as_deref())
+                                        .and_then(|detail| {
+                                            detail.lines().find(|line| {
+                                                line.starts_with(
+                                                    "Agent observation (display only):",
+                                                )
+                                            })
+                                        })
+                                    {
+                                        let base = item.detail.as_deref().unwrap_or("");
+                                        item.detail = Some(if base.is_empty() {
+                                            line.into()
+                                        } else {
+                                            format!("{base}\n{line}")
+                                        });
+                                    }
+                                }
+                                if !self.worktrees_refresh_pending {
+                                    self.handoff_capacity
+                                        .retain(|id| !items.iter().any(|item| &item.bead_id == id));
+                                }
                                 let selected_id = self
                                     .worktrees
                                     .get(self.selected_worktree)
                                     .map(|item| item.id.clone());
+                                let accepted_handoffs: HashSet<_> = items
+                                    .iter()
+                                    .filter(|item| item.handoff_accepted)
+                                    .map(|item| item.bead_id.clone())
+                                    .collect();
+                                if self.worktrees_refresh_pending {
+                                    // This scan started before the successful handoff.
+                                    self.accepted_handoffs.extend(accepted_handoffs);
+                                } else {
+                                    self.accepted_handoffs = accepted_handoffs;
+                                }
+                                self.known_handoffs
+                                    .extend(items.iter().map(|item| item.bead_id.clone()));
+                                items.retain(|item| {
+                                    item.status != worktrees::WorktreeStatus::CheckoutRemoved
+                                });
+                                order_worktrees(&mut items);
                                 self.worktrees = items;
                                 self.selected_worktree = selected_id
+                                    .as_deref()
                                     .and_then(|id| {
                                         self.worktrees.iter().position(|item| item.id == id)
                                     })
                                     .unwrap_or(self.selected_worktree)
                                     .min(self.worktrees.len().saturating_sub(1));
+                                if selected_id.as_deref()
+                                    != self
+                                        .worktrees
+                                        .get(self.selected_worktree)
+                                        .map(|item| item.id.as_str())
+                                {
+                                    self.worktree_detail_offset = 0;
+                                }
                                 self.worktrees_error = None;
                             }
                             Err(error) => self.worktrees_error = Some(error.to_string()),
                         }
                     }
+                    if std::mem::take(&mut self.worktrees_refresh_pending) {
+                        self.worktrees_discovered = false;
+                        self.worktrees_next_refresh = now;
+                    }
+                }
+                Response::AgentsObserved(result) => {
+                    if !self.agent_observation_inflight {
+                        continue;
+                    }
+                    self.agent_observation_inflight = false;
+                    self.next_agent_observation = now + Duration::from_secs(2);
+                    for item in &mut self.worktrees {
+                        if matches!(
+                            item.status,
+                            worktrees::WorktreeStatus::Reserved
+                                | worktrees::WorktreeStatus::WorkspaceClosed
+                                | worktrees::WorktreeStatus::CheckoutRemoved
+                        ) {
+                            continue;
+                        }
+                        let line = match &result {
+                            Ok(observations) => observations
+                                .iter()
+                                .find(|observation| {
+                                    observation.id == item.id
+                                        && observation.workspace_id == item.workspace_id
+                                })
+                                .map(|observation| observation.detail.clone()),
+                            Err(error) => Some(format!(
+                                "Agent observation (display only): unknown — poll failed: {error}"
+                            )),
+                        };
+                        if let Some(line) = line {
+                            let existing = item.detail.as_deref().unwrap_or("");
+                            let base = existing
+                                .split("\nAgent observation (display only):")
+                                .next()
+                                .unwrap_or("");
+                            let base = if base.starts_with("Agent observation (display only):") {
+                                ""
+                            } else {
+                                base
+                            };
+                            item.detail = Some(if base.is_empty() {
+                                line
+                            } else {
+                                format!("{base}\n{line}")
+                            });
+                        }
+                    }
+                }
+                Response::WorkspaceFocused(id, result) => {
+                    self.worktrees_focus_pending = false;
+                    self.worktrees_focus_feedback = Some(match result {
+                        Ok(()) => WorktreeFocusFeedback::Success(format!(
+                            "Switched to Herdr workspace {id}"
+                        )),
+                        Err(error) => WorktreeFocusFeedback::Error(format!(
+                            "Could not switch to Herdr workspace {id}: {error}"
+                        )),
+                    });
                 }
                 Response::WorktreeChanged(result) => {
                     self.mutation_busy = false;
@@ -938,12 +1586,25 @@ impl App {
                     self.worktree_action_pending = false;
                     match result {
                         Ok(item) => {
+                            if item.handoff_accepted {
+                                self.accepted_handoffs.insert(item.bead_id.clone());
+                            }
                             if let Some(index) = self
                                 .worktrees
                                 .iter()
                                 .position(|existing| existing.id == item.id)
                             {
-                                self.worktrees[index] = item.clone();
+                                if item.status == worktrees::WorktreeStatus::CheckoutRemoved {
+                                    self.worktrees.remove(index);
+                                    self.selected_worktree = self
+                                        .selected_worktree
+                                        .min(self.worktrees.len().saturating_sub(1));
+                                    if self.selected_worktree >= index {
+                                        self.worktree_detail_offset = 0;
+                                    }
+                                } else {
+                                    self.worktrees[index] = item.clone();
+                                }
                             }
                             self.notice = Some(format!(
                                 "{} · {}",
@@ -958,11 +1619,123 @@ impl App {
                         }
                     }
                 }
+                Response::WorktreeRestarted(result) => {
+                    self.mutation_busy = false;
+                    self.modal = None;
+                    self.worktree_action_pending = false;
+                    self.worktrees_focus_feedback = Some(match result {
+                        Ok(message) => WorktreeFocusFeedback::Success(message),
+                        Err(error) => {
+                            WorktreeFocusFeedback::Error(format!("Restart failed: {error}"))
+                        }
+                    });
+                    if self.worktrees_inflight {
+                        self.worktrees_refresh_pending = true;
+                    } else {
+                        self.worktrees_discovered = false;
+                        self.worktrees_next_refresh = now;
+                    }
+                }
+                Response::ReleaseChecked(result) => {
+                    self.release_inflight = false;
+                    self.notice = Some(match &result {
+                        Ok(release::CheckResult::Available { version, .. }) => {
+                            format!("Update v{version} available · press u to review")
+                        }
+                        Ok(release::CheckResult::Current { .. }) => "OnTrack is up to date".into(),
+                        Ok(release::CheckResult::NoPublishedRelease) => {
+                            "No public OnTrack release is available".into()
+                        }
+                        Err(error) => format!("Update check failed: {error}"),
+                    });
+                    self.release_result = Some(result);
+                }
+                Response::UpdatePrepared(result) => {
+                    self.update_preparing = false;
+                    match result {
+                        Ok(Check::Available(release)) => {
+                            if matches!(self.modal, Some(Modal::Release)) {
+                                self.modal = Some(Modal::ConfirmUpdate(release));
+                                self.modal_ready = false;
+                            } else {
+                                self.notice = Some(
+                                    "Update is ready to review; press u, then i to continue".into(),
+                                );
+                            }
+                        }
+                        Ok(Check::Current) => {
+                            self.notice = Some("OnTrack is up to date".into());
+                            self.release_result = Some(Ok(release::CheckResult::Current {
+                                version: semver::Version::parse(env!("CARGO_PKG_VERSION")).unwrap(),
+                            }));
+                        }
+                        Ok(Check::NoPublishedRelease) => {
+                            self.notice = Some("No public OnTrack release is available".into());
+                            self.release_result =
+                                Some(Ok(release::CheckResult::NoPublishedRelease));
+                        }
+                        Err(error) => {
+                            let message =
+                                format!("Update preparation failed: {error}. Press i to retry.");
+                            self.notice = Some(message.clone());
+                            self.toast = Some(Toast::result(message, true));
+                        }
+                    }
+                }
+                Response::ReleaseInstalled(result) => {
+                    self.release_cancel = None;
+                    self.modal = None;
+                    let toast = match result {
+                        Ok(()) => Toast::result(
+                            "OnTrack updated. Quit and restart to run the new version.".into(),
+                            false,
+                        ),
+                        Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                            Toast::result(
+                                "Update cancelled; existing executable is unchanged.".into(),
+                                false,
+                            )
+                        }
+                        Err(error) => Toast::result(
+                            format!(
+                                "Update failed: {error}. Existing executable remains usable; press u to retry."
+                            ),
+                            true,
+                        ),
+                    };
+                    self.notice = Some(toast.message.clone());
+                    self.toast = Some(toast);
+                }
             }
         }
     }
     fn key(&mut self, k: KeyEvent) -> bool {
         if self.mutation_busy {
+            return false;
+        }
+        if let Some(help) = self.help.as_mut() {
+            if hotkeys::is_help_key(k) || k.code == KeyCode::Esc {
+                self.help = None;
+            } else {
+                match k.code {
+                    KeyCode::Up | KeyCode::Char('k') => help.offset = help.offset.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        help.offset = help.offset.saturating_add(1)
+                    }
+                    KeyCode::PageUp => help.offset = help.offset.saturating_sub(10),
+                    KeyCode::PageDown => help.offset = help.offset.saturating_add(10),
+                    KeyCode::Home => help.offset = 0,
+                    KeyCode::End => help.offset = usize::MAX,
+                    _ => {}
+                }
+            }
+            return false;
+        }
+        if hotkeys::is_help_key(k) {
+            self.help = Some(Help {
+                context: hotkeys::Context::current(self),
+                offset: 0,
+            });
             return false;
         }
         if self.modal.is_some() {
@@ -977,34 +1750,46 @@ impl App {
                     self.worktrees_view = false
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
-                    self.selected_worktree = self.selected_worktree.saturating_sub(1)
+                    self.selected_worktree = self.selected_worktree.saturating_sub(1);
+                    self.worktree_detail_offset = 0;
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
                     self.selected_worktree =
-                        (self.selected_worktree + 1).min(self.worktrees.len().saturating_sub(1))
+                        (self.selected_worktree + 1).min(self.worktrees.len().saturating_sub(1));
+                    self.worktree_detail_offset = 0;
+                }
+                KeyCode::PageUp => {
+                    self.worktree_detail_offset = self
+                        .worktree_detail_offset
+                        .saturating_sub(self.detail_rect.height.saturating_sub(2));
+                }
+                KeyCode::PageDown => {
+                    self.worktree_detail_offset = self
+                        .worktree_detail_offset
+                        .saturating_add(self.detail_rect.height.saturating_sub(2));
                 }
                 KeyCode::Char('r') => {
                     self.worktrees_next_refresh = Instant::now();
                     self.poll_worktrees(Instant::now());
                 }
+                KeyCode::Enter => self.focus_selected_worktree(),
                 KeyCode::Char('m') => self.confirm_worktree_action(0),
                 KeyCode::Char('c') => self.confirm_worktree_action(1),
                 KeyCode::Char('x') => self.confirm_worktree_action(2),
+                KeyCode::Char('R') => self.confirm_worktree_action(3),
                 _ => {}
             }
             return false;
         }
         match k.code {
-            KeyCode::Char('t') => {
-                self.modal = Some(Modal::Tasks { scroll: 0 });
-                self.modal_ready = false;
-            }
             KeyCode::Char('w') => {
                 self.worktrees_view = true;
+                self.worktrees_focus_feedback = None;
                 self.worktrees_next_refresh = Instant::now();
                 self.poll_worktrees(Instant::now());
             }
-            KeyCode::Char('r') => self.refresh(),
+            KeyCode::Char('r' | 'R') => self.toggle_ready(),
+            KeyCode::Char('u') => self.open_release(),
             KeyCode::Char('s') => {
                 let load_error = self
                     .settings_load_error
@@ -1019,10 +1804,61 @@ impl App {
                 self.modal_ready = false;
             }
             KeyCode::Char(' ') => self.toggle_selected_group(),
-            KeyCode::Char('n') => {
-                self.modal = Some(Modal::Create(CreateForm::default()));
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                let child = k.code == KeyCode::Char('N')
+                    || (k.code == KeyCode::Char('n')
+                        && k.modifiers.contains(crossterm::event::KeyModifiers::SHIFT));
+                let parent_id = if child {
+                    match self.selected.and_then(|i| self.beads.get(i)) {
+                        Some(bead)
+                            if bead.data["issue_type"] == "task" && bead.status != "closed" =>
+                        {
+                            Some(bead.id.clone())
+                        }
+                        _ => {
+                            self.notice = Some("Select an open task to create a child".into());
+                            return false;
+                        }
+                    }
+                } else {
+                    None
+                };
+                self.harness_seq = self.harness_seq.wrapping_add(1);
+                let seq = self.harness_seq;
+                self.modal = Some(Modal::Create(CreateForm {
+                    parent_id,
+                    harness_loading: true,
+                    harness_seq: seq,
+                    ..CreateForm::default()
+                }));
                 self.modal_ready = false;
                 self.notice = None;
+                if self.requests.send(Request::DiscoverHarnesses(seq)).is_err()
+                    && let Some(Modal::Create(form)) = self.modal.as_mut()
+                {
+                    form.harness_loading = false;
+                    form.harness_error =
+                        Some("Herdr integration discovery could not be queued".into());
+                }
+            }
+            KeyCode::Char('e') => {
+                if let Some(b) = self.selected.and_then(|i| self.beads.get(i)) {
+                    let id = b.id.clone();
+                    self.edit_seq = self.edit_seq.wrapping_add(1);
+                    let seq = self.edit_seq;
+                    self.modal = Some(Modal::EditLoading {
+                        id: id.clone(),
+                        seq,
+                        error: None,
+                    });
+                    self.modal_ready = false;
+                    self.notice = None;
+                    if self.requests.send(Request::LoadEdit(id, seq)).is_err()
+                        && let Some(Modal::EditLoading { error, .. }) = self.modal.as_mut()
+                    {
+                        *error = Some("Edit could not be queued; try again".into());
+                    }
+                }
             }
             KeyCode::Char('d') => {
                 if let Some(b) = self.selected.and_then(|i| self.beads.get(i)) {
@@ -1068,6 +1904,38 @@ impl App {
         }
         false
     }
+    fn focus_selected_worktree(&mut self) {
+        if self.worktrees_focus_pending {
+            return;
+        }
+        let Some(item) = self.worktrees.get(self.selected_worktree) else {
+            self.worktrees_focus_feedback = Some(WorktreeFocusFeedback::Error(
+                "Select a managed worktree first".into(),
+            ));
+            return;
+        };
+        if matches!(
+            item.status,
+            worktrees::WorktreeStatus::WorkspaceClosed | worktrees::WorktreeStatus::CheckoutRemoved
+        ) {
+            self.worktrees_focus_feedback = Some(WorktreeFocusFeedback::Error(
+                "This worktree's Herdr workspace is closed".into(),
+            ));
+            return;
+        }
+        self.worktrees_focus_feedback = None;
+        self.worktrees_focus_pending = true;
+        if self
+            .requests
+            .send(Request::FocusWorkspace(item.workspace_id.clone()))
+            .is_err()
+        {
+            self.worktrees_focus_pending = false;
+            self.worktrees_focus_feedback = Some(WorktreeFocusFeedback::Error(
+                "Workspace switch could not be queued".into(),
+            ));
+        }
+    }
     fn confirm_worktree_action(&mut self, action: u8) {
         let Some(item) = self.worktrees.get(self.selected_worktree) else {
             self.worktrees_error = Some("Select a managed worktree first".into());
@@ -1090,10 +1958,23 @@ impl App {
         if action == 0
             && !matches!(
                 item.status,
-                worktrees::WorktreeStatus::Unmerged | worktrees::WorktreeStatus::NeedsResolution
+                worktrees::WorktreeStatus::InProgress
+                    | worktrees::WorktreeStatus::Unmerged
+                    | worktrees::WorktreeStatus::MergeQueued
+                    | worktrees::WorktreeStatus::NeedsResolution
             )
         {
             self.worktrees_error = Some("This worktree is not ready for a merge request".into());
+            return;
+        }
+        if action == 3
+            && matches!(
+                item.status,
+                worktrees::WorktreeStatus::CheckoutRemoved
+                    | worktrees::WorktreeStatus::WorkspaceClosed
+            )
+        {
+            self.worktrees_error = Some("Select an active checkout to restart".into());
             return;
         }
         self.modal = Some(Modal::ConfirmWorktree {
@@ -1102,20 +1983,42 @@ impl App {
         });
         self.modal_ready = false;
     }
+    fn open_release(&mut self) {
+        self.modal = Some(Modal::Release);
+        self.modal_ready = false;
+        if !self.release_inflight && self.release_result.is_none() {
+            self.start_release_check();
+        }
+    }
+    fn start_release_check(&mut self) {
+        if self.release_inflight {
+            return;
+        }
+        self.release_inflight = true;
+        self.release_result = None;
+        if self.requests.send(Request::CheckRelease).is_err() {
+            self.release_inflight = false;
+            self.release_result = Some(Err("Update check could not be queued".into()));
+        }
+    }
     fn modal_key(&mut self, key: KeyEvent) -> bool {
         use crossterm::event::KeyCode::*;
         if self.mutation_busy {
+            return false;
+        }
+        if matches!(self.modal, Some(Modal::InstallingUpdate(_))) {
+            if matches!(key.code, Esc | Char('c')) {
+                if let Some(cancel) = &self.release_cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                self.toast = Some(Toast::progress("Cancelling update…".into()));
+            }
             return false;
         }
         if !self.modal_ready && key.code != Esc {
             return false;
         }
         if key.code == Esc {
-            if matches!(self.modal, Some(Modal::Launch(_))) {
-                self.launch_seq = self.launch_seq.wrapping_add(1);
-                self.modal = None;
-                return false;
-            }
             if let Some(Modal::Settings { dropdown_open, .. }) = self.modal.as_mut() {
                 if *dropdown_open {
                     *dropdown_open = false;
@@ -1124,75 +2027,86 @@ impl App {
                 }
                 return false;
             }
-            if let Some(Modal::Create(form)) = self.modal.as_mut()
+            if let Some(Modal::Create(form) | Modal::Edit { form, .. }) = self.modal.as_mut()
                 && let Some(which) = form.dropdown.take()
             {
                 if let Some(old) = form.dropdown_original.take() {
                     match which {
                         2 => form.issue_type = old,
-                        _ => form.priority = old,
+                        3 => form.priority = old,
+                        _ => form.harness = old,
                     }
                 }
                 return false;
             }
+            for path in self.created_screenshots.drain(..) {
+                let _ = std::fs::remove_file(path);
+            }
             self.modal = None;
+            self.paste_seq = self.paste_seq.wrapping_add(1);
+            self.paste_pending = false;
             return false;
         }
-        if let Some(Modal::Tasks { scroll }) = self.modal.as_mut() {
-            match key.code {
-                Up | Char('k') => *scroll = scroll.saturating_sub(1),
-                Down | Char('j') => *scroll = scroll.saturating_add(1),
-                PageUp => *scroll = scroll.saturating_sub(6),
-                PageDown => *scroll = scroll.saturating_add(6),
-                Home => *scroll = 0,
-                End => *scroll = u16::MAX,
-                _ => {}
+        if self.paste_pending {
+            self.notice = Some("Wait for screenshot paste or press Esc to cancel".into());
+            return false;
+        }
+        if matches!(self.modal, Some(Modal::Release)) {
+            if key.code == KeyCode::Char('r') && !self.update_preparing {
+                self.start_release_check();
+            } else if key.code == KeyCode::Char('i')
+                && !self.update_preparing
+                && matches!(
+                    self.release_result,
+                    Some(Ok(release::CheckResult::Available { .. }))
+                )
+            {
+                self.update_preparing = true;
+                if self.requests.send(Request::PrepareUpdate).is_err() {
+                    self.update_preparing = false;
+                    self.notice = Some("Update preparation could not be queued".into());
+                }
             }
             return false;
         }
-        if let Some(Modal::ReleaseTask { seq, bead_id }) = self.modal.as_ref() {
-            let seq = *seq;
-            let bead_id = bead_id.clone();
-            match key.code {
-                Char('y') => {
-                    if self.can_release_task(seq, &bead_id) {
-                        let task = self
-                            .tasks
-                            .iter_mut()
-                            .find(|task| task.seq == seq && task.bead_id == bead_id)
-                            .unwrap();
-                        task.active = false;
-                        task.status = "tracking released".into();
-                        task.detail.push_str(" Local tracking manually released after confirmation. This does not certify completion, cancel agents, or delete remote work. Inspect Herdr/Git state before retrying.");
-                        self.notice = Some(format!(
-                            "Local tracking released for {bead_id}; remote work was not cancelled or deleted. Press h again to explicitly start another handoff."
-                        ));
-                    } else {
-                        self.notice = Some(
-                            "Tracking release is no longer available; inspect Tasks (t)".into(),
-                        );
-                    }
+        if let Some(Modal::ConfirmUpdate(release)) = self.modal.as_ref() {
+            if matches!(key.code, Char('y') | Char('Y')) {
+                let release = release.clone();
+                let cancel = Arc::new(AtomicBool::new(false));
+                self.release_cancel = Some(cancel.clone());
+                self.modal = Some(Modal::InstallingUpdate(release.version.clone()));
+                self.toast = Some(Toast::progress(format!(
+                    "Downloading and verifying OnTrack {}…",
+                    release.version
+                )));
+                if self
+                    .requests
+                    .send(Request::InstallRelease(release, cancel))
+                    .is_err()
+                {
+                    self.release_cancel = None;
                     self.modal = None;
+                    self.toast = Some(Toast::result(
+                        "Update could not be queued; press u to retry".into(),
+                        true,
+                    ));
                 }
-                Char('n') | Enter => self.modal = None,
-                _ => {}
+            } else if matches!(key.code, Char('n') | Char('N') | Enter) {
+                self.modal = None;
             }
             return false;
         }
         if let Some(Modal::ConfirmWorktree { id, action }) = self.modal.as_ref() {
             if matches!(key.code, Char('y') | Char('Y')) {
                 let id = id.clone();
-                let action = match action {
-                    0 => WorktreeAction::RequestMerge,
-                    1 => WorktreeAction::CloseWorkspace,
-                    _ => WorktreeAction::RemoveCheckout,
+                let request = match action {
+                    0 => Request::WorktreeAction(id, WorktreeAction::RequestMerge),
+                    1 => Request::WorktreeAction(id, WorktreeAction::CloseWorkspace),
+                    2 => Request::WorktreeAction(id, WorktreeAction::RemoveCheckout),
+                    _ => Request::RestartWorktree(id),
                 };
                 self.mutation_busy = true;
-                if self
-                    .requests
-                    .send(Request::WorktreeAction(id, action))
-                    .is_err()
-                {
+                if self.requests.send(request).is_err() {
                     self.mutation_busy = false;
                     self.worktrees_error = Some("Action could not be queued".into());
                 } else {
@@ -1215,32 +2129,44 @@ impl App {
                 match key.code {
                     Tab | BackTab => {
                         *dropdown_open = false;
-                        *focus = (*focus + if key.code == Tab { 1 } else { 4 }) % 5;
+                        *focus = (*focus + if key.code == Tab { 1 } else { 7 }) % 8;
                     }
                     Up | Down => {
-                        *focus = (*focus + if key.code == Down { 1 } else { 4 }) % 5;
+                        *focus = (*focus + if key.code == Down { 1 } else { 7 }) % 8;
                         *dropdown_open = false;
                     }
                     Left | Right if *focus == 0 => {
                         draft.theme = cycle_theme(draft.theme, key.code == Right);
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus == 0 && *dropdown_open => {
+                    Left | Right if *focus == 1 => {
+                        let count = beads::HARNESSES.len() + 2;
+                        let index =
+                            cycle_choice(draft.default_agent.index(), count, key.code == Right);
+                        draft.default_agent = DefaultAgent::at(index);
+                        save_settings = Some(*draft);
+                    }
+                    Left | Right if *focus == 2 => {
+                        draft.agent_limit = draft.agent_limit.step(key.code == Right);
+                        save_settings = Some(*draft);
+                    }
+                    Enter | Char(' ') if *focus <= 2 && *dropdown_open => {
                         *dropdown_open = false;
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus == 0 => {
+                    Enter | Char(' ') if *focus <= 2 => {
                         *dropdown_open = true;
                     }
-                    Enter | Char(' ') if (1..=3).contains(focus) => {
+                    Enter | Char(' ') if (3..=6).contains(focus) => {
                         match *focus {
-                            1 => draft.auto_merge = !draft.auto_merge,
-                            2 => draft.auto_close_workspace = !draft.auto_close_workspace,
+                            3 => draft.auto_merge = !draft.auto_merge,
+                            4 => draft.auto_merge_children = !draft.auto_merge_children,
+                            5 => draft.auto_close_workspace = !draft.auto_close_workspace,
                             _ => draft.auto_remove_checkout = !draft.auto_remove_checkout,
                         }
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus == 4 => {
+                    Enter | Char(' ') if *focus == 7 => {
                         self.modal = None;
                     }
                     _ => {}
@@ -1248,101 +2174,6 @@ impl App {
             }
             if let Some(settings) = save_settings {
                 self.save_settings(settings);
-            }
-            return false;
-        }
-        if let Some(Modal::Launch(modal)) = self.modal.as_mut() {
-            match key.code {
-                PageUp => modal.scroll = modal.scroll.saturating_sub(6),
-                PageDown => modal.scroll = modal.scroll.saturating_add(6),
-                Enter if modal.finished => {}
-                Up | Char('k') if modal.context.as_ref().is_some_and(|c| !c.agents.is_empty()) => {
-                    modal.selected_agent = modal.selected_agent.saturating_sub(1);
-                }
-                Down | Char('j')
-                    if modal.context.as_ref().is_some_and(|c| !c.agents.is_empty()) =>
-                {
-                    let len = modal.context.as_ref().unwrap().agents.len();
-                    modal.selected_agent = (modal.selected_agent + 1).min(len - 1);
-                }
-                Enter => {
-                    let Some(context) = modal.context.clone() else {
-                        return false;
-                    };
-                    let Some(agent) = context.agents.get(modal.selected_agent).cloned() else {
-                        self.notice = Some("No agents are available in this workspace".into());
-                        return false;
-                    };
-                    let seq = modal.seq;
-                    let bead = modal.bead.clone();
-                    if self
-                        .tasks
-                        .iter()
-                        .any(|task| task.bead_id == bead.id && task.active)
-                    {
-                        self.notice = Some(format!(
-                            "{} already has unresolved work; inspect Tasks (t)",
-                            bead.id
-                        ));
-                        self.modal = None;
-                        return false;
-                    }
-                    self.tasks.push(BackgroundTask {
-                        seq,
-                        bead_id: bead.id.clone(),
-                        title: bead.title.clone(),
-                        agent: agent.label.clone(),
-                        status: "starting".into(),
-                        detail: "Preparing an independent Herdr worktree and agent".into(),
-                        active: true,
-                    });
-                    self.task_states.insert(
-                        seq,
-                        TaskState {
-                            target: None,
-                            poll_inflight: false,
-                            next_poll: Instant::now(),
-                            observed_activity: false,
-                            recovery: None,
-                        },
-                    );
-                    // Record ownership before dispatch, then return to navigation.
-                    self.modal = None;
-                    self.notice = Some(format!("Starting {} in background · Tasks: t", bead.id));
-                    if self
-                        .requests
-                        .send(Request::Launch(seq, context, agent, bead))
-                        .is_err()
-                    {
-                        let task = self.tasks.last_mut().unwrap();
-                        task.status = "launch failed".into();
-                        task.active = false;
-                        task.detail =
-                            "Launch could not be queued; nothing dispatched; retry is safe".into();
-                        self.notice = Some("Launch could not be queued; try again".into());
-                    }
-                }
-                Char('h') if modal.error.is_some() => {
-                    let bead = modal.bead.clone();
-                    self.launch_seq = self.launch_seq.wrapping_add(1);
-                    let seq = self.launch_seq;
-                    self.modal = Some(Modal::Launch(LaunchModal {
-                        bead,
-                        seq,
-                        context: None,
-                        selected_agent: 0,
-                        error: None,
-                        scroll: 0,
-                        finished: false,
-                    }));
-                    if self.requests.send(Request::Discover(seq)).is_err()
-                        && let Some(Modal::Launch(modal)) = self.modal.as_mut()
-                    {
-                        modal.error =
-                            Some("Workspace discovery could not be queued; try again".into());
-                    }
-                }
-                _ => {}
             }
             return false;
         }
@@ -1360,7 +2191,25 @@ impl App {
             }
             return false;
         }
-        let Some(Modal::Create(form)) = self.modal.as_mut() else {
+        if let Some(Modal::EditLoading { id, seq, error }) = self.modal.as_mut() {
+            if key.code == Char('e') && error.is_some() {
+                let id = id.clone();
+                self.edit_seq = self.edit_seq.wrapping_add(1);
+                *seq = self.edit_seq;
+                *error = None;
+                if self.requests.send(Request::LoadEdit(id, *seq)).is_err()
+                    && let Some(Modal::EditLoading { error, .. }) = self.modal.as_mut()
+                {
+                    *error = Some("Edit could not be queued; try again".into());
+                }
+            }
+            return false;
+        }
+        let edit_id = match self.modal.as_ref() {
+            Some(Modal::Edit { id, .. }) => Some(id.clone()),
+            _ => None,
+        };
+        let Some(Modal::Create(form) | Modal::Edit { form, .. }) = self.modal.as_mut() else {
             return false;
         };
         if let Some(which) = form.dropdown {
@@ -1368,15 +2217,19 @@ impl App {
                 Up => {
                     if which == 2 {
                         form.issue_type = form.issue_type.saturating_sub(1)
-                    } else {
+                    } else if which == 3 {
                         form.priority = form.priority.saturating_sub(1)
+                    } else {
+                        form.harness = form.harness.saturating_sub(1)
                     }
                 }
                 Down => {
                     if which == 2 {
                         form.issue_type = (form.issue_type + 1).min(beads::BEAD_TYPES.len() - 1)
-                    } else {
+                    } else if which == 3 {
                         form.priority = (form.priority + 1).min(4)
+                    } else {
+                        form.harness = (form.harness + 1).min(form.harnesses.len())
                     }
                 }
                 Left | Right => {
@@ -1386,8 +2239,11 @@ impl App {
                             beads::BEAD_TYPES.len(),
                             key.code == Right,
                         );
-                    } else {
+                    } else if which == 3 {
                         form.priority = cycle_choice(form.priority, 5, key.code == Right);
+                    } else {
+                        form.harness =
+                            cycle_choice(form.harness, form.harnesses.len() + 1, key.code == Right);
                     }
                 }
                 Enter | Char(' ') => {
@@ -1398,33 +2254,58 @@ impl App {
             }
             return false;
         }
+        if form.focus == 1 && !matches!(key.code, Up | Down) {
+            form.description_preferred_col = None;
+        }
+        if key.code == Char('v') && key.modifiers.contains(KeyModifiers::CONTROL) && form.focus == 1
+        {
+            self.paste_seq = self.paste_seq.wrapping_add(1);
+            self.paste_pending = true;
+            if self
+                .requests
+                .send(Request::ReadScreenshot(self.paste_seq))
+                .is_err()
+            {
+                self.paste_pending = false;
+                self.notice = Some("Screenshot paste could not be queued".into());
+            }
+            return false;
+        }
         match key.code {
             Tab => {
+                let epic = edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic";
                 form.focus = match form.focus {
                     0 => 2,
                     2 => 3,
-                    3 => 1,
+                    3 => 6,
+                    6 => 1,
+                    1 if epic => 7,
                     1 => 4,
+                    7 => 4,
                     4 => 5,
                     _ => 0,
                 }
             }
             BackTab => {
+                let epic = edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic";
                 form.focus = match form.focus {
                     0 => 5,
                     5 => 4,
+                    4 if epic => 7,
                     4 => 1,
-                    1 => 3,
+                    7 => 1,
+                    1 => 6,
+                    6 => 3,
                     3 => 2,
                     _ => 0,
                 }
             }
-            Enter if form.focus == 2 || form.focus == 3 => {
+            Enter if matches!(form.focus, 2 | 3 | 6) => {
                 form.dropdown = Some(form.focus);
-                form.dropdown_original = Some(if form.focus == 2 {
-                    form.issue_type
-                } else {
-                    form.priority
+                form.dropdown_original = Some(match form.focus {
+                    2 => form.issue_type,
+                    3 => form.priority,
+                    _ => form.harness,
                 });
             }
             Left | Right if form.focus == 2 => {
@@ -1434,18 +2315,59 @@ impl App {
             Left | Right if form.focus == 3 => {
                 form.priority = cycle_choice(form.priority, 5, key.code == Right);
             }
+            Left | Right if form.focus == 6 => {
+                form.harness =
+                    cycle_choice(form.harness, form.harnesses.len() + 1, key.code == Right);
+            }
             Enter if form.focus == 4 => {
                 if !form.title.trim().is_empty() {
+                    if edit_id.is_none()
+                        && form.harness_loading
+                        && beads::BEAD_TYPES[form.issue_type] == "task"
+                    {
+                        self.notice =
+                            Some("Checking Herdr integrations; wait before creating a task".into());
+                        return false;
+                    }
+                    if edit_id.is_none()
+                        && form.generate_children
+                        && beads::BEAD_TYPES[form.issue_type] == "epic"
+                        && form.description.trim().is_empty()
+                    {
+                        self.notice =
+                            Some("Describe the Epic proposal before generating child tasks".into());
+                        return false;
+                    }
                     let input = CreateBead {
                         title: form.title.trim().into(),
                         description: form.description.clone(),
                         issue_type: beads::BEAD_TYPES[form.issue_type].into(),
                         priority: form.priority as u8,
+                        harness: if beads::BEAD_TYPES[form.issue_type] == "task" {
+                            form.harness
+                                .checked_sub(1)
+                                .map(|index| form.harnesses[index].clone())
+                        } else {
+                            None
+                        },
                     };
                     self.mutation_busy = true;
-                    if self.requests.send(Request::Create(input)).is_err() {
+                    let request = if let Some(id) = edit_id {
+                        Request::Update(UpdateBead {
+                            id,
+                            fields: input,
+                            previous_harness: form.previous_harness.clone(),
+                        })
+                    } else if form.generate_children && input.issue_type == "epic" {
+                        Request::CreateEpic(input, form.parent_id.clone())
+                    } else if let Some(parent) = &form.parent_id {
+                        Request::CreateChild(input, parent.clone())
+                    } else {
+                        Request::Create(input)
+                    };
+                    if self.requests.send(request).is_err() {
                         self.mutation_busy = false;
-                        self.notice = Some("Create could not be queued; try again".into());
+                        self.notice = Some("Save could not be queued; try again".into());
                     }
                 } else {
                     self.notice = Some("Title is required".into());
@@ -1453,31 +2375,50 @@ impl App {
             }
             Enter if form.focus == 5 => {
                 self.modal = None;
+                return false;
             }
-            Char(' ') if form.focus == 2 || form.focus == 3 => {
+            Enter | Char(' ') if form.focus == 7 => {
+                form.generate_children = !form.generate_children;
+            }
+            Char(' ') if matches!(form.focus, 2 | 3 | 6) => {
                 form.dropdown = Some(form.focus);
-                form.dropdown_original = Some(if form.focus == 2 {
-                    form.issue_type
-                } else {
-                    form.priority
+                form.dropdown_original = Some(match form.focus {
+                    2 => form.issue_type,
+                    3 => form.priority,
+                    _ => form.harness,
                 });
             }
             Enter if form.focus == 0 => {
                 form.focus = 1;
                 form.description_cursor = form.description.len();
             }
-            Enter if form.focus == 1 => {
+            Enter if form.focus == 1 && key.modifiers == crossterm::event::KeyModifiers::SHIFT => {
                 let i = form.description_cursor.min(form.description.len());
                 form.description.insert(i, '\n');
                 form.description_cursor = i + 1;
             }
+            Enter if form.focus == 1 && key.modifiers.is_empty() => {
+                form.focus = if edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic" {
+                    7
+                } else {
+                    4
+                };
+            }
             Up if form.focus == 1 => {
-                form.description_cursor =
-                    move_vertical(&form.description, form.description_cursor, false)
+                form.description_cursor = crate::ui::move_description_vertical(
+                    &form.description,
+                    form.description_cursor,
+                    false,
+                    &mut form.description_preferred_col,
+                )
             }
             Down if form.focus == 1 => {
-                form.description_cursor =
-                    move_vertical(&form.description, form.description_cursor, true)
+                form.description_cursor = crate::ui::move_description_vertical(
+                    &form.description,
+                    form.description_cursor,
+                    true,
+                    &mut form.description_preferred_col,
+                )
             }
             Left if form.focus == 0 => form.cursor = previous_boundary(&form.title, form.cursor),
             Right if form.focus == 0 => form.cursor = next_boundary(&form.title, form.cursor),
@@ -1544,6 +2485,12 @@ impl App {
             }
             _ => {}
         }
+        if beads::BEAD_TYPES[form.issue_type] != "epic" {
+            form.generate_children = false;
+            if form.focus == 7 {
+                form.focus = 4;
+            }
+        }
         false
     }
     fn save_settings(&mut self, proposed: Settings) {
@@ -1569,63 +2516,121 @@ impl App {
             }
         }
     }
-    fn can_release_task(&self, seq: u64, bead_id: &str) -> bool {
-        self.tasks.iter().any(|task| {
-            task.seq == seq && task.bead_id == bead_id && task.active && task.status != "starting"
-        }) && self.task_states.get(&seq).is_some_and(|state| {
-            state.recovery.is_some() && state.target.is_none() && !state.poll_inflight
-        })
-    }
     fn open_launch(&mut self) {
         let Some(bead) = self
             .selected
             .and_then(|index| self.beads.get(index))
             .cloned()
         else {
-            self.notice = Some("Select a bead before handing it to an agent".into());
+            let message = "Select a bead before handing it to an agent".to_owned();
+            self.notice = Some(message.clone());
+            self.toast = Some(Toast::result(message, true));
             return;
         };
-        if let Some(seq) = self
-            .tasks
-            .iter()
-            .find(|task| task.bead_id == bead.id && task.active)
-            .map(|task| task.seq)
+        self.start_launch(bead, false);
+    }
+    fn toggle_ready(&mut self) {
+        if self.mutation_busy {
+            return;
+        }
+        let Some(bead) = self.selected.and_then(|i| self.beads.get(i)) else {
+            self.notice = Some("Select an open Task or Epic first".into());
+            return;
+        };
+        let epic = bead.data["issue_type"] == "epic";
+        if bead.status != "open" || (!epic && bead.data["issue_type"] != "task") {
+            self.notice = Some("Only open Tasks and Epics can be marked Ready".into());
+            return;
+        }
+        let id = bead.id.clone();
+        let ready = !beads::is_ready(bead);
+        if !ready && !self.worktrees_discovered {
+            self.notice = Some("Wait for tracked handoffs to load before removing Ready".into());
+            return;
+        }
+        if self.known_handoffs.contains(&id) && ready {
+            self.notice = Some("This task already has a tracked handoff".into());
+            return;
+        }
+        let mut protected_handoffs = self.accepted_handoffs.clone();
+        protected_handoffs.extend(self.handoff.values().map(|pending| pending.bead.id.clone()));
+        if !ready && !epic && protected_handoffs.contains(&id) {
+            self.notice = Some(
+                "This task has been sent or is being handed off; Ready cannot be removed".into(),
+            );
+            return;
+        }
+        self.mutation_busy = true;
+        let request = if epic {
+            Request::SetEpicReady(id, ready, self.known_handoffs.clone(), protected_handoffs)
+        } else {
+            Request::SetReady(id, ready)
+        };
+        if self.requests.send(request).is_err() {
+            self.mutation_busy = false;
+            self.notice = Some("Ready change could not be queued".into());
+        }
+    }
+    fn start_launch(&mut self, bead: Bead, scheduled: bool) {
+        if self
+            .handoff
+            .values()
+            .any(|pending| pending.bead.id == bead.id)
         {
-            if self.can_release_task(seq, &bead.id) {
-                self.modal = Some(Modal::ReleaseTask {
-                    seq,
-                    bead_id: bead.id,
-                });
-                self.modal_ready = false;
-                self.notice = None;
-            } else {
-                self.notice = Some(format!(
-                    "{} already has unresolved work; inspect Tasks (t)",
-                    bead.id
-                ));
-            }
             return;
         }
         self.launch_seq = self.launch_seq.wrapping_add(1);
         let seq = self.launch_seq;
-        self.modal = Some(Modal::Launch(LaunchModal {
-            bead,
-            seq,
-            context: None,
-            selected_agent: 0,
-            error: None,
-            scroll: 0,
-            finished: false,
-        }));
         self.notice = None;
-        if self.requests.send(Request::Discover(seq)).is_err()
-            && let Some(Modal::Launch(modal)) = self.modal.as_mut()
-        {
-            modal.error = Some("Workspace discovery could not be queued; try again".into());
+        self.toast = Some(Toast::progress(format!(
+            "Finding a Herdr agent for {}…",
+            bead.id
+        )));
+        self.handoff.insert(
+            seq,
+            PendingHandoff {
+                seq,
+                bead,
+                launch_queued: false,
+                scheduled,
+            },
+        );
+        if self.requests.send(Request::Discover(seq)).is_err() {
+            self.handoff.remove(&seq);
+            let message = "Workspace discovery could not be queued; try again".to_owned();
+            self.notice = Some(message.clone());
+            self.toast = Some(Toast::result(message, true));
+        }
+    }
+    fn handoff_feedback(&mut self, seq: u64, message: String, error: bool) {
+        if seq == self.launch_seq {
+            self.notice = Some(message.clone());
+            self.toast = Some(Toast::result(message, error));
         }
     }
     fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
-        if self.modal.is_some() {
+        if self.modal.is_some() || self.help.is_some() {
+            return;
+        }
+        if self.worktrees_view {
+            match k {
+                MouseEventKind::Down(MouseButton::Left)
+                    if self.list_rect.contains((x, y).into()) && y > self.list_rect.y =>
+                {
+                    let row = usize::from(y - self.list_rect.y - 1) / 2 + self.worktree_offset;
+                    if row < self.worktrees.len() {
+                        self.selected_worktree = row;
+                        self.worktree_detail_offset = 0;
+                    }
+                }
+                MouseEventKind::ScrollUp if self.detail_rect.contains((x, y).into()) => {
+                    self.worktree_detail_offset = self.worktree_detail_offset.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown if self.detail_rect.contains((x, y).into()) => {
+                    self.worktree_detail_offset = self.worktree_detail_offset.saturating_add(3);
+                }
+                _ => {}
+            }
             return;
         }
         match k {
@@ -1662,19 +2667,31 @@ impl App {
 fn status_order(status: &str) -> (u8, &str) {
     match status {
         "open" => (0, status),
-        "closed" => (2, status),
-        _ => (1, status),
+        "ready" => (1, status),
+        "closed" => (3, status),
+        _ => (2, status),
+    }
+}
+pub fn display_status(bead: &Bead) -> &str {
+    if beads::is_ready(bead) {
+        "ready"
+    } else {
+        normalized_status(&bead.status)
     }
 }
 pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'static str {
     use worktrees::WorktreeStatus::*;
     match status {
-        Unmerged => "UNMERGED",
+        Reserved => "PREPARED",
+        InProgress => "IN PROGRESS",
+        Unmerged => "READY TO MERGE",
+        MergeQueued => "MERGE QUEUED",
         MergeRequested => "MERGE PENDING",
         NeedsResolution => "NEEDS RESOLUTION",
         Integrated => "INTEGRATED",
         WorkspaceClosed => "WORKSPACE CLOSED",
         CheckoutRemoved => "CHECKOUT REMOVED",
+        DirtyCheckout => "UNCOMMITTED CHANGES",
         NeedsAttention => "NEEDS ATTENTION",
     }
 }
@@ -1712,25 +2729,84 @@ pub struct ListTarget {
 pub fn group_statuses(beads: &[Bead]) -> Vec<String> {
     let mut groups = beads
         .iter()
-        .map(|b| normalized_status(&b.status).to_owned())
+        .map(|b| display_status(b).to_owned())
         .collect::<Vec<_>>();
     groups.sort_by(|a, b| status_order(a).cmp(&status_order(b)).then_with(|| a.cmp(b)));
     groups.dedup();
     groups
 }
+
+/// The visible ancestry of an issue within its status pane, from root to issue.
+/// A parent in another pane (or missing from the list) starts a new visible root.
+pub(crate) fn issue_path(
+    beads: &[Bead],
+    positions: &HashMap<&str, usize>,
+    index: usize,
+) -> Vec<usize> {
+    let status = display_status(&beads[index]);
+    let mut path = Vec::new();
+    let mut seen = HashSet::new();
+    let mut current = Some(index);
+    while let Some(i) = current {
+        if !seen.insert(i) {
+            break;
+        }
+        path.push(i);
+        current = beads[i]
+            .data
+            .get("parent")
+            .and_then(|parent| parent.as_str())
+            .and_then(|id| positions.get(id).copied())
+            .filter(|&parent| display_status(&beads[parent]) == status);
+    }
+    path.reverse();
+    path
+}
+
+fn order_worktrees(items: &mut [ManagedWorktree]) {
+    let positions: HashMap<_, _> = items
+        .iter()
+        .enumerate()
+        .map(|(index, item)| (item.bead_id.clone(), (index, item.parent_bead_id.clone())))
+        .collect();
+    items.sort_by_cached_key(|item| {
+        let mut path = Vec::new();
+        let mut parent = Some(item.bead_id.as_str());
+        let mut seen = HashSet::new();
+        while let Some(id) = parent {
+            if !seen.insert(id) {
+                break;
+            }
+            let Some((index, next)) = positions.get(id) else {
+                break;
+            };
+            path.push(*index);
+            parent = next.as_deref();
+        }
+        path.reverse();
+        path
+    });
+}
+
 pub fn list_layout(beads: &[Bead], collapsed: &HashSet<String>) -> ListLayout {
+    let positions = beads
+        .iter()
+        .enumerate()
+        .map(|(index, bead)| (bead.id.as_str(), index))
+        .collect::<HashMap<_, _>>();
     let mut layout = ListLayout {
         groups: Vec::new(),
         targets: Vec::new(),
         height: 0,
     };
     for status in group_statuses(beads) {
-        let indices = beads
+        let mut indices = beads
             .iter()
             .enumerate()
-            .filter(|(_, b)| normalized_status(&b.status) == status)
+            .filter(|(_, b)| display_status(b) == status)
             .map(|(i, _)| i)
             .collect::<Vec<_>>();
+        indices.sort_by_cached_key(|&index| issue_path(beads, &positions, index));
         let is_collapsed = collapsed.contains(&status);
         let y = layout.height;
         let height = if is_collapsed {
@@ -1769,8 +2845,9 @@ pub fn run(t: &mut Tui) -> std::io::Result<()> {
     loop {
         app.receive();
         app.poll_refresh(Instant::now());
-        app.poll_tasks(Instant::now());
         app.poll_worktrees(Instant::now());
+        app.poll_agent_observations(Instant::now());
+        app.poll_scheduler();
         t.draw(|f| ui::render(f, start.elapsed(), &mut app))?;
         if let Some(e) = event::poll_event(Duration::from_millis(35))? {
             match e {
@@ -1796,12 +2873,240 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use serde_json::json;
+
+    #[test]
+    fn release_check_is_dismissible_and_late_result_remains_available() {
+        let (mut app, requests, replies) = connected_app();
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::CheckRelease)));
+        assert!(app.release_inflight);
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        replies
+            .send(Response::ReleaseChecked(Ok(
+                release::CheckResult::Available {
+                    version: semver::Version::parse("1.2.0").unwrap(),
+                    url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+                },
+            )))
+            .unwrap();
+        app.receive();
+        assert!(!app.release_inflight);
+        assert!(app.notice.as_deref().unwrap().contains("v1.2.0"));
+        assert!(matches!(
+            app.release_result,
+            Some(Ok(release::CheckResult::Available { .. }))
+        ));
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(matches!(app.modal, Some(Modal::Release)));
+        assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn release_install_requires_available_asset_and_explicit_confirmation() {
+        let (mut app, requests, replies) = connected_app();
+        app.key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::CheckRelease)));
+        app.modal_ready = true;
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(requests.try_recv().is_err());
+
+        replies
+            .send(Response::ReleaseChecked(Ok(
+                release::CheckResult::Available {
+                    version: semver::Version::parse("1.2.0").unwrap(),
+                    url: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+                },
+            )))
+            .unwrap();
+        app.receive();
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::PrepareUpdate)));
+        assert!(app.update_preparing);
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(requests.try_recv().is_err());
+
+        replies
+            .send(Response::UpdatePrepared(Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "no compatible asset",
+            ))))
+            .unwrap();
+        app.receive();
+        assert!(matches!(app.modal, Some(Modal::Release)));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("no compatible asset")
+        );
+        app.key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE));
+        assert!(matches!(requests.try_recv(), Ok(Request::PrepareUpdate)));
+
+        let release = Available {
+            version: "1.2.0".into(),
+            page: "https://github.com/ThomasJRyan/OnTrack/releases/tag/v1.2.0".into(),
+            asset_name: "ontrack-v1.2.0-x86_64-unknown-linux-gnu.tar.gz".into(),
+            asset_url: "https://github.com/ThomasJRyan/OnTrack/releases/download/v1.2.0/ontrack-v1.2.0-x86_64-unknown-linux-gnu.tar.gz".into(),
+            checksum_url: "https://github.com/ThomasJRyan/OnTrack/releases/download/v1.2.0/ontrack-v1.2.0-x86_64-unknown-linux-gnu.tar.gz.sha256".into(),
+            digest: None,
+        };
+        replies
+            .send(Response::UpdatePrepared(Ok(Check::Available(
+                release.clone(),
+            ))))
+            .unwrap();
+        app.receive();
+        assert!(matches!(app.modal, Some(Modal::ConfirmUpdate(_))));
+        app.modal_ready = true;
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(app.modal.is_none());
+        assert!(requests.try_recv().is_err());
+
+        app.modal = Some(Modal::ConfirmUpdate(release.clone()));
+        app.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let Ok(Request::InstallRelease(chosen, cancel)) = requests.try_recv() else {
+            panic!("install was not queued")
+        };
+        assert_eq!(chosen, release);
+        assert!(!cancel.load(Ordering::Relaxed));
+        app.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(cancel.load(Ordering::Relaxed));
+        replies
+            .send(Response::ReleaseInstalled(Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "cancelled",
+            ))))
+            .unwrap();
+        app.receive();
+        assert!(app.modal.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("cancelled"));
+    }
+
+    #[test]
+    fn shift_n_creates_child_of_selected_task_and_n_stays_top_level() {
+        let mut app = app();
+        app.beads[0].data["issue_type"] = json!("task");
+        let (tx, rx) = mpsc::channel();
+        app.requests = tx;
+        app.key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT));
+        let seq = take_harness_discovery(&rx);
+        supply_harnesses(&mut app, seq, &["codex"]);
+        assert!(
+            matches!(&app.modal, Some(Modal::Create(form)) if form.parent_id.as_deref() == Some("b0"))
+        );
+        app.modal_ready = true;
+        app.key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+        for _ in 0..5 {
+            app.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        }
+        app.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::CreateChild(input, parent)) if input.title == "x" && parent == "b0")
+        );
+        app.modal = None;
+        app.mutation_busy = false;
+        app.key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(matches!(&app.modal, Some(Modal::Create(form)) if form.parent_id.is_none()));
+    }
+
+    #[test]
+    fn managed_children_sort_immediately_below_parent() {
+        let item = |id: &str, parent: Option<&str>| ManagedWorktree {
+            id: id.into(),
+            bead_id: id.into(),
+            parent_bead_id: parent.map(str::to_owned),
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: id.into(),
+            target_branch: "trunk".into(),
+            workspace_id: id.into(),
+            status: worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        };
+        let mut items = vec![
+            item("parent", None),
+            item("other", None),
+            item("child", Some("parent")),
+            item("grandchild", Some("child")),
+        ];
+        order_worktrees(&mut items);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.bead_id.as_str())
+                .collect::<Vec<_>>(),
+            ["parent", "child", "grandchild", "other"]
+        );
+    }
+
+    #[test]
+    fn issue_layout_groups_children_under_visible_parents() {
+        let bead = |id: &str, parent: Option<&str>, status: &str| Bead {
+            id: id.into(),
+            title: id.into(),
+            status: status.into(),
+            priority: 2,
+            data: json!({"parent": parent}),
+        };
+        // Input is ID order, like the refreshed list. A child can precede its parent.
+        let beads = vec![
+            bead("a-child", Some("z-parent"), "open"),
+            bead("b-grandchild", Some("a-child"), "open"),
+            bead("c-other", None, "open"),
+            bead("d-detached", Some("z-parent"), "closed"),
+            bead("e-orphan", Some("missing"), "open"),
+            bead("z-parent", None, "open"),
+        ];
+        let layout = list_layout(&beads, &HashSet::new());
+        let open = layout
+            .groups
+            .iter()
+            .find(|group| group.status == "open")
+            .unwrap();
+        assert_eq!(open.indices, [2, 4, 5, 0, 1]);
+        let closed = layout
+            .groups
+            .iter()
+            .find(|group| group.status == "closed")
+            .unwrap();
+        assert_eq!(closed.indices, [3]);
+        let positions = beads
+            .iter()
+            .enumerate()
+            .map(|(index, bead)| (bead.id.as_str(), index))
+            .collect();
+        assert_eq!(issue_path(&beads, &positions, 1), [5, 0, 1]);
+        assert_eq!(issue_path(&beads, &positions, 3), [3]);
+        assert_eq!(issue_path(&beads, &positions, 4), [4]);
+
+        let mut app = app();
+        app.beads = beads;
+        app.collapsed.clear();
+        app.selected = Some(5);
+        app.step(1);
+        assert_eq!(app.selected, Some(0));
+        app.step(1);
+        assert_eq!(app.selected, Some(1));
+        app.list_rect = Rect::new(5, 7, 40, 24);
+        let parent_row = list_layout(&app.beads, &app.collapsed)
+            .targets
+            .iter()
+            .find(|target| target.row == DisplayRow::Bead(5))
+            .unwrap()
+            .y;
+        app.mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            6,
+            7 + parent_row as u16,
+        );
+        assert_eq!(app.selected, Some(5));
+    }
     fn app() -> App {
         let (tx, _rx) = mpsc::channel();
         let (_out, responses) = mpsc::channel();
         App {
-            tasks: Vec::new(),
-            task_states: HashMap::new(),
             beads: (0..4)
                 .map(|i| Bead {
                     id: format!("b{i}"),
@@ -1812,6 +3117,7 @@ mod tests {
                 })
                 .collect(),
             collapsed: HashSet::new(),
+            closed_default_pending: false,
             collapse_context: None,
             selected: Some(0),
             detail: Some(json!({"id": "b0", "description": "detail 0"})),
@@ -1823,27 +3129,50 @@ mod tests {
             list_error: None,
             detail_error: None,
             detail_seq: 0,
+            edit_seq: 0,
+            harness_seq: 0,
             launch_seq: 0,
+            handoff: HashMap::new(),
+            handoff_capacity: HashSet::new(),
+            toast: None,
+            release_result: None,
+            release_inflight: false,
+            update_preparing: false,
+            release_cancel: None,
+            update_available: None,
             list_rect: Rect::new(0, 0, 30, 8),
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,
+            help: None,
             settings: Settings::default(),
             theme: Theme::Dark,
             settings_path: None,
             settings_load_error: None,
             worktrees: Vec::new(),
+            accepted_handoffs: HashSet::new(),
+            known_handoffs: HashSet::new(),
+            scheduler_attempted: HashSet::new(),
             selected_worktree: 0,
             worktree_offset: 0,
+            worktree_detail_offset: 0,
             worktrees_view: false,
             worktrees_loading: false,
             worktrees_error: None,
+            worktrees_focus_feedback: None,
+            worktrees_focus_pending: false,
             worktrees_inflight: false,
             worktrees_discovered: true,
+            worktrees_refresh_pending: false,
             worktree_action_pending: false,
             worktrees_next_refresh: Instant::now(),
+            agent_observation_inflight: false,
+            next_agent_observation: Instant::now(),
             notice: None,
             mutation_busy: false,
             modal_ready: true,
+            paste_seq: 0,
+            paste_pending: false,
+            created_screenshots: Vec::new(),
             preferred_id: None,
             refresh_inflight: false,
             refresh_pending: false,
@@ -1863,6 +3192,517 @@ mod tests {
         assert_eq!(bead.id, id);
         assert_eq!(a.detail.as_ref(), Some(&bead.data));
     }
+    #[test]
+    fn ready_group_is_distinct_while_beads_status_stays_open() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        assert_eq!(a.beads[0].status, "open");
+        assert_eq!(group_statuses(&a.beads), ["open", "ready"]);
+        let layout = list_layout(&a.beads, &HashSet::new());
+        assert_eq!(layout.groups[1].indices, [0]);
+        a.select(0);
+        assert_eq!(a.focused_status().as_deref(), Some("ready"));
+    }
+
+    #[test]
+    fn scheduler_uses_selected_harness_once_and_keeps_ready_after_launch() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:opencode"]);
+        a.poll_scheduler();
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!("discovery not queued")
+        };
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        let (out, responses) = mpsc::channel();
+        a.responses = responses;
+        out.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        let Request::LaunchReady(sent_seq, _, agent, bead) = rx.try_recv().unwrap() else {
+            panic!("launch not queued")
+        };
+        assert_eq!(sent_seq, seq);
+        assert_eq!(agent.id, "opencode");
+        assert_eq!(bead.id, "b0");
+        out.send(Response::Launched(
+            seq,
+            Ok(LaunchOutcome {
+                message: "Sent".into(),
+                reserved: false,
+            }),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(rx.try_recv().is_err(), "handoff must not clear Ready");
+        assert_eq!(display_status(&a.beads[0]), "ready");
+        assert!(a.known_handoffs.contains("b0"));
+        assert!(a.accepted_handoffs.contains("b0"));
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        a.beads[0].status = "in_progress".into();
+        assert_eq!(display_status(&a.beads[0]), "in_progress");
+    }
+
+    #[test]
+    fn ready_epic_prepares_parent_before_unlabelled_child_launch() {
+        let mut a = app();
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        let (replies, responses) = mpsc::channel();
+        a.responses = responses;
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[1].data["labels"] = json!([beads::READY_LABEL]);
+        a.settings.default_agent = DefaultAgent::Kind("opencode");
+        a.settings.agent_limit = settings::AgentLimit::Limited(1);
+        a.worktrees.push(ManagedWorktree {
+            id: "active".into(),
+            bead_id: "other".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/other".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws-other".into(),
+            status: worktrees::WorktreeStatus::InProgress,
+            detail: None,
+        });
+
+        a.poll_scheduler();
+        let Request::Discover(parent_seq) = queued.try_recv().unwrap() else {
+            panic!("parent discovery not queued")
+        };
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        replies
+            .send(Response::Discovered(parent_seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(matches!(queued.try_recv(), Ok(Request::Launch(_, _, _, bead)) if bead.id == "b0"));
+        replies
+            .send(Response::Launched(
+                parent_seq,
+                Ok(LaunchOutcome {
+                    message: "Prepared".into(),
+                    reserved: true,
+                }),
+            ))
+            .unwrap();
+        a.receive();
+        assert!(a.known_handoffs.contains("b0"));
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        replies
+            .send(Response::Worktrees(Ok(vec![ManagedWorktree {
+                id: "parent".into(),
+                bead_id: "b0".into(),
+                parent_bead_id: None,
+                handoff_accepted: false,
+                bead_title: None,
+                bead_description: None,
+                branch: "ontrack/parent".into(),
+                target_branch: "main".into(),
+                workspace_id: "ws-parent".into(),
+                status: worktrees::WorktreeStatus::Reserved,
+                detail: None,
+            }])))
+            .unwrap();
+        a.receive();
+        a.poll_scheduler();
+        let Request::Discover(child_seq) = queued.try_recv().unwrap() else {
+            panic!("child discovery not queued")
+        };
+        replies
+            .send(Response::Discovered(child_seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(
+            matches!(queued.try_recv(), Ok(Request::LaunchReady(_, _, agent, bead))
+            if bead.id == "b1" && agent.id == "opencode")
+        );
+    }
+
+    #[test]
+    fn explicit_unassigned_ready_task_is_not_scheduled() {
+        let mut a = app();
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, beads::UNASSIGNED_LABEL]);
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        assert!(a.notice.as_deref().unwrap().contains("Unassigned"));
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+    }
+
+    #[test]
+    fn failed_epic_preparation_is_not_retried_or_duplicated() {
+        let mut a = app();
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        let (replies, responses) = mpsc::channel();
+        a.responses = responses;
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[1].data["labels"] = json!([beads::READY_LABEL]);
+        a.poll_scheduler();
+        let Request::Discover(seq) = queued.try_recv().unwrap() else {
+            panic!("parent discovery not queued")
+        };
+        replies
+            .send(Response::Discovered(
+                seq,
+                Err(std::io::Error::other("Herdr unavailable")),
+            ))
+            .unwrap();
+        a.receive();
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+        assert!(a.notice.as_deref().unwrap().contains("Herdr unavailable"));
+
+        a.scheduler_attempted.clear();
+        a.known_handoffs.insert("b0".into());
+        a.poll_scheduler();
+        assert!(queued.try_recv().is_err());
+    }
+
+    #[test]
+    fn scheduler_defers_unavailable_harness_and_existing_handoffs() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:gemini"]);
+        a.poll_scheduler();
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        let (out, responses) = mpsc::channel();
+        a.responses = responses;
+        out.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(rx.try_recv().is_err());
+        assert!(a.notice.as_deref().unwrap().contains("unavailable"));
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        a.scheduler_attempted.remove("b0");
+        a.known_handoffs.insert("b0".into());
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn scheduler_waits_at_limit_and_resumes_after_active_handoff_finishes() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.settings.agent_limit = settings::AgentLimit::Limited(1);
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        a.worktrees.push(ManagedWorktree {
+            id: "manual".into(),
+            bead_id: "other".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/other".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws-other".into(),
+            status: worktrees::WorktreeStatus::DirtyCheckout,
+            detail: None,
+        });
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        assert!(!a.scheduler_attempted.contains("b0"));
+        let (out, responses) = mpsc::channel();
+        a.responses = responses;
+        let mut finished = a.worktrees[0].clone();
+        finished.status = worktrees::WorktreeStatus::Unmerged;
+        out.send(Response::Worktrees(Ok(vec![finished]))).unwrap();
+        a.receive();
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+        assert_eq!(a.handoff.values().next().unwrap().bead.id, "b0");
+    }
+
+    #[test]
+    fn unlimited_scheduler_ignores_active_handoff_count() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.settings.agent_limit = settings::AgentLimit::Unlimited;
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        a.worktrees.push(ManagedWorktree {
+            id: "active".into(),
+            bead_id: "other".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/other".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws-other".into(),
+            status: worktrees::WorktreeStatus::InProgress,
+            detail: None,
+        });
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+    }
+    #[test]
+    fn scheduler_skips_ready_task_with_journaled_handoff_after_restart() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        let (requests, rx) = mpsc::channel();
+        a.requests = requests;
+        let (responses, incoming) = mpsc::channel();
+        a.responses = incoming;
+        responses
+            .send(Response::Worktrees(Ok(vec![ManagedWorktree {
+                id: "handoff".into(),
+                bead_id: "b0".into(),
+                parent_bead_id: None,
+                handoff_accepted: true,
+                bead_title: None,
+                bead_description: None,
+                branch: "ontrack/b0".into(),
+                target_branch: "main".into(),
+                workspace_id: "ws".into(),
+                status: worktrees::WorktreeStatus::InProgress,
+                detail: None,
+            }])))
+            .unwrap();
+        a.receive();
+        assert_eq!(display_status(&a.beads[0]), "ready");
+        assert!(a.known_handoffs.contains("b0"));
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn ready_toggle_uses_r_in_both_panes_and_does_not_change_beads_status() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("task");
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, true)) if id == "b0"));
+        assert!(rx.try_recv().is_err());
+        assert!(!a.refresh_pending);
+        assert_eq!(a.beads[0].status, "open");
+        a.mutation_busy = false;
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.focus_detail = true;
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+        assert!(rx.try_recv().is_err());
+        assert!(!a.refresh_pending);
+        a.mutation_busy = false;
+        press(&mut a, KeyCode::Char('R'));
+        assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+    }
+
+    #[test]
+    fn ready_key_respects_task_and_handoff_guards() {
+        let (mut a, rx, _) = connected_app();
+        a.beads[0].data["issue_type"] = json!("bug");
+        press(&mut a, KeyCode::Char('r'));
+        assert_eq!(
+            a.notice.as_deref(),
+            Some("Only open Tasks and Epics can be marked Ready")
+        );
+        assert!(rx.try_recv().is_err());
+
+        a.beads[0].data["issue_type"] = json!("task");
+        a.known_handoffs.insert("b0".into());
+        press(&mut a, KeyCode::Char('r'));
+        assert_eq!(
+            a.notice.as_deref(),
+            Some("This task already has a tracked handoff")
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn sent_ready_task_cannot_be_unreadied_but_unsent_handoff_can() {
+        let (mut a, rx, _) = connected_app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.known_handoffs.insert("b0".into());
+        a.accepted_handoffs.insert("b0".into());
+        for focus_detail in [false, true] {
+            a.focus_detail = focus_detail;
+            press(&mut a, KeyCode::Char('r'));
+            assert!(rx.try_recv().is_err());
+            assert!(
+                a.notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Ready cannot be removed")
+            );
+            assert!(beads::is_ready(&a.beads[0]));
+        }
+
+        a.accepted_handoffs.clear();
+        a.worktrees_discovered = false;
+        press(&mut a, KeyCode::Char('r'));
+        assert!(rx.try_recv().is_err());
+        assert!(
+            a.notice
+                .as_deref()
+                .unwrap()
+                .contains("tracked handoffs to load")
+        );
+        a.worktrees_discovered = true;
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+    }
+
+    #[test]
+    fn ready_task_cannot_be_unreadied_during_handoff() {
+        let (mut a, rx, _) = connected_app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        press(&mut a, KeyCode::Char('h'));
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+        press(&mut a, KeyCode::Char('r'));
+        assert!(rx.try_recv().is_err());
+        assert!(
+            a.notice
+                .as_deref()
+                .unwrap()
+                .contains("Ready cannot be removed")
+        );
+    }
+
+    #[test]
+    fn epic_ready_toggle_queues_cascade_and_only_tasks_are_scheduled() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        assert_eq!(display_status(&a.beads[0]), "ready");
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+
+        a.beads[0].data["labels"] = json!([]);
+        a.known_handoffs.insert("b2".into());
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Request::SetEpicReady(id, true, handoffs, protected))
+                if id == "b0" && handoffs.contains("b2") && protected.is_empty()
+        ));
+        assert_eq!(a.beads[0].status, "open");
+    }
+
+    #[test]
+    fn epic_ready_response_updates_confirmed_ids_and_refreshes_after_failure() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[1].data["issue_type"] = json!("task");
+        let (requests, queued) = mpsc::channel();
+        a.requests = requests;
+        let (replies, responses) = mpsc::channel();
+        a.responses = responses;
+        a.mutation_busy = true;
+        replies
+            .send(Response::ReadySet(
+                "b0".into(),
+                true,
+                Ok(vec!["b0".into(), "b1".into()]),
+            ))
+            .unwrap();
+        a.receive();
+        assert!(a.beads.iter().take(2).all(beads::is_ready));
+        assert!(!a.mutation_busy);
+        assert!(matches!(queued.try_recv(), Ok(Request::List)));
+
+        a.refresh_inflight = false;
+        a.mutation_busy = true;
+        replies
+            .send(Response::ReadySet(
+                "b0".into(),
+                false,
+                Err(std::io::Error::other("partial update")),
+            ))
+            .unwrap();
+        a.receive();
+        assert!(matches!(queued.try_recv(), Ok(Request::List)));
+        assert!(a.notice.as_deref().unwrap().contains("partial update"));
+    }
+
+    #[test]
+    fn prepared_parent_waits_for_children_then_can_resume() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        a.beads[1].data["parent"] = json!("b0");
+        a.known_handoffs.insert("b0".into());
+        a.worktrees.push(ManagedWorktree {
+            id: "handoff".into(),
+            bead_id: "b0".into(),
+            parent_bead_id: None,
+            handoff_accepted: false,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/parent".into(),
+            target_branch: "main".into(),
+            workspace_id: "w1".into(),
+            status: worktrees::WorktreeStatus::Reserved,
+            detail: None,
+        });
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        a.beads[1].status = "closed".into();
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+    }
+
+    #[test]
+    fn ready_child_waits_for_parent_checkout_even_at_higher_priority() {
+        let mut a = app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        a.beads[0].priority = 3;
+        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[1].priority = 0;
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+        assert_eq!(
+            a.handoff.values().next().map(|item| item.bead.id.as_str()),
+            Some("b0")
+        );
+    }
+    fn unloaded_app() -> App {
+        let mut a = app();
+        a.beads.clear();
+        a.clear_selection();
+        a.closed_default_pending = true;
+        a
+    }
     fn launch_context() -> LaunchContext {
         LaunchContext {
             workspace: crate::herdr::Workspace {
@@ -1881,511 +3721,122 @@ mod tests {
             ],
         }
     }
-    #[test]
-    fn launch_discovery_is_queued_without_launch_until_explicit_confirmation() {
-        let (mut a, rx, tx) = connected_app();
-        a.beads[0].data["description"] = json!("Preserve full bead context for the worker");
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => panic!("expected discovery"),
-        };
-        assert!(rx.try_recv().is_err());
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        press(&mut a, KeyCode::Down);
-        assert!(rx.try_recv().is_err());
-        press(&mut a, KeyCode::Enter);
-        assert!(
-            matches!(rx.try_recv(), Ok(Request::Launch(_, context, agent, bead)) if context.workspace.id == "ws" && agent.id == "opencode" && bead.id == "b0" && bead.title == "issue 0" && bead.data["description"] == "Preserve full bead context for the worker")
-        );
-    }
-    #[test]
-    fn handoff_gates_selection_and_captures_selected_bead_across_discovery() {
-        let (mut a, rx, tx) = connected_app();
-        a.clear_selection();
-        press(&mut a, KeyCode::Char('h'));
-        assert!(rx.try_recv().is_err());
-        a.collapsed.insert("open".into());
-        a.focus_collapsed_group("open".into());
-        press(&mut a, KeyCode::Char('h'));
-        assert!(rx.try_recv().is_err());
-        assert!(a.modal.is_none());
-
-        a.collapsed.clear();
-        a.select(0);
-        let _ = rx.try_recv(); // selection detail request
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        a.select(1);
-        let _ = rx.try_recv(); // changed selection detail request
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        press(&mut a, KeyCode::Enter);
-        assert!(
-            matches!(rx.try_recv(), Ok(Request::Launch(_, _, _, bead)) if bead.id == "b0" && bead.title == "issue 0")
-        );
-    }
-    #[test]
-    fn empty_agents_prevent_launch_and_duplicate_confirmation_is_ignored() {
-        let (mut a, rx, tx) = connected_app();
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        tx.send(Response::Discovered(
-            seq,
-            Ok(LaunchContext {
-                workspace: crate::herdr::Workspace {
-                    id: "ws".into(),
-                    label: "ws".into(),
-                },
-                agents: vec![],
-            }),
-        ))
-        .unwrap();
-        a.receive();
-        press(&mut a, KeyCode::Enter);
-        assert!(!a.mutation_busy);
-        assert!(rx.try_recv().is_err());
-
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        press(&mut a, KeyCode::Enter);
-        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
-        press(&mut a, KeyCode::Enter);
-        assert!(rx.try_recv().is_err());
-    }
-    #[test]
-    fn disconnected_discovery_and_launch_queues_do_not_lock_the_ui() {
-        let mut a = app();
-        let (requests, rx) = mpsc::channel();
-        drop(rx);
-        a.requests = requests;
-        press(&mut a, KeyCode::Char('h'));
-        assert!(!a.mutation_busy);
-        assert!(
-            matches!(&a.modal, Some(Modal::Launch(m)) if m.error.as_deref().is_some_and(|e| e.contains("could not be queued")))
-        );
-
-        let (mut a, rx, tx) = connected_app();
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        let (requests, receiver) = mpsc::channel();
-        drop(receiver);
-        a.requests = requests;
-        press(&mut a, KeyCode::Enter);
-        assert!(!a.mutation_busy);
-        assert!(
-            a.notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("Launch could not be queued"))
-        );
-    }
-    #[test]
-    fn launch_cancel_ignores_stale_discovery_and_busy_guard_blocks_input() {
-        let (mut a, rx, tx) = connected_app();
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        press(&mut a, KeyCode::Esc);
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        assert!(a.modal.is_none());
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        a.mutation_busy = true;
-        press(&mut a, KeyCode::Down);
-        assert!(matches!(
-            a.modal,
-            Some(Modal::Launch(LaunchModal {
-                selected_agent: 0,
-                ..
-            }))
-        ));
-        assert!(rx.try_recv().is_err());
-    }
-    #[test]
-    fn discovery_failure_is_reported_and_retryable() {
-        let (mut a, rx, tx) = connected_app();
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        tx.send(Response::Discovered(
-            seq,
-            Err(std::io::Error::other("workspace unavailable")),
-        ))
-        .unwrap();
-        a.receive();
-        assert!(
-            matches!(&a.modal, Some(Modal::Launch(m)) if m.error.as_deref() == Some("workspace unavailable"))
-        );
-        press(&mut a, KeyCode::Char('h'));
-        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
-    }
-    #[test]
-    fn handoff_closes_modal_immediately_and_tasks_scroll_without_relaunch() {
-        let (mut a, rx, tx) = connected_app();
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        press(&mut a, KeyCode::Enter);
-        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
-        assert!(a.modal.is_none());
-        assert!(!a.mutation_busy);
-        assert_eq!(a.tasks[0].status, "starting");
-        assert!(a.tasks[0].active);
-        tx.send(Response::Launched(seq, Ok(launch_outcome())))
-            .unwrap();
-        a.receive();
-        assert!(!a.mutation_busy);
-        assert_eq!(
-            a.notice.as_deref(),
-            Some("Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0")
-        );
-        assert!(a.modal.is_none());
-        assert_eq!(a.tasks[0].status, "unknown");
-        press(&mut a, KeyCode::Enter);
-        assert!(
-            rx.try_recv().is_err(),
-            "Enter cannot repeat a completed launch"
-        );
-        press(&mut a, KeyCode::Char('h'));
-        assert!(a.modal.is_none());
-        assert!(
-            rx.try_recv().is_err(),
-            "duplicates blocked after modal close"
-        );
-        press(&mut a, KeyCode::Char('t'));
-        press(&mut a, KeyCode::PageDown);
-        assert!(matches!(&a.modal, Some(Modal::Tasks { scroll: 6 })));
-        press(&mut a, KeyCode::PageUp);
-        assert!(matches!(&a.modal, Some(Modal::Tasks { scroll: 0 })));
-        press(&mut a, KeyCode::Down);
-        assert!(matches!(&a.modal, Some(Modal::Tasks { scroll: 1 })));
-        press(&mut a, KeyCode::Up);
-        press(&mut a, KeyCode::End);
-        assert!(matches!(&a.modal, Some(Modal::Tasks { scroll: u16::MAX })));
-        press(&mut a, KeyCode::Home);
-        assert!(matches!(&a.modal, Some(Modal::Tasks { scroll: 0 })));
-        press(&mut a, KeyCode::Esc);
-        assert!(a.modal.is_none());
-    }
-    #[test]
-    fn uncertain_launch_failure_retains_recovery_and_prevents_blind_retry() {
-        let (mut a, rx, tx) = connected_app();
-        press(&mut a, KeyCode::Char('h'));
-        let seq = match rx.try_recv().unwrap() {
-            Request::Discover(seq) => seq,
-            _ => unreachable!(),
-        };
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        press(&mut a, KeyCode::Enter);
-        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
-        press(&mut a, KeyCode::Enter);
-        assert!(rx.try_recv().is_err());
-        tx.send(Response::Launched(
-            seq,
-            Err(std::io::Error::other(
-                "worktree may exist; inspect before retrying",
-            )),
-        ))
-        .unwrap();
-        a.receive();
-        assert!(!a.mutation_busy);
-        assert!(a.modal.is_none());
-        assert_eq!(a.tasks[0].status, "unknown");
-        assert!(a.tasks[0].active);
-        assert!(
-            a.notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("inspect before retrying"))
-        );
-        press(&mut a, KeyCode::Char('h'));
-        assert_eq!(
-            a.modal,
-            Some(Modal::ReleaseTask {
-                seq,
-                bead_id: "b0".into()
-            })
-        );
-        assert!(rx.try_recv().is_err());
-    }
-    fn untrackable_launch() -> (App, mpsc::Receiver<Request>, mpsc::Sender<Response>, u64) {
-        let (mut a, rx, tx) = connected_app();
-        let seq = confirm_launch(&mut a, &rx, &tx);
-        tx.send(Response::Launched(seq, Err(std::io::Error::other("Creation response unreadable. Recovery: branch ontrack/b0; workspace/pane unknown; inspect before retrying.")))).unwrap();
-        a.receive();
-        assert!(a.can_release_task(seq, "b0"));
-        (a, rx, tx, seq)
-    }
-
-    #[test]
-    fn manual_release_requires_y_preserves_history_and_allows_separate_explicit_retry() {
-        let (mut a, rx, tx, seq) = untrackable_launch();
-        let original = a.tasks[0].clone();
-        let recovery = a.task_states[&seq].recovery.clone();
-        press(&mut a, KeyCode::Char('h'));
-        assert_eq!(
-            a.modal,
-            Some(Modal::ReleaseTask {
-                seq,
-                bead_id: "b0".into()
-            })
-        );
-        assert!(rx.try_recv().is_err());
-        press(&mut a, KeyCode::Char('y'));
-        assert!(a.modal.is_none());
-        assert!(!a.mutation_busy);
-        assert!(!a.tasks[0].active);
-        assert_eq!(a.tasks[0].status, "tracking released");
-        assert_eq!(a.tasks[0].seq, original.seq);
-        assert_eq!(a.tasks[0].bead_id, original.bead_id);
-        assert_eq!(a.tasks[0].title, original.title);
-        assert_eq!(a.tasks[0].agent, original.agent);
-        assert!(a.tasks[0].detail.starts_with(&original.detail));
-        for warning in [
-            "does not certify completion",
-            "cancel agents",
-            "delete remote work",
-        ] {
-            assert!(a.tasks[0].detail.contains(warning));
-        }
-        assert_eq!(a.task_states[&seq].recovery, recovery);
-        assert!(a.task_states[&seq].target.is_none());
-        assert!(
-            rx.try_recv().is_err(),
-            "manual release must not dispatch any remote request"
-        );
-
-        let released_detail = a.tasks[0].detail.clone();
-        let retry_seq = confirm_launch(&mut a, &rx, &tx);
-        assert_ne!(retry_seq, seq);
-        assert_eq!(a.tasks.len(), 2);
-        tx.send(Response::Launched(seq, Ok(launch_outcome())))
-            .unwrap();
-        tx.send(Response::TaskPolled(
-            seq,
-            Ok(AgentObservation {
-                status: "working".into(),
-                completion_seq: None,
-            }),
-        ))
-        .unwrap();
-        a.receive();
-        assert_eq!(a.tasks[0].status, "tracking released");
-        assert!(!a.tasks[0].active);
-        assert_eq!(a.tasks[0].detail, released_detail);
-        assert!(a.task_states[&seq].target.is_none());
-        assert_eq!(a.task_states[&seq].recovery, recovery);
-        assert_eq!(a.tasks[1].status, "starting");
-        assert!(a.tasks[1].active);
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn manual_release_enter_n_and_escape_cancel_without_changing_history() {
-        for cancel in [KeyCode::Enter, KeyCode::Char('n'), KeyCode::Esc] {
-            let (mut a, rx, _, seq) = untrackable_launch();
-            let detail = a.tasks[0].detail.clone();
-            let recovery = a.task_states[&seq].recovery.clone();
-            press(&mut a, KeyCode::Char('h'));
-            press(&mut a, cancel);
-            assert!(a.modal.is_none());
-            assert!(a.tasks[0].active);
-            assert_eq!(a.tasks[0].status, "unknown");
-            assert_eq!(a.tasks[0].detail, detail);
-            assert_eq!(a.task_states[&seq].recovery, recovery);
-            assert!(rx.try_recv().is_err());
+    fn observed_row(bead: &str, status: worktrees::WorktreeStatus) -> ManagedWorktree {
+        ManagedWorktree {
+            id: format!("handoff-{bead}"),
+            bead_id: bead.into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: format!("ontrack/{bead}"),
+            target_branch: "main".into(),
+            workspace_id: "wTask".into(),
+            status,
+            detail: Some("Keep recovery evidence".into()),
         }
     }
 
     #[test]
-    fn manual_release_cannot_confirm_before_render_or_in_compact_fallback_but_escape_works() {
-        let (mut a, rx, _, _) = untrackable_launch();
-        a.key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE));
-        assert!(matches!(a.modal, Some(Modal::ReleaseTask { .. })));
-        assert!(!a.modal_ready);
-        for _ in 0..2 {
-            a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-            assert!(a.tasks[0].active);
-            assert!(matches!(a.modal, Some(Modal::ReleaseTask { .. })));
-            assert!(rx.try_recv().is_err());
-        }
-        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        assert!(a.modal.is_none());
-        assert!(a.tasks[0].active);
-    }
-
-    #[test]
-    fn manual_release_rechecks_task_identity_and_every_guard_on_confirmation() {
-        for change in [
-            "inactive",
-            "starting",
-            "no recovery",
-            "target",
-            "inflight",
-            "bead",
-            "seq",
-            "missing state",
-            "missing task",
-        ] {
-            let (mut a, rx, _, seq) = untrackable_launch();
-            press(&mut a, KeyCode::Char('h'));
-            match change {
-                "inactive" => a.tasks[0].active = false,
-                "starting" => a.tasks[0].status = "starting".into(),
-                "no recovery" => a.task_states.get_mut(&seq).unwrap().recovery = None,
-                "target" => a.task_states.get_mut(&seq).unwrap().target = Some(launch_outcome()),
-                "inflight" => a.task_states.get_mut(&seq).unwrap().poll_inflight = true,
-                "bead" => a.tasks[0].bead_id = "another-bead".into(),
-                "seq" => a.tasks[0].seq += 1,
-                "missing state" => {
-                    a.task_states.remove(&seq);
-                }
-                "missing task" => a.tasks.clear(),
-                _ => unreachable!(),
-            }
-            let before = a
-                .tasks
-                .first()
-                .map(|task| (task.status.clone(), task.active, task.detail.clone()));
-            press(&mut a, KeyCode::Char('y'));
-            assert!(a.modal.is_none());
-            assert_eq!(
-                a.tasks
-                    .first()
-                    .map(|task| (task.status.clone(), task.active, task.detail.clone())),
-                before,
-                "{change}"
-            );
-            assert!(a.notice.as_deref().unwrap().contains("no longer available"));
-            assert!(rx.try_recv().is_err());
-        }
-    }
-
-    #[test]
-    fn manual_release_is_unavailable_for_starting_or_any_pollable_task() {
-        for status in ["starting", "running", "blocked", "error", "unknown", "idle"] {
-            let (mut a, rx, _, seq) = untrackable_launch();
-            a.tasks[0].status = status.into();
-            if status != "starting" {
-                // Even a recovered launch with a validated target must stay
-                // monitored; neither poll errors nor agent state permit release.
-                a.task_states.get_mut(&seq).unwrap().target = Some(launch_outcome());
-            }
-            press(&mut a, KeyCode::Char('h'));
-            assert!(a.modal.is_none(), "{status}");
-            assert!(a.tasks[0].active);
-            assert!(rx.try_recv().is_err());
-        }
-        let (mut a, rx, tx) = connected_app();
-        let seq = confirm_launch(&mut a, &rx, &tx);
-        tx.send(Response::Launched(seq, Ok(launch_outcome())))
-            .unwrap();
-        let now = Instant::now();
-        a.receive_at(now);
-        a.poll_tasks(now);
-        assert!(matches!(rx.try_recv(), Ok(Request::PollTask(..))));
-        tx.send(Response::TaskPolled(
-            seq,
-            Err(std::io::Error::other("poll failed")),
-        ))
-        .unwrap();
-        a.receive_at(now);
-        press(&mut a, KeyCode::Char('h'));
-        assert!(
-            a.modal.is_none(),
-            "normal polling errors cannot be manually released"
-        );
-        assert!(a.tasks[0].active);
-        assert!(rx.try_recv().is_err());
-    }
-
-    fn launch_outcome() -> LaunchOutcome {
-        LaunchOutcome {
-            message: "Prompt sent · workspace ws-new · pane p1 · branch ontrack/b0".into(),
-            pane_id: "p1".into(),
-            workspace_id: "ws-new".into(),
-            branch: "ontrack/b0".into(),
-            completion_seq: Some(3),
-        }
-    }
-    fn confirm_launch(
-        a: &mut App,
-        rx: &mpsc::Receiver<Request>,
-        tx: &mpsc::Sender<Response>,
-    ) -> u64 {
-        press(a, KeyCode::Char('h'));
-        let Request::Discover(seq) = rx.try_recv().unwrap() else {
-            panic!("expected discovery")
-        };
-        tx.send(Response::Discovered(seq, Ok(launch_context())))
-            .unwrap();
-        a.receive();
-        press(a, KeyCode::Enter);
-        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
-        assert!(a.modal.is_none());
-        assert!(!a.mutation_busy);
-        seq
-    }
-
-    #[test]
-    fn blocked_managed_work_is_serial_but_does_not_delay_browser_bd_or_launches() {
+    fn blocked_launch_does_not_delay_ready_launch_browser_create_or_managed_refresh() {
         use std::sync::Barrier;
         let gate = Arc::new(Barrier::new(2));
         let worker_gate = gate.clone();
         let (entered, started) = mpsc::channel();
-        let (managed_step, steps) = mpsc::channel();
-        let (requests, responses) = start_workers(move |request| match request {
-            Request::WorktreeAction(_, _) => {
-                entered.send(()).unwrap();
-                worker_gate.wait();
-                managed_step.send(1).unwrap();
-                Response::WorktreeChanged(Err(std::io::Error::other("managed action finished")))
-            }
-            Request::ListWorktrees => {
-                managed_step.send(2).unwrap();
-                Response::Worktrees(Ok(vec![]))
-            }
-            Request::ReconcileWorktrees(_) => {
-                managed_step.send(3).unwrap();
-                Response::Worktrees(Ok(vec![]))
-            }
-            Request::List => Response::List(Ok(vec![])),
-            Request::Launch(seq, ..) => Response::Launched(seq, Ok(launch_outcome())),
-            _ => panic!("unexpected request"),
+        let (requests, responses, _) = start_workers(move |request, out| {
+            let response = match request {
+                Request::Launch(seq, ..) => {
+                    entered.send(()).unwrap();
+                    worker_gate.wait();
+                    Response::Launched(seq, Err(std::io::Error::other("first failed")))
+                }
+                Request::LaunchReady(seq, ..) => Response::Launched(
+                    seq,
+                    Ok(LaunchOutcome {
+                        reserved: false,
+                        message: "second accepted".into(),
+                    }),
+                ),
+                Request::List => Response::List(Ok(vec![])),
+                Request::Create(_) => Response::Created(Ok("created".into())),
+                Request::ListWorktrees => Response::Worktrees(Ok(vec![])),
+                _ => panic!("unexpected request"),
+            };
+            out.send(response).unwrap();
+        });
+        let context = launch_context();
+        let bead = app().beads[0].clone();
+        requests
+            .send(Request::Launch(
+                1,
+                context.clone(),
+                context.agents[0].clone(),
+                bead.clone(),
+            ))
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        requests
+            .send(Request::LaunchReady(
+                2,
+                context.clone(),
+                context.agents[0].clone(),
+                bead,
+            ))
+            .unwrap();
+        requests.send(Request::List).unwrap();
+        requests
+            .send(Request::Create(CreateBead {
+                title: "new".into(),
+                description: String::new(),
+                issue_type: "task".into(),
+                priority: 2,
+                harness: None,
+            }))
+            .unwrap();
+        requests.send(Request::ListWorktrees).unwrap();
+        let mut observed = HashSet::new();
+        for _ in 0..4 {
+            observed.insert(
+                match responses.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    Response::Launched(2, Ok(_)) => "ready",
+                    Response::List(Ok(_)) => "browser",
+                    Response::Created(Ok(_)) => "create",
+                    Response::Worktrees(Ok(_)) => "managed",
+                    _ => panic!("first launch remains blocked"),
+                },
+            );
+        }
+        assert_eq!(observed.len(), 4);
+        gate.wait();
+        assert!(matches!(
+            responses.recv_timeout(Duration::from_secs(5)),
+            Ok(Response::Launched(1, Err(_)))
+        ));
+    }
+
+    #[test]
+    fn managed_work_is_serial_and_cannot_occupy_the_browser_worker() {
+        use std::sync::Barrier;
+        let gate = Arc::new(Barrier::new(2));
+        let worker_gate = gate.clone();
+        let (tx, started) = mpsc::channel();
+        let (steps, received_steps) = mpsc::channel();
+        let (requests, responses, _) = start_workers(move |request, out| {
+            let response = match request {
+                Request::WorktreeAction(_, _) => {
+                    tx.send(()).unwrap();
+                    worker_gate.wait();
+                    steps.send(1).unwrap();
+                    Response::WorktreeChanged(Err(std::io::Error::other("finished")))
+                }
+                Request::ListWorktrees => {
+                    steps.send(2).unwrap();
+                    Response::Worktrees(Ok(vec![]))
+                }
+                Request::List => Response::List(Ok(vec![])),
+                _ => panic!("unexpected request"),
+            };
+            out.send(response).unwrap();
         });
         requests
             .send(Request::WorktreeAction(
@@ -2395,379 +3846,422 @@ mod tests {
             .unwrap();
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         requests.send(Request::ListWorktrees).unwrap();
-        requests
-            .send(Request::ReconcileWorktrees(CleanupPolicy::default()))
-            .unwrap();
         requests.send(Request::List).unwrap();
-        requests
-            .send(Request::Launch(
-                9,
-                launch_context(),
-                launch_context().agents[0].clone(),
-                app().beads[0].clone(),
-            ))
-            .unwrap();
-        let mut independent = HashSet::new();
-        for _ in 0..2 {
-            independent.insert(
-                match responses.recv_timeout(Duration::from_secs(5)).unwrap() {
-                    Response::List(Ok(_)) => "browser bd",
-                    Response::Launched(9, Ok(_)) => "launch",
-                    _ => panic!("managed work must remain blocked"),
-                },
-            );
-        }
-        assert_eq!(independent.len(), 2);
-        assert!(steps.try_recv().is_err());
-        gate.wait();
-        for expected in 1..=3 {
-            assert_eq!(
-                steps.recv_timeout(Duration::from_secs(5)).unwrap(),
-                expected
-            );
-            assert!(matches!(
-                responses.recv_timeout(Duration::from_secs(5)).unwrap(),
-                Response::Worktrees(_) | Response::WorktreeChanged(_)
-            ));
-        }
-    }
-
-    #[test]
-    fn blocked_launch_does_not_delay_another_launch_discovery_poll_or_bd() {
-        use std::sync::Barrier;
-        let gate = Arc::new(Barrier::new(2));
-        let worker_gate = gate.clone();
-        let (entered, first_entered) = mpsc::channel();
-        let (requests, responses) = start_workers(move |request| match request {
-            Request::Launch(seq, ..) => {
-                if seq == 1 {
-                    entered.send(()).unwrap();
-                    worker_gate.wait();
-                }
-                Response::Launched(
-                    seq,
-                    if seq == 2 {
-                        Err(std::io::Error::other("second failed independently"))
-                    } else {
-                        Ok(launch_outcome())
-                    },
-                )
-            }
-            Request::Discover(seq) => Response::Discovered(seq, Ok(launch_context())),
-            Request::PollTask(seq, _) => Response::TaskPolled(
-                seq,
-                Ok(AgentObservation {
-                    status: "blocked".into(),
-                    completion_seq: None,
-                }),
-            ),
-            Request::List => Response::List(Ok(vec![])),
-            _ => panic!("unexpected request"),
-        });
-        let bead = app().beads[0].clone();
-        let launch = |seq| {
-            Request::Launch(
-                seq,
-                launch_context(),
-                launch_context().agents[0].clone(),
-                bead.clone(),
-            )
-        };
-        requests.send(launch(1)).unwrap();
-        first_entered.recv_timeout(Duration::from_secs(5)).unwrap();
-        requests.send(launch(2)).unwrap();
-        requests.send(Request::Discover(3)).unwrap();
-        requests
-            .send(Request::PollTask(4, launch_outcome()))
-            .unwrap();
-        requests.send(Request::List).unwrap();
-        let mut observed = HashSet::new();
-        for _ in 0..4 {
-            let kind = match responses.recv_timeout(Duration::from_secs(5)).unwrap() {
-                Response::Launched(2, Err(_)) => "second launch",
-                Response::Discovered(3, Ok(_)) => "discovery",
-                Response::TaskPolled(4, Ok(_)) => "poll",
-                Response::List(Ok(_)) => "bd",
-                _ => panic!("first launch must still be blocked"),
-            };
-            observed.insert(kind);
-        }
-        assert_eq!(observed.len(), 4);
-        gate.wait();
         assert!(matches!(
             responses.recv_timeout(Duration::from_secs(5)),
-            Ok(Response::Launched(1, Ok(_)))
+            Ok(Response::List(Ok(_)))
         ));
+        assert!(received_steps.try_recv().is_err());
+        gate.wait();
+        assert_eq!(
+            received_steps.recv_timeout(Duration::from_secs(5)).unwrap(),
+            1
+        );
+        assert_eq!(
+            received_steps.recv_timeout(Duration::from_secs(5)).unwrap(),
+            2
+        );
     }
 
     #[test]
-    fn independent_task_results_survive_navigation_other_modals_and_bd_mutations() {
+    fn distinct_manual_and_ready_results_do_not_clear_other_pending_state_or_toast() {
         let (mut a, rx, tx) = connected_app();
-        let first = confirm_launch(&mut a, &rx, &tx);
-        press(&mut a, KeyCode::Down);
-        take_show(&rx, "b1");
-        let second = confirm_launch(&mut a, &rx, &tx);
-        press(&mut a, KeyCode::Char('r'));
-        assert!(matches!(rx.try_recv(), Ok(Request::List)));
-        press(&mut a, KeyCode::Char('n'));
-        a.mutation_busy = true; // an unrelated bd create is in flight
-        tx.send(Response::Launched(first, Ok(launch_outcome())))
+        a.start_launch(a.beads[0].clone(), false);
+        let Request::Discover(first) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        a.start_launch(a.beads[1].clone(), true);
+        let Request::Discover(second) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        a.start_launch(a.beads[0].clone(), false);
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::Discovered(first, Ok(launch_context())))
             .unwrap();
-        tx.send(Response::Launched(
-            second,
-            Err(std::io::Error::other("inspect second workspace")),
-        ))
-        .unwrap();
-        tx.send(Response::Launched(900, Ok(launch_outcome())))
+        tx.send(Response::Discovered(second, Ok(launch_context())))
             .unwrap();
         a.receive();
-        assert!(
-            a.mutation_busy,
-            "launch response cannot clear a bd mutation lock"
-        );
-        assert!(matches!(a.modal, Some(Modal::Create(_))));
-        assert_eq!(a.tasks.len(), 2);
-        assert_eq!(a.tasks[0].bead_id, "b0");
-        assert!(a.tasks[0].detail.contains("pane p1"));
-        assert_eq!(a.tasks[1].bead_id, "b1");
-        assert!(a.tasks[1].detail.contains("inspect second workspace"));
-        let detail = a.tasks[0].detail.clone();
+        assert!(matches!(rx.try_recv(), Ok(Request::Launch(seq,..)) if seq == first));
+        assert!(matches!(rx.try_recv(), Ok(Request::LaunchReady(seq,..)) if seq == second));
+        let toast = a.toast.as_ref().unwrap().message.clone();
+        a.worktrees_inflight = true;
+        tx.send(Response::Launched(
+            first,
+            Ok(LaunchOutcome {
+                message: "first success".into(),
+                reserved: false,
+            }),
+        ))
+        .unwrap();
+        a.receive();
+        assert_eq!(a.handoff.len(), 1);
+        assert_eq!(a.handoff[&second].bead.id, "b1");
+        assert_eq!(a.toast.as_ref().unwrap().message, toast);
+        assert!(a.worktrees_refresh_pending);
+        assert!(a.handoff_capacity.contains("b0"));
         tx.send(Response::Launched(
             first,
             Err(std::io::Error::other("stale")),
         ))
         .unwrap();
         a.receive();
-        assert_eq!(a.tasks[0].detail, detail);
-    }
-
-    #[test]
-    fn starting_launch_keeps_navigation_refresh_create_delete_and_quit_responsive() {
-        let (mut a, rx, tx) = connected_app();
-        let _ = confirm_launch(&mut a, &rx, &tx);
-        press(&mut a, KeyCode::Down);
-        take_show(&rx, "b1");
-        press(&mut a, KeyCode::Char('r'));
-        assert!(matches!(rx.try_recv(), Ok(Request::List)));
-        press(&mut a, KeyCode::Char('n'));
-        if let Some(Modal::Create(form)) = a.modal.as_mut() {
-            form.title = "Create while agent starts".into();
-            form.focus = 4;
-        }
-        press(&mut a, KeyCode::Enter);
-        assert!(
-            matches!(rx.try_recv(), Ok(Request::Create(input)) if input.title == "Create while agent starts")
-        );
-        tx.send(Response::Created(Err(std::io::Error::other("try later"))))
-            .unwrap();
+        assert_eq!(a.toast.as_ref().unwrap().message, toast);
+        tx.send(Response::Launched(
+            second,
+            Err(std::io::Error::other("second uncertain")),
+        ))
+        .unwrap();
         a.receive();
-        press(&mut a, KeyCode::Esc);
-        press(&mut a, KeyCode::Char('d'));
-        press(&mut a, KeyCode::Char('y'));
-        assert!(matches!(rx.try_recv(), Ok(Request::Delete(id)) if id == "b1"));
-        tx.send(Response::Deleted(Err(std::io::Error::other("try later"))))
-            .unwrap();
+        assert!(a.handoff.is_empty());
+        assert!(
+            a.toast
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("second uncertain")
+        );
+        tx.send(Response::Worktrees(Ok(vec![]))).unwrap();
         a.receive();
-        press(&mut a, KeyCode::Esc);
-        assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
-        assert_eq!(a.tasks[0].status, "starting");
         assert!(
-            a.tasks[0].active,
-            "quit does not cancel or wait for background work"
+            !a.worktrees_discovered,
+            "a stale scan requires a trailing durable refresh"
         );
+        assert!(a.handoff_capacity.contains("b0"));
+        a.poll_worktrees(Instant::now());
+        assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
+        tx.send(Response::Worktrees(Ok(vec![observed_row(
+            "b0",
+            worktrees::WorktreeStatus::InProgress,
+        )])))
+        .unwrap();
+        a.receive();
+        assert!(!a.handoff_capacity.contains("b0"));
     }
 
     #[test]
-    fn disconnected_poll_queue_preserves_identity_and_retries_without_detail_growth() {
-        let (mut a, rx, tx) = connected_app();
-        let seq = confirm_launch(&mut a, &rx, &tx);
-        tx.send(Response::Launched(seq, Ok(launch_outcome())))
-            .unwrap();
-        let now = Instant::now();
-        a.receive_at(now);
-        drop(rx);
-        a.poll_tasks(now);
-        assert_eq!(a.tasks[0].status, "unknown");
-        assert!(a.tasks[0].active);
-        assert!(!a.task_states[&seq].poll_inflight);
-        assert!(a.tasks[0].detail.contains("pane p1"));
-        let detail = a.tasks[0].detail.clone();
-        a.poll_tasks(now + TASK_POLL_INTERVAL);
-        assert_eq!(a.tasks[0].detail, detail);
-    }
-
-    #[test]
-    fn task_polling_is_bounded_recovers_and_rejects_stale_done() {
-        let (mut a, rx, tx) = connected_app();
-        let seq = confirm_launch(&mut a, &rx, &tx);
-        tx.send(Response::Launched(seq, Ok(launch_outcome())))
-            .unwrap();
-        let now = Instant::now();
-        a.receive_at(now);
-        for elapsed in [0, 1, 20] {
-            a.poll_tasks(now + Duration::from_secs(elapsed));
+    fn ready_capacity_counts_all_pending_agents_but_not_epic_checkout_reservations() {
+        let (mut a, rx, _) = connected_app();
+        a.settings.agent_limit = settings::AgentLimit::Limited(1);
+        for bead in &mut a.beads {
+            bead.data["issue_type"] = json!("task");
+            bead.data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
         }
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[1].data["parent"] = json!("b0");
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+        assert!(a.handoff.values().any(|pending| pending.bead.id == "b0"));
+        a.poll_scheduler();
         assert!(
-            matches!(rx.try_recv(), Ok(Request::PollTask(s, target)) if s == seq && target.pane_id == "p1")
+            matches!(rx.try_recv(), Ok(Request::Discover(_))),
+            "reserving an Epic's parent checkout consumes no agent slot"
         );
+        assert!(a.handoff.values().any(|pending| pending.bead.id == "b2"));
+        a.poll_scheduler();
         assert!(
             rx.try_recv().is_err(),
-            "overlap guard bounds inflight polls"
+            "pending agent launch consumes the remaining slot"
         );
-        let observe = |status: &str, completion_seq| {
-            Ok(AgentObservation {
-                status: status.into(),
-                completion_seq,
-            })
-        };
-        tx.send(Response::TaskPolled(seq, observe("done", Some(3))))
-            .unwrap();
+        a.selected = Some(2);
+        a.toggle_ready();
+        assert!(
+            rx.try_recv().is_err(),
+            "Ready cannot be removed from any pending task"
+        );
+        a.selected = Some(0);
+        a.toggle_ready();
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::SetEpicReady(_,false,_,protected)) if protected.contains("b0") && protected.contains("b2"))
+        );
+    }
+
+    #[test]
+    fn display_only_agent_polling_is_bounded_preserves_rows_and_cannot_change_worktree_state() {
+        let (mut a, rx, tx) = connected_app();
+        a.worktrees.push(observed_row(
+            "b0",
+            worktrees::WorktreeStatus::NeedsAttention,
+        ));
+        let now = Instant::now();
+        a.poll_agent_observations(now);
+        a.poll_agent_observations(now + Duration::from_secs(50));
+        assert!(matches!(rx.try_recv(), Ok(Request::ObserveAgents)));
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::AgentsObserved(Err(std::io::Error::other(
+            "offline",
+        ))))
+        .unwrap();
         a.receive_at(now);
-        assert_eq!(a.tasks[0].status, "unknown");
-        assert!(a.tasks[0].active);
-        a.poll_tasks(now + TASK_POLL_INTERVAL - Duration::from_nanos(1));
-        assert!(rx.try_recv().is_err());
-        let mut time = now;
-        for (result, expected) in [
-            (Err(std::io::Error::other("disconnected")), "unknown"),
-            (observe("working", Some(3)), "running"),
-            (observe("done", None), "unknown"),
-            (observe("done", Some(3)), "unknown"),
-            (observe("blocked", Some(3)), "blocked"),
-            (observe("error", Some(3)), "error"),
-            (observe("unexpected", None), "unknown"),
-            (observe("idle", Some(3)), "idle"),
-            (observe("done", Some(4)), "done"),
-        ] {
-            time += TASK_POLL_INTERVAL;
-            a.poll_tasks(time);
-            assert!(matches!(rx.try_recv(), Ok(Request::PollTask(..))));
-            tx.send(Response::TaskPolled(seq, result)).unwrap();
-            a.receive_at(time);
-            assert_eq!(a.tasks[0].status, expected);
-            assert!(a.tasks[0].detail.contains("pane p1"));
-            assert!(a.tasks[0].detail.contains("workspace ws-new"));
-            assert!(a.tasks[0].detail.contains("branch ontrack/b0"));
-        }
-        assert!(!a.tasks[0].active);
-        a.poll_tasks(time + TASK_POLL_INTERVAL);
-        assert!(rx.try_recv().is_err());
-        tx.send(Response::TaskPolled(seq, observe("working", Some(3))))
-            .unwrap();
-        a.receive_at(time);
+        assert_eq!(a.worktrees.len(), 1);
         assert_eq!(
-            a.tasks[0].status, "done",
-            "late responses cannot resurrect completed work"
+            a.worktrees[0].status,
+            worktrees::WorktreeStatus::NeedsAttention
+        );
+        assert!(
+            a.worktrees[0]
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("Keep recovery evidence")
+        );
+        assert!(a.worktrees[0].detail.as_ref().unwrap().contains("unknown"));
+        a.poll_agent_observations(now + Duration::from_secs(1));
+        assert!(rx.try_recv().is_err());
+        a.poll_agent_observations(now + Duration::from_secs(2));
+        assert!(matches!(rx.try_recv(), Ok(Request::ObserveAgents)));
+        tx.send(Response::AgentsObserved(Ok(vec![
+            worktrees::AgentDisplay {
+                id: "handoff-b0".into(),
+                workspace_id: "wTask".into(),
+                detail: "Agent observation (display only): working".into(),
+            },
+        ])))
+        .unwrap();
+        a.receive_at(now + Duration::from_secs(2));
+        assert_eq!(
+            a.worktrees[0].status,
+            worktrees::WorktreeStatus::NeedsAttention
+        );
+        assert!(a.worktrees[0].detail.as_ref().unwrap().contains("working"));
+        assert!(!a.worktrees[0].detail.as_ref().unwrap().contains("offline"));
+        tx.send(Response::Worktrees(Ok(vec![observed_row(
+            "b0",
+            worktrees::WorktreeStatus::NeedsAttention,
+        )])))
+        .unwrap();
+        a.receive_at(now + Duration::from_secs(2));
+        assert!(
+            a.worktrees[0]
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("Agent observation (display only): working")
+        );
+    }
+    #[test]
+    fn handoff_discovers_and_launches_once_without_dialog_or_confirmation() {
+        let (mut a, rx, tx) = connected_app();
+        a.beads[0].data["description"] = json!("Full context");
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => panic!("expected discovery"),
+        };
+        assert!(a.modal.is_none());
+        assert!(!a.handoff.is_empty());
+        assert!(
+            a.toast
+                .as_ref()
+                .is_some_and(|toast| toast.expires_at.is_none())
+        );
+        press(&mut a, KeyCode::Char('h'));
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.selected, Some(1), "browsing remains available");
+        assert!(matches!(rx.try_recv(), Ok(Request::Show(..))));
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Launch(id, context, agent, bead))
+            if id == seq && context.workspace.id == "ws" && agent.id == "codex"
+                && bead.id == "b0" && bead.data["description"] == "Full context")
+        );
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(
+            rx.try_recv().is_err(),
+            "duplicate discovery cannot relaunch"
         );
         press(&mut a, KeyCode::Char('h'));
         assert!(
-            matches!(rx.try_recv(), Ok(Request::Discover(_))),
-            "observed done permits retry"
+            matches!(rx.try_recv(), Ok(Request::Discover(next)) if next != seq),
+            "a distinct selected bead can launch concurrently"
+        );
+        assert_eq!(a.handoff.len(), 2);
+    }
+    #[test]
+    fn handoff_requires_selection_and_ignores_stale_discovery() {
+        let (mut a, rx, tx) = connected_app();
+        a.clear_selection();
+        press(&mut a, KeyCode::Char('h'));
+        assert!(rx.try_recv().is_err());
+        assert!(a.toast.as_ref().is_some_and(|toast| toast.error));
+        a.select(0);
+        let _ = rx.try_recv();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        tx.send(Response::Discovered(seq + 1, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(rx.try_recv().is_err());
+        assert!(!a.handoff.is_empty());
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
+    }
+    #[test]
+    fn handoff_uses_first_available_agent_if_codex_is_absent() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        let mut context = launch_context();
+        context.agents.remove(0);
+        tx.send(Response::Discovered(seq, Ok(context))).unwrap();
+        a.receive();
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Launch(_, _, agent, _)) if agent.id == "opencode")
         );
     }
-
     #[test]
-    fn first_poll_accepts_new_completion_counter_only_after_confirmed_new_pane_handoff() {
-        for (baseline, observed, status, uncertain, expected) in [
-            (None, Some(1), "done", false, "done"),
-            (Some(3), Some(3), "done", false, "unknown"),
-            (Some(3), Some(4), "done", false, "done"),
-            (None, None, "done", false, "unknown"),
-            (Some(3), None, "done", false, "unknown"),
-            (None, Some(1), "unknown", false, "unknown"),
-            (None, Some(1), "done", true, "unknown"),
-        ] {
-            let (mut a, rx, tx) = connected_app();
-            let seq = confirm_launch(&mut a, &rx, &tx);
-            let mut target = launch_outcome();
-            target.completion_seq = baseline;
-            tx.send(Response::Launched(seq, Ok(target))).unwrap();
-            let now = Instant::now();
-            a.receive_at(now);
-            if uncertain {
-                // Same pollable identity as a recovered partial launch, without
-                // claiming the prompt was accepted successfully.
-                a.task_states.get_mut(&seq).unwrap().recovery = Some("delivery uncertain".into());
-            }
-            assert!(!a.task_states[&seq].observed_activity);
-            a.poll_tasks(now);
-            assert!(matches!(rx.try_recv(), Ok(Request::PollTask(..))));
-            tx.send(Response::TaskPolled(
-                seq,
-                Ok(AgentObservation {
-                    status: status.into(),
-                    completion_seq: observed,
-                }),
-            ))
-            .unwrap();
-            a.receive_at(now);
-            assert_eq!(
-                a.tasks[0].status, expected,
-                "baseline={baseline:?}, observed={observed:?}, status={status}, uncertain={uncertain}"
-            );
-            assert_eq!(a.tasks[0].active, expected != "done");
-
-            if baseline == Some(3) && observed == Some(3) {
-                // The same launch must recover when a later poll sees an
-                // increment, without ever having sampled working/blocked.
-                a.poll_tasks(now + TASK_POLL_INTERVAL);
-                assert!(matches!(rx.try_recv(), Ok(Request::PollTask(..))));
-                tx.send(Response::TaskPolled(
-                    seq,
-                    Ok(AgentObservation {
-                        status: "done".into(),
-                        completion_seq: Some(4),
-                    }),
-                ))
-                .unwrap();
-                a.receive_at(now + TASK_POLL_INTERVAL);
-                assert_eq!(a.tasks[0].status, "done");
-                assert!(!a.tasks[0].active);
-            }
-        }
-    }
-
-    #[test]
-    fn servers_without_completion_counter_require_activity_and_known_launch_failure_allows_retry() {
+    fn unavailable_agents_and_discovery_failure_do_not_launch() {
         let (mut a, rx, tx) = connected_app();
-        let seq = confirm_launch(&mut a, &rx, &tx);
-        let mut target = launch_outcome();
-        target.completion_seq = None;
-        tx.send(Response::Launched(seq, Ok(target))).unwrap();
-        let now = Instant::now();
-        a.receive_at(now);
-        for (step, status) in ["done", "unknown", "working", "done"]
-            .into_iter()
-            .enumerate()
-        {
-            let time = now + TASK_POLL_INTERVAL * step as u32;
-            a.poll_tasks(time);
-            assert!(matches!(rx.try_recv(), Ok(Request::PollTask(..))));
-            tx.send(Response::TaskPolled(
-                seq,
-                Ok(AgentObservation {
-                    status: status.into(),
-                    completion_seq: None,
-                }),
-            ))
-            .unwrap();
-            a.receive_at(time);
-            assert_eq!(a.tasks[0].active, step < 3);
-        }
-        let retry = confirm_launch(&mut a, &rx, &tx);
-        let invalid_agent = Agent {
-            id: "not-discovered".into(),
-            label: "invalid".into(),
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
         };
-        let failure =
-            crate::herdr::launch(&launch_context(), &invalid_agent, &a.beads[0]).unwrap_err();
-        tx.send(Response::Launched(retry, Err(failure))).unwrap();
+        let mut context = launch_context();
+        context.agents.clear();
+        tx.send(Response::Discovered(seq, Ok(context))).unwrap();
         a.receive();
-        assert_eq!(a.tasks[1].status, "launch failed");
-        assert!(!a.tasks[1].active);
-        assert!(a.tasks[1].detail.contains("retry is safe"));
-        let _ = confirm_launch(&mut a, &rx, &tx);
-        assert_eq!(a.tasks.len(), 3);
+        assert!(a.handoff.is_empty());
+        assert!(a.toast.as_ref().is_some_and(|toast| toast.error));
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Char('h'));
+        let next = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        tx.send(Response::Discovered(
+            next,
+            Err(std::io::Error::other("workspace unavailable")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(a.handoff.is_empty());
+        assert!(
+            a.toast
+                .as_ref()
+                .is_some_and(|toast| toast.message.contains("workspace unavailable"))
+        );
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn disconnected_handoff_queues_show_toast_and_leave_ui_available() {
+        let mut a = app();
+        let (requests, rx) = mpsc::channel();
+        drop(rx);
+        a.requests = requests;
+        press(&mut a, KeyCode::Char('h'));
+        assert!(a.handoff.is_empty());
+        assert!(a.modal.is_none());
+        assert!(a.toast.as_ref().is_some_and(|toast| toast.error));
+
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        let (requests, receiver) = mpsc::channel();
+        drop(receiver);
+        a.requests = requests;
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(a.handoff.is_empty());
+        assert!(
+            a.toast
+                .as_ref()
+                .is_some_and(|toast| toast.message.contains("could not be queued"))
+        );
+    }
+    #[test]
+    fn handoff_result_sets_toast_and_refreshes_tracked_worktrees() {
+        let (mut a, rx, tx) = connected_app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
+        a.worktrees_inflight = true;
+        tx.send(Response::Launched(
+            seq,
+            Ok(LaunchOutcome {
+                message: "Prompt sent · workspace ws-new".into(),
+                reserved: false,
+            }),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(a.handoff.is_empty());
+        assert_eq!(display_status(&a.beads[0]), "ready");
+        assert!(
+            rx.try_recv().is_err(),
+            "manual handoff must not clear Ready"
+        );
+        assert!(a.worktrees_refresh_pending);
+        assert!(a.accepted_handoffs.contains("b0"));
+        tx.send(Response::Worktrees(Ok(Vec::new()))).unwrap();
+        a.receive();
+        assert!(a.accepted_handoffs.contains("b0"));
+        assert!(a.modal.is_none());
+        assert!(
+            a.toast
+                .as_ref()
+                .is_some_and(|toast| !toast.error && toast.expires_at.is_some())
+        );
+        assert_eq!(a.notice.as_deref(), Some("Prompt sent · workspace ws-new"));
+        tx.send(Response::Launched(seq, Err(std::io::Error::other("stale"))))
+            .unwrap();
+        a.receive();
+        assert!(
+            !a.toast.as_ref().unwrap().error,
+            "stale result cannot replace success"
+        );
+    }
+    #[test]
+    fn failed_handoff_shows_recovery_error_without_modal() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('h'));
+        let seq = match rx.try_recv().unwrap() {
+            Request::Discover(seq) => seq,
+            _ => unreachable!(),
+        };
+        tx.send(Response::Discovered(seq, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(matches!(rx.try_recv(), Ok(Request::Launch(..))));
+        tx.send(Response::Launched(
+            seq,
+            Err(std::io::Error::other(
+                "worktree may exist; inspect before retrying",
+            )),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(a.handoff.is_empty());
+        assert!(a.modal.is_none());
+        assert!(
+            a.toast.as_ref().is_some_and(
+                |toast| toast.error && toast.message.contains("inspect before retrying")
+            )
+        );
     }
     fn respond(a: &mut App, response: Response) {
         let (tx, rx) = mpsc::channel();
@@ -2791,6 +4285,177 @@ mod tests {
             }
             _ => panic!("missing show for {expected_id}"),
         }
+    }
+    fn take_harness_discovery(rx: &mpsc::Receiver<Request>) -> u64 {
+        match rx.try_recv() {
+            Ok(Request::DiscoverHarnesses(seq)) => seq,
+            _ => panic!("missing harness discovery"),
+        }
+    }
+    fn supply_harnesses(app: &mut App, seq: u64, kinds: &[&str]) {
+        let (tx, responses) = mpsc::channel();
+        app.responses = responses;
+        tx.send(Response::HarnessesDiscovered(
+            seq,
+            Ok(kinds.iter().map(|kind| (*kind).to_owned()).collect()),
+        ))
+        .unwrap();
+        app.receive();
+    }
+    #[test]
+    fn new_form_uses_only_discovered_harnesses_and_saves_selected_label() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&rx);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert!(form.harnesses.is_empty());
+        assert!(form.harness_loading);
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "New task".into();
+        form.focus = 4;
+        press(&mut a, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        assert!(a.notice.as_deref().unwrap().contains("Checking Herdr"));
+        tx.send(Response::HarnessesDiscovered(
+            seq,
+            Ok(vec!["opencode".into(), "hermes".into()]),
+        ))
+        .unwrap();
+        a.receive();
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.harnesses, ["opencode", "hermes"]);
+        assert_eq!(form.harness, 1);
+        // Right wraps through the installed kinds and Unassigned.
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        form.focus = 0;
+        for _ in 0..3 {
+            press(&mut a, KeyCode::Tab);
+        }
+        press(&mut a, KeyCode::Right);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.harnesses[form.harness - 1], "hermes");
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Right);
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        assert_eq!(form.harness, 1);
+        form.title = "New task".into();
+        form.focus = 4;
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Create(input)) if input.harness.as_deref() == Some("opencode"))
+        );
+    }
+
+    #[test]
+    fn new_form_defaults_to_codex_when_current_and_unassigned_on_failure() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('n'));
+        let first = take_harness_discovery(&rx);
+        tx.send(Response::HarnessesDiscovered(
+            first,
+            Ok(vec!["pi".into(), "codex".into()]),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(&a.modal, Some(Modal::Create(form)) if form.harness == 2));
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('n'));
+        let second = take_harness_discovery(&rx);
+        tx.send(Response::HarnessesDiscovered(
+            first,
+            Ok(vec!["claude".into()]),
+        ))
+        .unwrap();
+        tx.send(Response::HarnessesDiscovered(
+            second,
+            Err(std::io::Error::other("offline")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(
+            matches!(&a.modal, Some(Modal::Create(form)) if form.harness == 0 && form.harnesses.is_empty() && form.harness_error.as_deref().unwrap().contains("offline"))
+        );
+    }
+    #[test]
+    fn saved_default_agent_applies_to_new_and_child_forms_with_safe_fallback() {
+        let (mut a, rx, tx) = connected_app();
+        a.beads[0].data["issue_type"] = serde_json::json!("task");
+        a.settings.default_agent = DefaultAgent::Kind("hermes");
+        press(&mut a, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&rx);
+        tx.send(Response::HarnessesDiscovered(
+            seq,
+            Ok(vec!["codex".into(), "hermes".into()]),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(&a.modal, Some(Modal::Create(form)) if form.harness == 2));
+        press(&mut a, KeyCode::Esc);
+
+        a.settings.default_agent = DefaultAgent::Unassigned;
+        press(&mut a, KeyCode::Char('N'));
+        let seq = take_harness_discovery(&rx);
+        tx.send(Response::HarnessesDiscovered(seq, Ok(vec!["codex".into()])))
+            .unwrap();
+        a.receive();
+        assert!(
+            matches!(&a.modal, Some(Modal::Create(form)) if form.parent_id.is_some() && form.harness == 0)
+        );
+        press(&mut a, KeyCode::Esc);
+
+        a.settings.default_agent = DefaultAgent::Kind("hermes");
+        press(&mut a, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&rx);
+        tx.send(Response::HarnessesDiscovered(seq, Ok(vec!["codex".into()])))
+            .unwrap();
+        a.receive();
+        assert!(matches!(&a.modal, Some(Modal::Create(form)) if form.harness == 1));
+        assert_eq!(a.settings.default_agent, DefaultAgent::Kind("hermes"));
+
+        let existing = serde_json::json!({
+            "title": "Existing task",
+            "issue_type": "task",
+            "priority": 2,
+            "labels": ["ontrack:agent:codex"]
+        });
+        let edit = edit_form(&existing).unwrap();
+        assert_eq!(edit.harnesses[edit.harness - 1], "codex");
+    }
+
+    #[test]
+    fn settings_agent_choice_saves_and_reloads() {
+        let (mut a, _, _) = connected_app();
+        let dir =
+            std::env::temp_dir().join(format!("ontrack-agent-settings-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        a.settings_path = Some(path.clone());
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.settings.default_agent, DefaultAgent::Unassigned);
+        assert_eq!(
+            settings::load_from(&path).unwrap().default_agent,
+            DefaultAgent::Unassigned
+        );
+        press(&mut a, KeyCode::Right);
+        assert_eq!(
+            a.settings.default_agent,
+            DefaultAgent::Kind(beads::HARNESSES[0])
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
     fn startup_and_interval_polling_wait_for_completion_without_queue_growth() {
@@ -2821,13 +4486,13 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
     #[test]
-    fn repeated_manual_refreshes_coalesce_into_one_trailing_snapshot() {
+    fn repeated_refresh_requests_coalesce_into_one_trailing_snapshot() {
         let (mut a, rx, tx) = connected_app();
         let now = Instant::now();
         a.refresh_at(now);
         assert!(matches!(rx.try_recv(), Ok(Request::List)));
         for _ in 0..20 {
-            press(&mut a, KeyCode::Char('r'));
+            a.refresh();
         }
         assert!(rx.try_recv().is_err());
         assert!(a.refresh_pending);
@@ -3317,7 +4982,7 @@ mod tests {
         );
         press(&mut a, KeyCode::Tab);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 1, .. })));
-        assert_eq!(a.theme, Theme::Light, "Tab only focuses Close");
+        assert_eq!(a.theme, Theme::Light, "Tab only moves focus");
         press(&mut a, KeyCode::BackTab);
         press(&mut a, KeyCode::Esc);
         assert!(a.modal.is_none(), "Esc closes Settings without rollback");
@@ -3336,7 +5001,7 @@ mod tests {
             "reopening does not change the saved theme"
         );
         assert!(matches!(a.modal, Some(Modal::Settings { .. })));
-        for _ in 0..4 {
+        for _ in 0..7 {
             press(&mut a, KeyCode::Tab);
         }
         press(&mut a, KeyCode::Enter);
@@ -3388,15 +5053,23 @@ mod tests {
         a.settings_path = Some(path.clone());
         press(&mut a, KeyCode::Char('s'));
         press(&mut a, KeyCode::Up);
-        assert!(matches!(a.modal, Some(Modal::Settings { focus: 4, .. })));
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 7, .. })));
         press(&mut a, KeyCode::Down);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 0, .. })));
         press(&mut a, KeyCode::Down);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 1, .. })));
+        press(&mut a, KeyCode::Down);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 2, .. })));
+        press(&mut a, KeyCode::Down);
         press(&mut a, KeyCode::Enter);
         assert_eq!(a.theme, Theme::Dark);
         assert!(a.settings.auto_merge);
         assert!(settings::load_from(&path).unwrap().auto_merge);
+        press(&mut a, KeyCode::Down);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 4, .. })));
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.settings.auto_merge_children);
+        assert!(!settings::load_from(&path).unwrap().auto_merge_children);
         press(&mut a, KeyCode::Esc);
         assert!(a.modal.is_none());
         assert!(a.settings.auto_merge);
@@ -3407,6 +5080,50 @@ mod tests {
         assert_eq!(a.theme, Theme::Dark);
         assert!(a.settings.auto_merge);
         press(&mut a, KeyCode::Esc);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn settings_agent_limit_changes_save_and_survive_reopening() {
+        let dir = std::env::temp_dir().join(format!("ontrack-agent-limit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("settings.json");
+        let mut a = app();
+        a.settings_path = Some(path.clone());
+        press(&mut a, KeyCode::Char('s'));
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Tab);
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 2, .. })));
+        for expected in [4, 3, 2, 1] {
+            press(&mut a, KeyCode::Left);
+            assert_eq!(
+                a.settings.agent_limit,
+                settings::AgentLimit::Limited(expected)
+            );
+            assert_eq!(
+                settings::load_from(&path).unwrap().agent_limit,
+                a.settings.agent_limit
+            );
+        }
+        press(&mut a, KeyCode::Left);
+        assert_eq!(a.settings.agent_limit, settings::AgentLimit::Unlimited);
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: true,
+                ..
+            })
+        ));
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.settings.agent_limit, settings::AgentLimit::Limited(1));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        press(&mut a, KeyCode::Char('s'));
+        assert!(
+            matches!(a.modal, Some(Modal::Settings { draft, .. }) if draft.agent_limit == settings::AgentLimit::Limited(1))
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
@@ -3840,6 +5557,70 @@ mod tests {
         assert!(a.collapse_context.is_none());
     }
     #[test]
+    fn closed_group_starts_collapsed_and_user_expansion_survives_refresh() {
+        let mut a = unloaded_app();
+        let mut items = app().beads;
+        items.truncate(2);
+        items[1].status = " closed ".into();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_bead(&a, "b0");
+        let layout = list_layout(&a.beads, &a.collapsed);
+        assert_eq!(layout.groups.len(), 2);
+        assert!(!layout.groups[0].collapsed);
+        assert!(layout.groups[1].collapsed);
+        assert_eq!(layout.groups[1].indices, vec![1]);
+        assert!(
+            !layout
+                .targets
+                .iter()
+                .any(|target| target.row == DisplayRow::Bead(1))
+        );
+
+        press(&mut a, KeyCode::Down);
+        assert_collapsed_header_selected(&a, "closed");
+        press(&mut a, KeyCode::Right);
+        assert_bead(&a, "b1");
+        let refreshed = a.beads.clone();
+        respond(&mut a, Response::List(Ok(refreshed)));
+        assert_bead(&a, "b1");
+        assert!(!a.collapsed.contains("closed"));
+        press(&mut a, KeyCode::Left);
+        assert_collapsed_header_selected(&a, "closed");
+    }
+    #[test]
+    fn closed_group_defaults_when_it_first_appears_after_an_empty_list() {
+        let mut a = unloaded_app();
+        respond(&mut a, Response::List(Ok(vec![])));
+        assert!(a.closed_default_pending);
+        assert!(a.collapsed.is_empty());
+
+        let mut items = app().beads;
+        items.truncate(2);
+        respond(&mut a, Response::List(Ok(items.clone())));
+        assert!(a.closed_default_pending);
+        assert_bead(&a, "b0");
+
+        items[1].status = "closed".into();
+        respond(&mut a, Response::List(Ok(items)));
+        assert!(!a.closed_default_pending);
+        assert!(a.collapsed.contains("closed"));
+        assert_bead(&a, "b0");
+    }
+    #[test]
+    fn closed_only_workspace_keeps_header_keyboard_accessible() {
+        let mut a = unloaded_app();
+        let mut items = app().beads;
+        items.truncate(1);
+        items[0].status = "closed".into();
+        respond(&mut a, Response::List(Ok(items)));
+        assert!(a.collapsed.contains("closed"));
+        assert!(a.selected.is_none());
+        press(&mut a, KeyCode::Down);
+        assert_collapsed_header_selected(&a, "closed");
+        press(&mut a, KeyCode::Right);
+        assert_bead(&a, "b0");
+    }
+    #[test]
     fn refresh_never_selects_group_headers_or_makes_them_delete_targets() {
         let mut a = app();
         a.beads[1].status = "closed".into();
@@ -3970,16 +5751,131 @@ mod tests {
         assert_eq!(a.selected, Some(0));
     }
     #[test]
-    fn description_accepts_shortcut_letters_and_newlines_but_not_control_chars() {
+    fn epic_toggle_only_dispatches_opted_in_epics() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        press(&mut a, KeyCode::Char('n'));
+        take_harness_discovery(&rx);
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "Plan launch".into();
+        form.description = "Large proposal".into();
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.focus = 7;
+        press(&mut a, KeyCode::Enter);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert!(form.generate_children);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::CreateEpic(input, None)) if input.issue_type == "epic" && input.description == "Large proposal")
+        );
+
+        let mut b = app();
+        let (tx, rx) = mpsc::channel();
+        b.requests = tx;
+        press(&mut b, KeyCode::Char('n'));
+        take_harness_discovery(&rx);
+        let Some(Modal::Create(form)) = b.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "Ordinary".into();
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.generate_children = true;
+        form.focus = 2;
+        press(&mut b, KeyCode::Left);
+        let Some(Modal::Create(form)) = b.modal.as_mut() else {
+            panic!()
+        };
+        assert!(!form.generate_children);
+        form.focus = 4;
+        press(&mut b, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Create(input)) if input.issue_type == "feature")
+        );
+
+        let mut empty = app();
+        let (tx, rx) = mpsc::channel();
+        empty.requests = tx;
+        press(&mut empty, KeyCode::Char('n'));
+        take_harness_discovery(&rx);
+        let Some(Modal::Create(form)) = empty.modal.as_mut() else {
+            panic!()
+        };
+        form.title = "Needs proposal".into();
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.generate_children = true;
+        form.focus = 4;
+        press(&mut empty, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        assert!(empty.notice.as_deref().unwrap().contains("proposal"));
+    }
+    #[test]
+    fn epic_form_keeps_harness_and_generation_controls_separate() {
         let mut a = app();
         press(&mut a, KeyCode::Char('n'));
+        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+            panic!()
+        };
+        form.issue_type = beads::BEAD_TYPES
+            .iter()
+            .position(|value| *value == "epic")
+            .unwrap();
+        form.focus = 3;
+        press(&mut a, KeyCode::Tab);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.focus, 6);
+        press(&mut a, KeyCode::Tab);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.focus, 1);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Enter);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.focus, 7);
+        assert!(form.generate_children);
+        assert!(form.dropdown.is_none());
+        press(&mut a, KeyCode::Tab);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.focus, 4);
+        press(&mut a, KeyCode::BackTab);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.focus, 7);
+    }
+    #[test]
+    fn description_accepts_shortcut_letters_and_shift_enter_but_not_control_chars() {
+        let mut a = app();
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Tab);
         for c in ['q', 'r', 'n', 'd'] {
             press(&mut a, KeyCode::Char(c));
         }
-        press(&mut a, KeyCode::Enter);
+        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
         press(&mut a, KeyCode::Char('界'));
         a.modal_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
         let Some(Modal::Create(form)) = a.modal.as_ref() else {
@@ -3987,26 +5883,151 @@ mod tests {
         };
         assert_eq!(form.description, "qrnd\n界");
     }
+
+    #[test]
+    fn screenshot_paste_inserts_reference_at_description_caret() {
+        let mut form = CreateForm {
+            description: "before after".into(),
+            description_cursor: 7,
+            focus: 1,
+            ..Default::default()
+        };
+        form.insert_screenshot(std::path::Path::new("/shared/.beads/screenshots/test.png"));
+        assert_eq!(
+            form.description,
+            "before ![Screenshot](</shared/.beads/screenshots/test.png>)after"
+        );
+        assert_eq!(form.description_cursor, form.description.len() - 5);
+    }
+
+    #[test]
+    fn failed_screenshot_paste_keeps_description() {
+        let mut a = app();
+        a.modal = Some(Modal::Create(CreateForm {
+            description: "keep this".into(),
+            description_cursor: 4,
+            focus: 1,
+            ..Default::default()
+        }));
+        a.paste_seq = 1;
+        a.paste_pending = true;
+        let (tx, rx) = mpsc::channel();
+        a.responses = rx;
+        tx.send(Response::ScreenshotRead(
+            1,
+            Err(std::io::Error::other("no image")),
+        ))
+        .unwrap();
+        a.receive();
+        let Some(Modal::Create(form)) = a.modal else {
+            panic!("create form was closed")
+        };
+        assert_eq!(form.description, "keep this");
+        assert!(!a.paste_pending);
+        assert!(a.notice.as_deref().unwrap().contains("no image"));
+    }
+
+    #[test]
+    fn control_v_requests_image_only_in_description_for_create_and_edit() {
+        for editing in [false, true] {
+            let mut a = app();
+            let mut form = CreateForm {
+                focus: 1,
+                ..Default::default()
+            };
+            form.description = "draft".into();
+            a.modal = Some(if editing {
+                Modal::Edit {
+                    id: "b0".into(),
+                    form,
+                }
+            } else {
+                Modal::Create(form)
+            });
+            let (tx, rx) = mpsc::channel();
+            a.requests = tx;
+            a.modal_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL));
+            assert!(matches!(rx.try_recv(), Ok(Request::ReadScreenshot(1))));
+            assert!(a.paste_pending);
+            a.modal_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
+            let form = match a.modal.as_ref().unwrap() {
+                Modal::Create(form) | Modal::Edit { form, .. } => form,
+                _ => unreachable!(),
+            };
+            assert_eq!(form.description, "draft");
+        }
+    }
+
+    #[test]
+    fn cancel_form_removes_unsaved_screenshot() {
+        let path =
+            std::env::temp_dir().join(format!("ontrack-unsaved-screenshot-{}", std::process::id()));
+        std::fs::write(&path, b"image").unwrap();
+        let mut a = app();
+        a.modal = Some(Modal::Create(CreateForm::default()));
+        a.created_screenshots.push(path.clone());
+        a.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.modal.is_none());
+        assert!(!path.exists());
+    }
+    #[test]
+    fn enter_from_description_focuses_create_without_submitting() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        press(&mut a, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&rx);
+        supply_harnesses(&mut a, seq, &["codex"]);
+        for c in "Title".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Tab);
+        for c in "two words".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Left);
+        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!("form closed")
+        };
+        assert_eq!(form.description, "two word\ns");
+        assert_eq!(form.focus, 1);
+        press(&mut a, KeyCode::Enter);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!("form closed")
+        };
+        assert_eq!(form.focus, 4);
+        assert_eq!(form.description, "two word\ns");
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Enter);
+        let Ok(Request::Create(input)) = rx.try_recv() else {
+            panic!("missing create")
+        };
+        assert_eq!(input.description, "two word\ns");
+    }
     #[test]
     fn form_tab_order_follows_visual_layout_and_wraps_both_directions() {
         let mut a = app();
         press(&mut a, KeyCode::Char('n'));
         let mut forward = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut a, KeyCode::Tab);
             if let Some(Modal::Create(f)) = &a.modal {
                 forward.push(f.focus)
             }
         }
-        assert_eq!(forward, [2, 3, 1, 4, 5, 0]);
+        assert_eq!(forward, [2, 3, 6, 1, 4, 5, 0]);
         let mut reverse = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..7 {
             press(&mut a, KeyCode::BackTab);
             if let Some(Modal::Create(f)) = &a.modal {
                 reverse.push(f.focus)
             }
         }
-        assert_eq!(reverse, [5, 4, 1, 3, 2, 0]);
+        assert_eq!(reverse, [5, 4, 1, 6, 3, 2, 0]);
     }
     #[test]
     fn dropdown_escape_closes_choice_before_form_and_delete_captures_selection() {
@@ -4041,15 +6062,96 @@ mod tests {
         }
     }
     #[test]
+    fn help_tracks_active_view_and_preserves_underlying_form() {
+        let mut a = app();
+        let help_key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
+        a.key(help_key);
+        assert_eq!(a.help.unwrap().context, hotkeys::Context::Issues);
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.selected, Some(0));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.help.is_none());
+
+        press(&mut a, KeyCode::Tab);
+        a.key(help_key);
+        assert_eq!(a.help.unwrap().context, hotkeys::Context::Details);
+        a.key(help_key);
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Char('?'));
+        a.key(help_key);
+        assert_eq!(a.help.unwrap().context, hotkeys::Context::Form);
+        press(&mut a, KeyCode::Esc);
+        assert!(matches!(a.modal, Some(Modal::Create(ref form)) if form.title == "?"));
+        a.mutation_busy = true;
+        a.key(help_key);
+        assert!(a.help.is_none());
+    }
+
+    #[test]
+    fn help_lists_view_specific_commands() {
+        let mut a = app();
+        a.worktrees_view = true;
+        a.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        let context = a.help.unwrap().context;
+        assert_eq!(context, hotkeys::Context::Worktrees);
+        assert!(context.entries().iter().any(|(key, _)| *key == "Shift+R"));
+        assert!(!context.entries().iter().any(|(key, _)| *key == "n"));
+    }
+    #[test]
+    fn escape_navigates_back_without_quitting() {
+        let mut a = app();
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!a.worktrees_view);
+        assert!(a.modal.is_none());
+
+        a.worktrees_view = true;
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(!a.worktrees_view);
+
+        a.modal = Some(Modal::Settings {
+            draft: a.settings,
+            error: None,
+            dropdown_open: true,
+            focus: 0,
+        });
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Settings {
+                dropdown_open: false,
+                ..
+            })
+        ));
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(a.modal.is_none());
+
+        a.modal = Some(Modal::ConfirmDelete {
+            id: "b0".into(),
+            title: "issue 0".into(),
+        });
+        a.mutation_busy = true;
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(a.modal.is_some());
+        a.mutation_busy = false;
+        assert!(!a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert!(a.modal.is_none());
+
+        assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+    }
+    #[test]
     fn create_submits_payload_once_and_locks_until_error_then_preserves_form() {
         let mut a = app();
         let (tx, rx) = mpsc::channel();
         a.requests = tx;
         press(&mut a, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&rx);
+        supply_harnesses(&mut a, seq, &["codex"]);
         for c in "q/rn界".chars() {
             press(&mut a, KeyCode::Char(c));
         }
-        for _ in 0..4 {
+        for _ in 0..5 {
             press(&mut a, KeyCode::Tab);
         }
         press(&mut a, KeyCode::Enter);
@@ -4081,7 +6183,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.requests = tx;
         press(&mut a, KeyCode::Char('n'));
-        for _ in 0..4 {
+        take_harness_discovery(&rx);
+        for _ in 0..5 {
             press(&mut a, KeyCode::Tab);
         }
         press(&mut a, KeyCode::Enter);
@@ -4131,13 +6234,13 @@ mod tests {
     }
     #[test]
     fn unicode_cursor_and_multiline_vertical_movement_stay_on_boundaries() {
-        let s = "界a\nxy".to_string();
+        let s = "界a\nxyz".to_string();
         let mut cursor = "界".len();
         assert_eq!(previous_boundary(&s, cursor), 0);
         cursor = next_boundary(&s, 0);
         assert_eq!(cursor, 3);
-        let down = move_vertical(&s, 3, true);
-        assert_eq!(&s[down..down + 1], "y");
+        let down = crate::ui::move_description_vertical(&s, 3, true, &mut None);
+        assert_eq!(&s[down..down + 1], "z");
         let mut a = app();
         a.modal = Some(Modal::Create(CreateForm {
             title: s.clone(),
@@ -4149,7 +6252,77 @@ mod tests {
         let Some(Modal::Create(form)) = a.modal else {
             panic!()
         };
-        assert_eq!(form.title, "a\nxy");
+        assert_eq!(form.title, "a\nxyz");
+    }
+    #[test]
+    fn description_arrows_follow_soft_wrap_in_create_and_edit_forms() {
+        let description = format!("{} {}", "a".repeat(60), "b".repeat(20));
+        let first_line_cursor = 50;
+        for editing in [false, true] {
+            let mut a = app();
+            let form = CreateForm {
+                description: description.clone(),
+                description_cursor: first_line_cursor,
+                focus: 1,
+                ..Default::default()
+            };
+            a.modal = Some(if editing {
+                Modal::Edit {
+                    id: "b0".into(),
+                    form,
+                }
+            } else {
+                Modal::Create(form)
+            });
+            press(&mut a, KeyCode::Up);
+            let Some(Modal::Create(form) | Modal::Edit { form, .. }) = a.modal.as_ref() else {
+                panic!("form closed")
+            };
+            assert_eq!(form.description_cursor, first_line_cursor);
+            press(&mut a, KeyCode::Down);
+            let Some(Modal::Create(form) | Modal::Edit { form, .. }) = a.modal.as_ref() else {
+                panic!("form closed")
+            };
+            assert_eq!(form.description_cursor, description.len());
+            assert_eq!(form.description, description);
+            press(&mut a, KeyCode::Down);
+            press(&mut a, KeyCode::Up);
+            let Some(Modal::Create(form) | Modal::Edit { form, .. }) = a.modal.as_ref() else {
+                panic!("form closed")
+            };
+            assert_eq!(form.description_cursor, first_line_cursor);
+            assert_eq!(form.description, description);
+        }
+    }
+    #[test]
+    fn description_arrows_restore_column_across_short_explicit_line() {
+        let description = format!("{}\nhi\n{}", "a".repeat(55), "界".repeat(28));
+        let mut a = app();
+        a.modal = Some(Modal::Create(CreateForm {
+            description: description.clone(),
+            description_cursor: 50,
+            focus: 1,
+            ..Default::default()
+        }));
+        press(&mut a, KeyCode::Down);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.description_cursor, 58);
+        press(&mut a, KeyCode::Down);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.description_cursor, 59 + 25 * "界".len());
+        assert!(form.description.is_char_boundary(form.description_cursor));
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Up);
+        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+            panic!()
+        };
+        assert_eq!(form.description_cursor, 50);
+        assert_eq!(form.description, description);
     }
     #[test]
     fn create_success_refreshes_and_selects_created_id() {
@@ -4176,6 +6349,128 @@ mod tests {
             Ok(Request::Show(id, _)) => assert_eq!(id, "new-id"),
             _ => panic!("missing show follow-up"),
         }
+    }
+    #[test]
+    fn edit_loads_live_record_and_update_failure_keeps_draft_for_retry() {
+        let mut a = app();
+        let (requests, rx) = mpsc::channel();
+        let (out, responses) = mpsc::channel();
+        a.requests = requests;
+        a.responses = responses;
+        press(&mut a, KeyCode::Char('e'));
+        let seq = match rx.try_recv() {
+            Ok(Request::LoadEdit(id, seq)) if id == "b0" => seq,
+            _ => panic!("missing edit load"),
+        };
+        assert!(matches!(a.modal, Some(Modal::EditLoading { .. })));
+        out.send(Response::EditLoaded(
+            "b0".into(),
+            seq,
+            Ok(json!({
+                "id": "b0", "title": "Live title", "description": "Live\ntext",
+                "issue_type": "bug", "priority": 3, "notes": "untouched"
+            })),
+        ))
+        .unwrap();
+        a.receive();
+        let Some(Modal::Edit { id, form }) = a.modal.as_mut() else {
+            panic!("edit form not opened")
+        };
+        assert_eq!(id, "b0");
+        assert_eq!(
+            (
+                &*form.title,
+                &*form.description,
+                form.issue_type,
+                form.priority
+            ),
+            ("Live title", "Live\ntext", 1, 3)
+        );
+        form.title = "Changed".into();
+        form.focus = 4;
+        press(&mut a, KeyCode::Enter);
+        let Ok(Request::Update(input)) = rx.try_recv() else {
+            panic!("missing update request")
+        };
+        assert_eq!(input.id, "b0");
+        assert_eq!(input.fields.title, "Changed");
+        assert_eq!(input.fields.description, "Live\ntext");
+        assert_eq!(input.fields.issue_type, "bug");
+        assert_eq!(input.fields.priority, 3);
+        press(&mut a, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        out.send(Response::Updated(
+            "b0".into(),
+            Err(std::io::Error::other("offline")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(!a.mutation_busy);
+        assert!(matches!(&a.modal, Some(Modal::Edit { form, .. }) if form.title == "Changed"));
+        assert!(a.notice.as_deref().unwrap().contains("offline"));
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(Request::Update(_))));
+        out.send(Response::Updated("b0".into(), Ok(()))).unwrap();
+        a.receive();
+        assert!(a.modal.is_none());
+        assert_eq!(a.preferred_id.as_deref(), Some("b0"));
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+    }
+
+    #[test]
+    fn edit_cancellation_and_bad_live_record_do_not_write() {
+        let mut a = app();
+        let (requests, rx) = mpsc::channel();
+        let (out, responses) = mpsc::channel();
+        a.requests = requests;
+        a.responses = responses;
+        press(&mut a, KeyCode::Char('e'));
+        let seq = match rx.try_recv() {
+            Ok(Request::LoadEdit(_, seq)) => seq,
+            _ => panic!(),
+        };
+        out.send(Response::EditLoaded(
+            "b0".into(),
+            seq.wrapping_sub(1),
+            Ok(json!({"id": "b0", "title": "stale", "issue_type": "task", "priority": 2})),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(a.modal, Some(Modal::EditLoading { .. })));
+        out.send(Response::EditLoaded(
+            "b0".into(),
+            seq,
+            Ok(json!({
+                "id": "b0", "title": "Existing", "issue_type": "custom", "priority": 2
+            })),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(
+            &a.modal,
+            Some(Modal::EditLoading { error: Some(_), .. })
+        ));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Char('e'));
+        let seq = match rx.try_recv() {
+            Ok(Request::LoadEdit(_, seq)) => seq,
+            _ => panic!(),
+        };
+        out.send(Response::EditLoaded(
+            "b0".into(),
+            seq,
+            Ok(json!({
+                "id": "b0", "title": "Existing", "issue_type": "task", "priority": 2
+            })),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(matches!(a.modal, Some(Modal::Edit { .. })));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        assert!(rx.try_recv().is_err());
     }
     #[test]
     fn dropdown_confirm_commits_previewed_option() {
@@ -4332,16 +6627,105 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
     #[test]
+    fn enter_focuses_selected_worktree_without_repeating_pending_request() {
+        let (mut a, rx, tx) = connected_app();
+        a.worktrees_view = true;
+        a.worktrees = ["w1", "w2"]
+            .into_iter()
+            .map(|id| ManagedWorktree {
+                id: id.into(),
+                bead_id: "b1".into(),
+                parent_bead_id: None,
+                handoff_accepted: true,
+                bead_title: None,
+                bead_description: None,
+                branch: "ontrack/b1".into(),
+                target_branch: "main".into(),
+                workspace_id: id.into(),
+                status: worktrees::WorktreeStatus::Unmerged,
+                detail: None,
+            })
+            .collect();
+        a.selected_worktree = 1;
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(Request::FocusWorkspace(id)) if id == "w2"));
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::WorkspaceFocused("w2".into(), Ok(())))
+            .unwrap();
+        a.receive_at(Instant::now());
+        assert!(matches!(
+            a.worktrees_focus_feedback,
+            Some(WorktreeFocusFeedback::Success(ref message)) if message.contains("w2")
+        ));
+        assert!(!a.worktrees_focus_pending);
+    }
+    #[test]
+    fn enter_without_open_workspace_reports_error_without_request() {
+        let (mut a, rx, tx) = connected_app();
+        a.worktrees_view = true;
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.worktrees_focus_feedback,
+            Some(WorktreeFocusFeedback::Error(ref message)) if message.contains("Select")
+        ));
+        a.worktrees.push(ManagedWorktree {
+            id: "wt-1".into(),
+            bead_id: "b1".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/b1".into(),
+            target_branch: "main".into(),
+            workspace_id: "w1".into(),
+            status: worktrees::WorktreeStatus::WorkspaceClosed,
+            detail: None,
+        });
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.worktrees_focus_feedback,
+            Some(WorktreeFocusFeedback::Error(ref message)) if message.contains("closed")
+        ));
+        assert!(rx.try_recv().is_err());
+
+        a.worktrees[0].status = worktrees::WorktreeStatus::CheckoutRemoved;
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(
+            a.worktrees_focus_feedback,
+            Some(WorktreeFocusFeedback::Error(ref message)) if message.contains("closed")
+        ));
+        assert!(rx.try_recv().is_err());
+
+        a.worktrees[0].status = worktrees::WorktreeStatus::Integrated;
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(rx.try_recv(), Ok(Request::FocusWorkspace(id)) if id == "w1"));
+        tx.send(Response::WorkspaceFocused(
+            "w1".into(),
+            Err(std::io::Error::other("workspace missing")),
+        ))
+        .unwrap();
+        a.receive_at(Instant::now());
+        assert!(matches!(
+            a.worktrees_focus_feedback,
+            Some(WorktreeFocusFeedback::Error(ref message)) if message.contains("workspace missing")
+        ));
+    }
+    #[test]
     fn worktree_merge_requires_confirmation_and_cancel_has_no_side_effect() {
         let (mut a, rx, _) = connected_app();
         a.worktrees_view = true;
         a.worktrees.push(ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "b1".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
             branch: "ontrack/b1".into(),
             target_branch: "main".into(),
             workspace_id: "ws1".into(),
-            status: worktrees::WorktreeStatus::Unmerged,
+            status: worktrees::WorktreeStatus::InProgress,
             detail: None,
         });
         press(&mut a, KeyCode::Char('m'));
@@ -4357,6 +6741,36 @@ mod tests {
         assert!(
             matches!(rx.try_recv(), Ok(Request::WorktreeAction(id, WorktreeAction::RequestMerge)) if id == "wt-1")
         );
+    }
+    #[test]
+    fn restart_requires_explicit_confirmation_and_queues_selected_handoff() {
+        let (mut app, requests, _) = connected_app();
+        app.worktrees_view = true;
+        app.worktrees.push(ManagedWorktree {
+            id: "wt-1".into(),
+            bead_id: "b1".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: Some("Task".into()),
+            bead_description: None,
+            branch: "ontrack/b1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws1".into(),
+            status: worktrees::WorktreeStatus::NeedsAttention,
+            detail: None,
+        });
+        press(&mut app, KeyCode::Char('R'));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConfirmWorktree { action: 3, .. })
+        ));
+        assert!(requests.try_recv().is_err());
+        press(&mut app, KeyCode::Esc);
+        assert!(requests.try_recv().is_err());
+        press(&mut app, KeyCode::Char('R'));
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(requests.try_recv(), Ok(Request::RestartWorktree(id)) if id == "wt-1"));
+        assert!(app.mutation_busy);
     }
     #[test]
     fn worktree_worker_polls_without_queue_growth_and_surfaces_errors() {
@@ -4377,6 +6791,42 @@ mod tests {
         a.poll_worktrees(now + REFRESH_INTERVAL);
         assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
     }
+
+    #[test]
+    fn worktree_view_r_still_refreshes_worktrees() {
+        let (mut a, rx, _) = connected_app();
+        a.worktrees_view = true;
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn worktree_detail_scroll_is_separate_and_resets_on_selection() {
+        let (mut app, _, _) = connected_app();
+        app.worktrees_view = true;
+        app.detail_rect = Rect::new(40, 2, 40, 12);
+        app.worktrees = (0..2)
+            .map(|index| ManagedWorktree {
+                id: format!("wt-{index}"),
+                bead_id: format!("bead-{index}"),
+                parent_bead_id: None,
+                handoff_accepted: true,
+                bead_title: Some(format!("Title {index}")),
+                bead_description: Some("A long description".into()),
+                branch: format!("ontrack/bead-{index}"),
+                target_branch: "main".into(),
+                workspace_id: format!("ws-{index}"),
+                status: worktrees::WorktreeStatus::Unmerged,
+                detail: None,
+            })
+            .collect();
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.worktree_detail_offset, 10);
+        assert_eq!(app.detail_offset, 0);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.selected_worktree, 1);
+        assert_eq!(app.worktree_detail_offset, 0);
+    }
     #[test]
     fn worktree_policy_reconciles_outside_worktrees_view() {
         let (mut a, rx, _) = connected_app();
@@ -4392,12 +6842,44 @@ mod tests {
         assert!(!a.worktrees_view);
     }
     #[test]
+    fn tracked_worktree_reconciles_with_cleanup_preferences_disabled() {
+        let (mut app, rx, _) = connected_app();
+        app.worktrees_discovered = true;
+        app.worktrees.push(ManagedWorktree {
+            id: "tracked".into(),
+            bead_id: "bead".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: "ontrack/task".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws".into(),
+            status: worktrees::WorktreeStatus::Unmerged,
+            detail: None,
+        });
+        app.poll_worktrees(Instant::now());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Request::ReconcileWorktrees(CleanupPolicy {
+                auto_merge: false,
+                auto_merge_children: true,
+                auto_close_workspace: false,
+                auto_remove_checkout: false,
+            }))
+        ));
+    }
+    #[test]
     fn closed_bead_does_not_remove_its_managed_worktree() {
         let (mut a, _, tx) = connected_app();
         a.beads[0].status = "closed".into();
         let item = ManagedWorktree {
             id: "tracked-closed".into(),
             bead_id: a.beads[0].id.clone(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
             branch: "ontrack/b0".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),
@@ -4412,11 +6894,104 @@ mod tests {
         assert_eq!(a.beads[0].status, "closed");
     }
     #[test]
+    fn removed_checkout_is_hidden_on_refresh_without_hiding_attention_or_closed_workspace() {
+        let (mut app, _, tx) = connected_app();
+        let item = |id: &str, status| ManagedWorktree {
+            id: id.into(),
+            bead_id: format!("bead-{id}"),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: format!("ontrack/{id}"),
+            target_branch: "main".into(),
+            workspace_id: format!("ws-{id}"),
+            status,
+            detail: None,
+        };
+        let removed = item("removed", worktrees::WorktreeStatus::CheckoutRemoved);
+        let closed = item("closed", worktrees::WorktreeStatus::WorkspaceClosed);
+        let attention = item("attention", worktrees::WorktreeStatus::NeedsAttention);
+        app.worktrees = vec![removed.clone(), closed.clone()];
+        app.selected_worktree = 1;
+        app.worktree_detail_offset = 7;
+        tx.send(Response::Worktrees(Ok(vec![
+            removed.clone(),
+            closed.clone(),
+            attention.clone(),
+        ])))
+        .unwrap();
+        app.receive();
+        assert_eq!(
+            app.worktrees
+                .iter()
+                .map(|row| row.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["closed", "attention"]
+        );
+        assert_eq!(app.selected_worktree, 0);
+        assert_eq!(app.worktree_detail_offset, 7);
+        assert!(app.accepted_handoffs.contains(&removed.bead_id));
+
+        tx.send(Response::Worktrees(Ok(vec![
+            removed.clone(),
+            attention.clone(),
+        ])))
+        .unwrap();
+        app.receive();
+        assert_eq!(app.worktrees[0].id, attention.id);
+        assert_eq!(app.selected_worktree, 0);
+        assert_eq!(app.worktree_detail_offset, 0);
+
+        tx.send(Response::Worktrees(Ok(vec![removed]))).unwrap();
+        app.receive();
+        assert!(app.worktrees.is_empty());
+        assert_eq!(app.selected_worktree, 0);
+    }
+    #[test]
+    fn successful_checkout_removal_hides_selected_row_immediately() {
+        let (mut app, _, tx) = connected_app();
+        let item = |id: &str| ManagedWorktree {
+            id: id.into(),
+            bead_id: format!("bead-{id}"),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: format!("ontrack/{id}"),
+            target_branch: "main".into(),
+            workspace_id: format!("ws-{id}"),
+            status: worktrees::WorktreeStatus::Integrated,
+            detail: None,
+        };
+        let first = item("first");
+        let selected = item("selected");
+        let last = item("last");
+        app.worktrees = vec![first, selected.clone(), last.clone()];
+        app.selected_worktree = 1;
+        app.worktree_detail_offset = 9;
+        tx.send(Response::WorktreeChanged(Ok(ManagedWorktree {
+            status: worktrees::WorktreeStatus::CheckoutRemoved,
+            ..selected
+        })))
+        .unwrap();
+        app.receive();
+        assert_eq!(app.worktrees.len(), 2);
+        assert_eq!(app.worktrees[app.selected_worktree].id, last.id);
+        assert_eq!(app.worktree_detail_offset, 0);
+        assert!(app.accepted_handoffs.contains("bead-selected"));
+        assert!(app.notice.as_deref().unwrap().contains("CHECKOUT REMOVED"));
+    }
+    #[test]
     fn older_worktree_snapshot_cannot_overwrite_action_result() {
         let (mut a, _, tx) = connected_app();
         let before = ManagedWorktree {
             id: "wt".into(),
             bead_id: "b0".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
             branch: "ontrack/b0".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),
