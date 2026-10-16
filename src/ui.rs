@@ -3484,6 +3484,7 @@ mod tests {
             WorktreeStatus::Unmerged,
             WorktreeStatus::MergeQueued,
             WorktreeStatus::MergeRequested,
+            WorktreeStatus::MergeInProgress,
             WorktreeStatus::NeedsResolution,
             WorktreeStatus::Integrated,
             WorktreeStatus::WorkspaceClosed,

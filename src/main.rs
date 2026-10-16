@@ -30,13 +30,30 @@ fn main() -> Result<(), Box<dyn Error>> {
             uninstall::run(true)?;
             return Ok(());
         }
+        [command, state] if command == "status" => {
+            worktrees::report_activity(&std::env::current_dir()?, &state.to_string_lossy(), None)?;
+            println!("Worktree status report saved: {}", state.to_string_lossy());
+            return Ok(());
+        }
+        [command, state, detail] if command == "status" => {
+            worktrees::report_activity(
+                &std::env::current_dir()?,
+                &state.to_string_lossy(),
+                Some(&detail.to_string_lossy()),
+            )?;
+            println!("Worktree status report saved: {}", state.to_string_lossy());
+            return Ok(());
+        }
         [flag] if flag == "--help" || flag == "-h" => {
             println!(
-                "Usage: ontrack [uninstall [--yes]]\n\nRun without arguments to browse the current Beads workspace.\nUninstall removes the running OnTrack executable and user settings after confirmation."
+                "Usage: ontrack [uninstall [--yes] | status <working|merging|blocked|clear> [detail]]\n\nRun without arguments to browse the current Beads workspace.\nStatus reports advisory activity for the current managed checkout; clear removes it.\nUninstall removes the running OnTrack executable and user settings after confirmation."
             );
             return Ok(());
         }
-        _ => return Err("Usage: ontrack [uninstall [--yes]]".into()),
+        _ => return Err(
+            "Usage: ontrack [uninstall [--yes] | status <working|merging|blocked|clear> [detail]]"
+                .into(),
+        ),
     }
     startup::ensure_herdr_workspace()?;
     if !startup::ensure_workspace()? {
