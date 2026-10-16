@@ -19,7 +19,7 @@ const GOLD: Color = Color::Rgb(239, 183, 99);
 fn status_color(status: &str) -> Color {
     match status {
         "open" => TEAL,
-        "ready" => Color::Rgb(130, 205, 135),
+        "ready" => Color::Rgb(125, 168, 235),
         "closed" | "blocked" => Color::Rgb(255, 123, 123),
         "in_progress" => GOLD,
         "deferred" => Color::Rgb(145, 170, 220),
@@ -2849,6 +2849,7 @@ mod tests {
     fn stable_status_colors_and_scrolled_last_group_render_in_small_viewport() {
         assert_eq!(status_color("custom"), Color::Rgb(125, 168, 235));
         assert_eq!(status_color("open"), TEAL);
+        assert_eq!(status_color("ready"), Color::Rgb(125, 168, 235));
         assert_eq!(status_color("closed"), Color::Rgb(255, 123, 123));
         let mut a = app();
         a.beads = (0..15)
@@ -2865,6 +2866,36 @@ mod tests {
         assert!(shown.contains("CLOSED"));
         assert!(shown.contains("b14"));
         assert!(a.list_offset > 0);
+    }
+    #[test]
+    fn ready_group_and_row_use_blue_in_every_theme() {
+        for theme in Theme::ALL {
+            let mut a = app();
+            a.theme = theme;
+            a.beads[0].status = "open".into();
+            a.beads[0].data["labels"] = json!([crate::beads::READY_LABEL]);
+            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let top = a.list_rect.y;
+            let border_x = a.list_rect.x;
+            let ready = crate::theme::status_color(theme, "ready");
+            assert_eq!(buffer[(border_x, top)].fg, ready);
+            let row = top + 1;
+            let status_x = (0..96)
+                .find(|&x| {
+                    (x..x + 5)
+                        .map(|column| buffer[(column, row)].symbol())
+                        .collect::<String>()
+                        == "ready"
+                })
+                .expect("Ready row status is visible");
+            for x in status_x..status_x + 5 {
+                assert_eq!(buffer[(x, row)].fg, ready);
+            }
+        }
     }
     #[test]
     fn expanded_panes_enclose_rows_and_follow_status_order() {

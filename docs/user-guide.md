@@ -35,6 +35,8 @@ OnTrack checks the latest published release from its GitHub repository in the ba
 
 Issues are shown in rounded, colour-coded panes. Open appears first and closed last; other and unrecognized statuses remain grouped alphabetically. An empty status is labelled unknown. The Closed group starts collapsed on each launch, including when closed issues first appear after startup; other groups start expanded. Pane titles show the status and count. Each issue's type, priority, and status columns align across groups; the selected issue's details pane title shows its ID, status, and priority. Use `↑` / `↓` to move through visible issues and collapsed group headers. Expanded group headers are skipped, so navigation crosses directly between their issue rows; collapsed headers appear in order among the remaining issues, and movement clamps at the first and last target. A focused collapsed header is highlighted and does not select an issue or retain detail/delete identity. Press `Right` or `Space` on that header to expand the group and select its first issue; `Left` leaves it collapsed. Press `Space` on a selected issue or use `←` / `→` to collapse or expand its group; clicking a pane title also toggles that group. Collapsing a selected issue's group selects its collapsed header. If all groups are collapsed, headers remain keyboard targets; mouse title clicks can also reopen them. Refresh preserves focus on a collapsed header while its group still exists.
 
+Ready group borders and Ready status text are blue in every theme. The label remains visible alongside the colour.
+
 ## Browsing and controls
 
 ### Ready tasks and scheduler
