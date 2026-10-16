@@ -8,6 +8,8 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::atomic::{AtomicU64, Ordering},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
@@ -28,6 +30,65 @@ pub struct ManagedWorktree {
     pub workspace_id: String,
     pub status: WorktreeStatus,
     pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AgentDisplay {
+    pub id: String,
+    pub workspace_id: String,
+    pub detail: String,
+}
+
+/// Read-only presentation evidence, never passed to merge/cleanup eligibility.
+pub(crate) fn observe_agents() -> io::Result<Vec<AgentDisplay>> {
+    observe_agents_with(&std::env::current_dir()?, &mut SystemExecutor)
+}
+
+fn observe_agents_with(cwd: &Path, executor: &mut impl Executor) -> io::Result<Vec<AgentDisplay>> {
+    let registry = LaunchJournal::open(cwd)?;
+    let entries = registry.entries.clone();
+    drop(registry);
+    Ok(entries.iter().filter(|entry| entry["workspace_closed"] != true && entry["checkout_removed"] != true && entry["phase"] != "reserved").map(|entry| {
+        let identity = format!("workspace {} · pane {} · branch {}", entry["workspace_id"].as_str().unwrap_or("unknown"), entry["pane_id"].as_str().unwrap_or("unknown"), entry["branch"].as_str().unwrap_or("unknown"));
+        let status = observe_entry(entry, executor).unwrap_or_else(|error| format!("unknown — {error}"));
+        AgentDisplay {
+            id: entry["id"].as_str().unwrap_or_default().into(),
+            workspace_id: entry["workspace_id"].as_str().unwrap_or_default().into(),
+            detail: format!("Agent observation (display only): {status} · {identity}. Not completion, retry, merge, or cleanup authorization."),
+        }
+    }).collect())
+}
+
+fn observe_entry(entry: &Value, executor: &mut impl Executor) -> io::Result<String> {
+    let pane = field(entry, "pane_id")?;
+    if pane.starts_with('-')
+        || !pane
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte))
+    {
+        return Err(error("Unsafe recorded pane identity"));
+    }
+    let result = envelope(&executor.run(&["agent", "get", pane])?)?;
+    let agent = &result["agent"];
+    if result["type"] != "agent_info"
+        || agent["pane_id"] != entry["pane_id"]
+        || agent["workspace_id"] != entry["workspace_id"]
+        || agent["agent"] != entry["agent"]
+    {
+        return Err(error("Agent pane/workspace/kind identity changed"));
+    }
+    if !entry["agent_session"].is_object() || agent["agent_session"] != entry["agent_session"] {
+        return Err(error("Recorded native agent session is missing or changed"));
+    }
+    if entry["initial_terminal_id"].is_string()
+        && agent["terminal_id"] != entry["initial_terminal_id"]
+    {
+        return Err(error("Recorded terminal identity changed"));
+    }
+    Ok(match agent["agent_status"].as_str() {
+        Some(status @ ("working" | "blocked" | "idle" | "done" | "error")) => status.to_owned(),
+        _ => "unknown".into(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -263,8 +324,9 @@ impl Registry {
             .truncate(false)
             .open(lock_path)?;
         // std::fs::File::try_lock requires Rust 1.89; keep the project's 1.88 MSRV.
-        fs2::FileExt::try_lock_exclusive(&lock)
-            .map_err(|e| error(format!("OnTrack worktree registry is busy: {e}")))?;
+        fs2::FileExt::try_lock_exclusive(&lock).map_err(|e| {
+            io::Error::new(e.kind(), format!("OnTrack worktree registry is busy: {e}"))
+        })?;
         let path = directory.join("registry.json");
         reject_symlink(&path)?;
         let entries = match fs::read(&path) {
@@ -373,11 +435,80 @@ fn field<'a>(entry: &'a Value, key: &str) -> io::Result<&'a str> {
 }
 
 pub(crate) struct LaunchJournal {
-    registry: Registry,
-    index: usize,
+    checkout: PathBuf,
+    repo: RepositoryIdentity,
+    intent: Value,
+    claim: String,
 }
 
 impl LaunchJournal {
+    fn open(checkout: &Path) -> io::Result<Registry> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match Registry::open(checkout) {
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    fn handle(checkout: &Path, registry: &Registry, intent: Value) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self {
+            checkout: checkout.to_path_buf(),
+            repo: registry.repo.clone(),
+            intent,
+            claim: format!(
+                "{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ),
+        }
+    }
+
+    fn transaction<T>(&self, update: impl FnOnce(&mut Value) -> io::Result<T>) -> io::Result<T> {
+        let mut registry = Self::open(&self.checkout)?;
+        if registry.repo != self.repo {
+            return Err(error("Launch journal repository identity changed"));
+        }
+        let index = registry.index(field(&self.intent, "id")?)?;
+        let entry = &mut registry.entries[index];
+        for key in [
+            "id",
+            "bead_id",
+            "branch",
+            "target_branch",
+            "target_path",
+            "parent_bead_id",
+            "common_dir",
+            "main_root",
+            "source_workspace",
+            "agent",
+            "base",
+        ] {
+            if entry[key] != self.intent[key] {
+                return Err(error(format!("Launch journal intent changed: {key}")));
+            }
+        }
+        if entry["launch_owner"] != self.intent["launch_owner"]
+            && entry["launch_owner"].as_str() != Some(&self.claim)
+        {
+            return Err(error(
+                "Reserved parent launch has been claimed by another handoff",
+            ));
+        }
+        let result = update(entry)?;
+        registry.save()?;
+        Ok(result)
+    }
     pub(crate) fn begin(
         checkout: &Path,
         bead: &Value,
@@ -387,7 +518,8 @@ impl LaunchJournal {
         workspace: &str,
     ) -> io::Result<Self> {
         let bead_id = field(bead, "id")?;
-        let mut registry = Registry::open(checkout)?;
+        let checkout = checkout.canonicalize()?;
+        let registry = Self::open(&checkout)?;
         if let Some(index) = registry
             .entries
             .iter()
@@ -400,8 +532,12 @@ impl LaunchJournal {
             {
                 return Err(error("Reserved parent handoff identity changed"));
             }
-            verify(&registry.repo, entry)?;
-            return Ok(Self { registry, index });
+            let journal = Self::handle(&checkout, &registry, entry.clone());
+            drop(registry);
+            // A snapshot is not authority to start: phase() atomically claims
+            // the still-reserved entry immediately before the start command.
+            verify(&journal.repo, &journal.intent)?;
+            return Ok(journal);
         }
         if registry
             .entries
@@ -410,12 +546,14 @@ impl LaunchJournal {
         {
             return Err(error("An OnTrack worktree already exists for this task"));
         }
-        let default = default_branch(&registry.repo)?;
-        clean(&registry.repo.main_root)?;
+        let repo = registry.repo.clone();
+        let entries = registry.entries.clone();
+        drop(registry);
+        let default = default_branch(&repo)?;
+        clean(&repo.main_root)?;
         let parent_bead_id = bead["parent"].as_str();
         let (target, target_path, base) = if let Some(parent_id) = parent_bead_id {
-            let parents: Vec<_> = registry
-                .entries
+            let parents: Vec<_> = entries
                 .iter()
                 .filter(|entry| {
                     entry["bead_id"] == parent_id
@@ -432,7 +570,7 @@ impl LaunchJournal {
             let parent = parents[0];
             let path = Path::new(field(parent, "path")?).canonicalize()?;
             if path.to_str() != parent["path"].as_str()
-                || SystemExecutor.git_identity(&path)? != registry.repo
+                || SystemExecutor.git_identity(&path)? != repo
                 || branch(&path)? != field(parent, "branch")?
             {
                 return Err(error(
@@ -443,10 +581,9 @@ impl LaunchJournal {
             let base = tip(&path, "HEAD")?;
             (field(parent, "branch")?.to_owned(), Some(path), base)
         } else {
-            (default, None, tip(&registry.repo.main_root, "HEAD")?)
+            (default, None, tip(&repo.main_root, "HEAD")?)
         };
-        if registry
-            .entries
+        if entries
             .iter()
             .any(|e| e["id"] == name || e["branch"] == launch_branch)
         {
@@ -456,7 +593,7 @@ impl LaunchJournal {
         }
         // Also catch branches without an open Herdr workspace.
         if git_output(
-            &registry.repo.main_root,
+            &repo.main_root,
             &[
                 "show-ref",
                 "--verify",
@@ -467,6 +604,43 @@ impl LaunchJournal {
         .success()
         {
             return Err(error("Launch branch already exists; refusing reuse"));
+        }
+        // Reload after all Git verification; the short write transaction checks
+        // competing per-Bead intents and the parent snapshot before saving.
+        let mut registry = Self::open(&checkout)?;
+        if registry.repo != repo
+            || registry.entries.iter().any(|entry| {
+                (entry["bead_id"] == bead_id && entry["checkout_removed"] != true)
+                    || entry["id"] == name
+                    || entry["branch"] == launch_branch
+            })
+        {
+            return Err(error(
+                "An OnTrack worktree/launch intent already exists for this task or branch",
+            ));
+        }
+        if let Some(parent_id) = parent_bead_id {
+            let previous = entries
+                .iter()
+                .find(|entry| entry["bead_id"] == parent_id && entry["checkout_removed"] != true);
+            let current = registry
+                .entries
+                .iter()
+                .find(|entry| entry["bead_id"] == parent_id && entry["checkout_removed"] != true);
+            for key in [
+                "id",
+                "branch",
+                "path",
+                "phase",
+                "workspace_closed",
+                "checkout_removed",
+            ] {
+                if previous.map(|entry| &entry[key]) != current.map(|entry| &entry[key]) {
+                    return Err(error(
+                        "Parent handoff changed during child launch validation",
+                    ));
+                }
+            }
         }
         let index = registry.entries.len();
         registry.entries.push(json!({
@@ -481,82 +655,113 @@ impl LaunchJournal {
             "workspace_closed":false, "checkout_removed":false,
             "detail":"Launch intent persisted before Herdr creation. If interrupted, inspect the raw response and Herdr/Git before recovery; never blindly relaunch."
         }));
+        let journal = Self::handle(&checkout, &registry, registry.entries[index].clone());
+        registry.entries[index]["launch_owner"] = json!(journal.claim);
         registry.save()?;
-        Ok(Self { registry, index })
+        Ok(Self {
+            intent: registry.entries[index].clone(),
+            ..journal
+        })
     }
 
     pub(crate) fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()> {
-        let entry = &mut self.registry.entries[self.index];
-        entry["responses"][kind] = json!(String::from_utf8_lossy(bytes));
-        if let Ok(result) = envelope(bytes) {
-            if result["agent"]["agent_session"].is_object() {
-                entry["agent_session"] = result["agent"]["agent_session"].clone();
-            }
-            if kind == "ready" {
-                if result["agent"]["state_change_seq"].is_u64() {
-                    entry["initial_lifecycle_seq"] = result["agent"]["state_change_seq"].clone();
+        self.transaction(|entry| {
+            entry["responses"][kind] = json!(String::from_utf8_lossy(bytes));
+            if let Ok(result) = envelope(bytes) {
+                if result["agent"]["agent_session"].is_object() {
+                    entry["agent_session"] = result["agent"]["agent_session"].clone();
                 }
-                if result["agent"]["terminal_id"]
-                    .as_str()
-                    .is_some_and(|id| !id.is_empty())
-                {
-                    entry["initial_terminal_id"] = result["agent"]["terminal_id"].clone();
+                if kind == "ready" {
+                    if result["agent"]["state_change_seq"].is_u64() {
+                        entry["initial_lifecycle_seq"] =
+                            result["agent"]["state_change_seq"].clone();
+                    }
+                    if result["agent"]["terminal_id"]
+                        .as_str()
+                        .is_some_and(|id| !id.is_empty())
+                    {
+                        entry["initial_terminal_id"] = result["agent"]["terminal_id"].clone();
+                    }
                 }
             }
-        }
-        self.registry.save()
+            Ok(())
+        })
     }
 
     pub(crate) fn created(&mut self, result: &Value) -> io::Result<()> {
         // Persist received handles BEFORE filesystem identity checks or agent start.
-        let entry = &mut self.registry.entries[self.index];
-        entry["workspace_id"] = result["workspace"]["workspace_id"].clone();
-        entry["pane_id"] = result["root_pane"]["pane_id"].clone();
-        entry["path"] = result["worktree"]["path"].clone();
-        entry["phase"] = json!("created");
-        self.registry.save()?;
-        let entry = &self.registry.entries[self.index];
-        let source = Path::new(field(entry, "path")?).canonicalize()?;
-        if source == self.registry.repo.main_root || source.to_str() != entry["path"].as_str() {
+        let entry = self.transaction(|entry| {
+            entry["workspace_id"] = result["workspace"]["workspace_id"].clone();
+            entry["pane_id"] = result["root_pane"]["pane_id"].clone();
+            entry["path"] = result["worktree"]["path"].clone();
+            entry["phase"] = json!("created");
+            Ok(entry.clone())
+        })?;
+        let source = Path::new(field(&entry, "path")?).canonicalize()?;
+        if source == self.repo.main_root || source.to_str() != entry["path"].as_str() {
             return Err(error(
                 "Created checkout path is not a distinct canonical path",
             ));
         }
         let identity = SystemExecutor.git_identity(&source)?;
-        if identity != self.registry.repo
-            || branch(&source)? != field(entry, "branch")?
-            || tip(&source, "HEAD")? != field(entry, "base")?
+        if identity != self.repo
+            || branch(&source)? != field(&entry, "branch")?
+            || tip(&source, "HEAD")? != field(&entry, "base")?
         {
             return Err(error(
                 "Created checkout identity, branch, or launch base does not match intent; no agent started",
             ));
         }
         clean(&source)?;
-        self.phase("created_verified")
+        self.transaction(|current| {
+            for key in ["workspace_id", "pane_id", "path", "phase"] {
+                if current[key] != entry[key] {
+                    return Err(error("Created launch evidence changed during verification"));
+                }
+            }
+            current["phase"] = json!("created_verified");
+            Ok(())
+        })
     }
 
     pub(crate) fn phase(&mut self, phase: &str) -> io::Result<()> {
-        let entry = &mut self.registry.entries[self.index];
-        entry["phase"] = json!(phase);
-        if phase == "active" {
-            entry["detail"] = Value::Null;
-        }
-        self.registry.save()
+        self.transaction(|entry| {
+            if self.intent["phase"] == "reserved" && phase == "agent_start_possibly_sent" {
+                if entry["phase"] != "reserved" {
+                    return Err(error(
+                        "Reserved parent is no longer available for agent start",
+                    ));
+                }
+                for key in ["workspace_id", "pane_id", "path"] {
+                    if entry[key] != self.intent[key] {
+                        return Err(error("Reserved parent target changed before start"));
+                    }
+                }
+                entry["launch_owner"] = json!(self.claim);
+            }
+            entry["phase"] = json!(phase);
+            if phase == "active" {
+                entry["detail"] = Value::Null;
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn failed(&mut self, message: &str) -> io::Result<()> {
-        self.registry.entries[self.index]["detail"] = json!(message);
-        self.registry.save()
+        self.transaction(|entry| {
+            entry["detail"] = json!(message);
+            Ok(())
+        })
     }
 
     pub(crate) fn base_branch(&self) -> Option<&str> {
-        self.registry.entries[self.index]["parent_bead_id"]
+        self.intent["parent_bead_id"]
             .as_str()
-            .and_then(|_| self.registry.entries[self.index]["target_branch"].as_str())
+            .and_then(|_| self.intent["target_branch"].as_str())
     }
 
     pub(crate) fn reserved_target(&self) -> Option<(String, String, String, PathBuf)> {
-        let entry = &self.registry.entries[self.index];
+        let entry = &self.intent;
         if entry["phase"] != "reserved" {
             return None;
         }
@@ -570,7 +775,7 @@ impl LaunchJournal {
 }
 
 pub fn reserved_name(bead_id: &str) -> io::Result<Option<String>> {
-    let registry = Registry::open(&std::env::current_dir()?)?;
+    let registry = LaunchJournal::open(&std::env::current_dir()?)?;
     registry
         .entries
         .iter()
@@ -1157,8 +1362,13 @@ fn list_with(cwd: &Path, executor: &mut impl Executor) -> io::Result<Vec<Managed
 }
 
 pub fn pending_child_handoffs(parent_id: &str) -> io::Result<Vec<String>> {
-    Ok(list()?
-        .into_iter()
+    let registry = LaunchJournal::open(&std::env::current_dir()?)?;
+    let entries = registry.entries.clone();
+    let repo = registry.repo.clone();
+    drop(registry);
+    Ok(entries
+        .iter()
+        .map(|entry| inspect(&repo, entry))
         .filter(|item| {
             item.parent_bead_id.as_deref() == Some(parent_id)
                 && !matches!(
@@ -2544,6 +2754,208 @@ mod tests {
         })
     }
 
+    #[test]
+    fn interleaved_journals_preserve_both_latest_entries_and_captured_context() {
+        let fixture = Fixture::new();
+        let mut first =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        let mut second = LaunchJournal::begin(
+            &fixture.main,
+            &json!({"id":"Bead-2","title":"Second"}),
+            "ontrack/second",
+            "codex",
+            "second",
+            "wMain",
+        )
+        .unwrap();
+        first.capture("create", b"first response").unwrap();
+        second.phase("agent_start_possibly_sent").unwrap();
+        first.failed("first recovery").unwrap();
+        second.capture("start", b"second response").unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries.len(), 2);
+        assert_eq!(registry.entries[0]["responses"]["create"], "first response");
+        assert_eq!(
+            registry.entries[0]["bead_description"],
+            test_bead()["description"]
+        );
+        assert_eq!(registry.entries[0]["detail"], "first recovery");
+        assert_eq!(registry.entries[1]["responses"]["start"], "second response");
+        assert_eq!(registry.entries[1]["phase"], "agent_start_possibly_sent");
+    }
+
+    #[test]
+    fn paused_real_launch_intent_does_not_prevent_second_journal_progress() {
+        use std::sync::{Arc, Barrier, mpsc};
+        let fixture = Fixture::new();
+        let main = fixture.main.clone();
+        let (tx, rx) = mpsc::channel();
+        let gate = Arc::new(Barrier::new(2));
+        let worker_gate = gate.clone();
+        let first = std::thread::spawn(move || {
+            let mut journal =
+                LaunchJournal::begin(&main, &test_bead(), BRANCH, "opencode", ID, "wMain").unwrap();
+            tx.send(()).unwrap();
+            worker_gate.wait();
+            journal.capture("create", b"first resumes").unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut second = LaunchJournal::begin(
+            &fixture.main,
+            &json!({"id":"Bead-2"}),
+            "ontrack/second",
+            "opencode",
+            "second",
+            "wMain",
+        )
+        .unwrap();
+        second.capture("create", b"second progressed").unwrap();
+        gate.wait();
+        first.join().unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["responses"]["create"], "first resumes");
+        assert_eq!(
+            registry.entries[1]["responses"]["create"],
+            "second progressed"
+        );
+    }
+
+    #[test]
+    fn journal_contention_exhaustion_is_bounded_and_preserves_the_last_durable_phase() {
+        let fixture = Fixture::new();
+        let mut journal =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(
+            journal
+                .phase("agent_start_possibly_sent")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(registry.entries[0]["phase"], "create_possibly_sent");
+        drop(registry);
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["phase"], "create_possibly_sent");
+    }
+
+    #[test]
+    fn two_reserved_parent_resumes_have_exactly_one_atomic_start_claim() {
+        use std::sync::{Arc, Barrier};
+        let fixture = Fixture::new();
+        let mut initial =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                BRANCH,
+                fixture.source.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        initial.created(&json!({"workspace":{"workspace_id":"wTask"},"root_pane":{"pane_id":"wTask:p1"},"worktree":{"path":fixture.source,"branch":BRANCH}})).unwrap();
+        initial.phase("reserved").unwrap();
+        let first =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        let second =
+            LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
+                .unwrap();
+        let gate = Arc::new(Barrier::new(2));
+        let workers: Vec<_> = [first, second]
+            .into_iter()
+            .map(|mut journal| {
+                let gate = gate.clone();
+                std::thread::spawn(move || {
+                    gate.wait();
+                    if journal.phase("agent_start_possibly_sent").is_ok() {
+                        journal
+                            .capture("start", b"only the winning handoff started")
+                            .unwrap();
+                        true
+                    } else {
+                        assert!(journal.failed("loser must not overwrite winner").is_err());
+                        false
+                    }
+                })
+            })
+            .collect();
+        assert_eq!(
+            workers
+                .into_iter()
+                .map(|worker| usize::from(worker.join().unwrap()))
+                .sum::<usize>(),
+            1
+        );
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries.len(), 1);
+        assert_eq!(registry.entries[0]["phase"], "agent_start_possibly_sent");
+        assert_eq!(
+            registry.entries[0]["responses"]["start"],
+            "only the winning handoff started"
+        );
+        assert_ne!(
+            registry.entries[0]["detail"],
+            "loser must not overwrite winner"
+        );
+    }
+
+    #[test]
+    fn display_observations_validate_session_and_never_mutate_durable_status() {
+        let fixture = Fixture::managed();
+        let before = fs::read(fixture.main.join(".git/ontrack-worktrees/registry.json")).unwrap();
+        for mode in [
+            "working",
+            "blocked",
+            "idle",
+            "done",
+            "error",
+            "unknown",
+            "missing",
+            "session",
+            "pane",
+            "poll_error",
+        ] {
+            let mut executor = Fake::default();
+            let mut agent = fixture.agent(12, mode);
+            match mode {
+                "missing" => agent["result"]["agent"]["agent_status"] = Value::Null,
+                "session" => {
+                    agent["result"]["agent"]["agent_session"]["value"] = json!("replacement")
+                }
+                "pane" => agent["result"]["agent"]["pane_id"] = json!("other"),
+                _ => {}
+            }
+            if mode == "poll_error" {
+                executor.outputs.push_back(Err(error("offline")));
+            } else {
+                executor.json(agent);
+            }
+            let rows = observe_agents_with(&fixture.main, &mut executor).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(rows[0].id, ID);
+            assert!(rows[0].detail.contains("workspace wTask"));
+            assert!(rows[0].detail.contains("pane wTask:p1"));
+            assert!(rows[0].detail.contains(
+                if matches!(mode, "missing" | "session" | "pane" | "poll_error") {
+                    "unknown"
+                } else {
+                    mode
+                }
+            ));
+            assert_eq!(
+                fs::read(fixture.main.join(".git/ontrack-worktrees/registry.json")).unwrap(),
+                before
+            );
+        }
+    }
+
     struct Fixture {
         directory: PathBuf,
         main: PathBuf,
@@ -2786,13 +3198,19 @@ mod tests {
     }
 
     #[test]
-    fn intent_is_durable_before_creation_and_exclusively_locked() {
+    fn intent_is_durable_and_only_write_transactions_hold_the_exclusive_lock() {
         let fixture = Fixture::new();
         let journal =
             LaunchJournal::begin(&fixture.main, &test_bead(), BRANCH, "opencode", ID, "wMain")
                 .unwrap();
         let persisted: Value = serde_json::from_slice(
-            &fs::read(journal.registry.directory.join("registry.json")).unwrap(),
+            &fs::read(
+                journal
+                    .repo
+                    .common_dir
+                    .join("ontrack-worktrees/registry.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(persisted["version"], 1);
@@ -2806,13 +3224,19 @@ mod tests {
             "First line\nSecond line"
         );
         assert!(!fixture.source.exists());
+        let registry = Registry::open(&fixture.main).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "worktrees::tests::registry_lock_child"])
+            .env("ONTRACK_TEST_LOCK_REPOSITORY", &fixture.main)
+            .env("ONTRACK_TEST_LOCK_EXPECT_BUSY", "1")
+            .output()
+            .unwrap();
         assert!(
-            Registry::open(&fixture.main)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("busy")
+            child.status.success(),
+            "{}",
+            String::from_utf8_lossy(&child.stdout)
         );
+        drop(registry);
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "worktrees::tests::registry_lock_child"])
             .env("ONTRACK_TEST_LOCK_REPOSITORY", &fixture.main)
@@ -2823,6 +3247,9 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&child.stdout)
         );
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["cross_process_write"], true);
+        drop(registry);
         drop(journal);
         assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
         assert!(!fixture.status().handoff_accepted);
@@ -2871,13 +3298,14 @@ mod tests {
     #[test]
     fn registry_lock_child() {
         if let Some(repository) = std::env::var_os("ONTRACK_TEST_LOCK_REPOSITORY") {
-            assert!(
-                Registry::open(Path::new(&repository))
-                    .err()
-                    .unwrap()
-                    .to_string()
-                    .contains("busy")
-            );
+            let registry = Registry::open(Path::new(&repository));
+            if std::env::var_os("ONTRACK_TEST_LOCK_EXPECT_BUSY").is_some() {
+                assert_eq!(registry.err().unwrap().kind(), io::ErrorKind::WouldBlock);
+            } else {
+                let mut registry = registry.unwrap();
+                registry.entries[0]["cross_process_write"] = json!(true);
+                registry.save().unwrap();
+            }
         }
     }
 
@@ -3670,12 +4098,10 @@ mod tests {
         journal
             .capture("ready", ready.to_string().as_bytes())
             .unwrap();
-        assert_eq!(journal.registry.entries[0]["initial_lifecycle_seq"], 10);
-        assert_eq!(
-            journal.registry.entries[0]["initial_terminal_id"],
-            "term-task"
-        );
-        assert!(journal.registry.entries[0]["agent_session"].is_null());
+        let registry = Registry::open(&fixture.main).unwrap();
+        assert_eq!(registry.entries[0]["initial_lifecycle_seq"], 10);
+        assert_eq!(registry.entries[0]["initial_terminal_id"], "term-task");
+        assert!(registry.entries[0]["agent_session"].is_null());
     }
 
     #[test]

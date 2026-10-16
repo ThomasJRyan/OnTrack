@@ -8,6 +8,7 @@ mod hotkeys;
 mod release;
 mod screenshots;
 mod settings;
+mod startup;
 mod terminal;
 mod theme;
 mod ui;
@@ -18,7 +19,9 @@ mod worktrees;
 use std::{error::Error, io};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    beads::ensure_workspace()?;
+    if !startup::ensure_workspace()? {
+        return Ok(());
+    }
     let mut terminal = terminal::init()?;
     let result = app::run(&mut terminal);
     let restore_result = terminal::restore(&mut terminal);

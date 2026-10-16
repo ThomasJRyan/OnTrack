@@ -25,6 +25,25 @@ use std::{
     time::{Duration, Instant},
 };
 
+fn spawn_epic_planning(id: String, replies: mpsc::Sender<Response>) {
+    thread::spawn(move || {
+        let session = match crate::epic::launch(&id) {
+            Ok(session) => session,
+            Err(error) => {
+                let _ = replies.send(Response::EpicLaunched(id, Err(error)));
+                return;
+            }
+        };
+        if replies
+            .send(Response::EpicLaunched(id.clone(), Ok(session.clone())))
+            .is_ok()
+        {
+            let result = crate::epic::finish(&session, &id);
+            let _ = replies.send(Response::EpicFinished(id, result));
+        }
+    });
+}
+
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(super) enum Request {
@@ -33,6 +52,7 @@ pub(super) enum Request {
     LoadEdit(String, u64),
     Create(CreateBead),
     CreateEpic(CreateBead, Option<String>),
+    GenerateEpic(String),
     CreateChild(CreateBead, String),
     Update(UpdateBead),
     SetReady(String, bool),
@@ -47,6 +67,7 @@ pub(super) enum Request {
     WorktreeAction(String, WorktreeAction),
     RestartWorktree(String),
     ReconcileWorktrees(CleanupPolicy),
+    ObserveAgents,
     CheckRelease,
     PrepareUpdate,
     InstallRelease(Available, Arc<AtomicBool>),
@@ -69,6 +90,7 @@ pub(super) enum Response {
     WorkspaceFocused(String, std::io::Result<()>),
     WorktreeChanged(std::io::Result<ManagedWorktree>),
     WorktreeRestarted(std::io::Result<String>),
+    AgentsObserved(std::io::Result<Vec<worktrees::AgentDisplay>>),
     ReleaseChecked(Result<release::CheckResult, String>),
     UpdatePrepared(std::io::Result<Check>),
     ReleaseInstalled(std::io::Result<()>),
@@ -97,7 +119,9 @@ pub struct App {
     pub(super) edit_seq: u64,
     pub(super) harness_seq: u64,
     pub(super) launch_seq: u64,
-    pub(super) handoff: Option<PendingHandoff>,
+    pub(super) handoff: HashMap<u64, PendingHandoff>,
+    /// Accepted agent starts not yet acknowledged by a fresh durable scan.
+    pub(crate) handoff_capacity: HashSet<String>,
     pub toast: Option<Toast>,
     pub release_result: Option<Result<release::CheckResult, String>>,
     pub release_inflight: bool,
@@ -130,8 +154,13 @@ pub struct App {
     pub worktrees_refresh_pending: bool,
     pub worktree_action_pending: bool,
     pub worktrees_next_refresh: Instant,
+    pub(crate) agent_observation_inflight: bool,
+    pub(crate) next_agent_observation: Instant,
     pub notice: Option<String>,
     pub mutation_busy: bool,
+    /// Ready keeps mutation exclusion without locking browser input.
+    pub ready_pending: bool,
+    pub planning_epics: HashSet<String>,
     pub modal_ready: bool,
     pub(crate) paste_seq: u64,
     pub(crate) paste_pending: bool,
@@ -154,6 +183,10 @@ pub enum Modal {
     Edit {
         id: String,
         form: CreateForm,
+    },
+    ConfirmGenerateEpic {
+        id: String,
+        title: String,
     },
     ConfirmDelete {
         id: String,
@@ -361,128 +394,161 @@ fn cycle_theme(theme: Theme, forward: bool) -> Theme {
         .unwrap_or(0);
     Theme::ALL[cycle_choice(index, Theme::ALL.len(), forward)]
 }
-impl App {
-    fn new() -> Self {
-        let (tx, rx) = mpsc::channel::<Request>();
-        let (out, responses) = mpsc::channel();
-        let updates_out = out.clone();
+fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
+    let response = match request {
+        Request::List => Response::List(beads::list_beads()),
+        Request::Show(id, seq) => Response::Show(id.clone(), seq, beads::show_bead(&id)),
+        Request::LoadEdit(id, seq) => Response::EditLoaded(id.clone(), seq, beads::show_bead(&id)),
+        Request::Create(input) => Response::Created(beads::create_bead(&input)),
+        Request::CreateEpic(input, parent) => match parent.as_deref().map_or_else(
+            || beads::create_bead(&input),
+            |id| beads::create_child(&input, id),
+        ) {
+            Ok(id) => {
+                if out.send(Response::Created(Ok(id.clone()))).is_err() {
+                    return;
+                }
+                spawn_epic_planning(id, out.clone());
+                return;
+            }
+            Err(error) => Response::Created(Err(error)),
+        },
+        Request::GenerateEpic(id) => {
+            spawn_epic_planning(id, out.clone());
+            return;
+        }
+        Request::CreateChild(input, parent) => {
+            Response::Created(beads::create_child(&input, &parent))
+        }
+        Request::Update(input) => Response::Updated(input.id.clone(), beads::update_bead(&input)),
+        Request::ReadScreenshot(seq) => {
+            Response::ScreenshotRead(seq, screenshots::read_clipboard())
+        }
+        Request::SetReady(id, ready) => Response::ReadySet(
+            id.clone(),
+            ready,
+            beads::set_ready(&id, ready).map(|()| vec![id]),
+        ),
+        Request::SetEpicReady(id, ready, known_handoffs, protected_handoffs) => Response::ReadySet(
+            id.clone(),
+            ready,
+            beads::set_epic_ready(&id, ready, &known_handoffs, &protected_handoffs),
+        ),
+        Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
+        Request::DiscoverHarnesses(seq) => {
+            Response::HarnessesDiscovered(seq, crate::herdr::installed_harnesses())
+        }
+        Request::Discover(seq) => Response::Discovered(seq, crate::herdr::discover()),
+        Request::Launch(seq, context, agent, bead) => {
+            Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
+        }
+        Request::LaunchReady(seq, context, agent, bead) => {
+            Response::Launched(seq, crate::herdr::launch_ready(&context, &agent, &bead))
+        }
+        Request::ListWorktrees => Response::Worktrees(worktrees::list()),
+        Request::FocusWorkspace(id) => {
+            Response::WorkspaceFocused(id.clone(), crate::herdr::focus_workspace(&id))
+        }
+        Request::WorktreeAction(id, action) => {
+            Response::WorktreeChanged(worktrees::act(&id, action))
+        }
+        Request::RestartWorktree(id) => Response::WorktreeRestarted(worktrees::restart(&id)),
+        Request::ReconcileWorktrees(policy) => Response::Worktrees(worktrees::reconcile(policy)),
+        Request::ObserveAgents => Response::AgentsObserved(worktrees::observe_agents()),
+        Request::CheckRelease => {
+            let replies = out.clone();
+            thread::spawn(move || {
+                let _ = replies.send(Response::ReleaseChecked(release::check()));
+            });
+            return;
+        }
+        Request::PrepareUpdate => {
+            let replies = out.clone();
+            thread::spawn(move || {
+                let _ = replies.send(Response::UpdatePrepared(update::check()));
+            });
+            return;
+        }
+        Request::InstallRelease(release, cancel) => {
+            let replies = out.clone();
+            thread::spawn(move || {
+                let _ = replies.send(Response::ReleaseInstalled(update::install(
+                    &release, &cancel,
+                )));
+            });
+            return;
+        }
+    };
+    let _ = out.send(response);
+}
+
+/// Browser bd, managed work, and independent Herdr jobs never share a FIFO.
+/// Detached jobs are not joined or cancelled when the terminal app exits.
+fn start_workers(
+    execute: impl Fn(Request, &mpsc::Sender<Response>) + Send + Sync + 'static,
+) -> (
+    mpsc::Sender<Request>,
+    mpsc::Receiver<Response>,
+    mpsc::Sender<Response>,
+) {
+    let execute = Arc::new(execute);
+    let (requests, incoming) = mpsc::channel();
+    let (out, responses) = mpsc::channel();
+    let (browser, browser_in) = mpsc::channel();
+    let (managed, managed_in) = mpsc::channel();
+    let (ready, ready_in) = mpsc::channel();
+    for lane in [browser_in, managed_in, ready_in] {
+        let execute = execute.clone();
+        let out = out.clone();
         thread::spawn(move || {
-            let _ = updates_out.send(Response::UpdateAvailable(updates::available_version()));
+            while let Ok(request) = lane.recv() {
+                execute(request, &out);
+            }
         });
-        thread::spawn(move || {
-            while let Ok(request) = rx.recv() {
-                let response = match request {
-                    Request::List => Response::List(beads::list_beads()),
-                    Request::Show(id, seq) => {
-                        Response::Show(id.clone(), seq, beads::show_bead(&id))
-                    }
-                    Request::LoadEdit(id, seq) => {
-                        Response::EditLoaded(id.clone(), seq, beads::show_bead(&id))
-                    }
-                    Request::Create(input) => Response::Created(beads::create_bead(&input)),
-                    Request::CreateEpic(input, parent) => match parent.as_deref().map_or_else(
-                        || beads::create_bead(&input),
-                        |id| beads::create_child(&input, id),
-                    ) {
-                        Ok(id) => {
-                            if out.send(Response::Created(Ok(id.clone()))).is_err() {
-                                break;
-                            }
-                            let replies = out.clone();
-                            thread::spawn(move || {
-                                let session = match crate::epic::launch(&id) {
-                                    Ok(session) => session,
-                                    Err(error) => {
-                                        let _ =
-                                            replies.send(Response::EpicLaunched(id, Err(error)));
-                                        return;
-                                    }
-                                };
-                                if replies
-                                    .send(Response::EpicLaunched(id.clone(), Ok(session.clone())))
-                                    .is_ok()
-                                {
-                                    let result = crate::epic::finish(&session, &id);
-                                    let _ = replies.send(Response::EpicFinished(id, result));
-                                }
-                            });
-                            continue;
-                        }
-                        Err(error) => Response::Created(Err(error)),
-                    },
-                    Request::CreateChild(input, parent) => {
-                        Response::Created(beads::create_child(&input, &parent))
-                    }
-                    Request::Update(input) => {
-                        Response::Updated(input.id.clone(), beads::update_bead(&input))
-                    }
-                    Request::ReadScreenshot(seq) => {
-                        Response::ScreenshotRead(seq, screenshots::read_clipboard())
-                    }
-                    Request::SetReady(id, ready) => Response::ReadySet(
-                        id.clone(),
-                        ready,
-                        beads::set_ready(&id, ready).map(|()| vec![id]),
-                    ),
-                    Request::SetEpicReady(id, ready, known_handoffs, protected_handoffs) => {
-                        Response::ReadySet(
-                            id.clone(),
-                            ready,
-                            beads::set_epic_ready(&id, ready, &known_handoffs, &protected_handoffs),
-                        )
-                    }
-                    Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
-                    Request::DiscoverHarnesses(seq) => {
-                        Response::HarnessesDiscovered(seq, crate::herdr::installed_harnesses())
-                    }
-                    Request::Discover(seq) => Response::Discovered(seq, crate::herdr::discover()),
-                    Request::Launch(seq, context, agent, bead) => {
-                        Response::Launched(seq, crate::herdr::launch(&context, &agent, &bead))
-                    }
-                    Request::LaunchReady(seq, context, agent, bead) => {
-                        Response::Launched(seq, crate::herdr::launch_ready(&context, &agent, &bead))
-                    }
-                    Request::ListWorktrees => Response::Worktrees(worktrees::list()),
-                    Request::FocusWorkspace(id) => {
-                        Response::WorkspaceFocused(id.clone(), crate::herdr::focus_workspace(&id))
-                    }
-                    Request::WorktreeAction(id, action) => {
-                        Response::WorktreeChanged(worktrees::act(&id, action))
-                    }
-                    Request::RestartWorktree(id) => {
-                        Response::WorktreeRestarted(worktrees::restart(&id))
-                    }
-                    Request::ReconcileWorktrees(policy) => {
-                        Response::Worktrees(worktrees::reconcile(policy))
-                    }
-                    Request::CheckRelease => {
-                        let replies = out.clone();
-                        thread::spawn(move || {
-                            let _ = replies.send(Response::ReleaseChecked(release::check()));
-                        });
-                        continue;
-                    }
-                    Request::PrepareUpdate => {
-                        let replies = out.clone();
-                        thread::spawn(move || {
-                            let _ = replies.send(Response::UpdatePrepared(update::check()));
-                        });
-                        continue;
-                    }
-                    Request::InstallRelease(release, cancel) => {
-                        let replies = out.clone();
-                        thread::spawn(move || {
-                            let _ = replies.send(Response::ReleaseInstalled(update::install(
-                                &release, &cancel,
-                            )));
-                        });
-                        continue;
-                    }
-                };
-                if out.send(response).is_err() {
+    }
+    let replies = out.clone();
+    thread::spawn(move || {
+        while let Ok(request) = incoming.recv() {
+            if matches!(
+                request,
+                Request::Discover(_)
+                    | Request::DiscoverHarnesses(_)
+                    | Request::Launch(..)
+                    | Request::LaunchReady(..)
+                    | Request::FocusWorkspace(_)
+                    | Request::ReadScreenshot(_)
+                    | Request::ObserveAgents
+            ) {
+                let execute = execute.clone();
+                let out = replies.clone();
+                thread::spawn(move || execute(request, &out));
+            } else if matches!(
+                request,
+                Request::ListWorktrees
+                    | Request::WorktreeAction(..)
+                    | Request::RestartWorktree(_)
+                    | Request::ReconcileWorktrees(_)
+            ) {
+                if managed.send(request).is_err() {
                     break;
                 }
+            } else if matches!(request, Request::SetReady(..) | Request::SetEpicReady(..)) {
+                if ready.send(request).is_err() {
+                    break;
+                }
+            } else if browser.send(request).is_err() {
+                break;
             }
+        }
+    });
+    (requests, responses, out)
+}
+
+impl App {
+    fn new() -> Self {
+        let (tx, responses, out) = start_workers(execute_request);
+        thread::spawn(move || {
+            let _ = out.send(Response::UpdateAvailable(updates::available_version()));
         });
         let (settings, settings_path, settings_error) = match settings::config_path() {
             Ok(path) => match settings::load_from(&path) {
@@ -518,7 +584,8 @@ impl App {
             edit_seq: 0,
             harness_seq: 0,
             launch_seq: 0,
-            handoff: None,
+            handoff: HashMap::new(),
+            handoff_capacity: HashSet::new(),
             toast: None,
             release_result: None,
             release_inflight: false,
@@ -550,8 +617,12 @@ impl App {
             worktrees_refresh_pending: false,
             worktree_action_pending: false,
             worktrees_next_refresh: Instant::now(),
+            agent_observation_inflight: false,
+            next_agent_observation: Instant::now(),
             notice: settings_error,
             mutation_busy: false,
+            ready_pending: false,
+            planning_epics: HashSet::new(),
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -583,7 +654,7 @@ impl App {
         }
     }
     fn poll_scheduler(&mut self) {
-        if !self.worktrees_discovered || self.handoff.is_some() || self.mutation_busy {
+        if !self.worktrees_discovered || self.mutation_busy {
             return;
         }
         // A child must branch from its managed parent checkout. Preparing an
@@ -597,6 +668,10 @@ impl App {
                     || self.scheduler_attempted.contains(&bead.id)
                     || self.known_handoffs.contains(&bead.id)
                     || self.worktrees.iter().any(|item| item.bead_id == bead.id)
+                    || self
+                        .handoff
+                        .values()
+                        .any(|pending| pending.bead.id == bead.id)
                 {
                     return false;
                 }
@@ -617,18 +692,40 @@ impl App {
             self.start_launch(epic, false);
             return;
         }
-        let active_agents = self
-            .worktrees
-            .iter()
-            .filter(|item| {
-                item.handoff_accepted
-                    && matches!(
-                        item.status,
-                        worktrees::WorktreeStatus::InProgress
-                            | worktrees::WorktreeStatus::DirtyCheckout
-                    )
-            })
-            .count();
+        let active_agents =
+            self.worktrees
+                .iter()
+                .filter(|item| {
+                    item.handoff_accepted
+                        && matches!(
+                            item.status,
+                            worktrees::WorktreeStatus::InProgress
+                                | worktrees::WorktreeStatus::DirtyCheckout
+                        )
+                })
+                .count()
+                + self
+                    .handoff_capacity
+                    .iter()
+                    .filter(|id| {
+                        !self
+                            .worktrees
+                            .iter()
+                            .any(|item| &item.bead_id == *id && item.handoff_accepted)
+                    })
+                    .count()
+                + self
+                    .handoff
+                    .values()
+                    .filter(|pending| {
+                        // Reserving a parent checkout for open descendants starts no
+                        // agent. Resuming that reserved parent after its children does.
+                        !self.reserves_parent(&pending.bead)
+                            && !self.worktrees.iter().any(|item| {
+                                item.bead_id == pending.bead.id && item.handoff_accepted
+                            })
+                    })
+                    .count();
         if !self.settings.agent_limit.allows(active_agents) {
             return;
         }
@@ -665,6 +762,13 @@ impl App {
         }
     }
     fn scheduler_eligible(&self, bead: &Bead) -> bool {
+        if self
+            .handoff
+            .values()
+            .any(|pending| pending.bead.id == bead.id)
+        {
+            return false;
+        }
         if let Some(parent) = bead.data["parent"].as_str()
             && !self.worktrees.iter().any(|item| {
                 item.bead_id == parent
@@ -695,6 +799,18 @@ impl App {
                     )
             })
             && !reserved.workspace_id.is_empty()
+    }
+    fn reserves_parent(&self, bead: &Bead) -> bool {
+        !beads::open_descendants_in(&self.beads, &bead.id).is_empty()
+            || self.worktrees.iter().any(|item| {
+                item.parent_bead_id.as_deref() == Some(bead.id.as_str())
+                    && !matches!(
+                        item.status,
+                        worktrees::WorktreeStatus::Integrated
+                            | worktrees::WorktreeStatus::WorkspaceClosed
+                            | worktrees::WorktreeStatus::CheckoutRemoved
+                    )
+            })
     }
     fn poll_worktrees(&mut self, now: Instant) {
         let automatic = self.settings.auto_merge
@@ -730,6 +846,19 @@ impl App {
                 self.worktrees_error = Some("Worktree refresh could not be queued".into());
                 self.worktrees_next_refresh = now + REFRESH_INTERVAL;
             }
+        }
+    }
+    fn poll_agent_observations(&mut self, now: Instant) {
+        if self.agent_observation_inflight
+            || self.worktrees.is_empty()
+            || now < self.next_agent_observation
+        {
+            return;
+        }
+        self.agent_observation_inflight = true;
+        if self.requests.send(Request::ObserveAgents).is_err() {
+            self.agent_observation_inflight = false;
+            self.next_agent_observation = now + Duration::from_secs(2);
         }
     }
     fn start_refresh(&mut self, now: Instant) {
@@ -1024,6 +1153,7 @@ impl App {
                         Ok(id) => {
                             if matches!(&self.modal, Some(Modal::Create(form)) if form.generate_children && beads::BEAD_TYPES[form.issue_type] == "epic")
                             {
+                                self.planning_epics.insert(id.clone());
                                 self.toast = Some(Toast::progress(format!(
                                     "Created Epic {id}; starting sub-task agent…"
                                 )));
@@ -1041,19 +1171,21 @@ impl App {
                 }
                 Response::EpicLaunched(id, result) => match result {
                     Ok(session) => {
+                        self.planning_epics.insert(id.clone());
                         let message =
                             format!("Planning {id} in Herdr workspace {}…", session.workspace_id);
                         self.notice = Some(message.clone());
                         self.toast = Some(Toast::progress(message));
                     }
                     Err(error) => {
-                        let message =
-                            format!("Epic {id} created; automatic planning failed: {error}");
+                        self.planning_epics.remove(&id);
+                        let message = format!("Epic {id}: planning failed: {error}");
                         self.notice = Some(message.clone());
                         self.toast = Some(Toast::result(message, true));
                     }
                 },
                 Response::EpicFinished(id, result) => {
+                    self.planning_epics.remove(&id);
                     let (message, error) = match result {
                         Ok(children) => (
                             format!(
@@ -1106,6 +1238,7 @@ impl App {
                 }
                 Response::ReadySet(id, ready, result) => {
                     self.mutation_busy = false;
+                    self.ready_pending = false;
                     match result {
                         Ok(ids) => {
                             for changed_id in &ids {
@@ -1188,7 +1321,7 @@ impl App {
                 Response::Discovered(seq, result) => {
                     if let Some(pending) = self
                         .handoff
-                        .as_ref()
+                        .get(&seq)
                         .filter(|item| item.seq == seq && !item.launch_queued)
                         .cloned()
                     {
@@ -1228,25 +1361,26 @@ impl App {
                                 .cloned();
                                 if let Some(agent) = agent {
                                     let bead = pending.bead.clone();
-                                    self.handoff.as_mut().unwrap().launch_queued = true;
-                                    self.toast = Some(Toast::progress(format!(
-                                        "Handing {} to {} in Herdr…",
-                                        bead.id, agent.label
-                                    )));
+                                    self.handoff.get_mut(&seq).unwrap().launch_queued = true;
+                                    if seq == self.launch_seq {
+                                        self.toast = Some(Toast::progress(format!(
+                                            "Handing {} to {} in Herdr…",
+                                            bead.id, agent.label
+                                        )));
+                                    }
                                     let request = if pending.scheduled {
                                         Request::LaunchReady(seq, context, agent, bead)
                                     } else {
                                         Request::Launch(seq, context, agent, bead)
                                     };
                                     if self.requests.send(request).is_err() {
-                                        self.handoff = None;
+                                        self.handoff.remove(&seq);
                                         let message =
                                             "Handoff could not be queued; try again".to_owned();
-                                        self.notice = Some(message.clone());
-                                        self.toast = Some(Toast::result(message, true));
+                                        self.handoff_feedback(seq, message, true);
                                     }
                                 } else {
-                                    self.handoff = None;
+                                    self.handoff.remove(&seq);
                                     let message = if let Some(kind) = chosen {
                                         format!(
                                             "Harness {kind} for {} is unavailable; change it or toggle Ready to retry",
@@ -1260,15 +1394,13 @@ impl App {
                                     } else {
                                         "No Herdr agents are available in this workspace".to_owned()
                                     };
-                                    self.notice = Some(message.clone());
-                                    self.toast = Some(Toast::result(message, true));
+                                    self.handoff_feedback(seq, message, true);
                                 }
                             }
                             Err(error) => {
-                                self.handoff = None;
+                                self.handoff.remove(&seq);
                                 let message = format!("Handoff discovery failed: {error}");
-                                self.notice = Some(message.clone());
-                                self.toast = Some(Toast::result(message, true));
+                                self.handoff_feedback(seq, message, true);
                             }
                         }
                     }
@@ -1276,17 +1408,22 @@ impl App {
                 Response::Launched(seq, result) => {
                     if self
                         .handoff
-                        .as_ref()
-                        .is_some_and(|item| item.seq == seq && item.launch_queued)
+                        .get(&seq)
+                        .is_some_and(|item| item.launch_queued)
                     {
                         let ready_id = self
                             .handoff
-                            .as_ref()
+                            .get(&seq)
                             .filter(|item| beads::is_ready(&item.bead))
                             .map(|item| item.bead.id.clone());
-                        self.handoff = None;
+                        let bead_id = self.handoff[&seq].bead.id.clone();
+                        self.handoff.remove(&seq);
                         match result {
                             Ok(outcome) => {
+                                self.known_handoffs.insert(bead_id.clone());
+                                if !outcome.reserved {
+                                    self.handoff_capacity.insert(bead_id);
+                                }
                                 if let Some(id) = ready_id {
                                     self.known_handoffs.insert(id.clone());
                                     if outcome.reserved {
@@ -1295,8 +1432,7 @@ impl App {
                                         self.accepted_handoffs.insert(id);
                                     }
                                 }
-                                self.toast = Some(Toast::result(outcome.message.clone(), false));
-                                self.notice = Some(outcome.message);
+                                self.handoff_feedback(seq, outcome.message, false);
                                 // The launch journal is now active. Reload it even if the
                                 // initial worktree scan found no managed handoffs.
                                 if self.worktrees_inflight {
@@ -1308,8 +1444,15 @@ impl App {
                             }
                             Err(error) => {
                                 let message = format!("Handoff failed: {error}");
-                                self.toast = Some(Toast::result(message.clone(), true));
-                                self.notice = Some(message);
+                                self.handoff_feedback(seq, message, true);
+                                // A failed launch can still have a durable partial
+                                // intent/remote worktree. Always inspect it again.
+                                if self.worktrees_inflight {
+                                    self.worktrees_refresh_pending = true;
+                                } else {
+                                    self.worktrees_discovered = false;
+                                    self.worktrees_next_refresh = now;
+                                }
                             }
                         }
                     }
@@ -1322,6 +1465,43 @@ impl App {
                     if !self.worktree_action_pending {
                         match result {
                             Ok(mut items) => {
+                                for item in &mut items {
+                                    if matches!(
+                                        item.status,
+                                        worktrees::WorktreeStatus::Reserved
+                                            | worktrees::WorktreeStatus::WorkspaceClosed
+                                            | worktrees::WorktreeStatus::CheckoutRemoved
+                                    ) {
+                                        continue;
+                                    }
+                                    if let Some(line) = self
+                                        .worktrees
+                                        .iter()
+                                        .find(|previous| {
+                                            previous.id == item.id
+                                                && previous.workspace_id == item.workspace_id
+                                        })
+                                        .and_then(|previous| previous.detail.as_deref())
+                                        .and_then(|detail| {
+                                            detail.lines().find(|line| {
+                                                line.starts_with(
+                                                    "Agent observation (display only):",
+                                                )
+                                            })
+                                        })
+                                    {
+                                        let base = item.detail.as_deref().unwrap_or("");
+                                        item.detail = Some(if base.is_empty() {
+                                            line.into()
+                                        } else {
+                                            format!("{base}\n{line}")
+                                        });
+                                    }
+                                }
+                                if !self.worktrees_refresh_pending {
+                                    self.handoff_capacity
+                                        .retain(|id| !items.iter().any(|item| &item.bead_id == id));
+                                }
                                 let selected_id = self
                                     .worktrees
                                     .get(self.selected_worktree)
@@ -1367,6 +1547,52 @@ impl App {
                     if std::mem::take(&mut self.worktrees_refresh_pending) {
                         self.worktrees_discovered = false;
                         self.worktrees_next_refresh = now;
+                    }
+                }
+                Response::AgentsObserved(result) => {
+                    if !self.agent_observation_inflight {
+                        continue;
+                    }
+                    self.agent_observation_inflight = false;
+                    self.next_agent_observation = now + Duration::from_secs(2);
+                    for item in &mut self.worktrees {
+                        if matches!(
+                            item.status,
+                            worktrees::WorktreeStatus::Reserved
+                                | worktrees::WorktreeStatus::WorkspaceClosed
+                                | worktrees::WorktreeStatus::CheckoutRemoved
+                        ) {
+                            continue;
+                        }
+                        let line = match &result {
+                            Ok(observations) => observations
+                                .iter()
+                                .find(|observation| {
+                                    observation.id == item.id
+                                        && observation.workspace_id == item.workspace_id
+                                })
+                                .map(|observation| observation.detail.clone()),
+                            Err(error) => Some(format!(
+                                "Agent observation (display only): unknown — poll failed: {error}"
+                            )),
+                        };
+                        if let Some(line) = line {
+                            let existing = item.detail.as_deref().unwrap_or("");
+                            let base = existing
+                                .split("\nAgent observation (display only):")
+                                .next()
+                                .unwrap_or("");
+                            let base = if base.starts_with("Agent observation (display only):") {
+                                ""
+                            } else {
+                                base
+                            };
+                            item.detail = Some(if base.is_empty() {
+                                line
+                            } else {
+                                format!("{base}\n{line}")
+                            });
+                        }
                     }
                 }
                 Response::WorkspaceFocused(id, result) => {
@@ -1510,7 +1736,7 @@ impl App {
         }
     }
     fn key(&mut self, k: KeyEvent) -> bool {
-        if self.mutation_busy {
+        if self.mutation_busy && !self.ready_pending {
             return false;
         }
         if let Some(help) = self.help.as_mut() {
@@ -1543,6 +1769,18 @@ impl App {
         }
         if event::is_quit(k) {
             return true;
+        }
+        // Keep browsing available during Ready, but do not open mutation dialogs
+        // or start handoffs against a partially updated cascade.
+        if self.ready_pending
+            && matches!(
+                k.code,
+                KeyCode::Char(
+                    'n' | 'N' | 'e' | 'd' | 'g' | 'h' | 's' | 'u' | 'm' | 'c' | 'x' | 'R'
+                )
+            )
+        {
+            return false;
         }
         if self.worktrees_view {
             match k.code {
@@ -1670,6 +1908,7 @@ impl App {
                     self.notice = None;
                 }
             }
+            KeyCode::Char('g') => self.open_epic_generation(),
             KeyCode::Char('h') => self.open_launch(),
             KeyCode::Tab => self.focus_detail = !self.focus_detail,
             KeyCode::Left if !self.focus_detail => {
@@ -1974,6 +2213,30 @@ impl App {
             }
             if let Some(settings) = save_settings {
                 self.save_settings(settings);
+            }
+            return false;
+        }
+        if let Some(Modal::ConfirmGenerateEpic { id, .. }) = self.modal.as_ref() {
+            if matches!(key.code, Char('y') | Char('Y')) {
+                let id = id.clone();
+                if !self.planning_epics.contains(&id) {
+                    if self
+                        .requests
+                        .send(Request::GenerateEpic(id.clone()))
+                        .is_ok()
+                    {
+                        self.planning_epics.insert(id.clone());
+                        self.modal = None;
+                        self.notice = Some(format!("Starting child-task planning for {id}…"));
+                        self.toast = Some(Toast::progress(format!(
+                            "Starting child-task planning for {id}…"
+                        )));
+                    } else {
+                        self.notice = Some("Epic planning could not be queued; try again".into());
+                    }
+                }
+            } else if matches!(key.code, Char('n') | Char('N') | Enter) {
+                self.modal = None;
             }
             return false;
         }
@@ -2316,10 +2579,28 @@ impl App {
             }
         }
     }
-    fn open_launch(&mut self) {
-        if self.handoff.is_some() {
+    pub fn selected_is_epic(&self) -> bool {
+        self.selected
+            .and_then(|i| self.beads.get(i))
+            .is_some_and(|bead| bead.data["issue_type"] == "epic")
+    }
+    fn open_epic_generation(&mut self) {
+        if !self.selected_is_epic() {
             return;
         }
+        let bead = &self.beads[self.selected.unwrap()];
+        if self.planning_epics.contains(&bead.id) {
+            self.notice = Some(format!("Epic {} is already being planned", bead.id));
+            return;
+        }
+        self.modal = Some(Modal::ConfirmGenerateEpic {
+            id: bead.id.clone(),
+            title: bead.title.clone(),
+        });
+        self.modal_ready = false;
+        self.notice = None;
+    }
+    fn open_launch(&mut self) {
         let Some(bead) = self
             .selected
             .and_then(|index| self.beads.get(index))
@@ -2356,9 +2637,7 @@ impl App {
             return;
         }
         let mut protected_handoffs = self.accepted_handoffs.clone();
-        if let Some(pending) = &self.handoff {
-            protected_handoffs.insert(pending.bead.id.clone());
-        }
+        protected_handoffs.extend(self.handoff.values().map(|pending| pending.bead.id.clone()));
         if !ready && !epic && protected_handoffs.contains(&id) {
             self.notice = Some(
                 "This task has been sent or is being handed off; Ready cannot be removed".into(),
@@ -2366,6 +2645,8 @@ impl App {
             return;
         }
         self.mutation_busy = true;
+        self.ready_pending = true;
+        self.notice = Some(format!("Updating Ready for {id}…"));
         let request = if epic {
             Request::SetEpicReady(id, ready, self.known_handoffs.clone(), protected_handoffs)
         } else {
@@ -2373,10 +2654,18 @@ impl App {
         };
         if self.requests.send(request).is_err() {
             self.mutation_busy = false;
+            self.ready_pending = false;
             self.notice = Some("Ready change could not be queued".into());
         }
     }
     fn start_launch(&mut self, bead: Bead, scheduled: bool) {
+        if self
+            .handoff
+            .values()
+            .any(|pending| pending.bead.id == bead.id)
+        {
+            return;
+        }
         self.launch_seq = self.launch_seq.wrapping_add(1);
         let seq = self.launch_seq;
         self.notice = None;
@@ -2384,17 +2673,26 @@ impl App {
             "Finding a Herdr agent for {}…",
             bead.id
         )));
-        self.handoff = Some(PendingHandoff {
+        self.handoff.insert(
             seq,
-            bead,
-            launch_queued: false,
-            scheduled,
-        });
+            PendingHandoff {
+                seq,
+                bead,
+                launch_queued: false,
+                scheduled,
+            },
+        );
         if self.requests.send(Request::Discover(seq)).is_err() {
-            self.handoff = None;
+            self.handoff.remove(&seq);
             let message = "Workspace discovery could not be queued; try again".to_owned();
             self.notice = Some(message.clone());
             self.toast = Some(Toast::result(message, true));
+        }
+    }
+    fn handoff_feedback(&mut self, seq: u64, message: String, error: bool) {
+        if seq == self.launch_seq {
+            self.notice = Some(message.clone());
+            self.toast = Some(Toast::result(message, error));
         }
     }
     fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
@@ -2635,6 +2933,7 @@ pub fn run(t: &mut Tui) -> std::io::Result<()> {
         app.receive();
         app.poll_refresh(Instant::now());
         app.poll_worktrees(Instant::now());
+        app.poll_agent_observations(Instant::now());
         app.poll_scheduler();
         t.draw(|f| ui::render(f, start.elapsed(), &mut app))?;
         if let Some(e) = event::poll_event(Duration::from_millis(35))? {
@@ -2920,7 +3219,8 @@ mod tests {
             edit_seq: 0,
             harness_seq: 0,
             launch_seq: 0,
-            handoff: None,
+            handoff: HashMap::new(),
+            handoff_capacity: HashSet::new(),
             toast: None,
             release_result: None,
             release_inflight: false,
@@ -2952,8 +3252,12 @@ mod tests {
             worktrees_refresh_pending: false,
             worktree_action_pending: false,
             worktrees_next_refresh: Instant::now(),
+            agent_observation_inflight: false,
+            next_agent_observation: Instant::now(),
             notice: None,
             mutation_busy: false,
+            ready_pending: false,
+            planning_epics: HashSet::new(),
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -3220,7 +3524,7 @@ mod tests {
         a.receive();
         a.poll_scheduler();
         assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
-        assert_eq!(a.handoff.as_ref().unwrap().bead.id, "b0");
+        assert_eq!(a.handoff.values().next().unwrap().bead.id, "b0");
     }
 
     #[test]
@@ -3289,6 +3593,7 @@ mod tests {
         assert!(!a.refresh_pending);
         assert_eq!(a.beads[0].status, "open");
         a.mutation_busy = false;
+        a.ready_pending = false;
         a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
         a.focus_detail = true;
         press(&mut a, KeyCode::Char('r'));
@@ -3296,8 +3601,128 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(!a.refresh_pending);
         a.mutation_busy = false;
+        a.ready_pending = false;
         press(&mut a, KeyCode::Char('R'));
         assert!(matches!(rx.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+    }
+
+    #[test]
+    fn pending_ready_keeps_browser_input_live_and_excludes_mutations() {
+        for epic in [false, true] {
+            for ready in [false, true] {
+                let (mut a, requests, replies) = connected_app();
+                a.beads[0].data["issue_type"] = json!(if epic { "epic" } else { "task" });
+                a.beads[1].data["issue_type"] = json!("task");
+                if !ready {
+                    a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+                    a.beads[1].data["labels"] = json!([beads::READY_LABEL]);
+                }
+                press(&mut a, KeyCode::Char('r'));
+                assert!(a.ready_pending && a.mutation_busy);
+                assert!(a.notice.as_deref().unwrap().contains("Updating Ready"));
+                assert!(matches!(
+                    requests.try_recv(),
+                    Ok(Request::SetReady(..) | Request::SetEpicReady(..))
+                ));
+                for key in ['r', 'R', 'n', 'N', 'e', 'd', 'g', 'h', 's', 'u'] {
+                    press(&mut a, KeyCode::Char(key));
+                }
+                a.poll_scheduler();
+                assert!(requests.try_recv().is_err());
+                assert!(a.modal.is_none());
+                press(&mut a, KeyCode::Down);
+                assert_ne!(a.selected, Some(0));
+                assert!(matches!(requests.try_recv(), Ok(Request::Show(..))));
+                press(&mut a, KeyCode::Tab);
+                press(&mut a, KeyCode::Down);
+                assert!(a.focus_detail);
+                assert_eq!(a.detail_offset, 1);
+                // Ctrl+? opens help while a Ready update is still blocked.
+                a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+                assert!(a.help.is_some());
+                press(&mut a, KeyCode::Esc);
+                assert!(a.help.is_none());
+                assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+                assert_eq!(beads::is_ready(&a.beads[0]), !ready);
+                replies
+                    .send(Response::ReadySet(
+                        "b0".into(),
+                        ready,
+                        Ok(vec!["b0".into()]),
+                    ))
+                    .unwrap();
+                a.receive();
+                assert!(!a.ready_pending && !a.mutation_busy);
+                assert_eq!(beads::is_ready(&a.beads[0]), ready);
+                assert!(matches!(requests.try_recv(), Ok(Request::List)));
+            }
+        }
+    }
+
+    #[test]
+    fn ready_queue_failure_releases_input_and_mutation_state() {
+        let mut a = app(); // Its request receiver has been dropped.
+        a.beads[0].data["issue_type"] = json!("task");
+        press(&mut a, KeyCode::Char('r'));
+        assert!(!a.ready_pending && !a.mutation_busy);
+        assert!(a.notice.as_deref().unwrap().contains("could not be queued"));
+        assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn blocked_ready_does_not_delay_browser_reads_or_managed_work() {
+        for epic in [false, true] {
+            let (release, blocked) = mpsc::channel();
+            let blocked = std::sync::Mutex::new(blocked);
+            let (entered, started) = mpsc::channel();
+            let (requests, responses, _) = start_workers(move |request, out| {
+                let response = match request {
+                    Request::SetReady(id, ready) | Request::SetEpicReady(id, ready, ..) => {
+                        entered.send(()).unwrap();
+                        // Timeout also releases the worker if a regression fails the test.
+                        blocked
+                            .lock()
+                            .unwrap()
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap();
+                        Response::ReadySet(id.clone(), ready, Ok(vec![id]))
+                    }
+                    Request::List => Response::List(Ok(vec![])),
+                    Request::Show(id, seq) => Response::Show(id, seq, Ok(json!({}))),
+                    Request::ListWorktrees => Response::Worktrees(Ok(vec![])),
+                    _ => panic!("unexpected request"),
+                };
+                out.send(response).unwrap();
+            });
+            requests
+                .send(if epic {
+                    Request::SetEpicReady("epic".into(), true, HashSet::new(), HashSet::new())
+                } else {
+                    Request::SetReady("task".into(), false)
+                })
+                .unwrap();
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            requests.send(Request::List).unwrap();
+            requests.send(Request::Show("other".into(), 1)).unwrap();
+            requests.send(Request::ListWorktrees).unwrap();
+            let mut observed = HashSet::new();
+            for _ in 0..3 {
+                observed.insert(
+                    match responses.recv_timeout(Duration::from_secs(5)).unwrap() {
+                        Response::List(Ok(_)) => "list",
+                        Response::Show(_, _, Ok(_)) => "detail",
+                        Response::Worktrees(Ok(_)) => "managed",
+                        _ => panic!("Ready must still be blocked"),
+                    },
+                );
+            }
+            assert_eq!(observed.len(), 3);
+            release.send(()).unwrap();
+            assert!(matches!(
+                responses.recv_timeout(Duration::from_secs(5)),
+                Ok(Response::ReadySet(_, _, Ok(_)))
+            ));
+        }
     }
 
     #[test]
@@ -3407,6 +3832,7 @@ mod tests {
         let (replies, responses) = mpsc::channel();
         a.responses = responses;
         a.mutation_busy = true;
+        a.ready_pending = true;
         replies
             .send(Response::ReadySet(
                 "b0".into(),
@@ -3421,6 +3847,7 @@ mod tests {
 
         a.refresh_inflight = false;
         a.mutation_busy = true;
+        a.ready_pending = true;
         replies
             .send(Response::ReadySet(
                 "b0".into(),
@@ -3431,6 +3858,7 @@ mod tests {
         a.receive();
         assert!(matches!(queued.try_recv(), Ok(Request::List)));
         assert!(a.notice.as_deref().unwrap().contains("partial update"));
+        assert!(!a.ready_pending && !a.mutation_busy);
     }
 
     #[test]
@@ -3477,7 +3905,7 @@ mod tests {
         a.poll_scheduler();
         assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
         assert_eq!(
-            a.handoff.as_ref().map(|item| item.bead.id.as_str()),
+            a.handoff.values().next().map(|item| item.bead.id.as_str()),
             Some("b0")
         );
     }
@@ -3506,6 +3934,323 @@ mod tests {
             ],
         }
     }
+    fn observed_row(bead: &str, status: worktrees::WorktreeStatus) -> ManagedWorktree {
+        ManagedWorktree {
+            id: format!("handoff-{bead}"),
+            bead_id: bead.into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: None,
+            bead_description: None,
+            branch: format!("ontrack/{bead}"),
+            target_branch: "main".into(),
+            workspace_id: "wTask".into(),
+            status,
+            detail: Some("Keep recovery evidence".into()),
+        }
+    }
+
+    #[test]
+    fn blocked_launch_does_not_delay_ready_launch_browser_create_or_managed_refresh() {
+        use std::sync::Barrier;
+        let gate = Arc::new(Barrier::new(2));
+        let worker_gate = gate.clone();
+        let (entered, started) = mpsc::channel();
+        let (requests, responses, _) = start_workers(move |request, out| {
+            let response = match request {
+                Request::Launch(seq, ..) => {
+                    entered.send(()).unwrap();
+                    worker_gate.wait();
+                    Response::Launched(seq, Err(std::io::Error::other("first failed")))
+                }
+                Request::LaunchReady(seq, ..) => Response::Launched(
+                    seq,
+                    Ok(LaunchOutcome {
+                        reserved: false,
+                        message: "second accepted".into(),
+                    }),
+                ),
+                Request::List => Response::List(Ok(vec![])),
+                Request::Create(_) => Response::Created(Ok("created".into())),
+                Request::ListWorktrees => Response::Worktrees(Ok(vec![])),
+                _ => panic!("unexpected request"),
+            };
+            out.send(response).unwrap();
+        });
+        let context = launch_context();
+        let bead = app().beads[0].clone();
+        requests
+            .send(Request::Launch(
+                1,
+                context.clone(),
+                context.agents[0].clone(),
+                bead.clone(),
+            ))
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        requests
+            .send(Request::LaunchReady(
+                2,
+                context.clone(),
+                context.agents[0].clone(),
+                bead,
+            ))
+            .unwrap();
+        requests.send(Request::List).unwrap();
+        requests
+            .send(Request::Create(CreateBead {
+                title: "new".into(),
+                description: String::new(),
+                issue_type: "task".into(),
+                priority: 2,
+                harness: None,
+            }))
+            .unwrap();
+        requests.send(Request::ListWorktrees).unwrap();
+        let mut observed = HashSet::new();
+        for _ in 0..4 {
+            observed.insert(
+                match responses.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    Response::Launched(2, Ok(_)) => "ready",
+                    Response::List(Ok(_)) => "browser",
+                    Response::Created(Ok(_)) => "create",
+                    Response::Worktrees(Ok(_)) => "managed",
+                    _ => panic!("first launch remains blocked"),
+                },
+            );
+        }
+        assert_eq!(observed.len(), 4);
+        gate.wait();
+        assert!(matches!(
+            responses.recv_timeout(Duration::from_secs(5)),
+            Ok(Response::Launched(1, Err(_)))
+        ));
+    }
+
+    #[test]
+    fn managed_work_is_serial_and_cannot_occupy_the_browser_worker() {
+        use std::sync::Barrier;
+        let gate = Arc::new(Barrier::new(2));
+        let worker_gate = gate.clone();
+        let (tx, started) = mpsc::channel();
+        let (steps, received_steps) = mpsc::channel();
+        let (requests, responses, _) = start_workers(move |request, out| {
+            let response = match request {
+                Request::WorktreeAction(_, _) => {
+                    tx.send(()).unwrap();
+                    worker_gate.wait();
+                    steps.send(1).unwrap();
+                    Response::WorktreeChanged(Err(std::io::Error::other("finished")))
+                }
+                Request::ListWorktrees => {
+                    steps.send(2).unwrap();
+                    Response::Worktrees(Ok(vec![]))
+                }
+                Request::List => Response::List(Ok(vec![])),
+                _ => panic!("unexpected request"),
+            };
+            out.send(response).unwrap();
+        });
+        requests
+            .send(Request::WorktreeAction(
+                "first".into(),
+                WorktreeAction::RequestMerge,
+            ))
+            .unwrap();
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        requests.send(Request::ListWorktrees).unwrap();
+        requests.send(Request::List).unwrap();
+        assert!(matches!(
+            responses.recv_timeout(Duration::from_secs(5)),
+            Ok(Response::List(Ok(_)))
+        ));
+        assert!(received_steps.try_recv().is_err());
+        gate.wait();
+        assert_eq!(
+            received_steps.recv_timeout(Duration::from_secs(5)).unwrap(),
+            1
+        );
+        assert_eq!(
+            received_steps.recv_timeout(Duration::from_secs(5)).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn distinct_manual_and_ready_results_do_not_clear_other_pending_state_or_toast() {
+        let (mut a, rx, tx) = connected_app();
+        a.start_launch(a.beads[0].clone(), false);
+        let Request::Discover(first) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        a.start_launch(a.beads[1].clone(), true);
+        let Request::Discover(second) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        a.start_launch(a.beads[0].clone(), false);
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::Discovered(first, Ok(launch_context())))
+            .unwrap();
+        tx.send(Response::Discovered(second, Ok(launch_context())))
+            .unwrap();
+        a.receive();
+        assert!(matches!(rx.try_recv(), Ok(Request::Launch(seq,..)) if seq == first));
+        assert!(matches!(rx.try_recv(), Ok(Request::LaunchReady(seq,..)) if seq == second));
+        let toast = a.toast.as_ref().unwrap().message.clone();
+        a.worktrees_inflight = true;
+        tx.send(Response::Launched(
+            first,
+            Ok(LaunchOutcome {
+                message: "first success".into(),
+                reserved: false,
+            }),
+        ))
+        .unwrap();
+        a.receive();
+        assert_eq!(a.handoff.len(), 1);
+        assert_eq!(a.handoff[&second].bead.id, "b1");
+        assert_eq!(a.toast.as_ref().unwrap().message, toast);
+        assert!(a.worktrees_refresh_pending);
+        assert!(a.handoff_capacity.contains("b0"));
+        tx.send(Response::Launched(
+            first,
+            Err(std::io::Error::other("stale")),
+        ))
+        .unwrap();
+        a.receive();
+        assert_eq!(a.toast.as_ref().unwrap().message, toast);
+        tx.send(Response::Launched(
+            second,
+            Err(std::io::Error::other("second uncertain")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(a.handoff.is_empty());
+        assert!(
+            a.toast
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("second uncertain")
+        );
+        tx.send(Response::Worktrees(Ok(vec![]))).unwrap();
+        a.receive();
+        assert!(
+            !a.worktrees_discovered,
+            "a stale scan requires a trailing durable refresh"
+        );
+        assert!(a.handoff_capacity.contains("b0"));
+        a.poll_worktrees(Instant::now());
+        assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
+        tx.send(Response::Worktrees(Ok(vec![observed_row(
+            "b0",
+            worktrees::WorktreeStatus::InProgress,
+        )])))
+        .unwrap();
+        a.receive();
+        assert!(!a.handoff_capacity.contains("b0"));
+    }
+
+    #[test]
+    fn ready_capacity_counts_all_pending_agents_but_not_epic_checkout_reservations() {
+        let (mut a, rx, _) = connected_app();
+        a.settings.agent_limit = settings::AgentLimit::Limited(1);
+        for bead in &mut a.beads {
+            bead.data["issue_type"] = json!("task");
+            bead.data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+        }
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[1].data["parent"] = json!("b0");
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+        assert!(a.handoff.values().any(|pending| pending.bead.id == "b0"));
+        a.poll_scheduler();
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Discover(_))),
+            "reserving an Epic's parent checkout consumes no agent slot"
+        );
+        assert!(a.handoff.values().any(|pending| pending.bead.id == "b2"));
+        a.poll_scheduler();
+        assert!(
+            rx.try_recv().is_err(),
+            "pending agent launch consumes the remaining slot"
+        );
+        a.selected = Some(2);
+        a.toggle_ready();
+        assert!(
+            rx.try_recv().is_err(),
+            "Ready cannot be removed from any pending task"
+        );
+        a.selected = Some(0);
+        a.toggle_ready();
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::SetEpicReady(_,false,_,protected)) if protected.contains("b0") && protected.contains("b2"))
+        );
+    }
+
+    #[test]
+    fn display_only_agent_polling_is_bounded_preserves_rows_and_cannot_change_worktree_state() {
+        let (mut a, rx, tx) = connected_app();
+        a.worktrees.push(observed_row(
+            "b0",
+            worktrees::WorktreeStatus::NeedsAttention,
+        ));
+        let now = Instant::now();
+        a.poll_agent_observations(now);
+        a.poll_agent_observations(now + Duration::from_secs(50));
+        assert!(matches!(rx.try_recv(), Ok(Request::ObserveAgents)));
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::AgentsObserved(Err(std::io::Error::other(
+            "offline",
+        ))))
+        .unwrap();
+        a.receive_at(now);
+        assert_eq!(a.worktrees.len(), 1);
+        assert_eq!(
+            a.worktrees[0].status,
+            worktrees::WorktreeStatus::NeedsAttention
+        );
+        assert!(
+            a.worktrees[0]
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("Keep recovery evidence")
+        );
+        assert!(a.worktrees[0].detail.as_ref().unwrap().contains("unknown"));
+        a.poll_agent_observations(now + Duration::from_secs(1));
+        assert!(rx.try_recv().is_err());
+        a.poll_agent_observations(now + Duration::from_secs(2));
+        assert!(matches!(rx.try_recv(), Ok(Request::ObserveAgents)));
+        tx.send(Response::AgentsObserved(Ok(vec![
+            worktrees::AgentDisplay {
+                id: "handoff-b0".into(),
+                workspace_id: "wTask".into(),
+                detail: "Agent observation (display only): working".into(),
+            },
+        ])))
+        .unwrap();
+        a.receive_at(now + Duration::from_secs(2));
+        assert_eq!(
+            a.worktrees[0].status,
+            worktrees::WorktreeStatus::NeedsAttention
+        );
+        assert!(a.worktrees[0].detail.as_ref().unwrap().contains("working"));
+        assert!(!a.worktrees[0].detail.as_ref().unwrap().contains("offline"));
+        tx.send(Response::Worktrees(Ok(vec![observed_row(
+            "b0",
+            worktrees::WorktreeStatus::NeedsAttention,
+        )])))
+        .unwrap();
+        a.receive_at(now + Duration::from_secs(2));
+        assert!(
+            a.worktrees[0]
+                .detail
+                .as_ref()
+                .unwrap()
+                .contains("Agent observation (display only): working")
+        );
+    }
     #[test]
     fn handoff_discovers_and_launches_once_without_dialog_or_confirmation() {
         let (mut a, rx, tx) = connected_app();
@@ -3516,7 +4261,7 @@ mod tests {
             _ => panic!("expected discovery"),
         };
         assert!(a.modal.is_none());
-        assert!(a.handoff.is_some());
+        assert!(!a.handoff.is_empty());
         assert!(
             a.toast
                 .as_ref()
@@ -3543,7 +4288,11 @@ mod tests {
             "duplicate discovery cannot relaunch"
         );
         press(&mut a, KeyCode::Char('h'));
-        assert!(rx.try_recv().is_err());
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Discover(next)) if next != seq),
+            "a distinct selected bead can launch concurrently"
+        );
+        assert_eq!(a.handoff.len(), 2);
     }
     #[test]
     fn handoff_requires_selection_and_ignores_stale_discovery() {
@@ -3563,7 +4312,7 @@ mod tests {
             .unwrap();
         a.receive();
         assert!(rx.try_recv().is_err());
-        assert!(a.handoff.is_some());
+        assert!(!a.handoff.is_empty());
         tx.send(Response::Discovered(seq, Ok(launch_context())))
             .unwrap();
         a.receive();
@@ -3597,7 +4346,7 @@ mod tests {
         context.agents.clear();
         tx.send(Response::Discovered(seq, Ok(context))).unwrap();
         a.receive();
-        assert!(a.handoff.is_none());
+        assert!(a.handoff.is_empty());
         assert!(a.toast.as_ref().is_some_and(|toast| toast.error));
         assert!(rx.try_recv().is_err());
         press(&mut a, KeyCode::Char('h'));
@@ -3611,7 +4360,7 @@ mod tests {
         ))
         .unwrap();
         a.receive();
-        assert!(a.handoff.is_none());
+        assert!(a.handoff.is_empty());
         assert!(
             a.toast
                 .as_ref()
@@ -3626,7 +4375,7 @@ mod tests {
         drop(rx);
         a.requests = requests;
         press(&mut a, KeyCode::Char('h'));
-        assert!(a.handoff.is_none());
+        assert!(a.handoff.is_empty());
         assert!(a.modal.is_none());
         assert!(a.toast.as_ref().is_some_and(|toast| toast.error));
 
@@ -3642,7 +4391,7 @@ mod tests {
         tx.send(Response::Discovered(seq, Ok(launch_context())))
             .unwrap();
         a.receive();
-        assert!(a.handoff.is_none());
+        assert!(a.handoff.is_empty());
         assert!(
             a.toast
                 .as_ref()
@@ -3673,7 +4422,7 @@ mod tests {
         ))
         .unwrap();
         a.receive();
-        assert!(a.handoff.is_none());
+        assert!(a.handoff.is_empty());
         assert_eq!(display_status(&a.beads[0]), "ready");
         assert!(
             rx.try_recv().is_err(),
@@ -3719,7 +4468,7 @@ mod tests {
         ))
         .unwrap();
         a.receive();
-        assert!(a.handoff.is_none());
+        assert!(a.handoff.is_empty());
         assert!(a.modal.is_none());
         assert!(
             a.toast.as_ref().is_some_and(
@@ -5214,6 +5963,105 @@ mod tests {
         a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 1);
         assert_eq!(a.selected, Some(0));
     }
+    #[test]
+    fn existing_epic_generation_requires_readable_confirmation_and_prevents_repeats() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        a.selected = None;
+        press(&mut a, KeyCode::Char('g'));
+        assert!(a.modal.is_none());
+        a.selected = Some(0);
+        a.beads[0].data["issue_type"] = json!("task");
+        press(&mut a, KeyCode::Char('g'));
+        assert!(a.modal.is_none());
+        assert!(rx.try_recv().is_err());
+        a.beads[0].data["issue_type"] = json!("epic");
+        for cancel in [
+            KeyCode::Esc,
+            KeyCode::Enter,
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+        ] {
+            press(&mut a, KeyCode::Char('g'));
+            assert!(matches!(&a.modal, Some(Modal::ConfirmGenerateEpic { id, .. }) if id == "b0"));
+            a.modal_ready = false;
+            a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            assert!(rx.try_recv().is_err()); // No render yet.
+            a.modal_ready = true;
+            press(&mut a, cancel);
+            assert!(a.modal.is_none());
+            assert!(rx.try_recv().is_err());
+        }
+        a.focus_detail = true;
+        press(&mut a, KeyCode::Char('g'));
+        a.modal_ready = true;
+        // The confirmation remains bound to the original Epic if selection changes.
+        a.selected = Some(1);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(matches!(rx.try_recv(), Ok(Request::GenerateEpic(id)) if id == "b0"));
+        assert!(a.modal.is_none());
+        assert!(a.planning_epics.contains("b0"));
+        assert!(!a.mutation_busy);
+        a.selected = Some(0);
+        press(&mut a, KeyCode::Char('g'));
+        assert!(a.modal.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn epic_planning_failure_completion_and_queue_errors_allow_recovery() {
+        let mut a = app();
+        let (tx, rx) = mpsc::channel();
+        a.requests = tx;
+        let (out, responses) = mpsc::channel();
+        a.responses = responses;
+        a.planning_epics.insert("b0".into());
+        out.send(Response::EpicLaunched(
+            "b0".into(),
+            Err(std::io::Error::other("proposal is empty")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(!a.planning_epics.contains("b0"));
+        assert!(a.notice.as_deref().unwrap().contains("proposal is empty"));
+        assert!(!a.notice.as_deref().unwrap().contains("created"));
+        out.send(Response::EpicLaunched(
+            "b0".into(),
+            Ok(crate::epic::Session {
+                workspace_id: "w1".into(),
+                pane_id: "w1:p1".into(),
+            }),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(a.planning_epics.contains("b0"));
+        out.send(Response::EpicFinished("b0".into(), Ok(vec!["b0.1".into()])))
+            .unwrap();
+        a.receive();
+        assert!(!a.planning_epics.contains("b0"));
+        assert!(a.notice.as_deref().unwrap().contains("1 child Beads"));
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        a.planning_epics.insert("b0".into());
+        out.send(Response::EpicFinished(
+            "b0".into(),
+            Err(std::io::Error::other("agent blocked")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(!a.planning_epics.contains("b0"));
+        assert!(a.notice.as_deref().unwrap().contains("agent blocked"));
+        drop(rx);
+        a.selected = Some(0);
+        a.beads[0].data["issue_type"] = json!("epic");
+        press(&mut a, KeyCode::Char('g'));
+        a.modal_ready = true;
+        press(&mut a, KeyCode::Char('y'));
+        assert!(!a.planning_epics.contains("b0"));
+        assert!(a.modal.is_some());
+        assert!(a.notice.as_deref().unwrap().contains("could not be queued"));
+    }
+
     #[test]
     fn epic_toggle_only_dispatches_opted_in_epics() {
         let mut a = app();

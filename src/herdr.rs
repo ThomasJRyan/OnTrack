@@ -37,6 +37,36 @@ pub struct LaunchOutcome {
     pub reserved: bool,
 }
 
+#[derive(Debug)]
+pub(crate) struct LaunchFailure {
+    pub retry_safe: bool,
+    message: String,
+}
+impl std::fmt::Display for LaunchFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for LaunchFailure {}
+
+pub(crate) fn launch_failure(error: &io::Error) -> Option<&LaunchFailure> {
+    error.get_ref()?.downcast_ref()
+}
+
+fn preflight_failure(error: io::Error) -> io::Error {
+    if launch_failure(&error).is_some() {
+        error
+    } else {
+        io::Error::new(
+            error.kind(),
+            LaunchFailure {
+                retry_safe: true,
+                message: error.to_string(),
+            },
+        )
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Discovery {
     pub workspace_id: String,
@@ -259,6 +289,7 @@ fn launch_mode(
         &name,
         require_ready,
     )
+    .map_err(preflight_failure)
 }
 
 pub(crate) fn validate_restart_source(
@@ -478,6 +509,12 @@ fn canonical_git_path(bytes: &[u8]) -> io::Result<PathBuf> {
         return Err(invalid("Git trust metadata must return an absolute path"));
     }
     path.canonicalize()
+}
+
+/// Invocation-only trust for the verified main repository, including when
+/// launching from a linked checkout. Shares the handoff's resolver and encoding.
+pub(crate) fn codex_startup_trust(checkout: &Path) -> io::Result<String> {
+    codex_trust_override(&SystemExecutor.git_identity(checkout)?.main_root)
 }
 
 fn codex_trust_override(root: &Path) -> io::Result<String> {
@@ -784,11 +821,22 @@ fn launch_with_mode(
             expected_repository,
         },
         &mut journal,
-    );
-    if let (Err(error), Some(journal)) = (&result, journal.as_mut()) {
-        journal.failed(&error.to_string())?;
-    }
-    result
+    ).map_err(|error| {
+        if launch_failure(&error).is_some() { error } else {
+            recovery(request, &branch, None, None, &format!("Launch interrupted after creation or reserved-parent resume may have begun: {error}"))
+        }
+    });
+    result.map_err(|error| {
+        if let Some(journal) = journal.as_mut()
+            && let Err(journal_error) = journal.failed(&error.to_string())
+        {
+            return io::Error::other(LaunchFailure {
+                retry_safe: launch_failure(&error).is_some_and(|failure| failure.retry_safe),
+                message: format!("{error}. Recording launch failure also failed: {journal_error}. Inspect durable possibly-sent evidence; do not blindly retry."),
+            });
+        }
+        error
+    })
 }
 
 fn create_and_prompt(
@@ -842,7 +890,10 @@ fn create_and_prompt(
             )
         })?;
         if let Some(journal) = journal.as_mut() {
-            journal.capture("create", &bytes)?;
+            journal.capture("create", &bytes).map_err(|error| {
+                let target = envelope(&bytes).ok().and_then(|result| created_target(&result, source, branch).ok());
+                recovery(request, branch, target.as_ref().map(|target| target.workspace_id.as_str()), target.as_ref().map(|target| target.pane_id.as_str()), &format!("Persisting raw creation response failed: {error}. Creation may have succeeded"))
+            })?;
         }
         let result = envelope(&bytes).map_err(|error| {
             recovery(
@@ -857,6 +908,17 @@ fn create_and_prompt(
             .pointer("/workspace/workspace_id")
             .and_then(Value::as_str);
         let pane = result.pointer("/root_pane/pane_id").and_then(Value::as_str);
+        if let Some(journal) = journal.as_mut() {
+            journal.created(&result).map_err(|error| {
+                recovery(
+                    request,
+                    branch,
+                    workspace,
+                    pane,
+                    &format!("Recording/verifying created checkout failed: {error}"),
+                )
+            })?;
+        }
         let target = created_target(&result, source, branch).map_err(|error| {
             recovery(
                 request,
@@ -866,9 +928,6 @@ fn create_and_prompt(
                 &format!("Worktree creation response: {error}"),
             )
         })?;
-        if let Some(journal) = journal.as_mut() {
-            journal.created(&result)?;
-        }
         (target, PathBuf::from(text(&result["worktree"], "path")?))
     };
     let recover = |message: &str| {
@@ -882,7 +941,9 @@ fn create_and_prompt(
     };
     if plan.reserve_for_children {
         if let Some(journal) = journal.as_mut() {
-            journal.phase("reserved")?;
+            journal.phase("reserved").map_err(|error| {
+                recover(&format!("Persisting parent reservation failed: {error}"))
+            })?;
         }
         target.reserved = true;
         return Ok(target);
@@ -926,7 +987,13 @@ fn create_and_prompt(
         ]);
     }
     if let Some(journal) = journal.as_mut() {
-        journal.phase("agent_start_possibly_sent")?;
+        journal
+            .phase("agent_start_possibly_sent")
+            .map_err(|error| {
+                recover(&format!(
+                    "Agent-start fence/claim failed; no start dispatched: {error}"
+                ))
+            })?;
     }
     executor
         .run(&start_args)
@@ -942,9 +1009,23 @@ fn create_and_prompt(
             ))
         })?;
     if let Some(journal) = journal.as_mut() {
-        let bytes = executor.run(&["agent", "get", &target.pane_id])?;
-        journal.capture("ready", &bytes)?;
-        let ready = envelope(&bytes)?;
+        let bytes = executor
+            .run(&["agent", "get", &target.pane_id])
+            .map_err(|error| {
+                recover(&format!(
+                    "Readiness lookup failed; no initial prompt sent: {error}"
+                ))
+            })?;
+        journal.capture("ready", &bytes).map_err(|error| {
+            recover(&format!(
+                "Persisting readiness evidence failed; no initial prompt sent: {error}"
+            ))
+        })?;
+        let ready = envelope(&bytes).map_err(|error| {
+            recover(&format!(
+                "Invalid readiness evidence; no initial prompt sent: {error}"
+            ))
+        })?;
         if ready["type"] != "agent_info"
             || ready["agent"]["pane_id"] != target.pane_id
             || ready["agent"]["workspace_id"] != target.workspace_id
@@ -957,7 +1038,13 @@ fn create_and_prompt(
     }
     // No --wait: submit once and return rather than blocking for the agent's turn.
     if let Some(journal) = journal.as_mut() {
-        journal.phase("initial_prompt_possibly_sent")?;
+        journal
+            .phase("initial_prompt_possibly_sent")
+            .map_err(|error| {
+                recover(&format!(
+                    "Initial-prompt fence failed; no prompt sent: {error}"
+                ))
+            })?;
     }
     executor.run(&["agent", "prompt", &target.pane_id, prompt])
         .and_then(|bytes| {
@@ -968,7 +1055,7 @@ fn create_and_prompt(
             "Prompt submission failed: {error}. The agent started and the prompt may already have been delivered; do not resubmit blindly"
         )))?;
     if let Some(journal) = journal.as_mut() {
-        journal.phase("active")?;
+        journal.phase("active").map_err(|error| recover(&format!("Prompt was accepted but persisting active phase failed: {error}. Do not resubmit blindly")))?;
     }
     Ok(target)
 }
@@ -1084,13 +1171,16 @@ fn recovery(
     pane: Option<&str>,
     message: &str,
 ) -> io::Error {
-    io::Error::other(format!(
-        "{message}. Recovery: source workspace {}, new workspace {}, root pane {}, branch {branch}, agent name {}. Inspect `herdr worktree list`, `git worktree list`, and the new pane/agent before retrying. Nothing was automatically deleted.",
-        request.workspace_id,
-        workspace.unwrap_or("unknown"),
-        pane.unwrap_or("unknown"),
-        request.name
-    ))
+    io::Error::other(LaunchFailure {
+        retry_safe: false,
+        message: format!(
+            "{message}. Recovery: source workspace {}, new workspace {}, root pane {}, branch {branch}, agent name {}. Inspect `herdr worktree list`, `git worktree list`, and the new pane/agent before retrying. Nothing was automatically deleted.",
+            request.workspace_id,
+            workspace.unwrap_or("unknown"),
+            pane.unwrap_or("unknown"),
+            request.name
+        ),
+    })
 }
 
 pub(crate) fn envelope(bytes: &[u8]) -> io::Result<Value> {
@@ -1273,6 +1363,45 @@ mod tests {
         }
     }
 
+    struct FaultRecord {
+        inner: Box<dyn LaunchRecord>,
+        fault: &'static str,
+    }
+    impl LaunchRecord for FaultRecord {
+        fn capture(&mut self, kind: &str, bytes: &[u8]) -> io::Result<()> {
+            if self.fault == format!("capture:{kind}") {
+                return Err(io::Error::other(format!(
+                    "Injected journal save failure at {}",
+                    self.fault
+                )));
+            }
+            self.inner.capture(kind, bytes)
+        }
+        fn created(&mut self, result: &Value) -> io::Result<()> {
+            if self.fault == "created" {
+                return Err(io::Error::other("Injected journal created save failure"));
+            }
+            self.inner.created(result)
+        }
+        fn phase(&mut self, phase: &str) -> io::Result<()> {
+            if self.fault == phase {
+                return Err(io::Error::other(format!(
+                    "Injected journal phase save failure at {phase}"
+                )));
+            }
+            self.inner.phase(phase)
+        }
+        fn failed(&mut self, _message: &str) -> io::Result<()> {
+            Err(io::Error::other("Injected failure-record save failure"))
+        }
+        fn base_branch(&self) -> Option<&str> {
+            self.inner.base_branch()
+        }
+        fn reserved_target(&self) -> Option<(String, String, String, PathBuf)> {
+            self.inner.reserved_target()
+        }
+    }
+
     #[derive(Default)]
     struct FakeExecutor {
         outputs: VecDeque<io::Result<Vec<u8>>>,
@@ -1283,6 +1412,7 @@ mod tests {
         open_children: Vec<String>,
         pending_children: Vec<String>,
         resume_target: Option<PathBuf>,
+        journal_fault: Option<&'static str>,
     }
 
     impl Executor for FakeExecutor {
@@ -1337,15 +1467,21 @@ mod tests {
             _name: &str,
             _workspace: &str,
         ) -> io::Result<Option<Box<dyn LaunchRecord>>> {
-            if let Some(path) = self.resume_target.as_ref() {
-                return Ok(Some(Box::new(FakeReservedJournal(path.clone()))));
-            }
-            if let Some(root) = self.tracked_root.as_ref() {
-                FakeJournal::new(root, bead)
-                    .map(|journal| Some(Box::new(journal) as Box<dyn LaunchRecord>))
-            } else {
-                Ok(None)
-            }
+            let record: Option<Box<dyn LaunchRecord>> =
+                if let Some(path) = self.resume_target.as_ref() {
+                    Some(Box::new(FakeReservedJournal(path.clone())))
+                } else if let Some(root) = self.tracked_root.as_ref() {
+                    Some(Box::new(FakeJournal::new(root, bead)?))
+                } else {
+                    None
+                };
+            Ok(record.map(|inner| {
+                if let Some(fault) = self.journal_fault {
+                    Box::new(FaultRecord { inner, fault }) as Box<dyn LaunchRecord>
+                } else {
+                    inner
+                }
+            }))
         }
 
         fn show_bead(&mut self, id: &str) -> io::Result<Value> {
@@ -1406,6 +1542,114 @@ mod tests {
         assert_eq!(executor.mutations().len(), 2);
         assert_eq!(executor.mutations()[0][..2], ["agent", "start"]);
         assert_eq!(executor.mutations()[1][..2], ["agent", "prompt"]);
+    }
+
+    #[test]
+    fn reserved_resume_fence_and_capture_failures_are_uncertain_and_never_cross_failed_fences() {
+        for fault in [
+            "agent_start_possibly_sent",
+            "capture:start",
+            "capture:ready",
+            "initial_prompt_possibly_sent",
+            "capture:prompt",
+            "active",
+        ] {
+            let mut executor = FakeExecutor::launch();
+            executor.resume_target = Some(PathBuf::from("/new worktree/path"));
+            executor.journal_fault = Some(fault);
+            let create_index = executor.outputs.len() - 3;
+            executor.outputs.remove(create_index);
+            executor.outputs.insert(create_index + 1, Ok(json!({"result":{"type":"agent_info","agent":{"pane_id":"wNew:p1","workspace_id":"wNew","agent":"codex"}}}).to_string().into_bytes()));
+            let error = preflight_failure(run_launch(&mut executor).unwrap_err());
+            assert!(
+                !launch_failure(&error).unwrap().retry_safe,
+                "{fault}: {error}"
+            );
+            assert!(error.to_string().contains("Injected journal"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("Recording launch failure also failed")
+            );
+            assert!(error.to_string().contains("wNew:p1"));
+            assert_eq!(
+                executor.mutations().len(),
+                match fault {
+                    "agent_start_possibly_sent" => 0,
+                    "capture:start" | "capture:ready" | "initial_prompt_possibly_sent" => 1,
+                    _ => 2,
+                },
+                "{fault}"
+            );
+        }
+    }
+
+    #[test]
+    fn new_launch_journal_failures_preserve_durable_possibly_sent_evidence_and_original_error() {
+        for fault in [
+            "capture:create",
+            "created",
+            "agent_start_possibly_sent",
+            "capture:start",
+            "capture:ready",
+            "initial_prompt_possibly_sent",
+            "capture:prompt",
+            "active",
+        ] {
+            let fixture = MainCheckout::new();
+            let mut executor = FakeExecutor::launch();
+            executor.tracked_root = Some(fixture.0.clone());
+            executor.journal_fault = Some(fault);
+            let mut response = created();
+            response["result"]["worktree"]["path"] = json!(fixture.0.join("checkout"));
+            executor.outputs[3] = Ok(response.to_string().into_bytes());
+            executor.outputs.insert(5, Ok(json!({"result":{"type":"agent_info","agent":{"pane_id":"wNew:p1","workspace_id":"wNew","agent":"codex","state_change_seq":10}}}).to_string().into_bytes()));
+            let error = preflight_failure(run_launch(&mut executor).unwrap_err());
+            assert!(
+                !launch_failure(&error).unwrap().retry_safe,
+                "{fault}: {error}"
+            );
+            assert!(error.to_string().contains("Injected journal"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("Recording launch failure also failed")
+            );
+            let registry: Value = serde_json::from_slice(
+                &std::fs::read(fixture.0.join("main/.git/ontrack-worktrees/registry.json"))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                registry["entries"][0]["phase"],
+                match fault {
+                    "capture:create" | "created" => "create_possibly_sent",
+                    "agent_start_possibly_sent" => "created_verified",
+                    "capture:start" | "capture:ready" | "initial_prompt_possibly_sent" =>
+                        "agent_start_possibly_sent",
+                    _ => "initial_prompt_possibly_sent",
+                },
+                "{fault}"
+            );
+            assert_eq!(
+                executor.mutations().len(),
+                match fault {
+                    "capture:create" | "created" | "agent_start_possibly_sent" => 1,
+                    "capture:start" | "capture:ready" | "initial_prompt_possibly_sent" => 2,
+                    _ => 3,
+                },
+                "{fault}"
+            );
+            if fault == "active" {
+                assert!(
+                    registry["entries"][0]["responses"]["prompt"]
+                        .as_str()
+                        .unwrap()
+                        .contains("agent_prompted")
+                );
+                assert!(error.to_string().contains("Prompt was accepted"));
+            }
+        }
     }
 
     #[test]
@@ -2133,6 +2377,48 @@ mod tests {
             _ => panic!("unexpected Git argv {args:?}"),
         };
         Ok(format!("{}\n", output.to_str().unwrap()).into_bytes())
+    }
+
+    #[test]
+    fn startup_trust_uses_real_main_repository_for_main_and_linked_checkouts() {
+        let fixture = MainCheckout::new();
+        let git = |args: &[&std::ffi::OsStr]| {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(&fixture.0)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&[
+            "-c".as_ref(),
+            "user.name=Test".as_ref(),
+            "-c".as_ref(),
+            "user.email=test@example.invalid".as_ref(),
+            "commit".as_ref(),
+            "--quiet".as_ref(),
+            "--allow-empty".as_ref(),
+            "--no-verify".as_ref(),
+            "-m".as_ref(),
+            "fixture".as_ref(),
+        ]);
+        let linked = fixture.0.join("target/linked checkout");
+        git(&[
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "--quiet".as_ref(),
+            "--detach".as_ref(),
+            linked.as_os_str(),
+        ]);
+        let expected = codex_trust_override(&fixture.0.canonicalize().unwrap()).unwrap();
+        assert_eq!(codex_startup_trust(&fixture.0).unwrap(), expected);
+        assert_eq!(codex_startup_trust(&linked).unwrap(), expected);
+        assert!(codex_startup_trust(&fixture.0.join("src")).is_err());
     }
 
     #[test]

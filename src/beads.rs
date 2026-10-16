@@ -1,7 +1,7 @@
-//! Workspace initialization, read-only browsing, and explicit mutations through the Beads CLI.
+//! Read-only browsing and explicit issue mutations through the Beads CLI.
 
+use std::io;
 use std::process::{Command, Output};
-use std::{io, path::Path};
 
 use serde_json::Value;
 
@@ -80,56 +80,6 @@ const LIST_ARGS: &[&str] = &[
     "0",
     "--json",
 ];
-
-const INIT_ARGS: &[&str] = &[
-    "--no-color",
-    "init",
-    "--init-if-missing",
-    "--non-interactive",
-    "--skip-agents",
-    "--skip-hooks",
-    "--quiet",
-];
-const DISABLE_EXPORT_ARGS: &[&str] = &["--no-color", "config", "set", "export.auto", "false"];
-
-/// Ensure the launch directory can use Beads before the terminal enters raw mode.
-pub fn ensure_workspace() -> io::Result<()> {
-    ensure_workspace_in(&std::env::current_dir()?)
-}
-
-fn ensure_workspace_in(directory: &Path) -> io::Result<()> {
-    ensure_workspace_in_with(directory, |directory, args| {
-        Command::new("bd")
-            .args(args)
-            .current_dir(directory)
-            .output()
-    })
-}
-
-fn ensure_workspace_in_with(
-    directory: &Path,
-    mut execute: impl FnMut(&Path, &[&str]) -> io::Result<Output>,
-) -> io::Result<()> {
-    run_bd_with(INIT_ARGS, |args| execute(directory, args)).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "Could not initialize Beads for {}: {error}. Install or check bd, then retry",
-                directory.display()
-            ),
-        )
-    })?;
-    run_bd_with(DISABLE_EXPORT_ARGS, |args| execute(directory, args)).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "Could not disable Beads issue export for {}: {error}. Check bd and workspace permissions, then retry",
-                directory.display()
-            ),
-        )
-    })?;
-    Ok(())
-}
 
 pub fn list_beads() -> io::Result<Vec<Bead>> {
     parse_list(&run_bd(LIST_ARGS)?)
@@ -553,134 +503,6 @@ fn parse_show(bytes: &[u8], id: &str) -> io::Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn startup_initializes_missing_workspace_and_preserves_existing_one() {
-        struct Fixture(std::path::PathBuf);
-        impl Drop for Fixture {
-            fn drop(&mut self) {
-                std::fs::remove_dir_all(&self.0).ok();
-            }
-        }
-
-        let directory = std::env::temp_dir().join(format!(
-            "ontrack-beads-init-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let _fixture = Fixture(directory.clone());
-
-        ensure_workspace_in(&directory).unwrap();
-        assert!(directory.join(".beads").is_dir());
-        assert!(!directory.join("AGENTS.md").exists());
-        assert_eq!(config_value(&directory, "export.auto"), "false");
-
-        let marker = directory.join(".beads/ontrack-marker");
-        std::fs::write(&marker, b"keep").unwrap();
-        set_config(&directory, "export.auto", "true");
-        set_config(&directory, "list.limit", "17");
-        ensure_workspace_in(&directory).unwrap();
-        assert_eq!(std::fs::read(&marker).unwrap(), b"keep");
-        assert_eq!(config_value(&directory, "export.auto"), "false");
-        assert_eq!(config_value(&directory, "list.limit"), "17");
-
-        let nested = directory.join("nested");
-        std::fs::create_dir(&nested).unwrap();
-        set_config(&directory, "export.auto", "true");
-        ensure_workspace_in(&nested).unwrap();
-        assert!(!nested.join(".beads").exists());
-        assert_eq!(config_value(&directory, "export.auto"), "false");
-    }
-
-    fn config_value(directory: &Path, key: &str) -> String {
-        let output = Command::new("bd")
-            .args(["config", "get", key])
-            .current_dir(directory)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        String::from_utf8(output.stdout).unwrap().trim().to_owned()
-    }
-
-    fn set_config(directory: &Path, key: &str, value: &str) {
-        let output = Command::new("bd")
-            .args(["config", "set", key, value])
-            .current_dir(directory)
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[test]
-    fn startup_failure_is_reported_before_terminal_setup() {
-        let directory = Path::new("/missing-workspace");
-        let error = ensure_workspace_in_with(directory, |actual_directory, args| {
-            assert_eq!(actual_directory, directory);
-            assert_eq!(args, INIT_ARGS);
-            Err(io::Error::new(io::ErrorKind::NotFound, "bd not installed"))
-        })
-        .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        assert!(error.to_string().contains("/missing-workspace"));
-        assert!(error.to_string().contains("Install or check bd"));
-    }
-
-    #[test]
-    fn startup_does_not_configure_export_when_init_fails() {
-        let directory = Path::new("/missing-workspace");
-        let mut calls = 0;
-        let error = ensure_workspace_in_with(directory, |actual_directory, args| {
-            calls += 1;
-            assert_eq!(actual_directory, directory);
-            assert_eq!(args, INIT_ARGS);
-            Err(io::Error::other("init denied"))
-        })
-        .unwrap_err();
-        assert_eq!(calls, 1);
-        assert!(error.to_string().contains("init denied"));
-    }
-
-    #[test]
-    fn startup_reports_export_config_failure() {
-        let directory = Path::new("/read-only-workspace");
-        let mut calls = 0;
-        let error = ensure_workspace_in_with(directory, |actual_directory, args| {
-            calls += 1;
-            assert_eq!(actual_directory, directory);
-            match calls {
-                1 => assert_eq!(args, INIT_ARGS),
-                2 => assert_eq!(args, DISABLE_EXPORT_ARGS),
-                _ => panic!("unexpected bd invocation"),
-            }
-            if calls == 2 {
-                Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "config denied",
-                ))
-            } else {
-                Command::new("true").output()
-            }
-        })
-        .unwrap_err();
-        assert_eq!(calls, 2);
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert!(error.to_string().contains("/read-only-workspace"));
-        assert!(error.to_string().contains("config denied"));
-        assert!(error.to_string().contains("workspace permissions"));
-    }
-
     #[test]
     fn child_creation_keeps_parent_and_user_text_in_separate_arguments() {
         let args = create_child_args(
@@ -792,6 +614,28 @@ mod tests {
             ["epic", "ready", "reserved"]
         );
         assert!(epic_ready_targets_in(&beads, "other", true, &handoffs, &accepted).is_err());
+    }
+
+    #[test]
+    fn large_epic_ready_cascade_includes_all_open_tasks() {
+        let mut rows = vec![serde_json::json!({
+            "id": "epic", "title": "Large Epic", "status": "open", "issue_type": "epic"
+        })];
+        rows.extend((0..100).map(|i| {
+            serde_json::json!({
+                "id": format!("task-{i}"), "title": "Task", "status": "open",
+                "issue_type": "task", "parent": "epic"
+            })
+        }));
+        let mut beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        let empty = std::collections::HashSet::new();
+        let marked = epic_ready_targets_in(&beads, "epic", true, &empty, &empty).unwrap();
+        assert_eq!(marked.len(), 101);
+        for bead in &mut beads {
+            bead.data["labels"] = serde_json::json!([READY_LABEL]);
+        }
+        let cleared = epic_ready_targets_in(&beads, "epic", false, &empty, &empty).unwrap();
+        assert_eq!(marked, cleared);
     }
 
     #[test]
