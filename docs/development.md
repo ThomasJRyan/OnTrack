@@ -8,10 +8,11 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Defines the terminal type, ensures Beads is initialized, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
+| `src/main.rs` | Defines the terminal type, runs first-use setup, initializes the terminal, runs the app, and restores the terminal before propagating application errors. |
+| `src/startup.rs` | Discovers the active workspace through Beads and runs the cooked-terminal setup dialogue only when none exists. |
 | `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
-| `src/beads.rs` | Initializes missing workspaces, builds CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
+| `src/beads.rs` | Builds issue CLI commands, runs `bd`, validates JSON responses, and preserves complete returned issue records. |
 | `src/screenshots.rs` | Reads clipboard images, writes local screenshots into the shared Beads workspace, and parses description references for agent prompts. |
 | `src/herdr.rs` | Discovers usable agent integrations, maps the current checkout to a Herdr workspace, focuses a selected managed workspace, and explicitly creates a worktree and starts/prompts an agent. |
 | `src/worktrees.rs` | Journals OnTrack-created handoffs separately from Beads and verifies Git/Herdr evidence before merge finalization or cleanup. |
@@ -50,9 +51,13 @@ retain the existing compact-terminal fallback when changing this layout.
 
 ## Beads CLI contract
 
-Before terminal initialization, `beads::ensure_workspace` runs `bd --no-color init --init-if-missing --non-interactive --skip-agents --skip-hooks --quiet`, then `bd --no-color config set export.auto false`, in the launch directory. Beads creates a local workspace only when none is discoverable, including from an ancestor directory. The second command explicitly disables issue JSONL auto-export in the active workspace on every launch, even if an existing workspace had enabled it. Other Beads settings are retained. A failed command stops startup before raw mode and alternate-screen setup; its error includes the launch directory, the failed step, and the CLI failure. The skip flags preserve tracked agent instructions and avoid installing hooks on application launch. Tests exercise first startup, repeated startup, inherited workspaces, and failures in both steps.
+Before terminal initialization, `startup::ensure_workspace` runs `bd --no-color where --json`. Successful discovery reuses the existing workspace with no configuration writes. Only the structured `no_beads_directory` error enables first-run setup; permission, malformed-output and other discovery failures stop startup. Beads owns ancestor, worktree and redirect discovery. This deliberately replaces the former unconditional idempotent init and forced export-disable commands.
 
-The embedded Dolt database is the issue source of truth. Keep Beads JSONL auto-export disabled (`export.auto: false` in `.beads/config.yaml`) and do not track `.beads/issues.jsonl`; the ignored export is optional interchange data and can dirty the main checkout, blocking safe worktree merges.
+Missing workspaces require interactive stdin/stdout. The cooked-terminal dialogue gathers common init settings, reads additional non-destructive flags and value types from the installed `bd init --help` (excluding global flags), summarizes literal argv and requires explicit confirmation. Cancellation, EOF and declined confirmation return before writes or terminal initialization. Ordinary init uses `--non-interactive` because the dialogue has already collected the choices. Explicit contributor/team wizards omit that switch and use inherited terminal streams; values use `--name=value` arguments, never shell commands. Failed init stops before setting export. Successful init is followed by `bd config set export.auto true|false`, then the existing splash/browser. All errors stop before raw mode, preserving terminal cleanup paths.
+
+New setup recommends JSONL auto-export off to avoid dirty main checkouts blocking worktree merges. Existing workspace settings are preserved; `.beads/issues.jsonl` remains optional interchange data, never the source of truth. The setup does not add a second store for existing global OnTrack preferences.
+
+Focused `cargo test startup::tests` uses injected command execution and buffered dialogue input/output to cover defaults, custom literal values, safe help parsing, invalid input, cancellation/EOF, non-TTY rejection, discovery classification, existing/inherited/redirected workspace bypass, and help/init/export failures. No live project initialization occurs in unit tests. For a manual terminal check, run the built binary from a disposable directory with no ancestor Beads workspace, cancel once, then complete setup and verify the chosen configuration with `bd config get export.auto`. Check terminal recovery on exit and verify a second launch bypasses setup.
 
 ### Ready and agent harness labels
 

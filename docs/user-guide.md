@@ -6,7 +6,7 @@ ontrack browses Beads issues in a two-pane terminal view and can create, edit, o
 
 - Rust 1.88 or newer to build this Rust 2024 project.
 - `bd` available on `PATH`, with support for the JSON commands shown in the [development guide](development.md#beads-cli-contract).
-- OnTrack initializes Beads in the launch directory if no workspace is accessible there. An existing workspace, including one inherited from a parent directory, is reused.
+- OnTrack offers a setup dialogue if no Beads workspace is accessible from the launch directory. Existing workspaces, including inherited and redirected ones, are reused with their configuration intact.
 - An interactive terminal supporting raw mode and the alternate screen; mouse support is needed for clicking and wheel input.
 - For in-app updates, `curl` must be on `PATH`; `tar` is also needed for `.tar.gz` release assets. The executable's directory must be writable for replacement.
 
@@ -20,7 +20,15 @@ cargo run
 
 To browse another workspace, build with `cargo build`, change to that workspace, and launch the built binary using its absolute path. The launch directory, not the binary's location, determines which workspace `bd` uses. Do not launch the interactive application in a runner without a terminal.
 
-Before opening the terminal interface, OnTrack runs non-interactive `bd init --init-if-missing`, then sets `export.auto` to `false` in the active Beads workspace. This also disables issue JSONL auto-export in an existing or inherited workspace where it was enabled. If `bd` is missing or either step fails, OnTrack exits with an error naming the launch directory; check `bd` and workspace permissions, then retry. Startup does not replace project agent instructions or install Beads hooks.
+Before opening the terminal interface, OnTrack asks Beads to locate the active workspace. If none exists, a normal terminal dialogue lets you choose the issue prefix, maintainer/contributor role, embedded or external/shared Dolt storage, stealth mode, git hooks, and agent instruction generation/profile. External server setup asks for host, port and user; supply credentials through `BEADS_DOLT_PASSWORD`, never an option value. Press Enter to accept a displayed default.
+
+The dialogue also offers JSONL auto-export. The recommended default is **off** because exports can dirty checkouts and prevent worktree merges. Existing workspaces retain their export setting; startup no longer forces it off. OnTrack preferences such as theme, default agent, agent limit and cleanup remain available with `s` in the browser.
+
+At “Additional option”, type `help` to see supported options from your installed `bd init --help`, then enter one option name at a time and its literal value when prompted. This covers remote cloning, custom agent files/templates, server sockets/TLS, external servers and Beads contributor/team wizards. No shell quoting or escaping is needed, including for spaces. Destructive reinitialization/import options and global database overrides are excluded. Beads validates option combinations. Explicit contributor/team wizards may ask their own additional setup questions after confirmation. See the [Beads quick start](https://beads.gascity.com/getting-started/quickstart) and `bd init --help` for the installed CLI's contract.
+
+Review the arguments and export setting, then type `yes` to initialize and open OnTrack. The confirmation defaults to **no**. Type `:cancel`, press Ctrl+D, or decline confirmation to exit without creating a workspace. Non-terminal startup never silently initializes: run OnTrack in a terminal or initialize with `bd init` yourself. Hook installation and agent generation default to off; enabling them allows Beads to modify project files.
+
+If `bd` is missing, discovery fails, or initialization fails, OnTrack stops before raw mode and reports the launch directory and failing step. Discovery/permission/database failures do not trigger replacement initialization. Initialization can leave a partial workspace on failure; inspect it with `bd doctor` before retrying. If only export configuration fails, the workspace may already be initialized; use `bd config set export.auto false` (or `true`) before launching again.
 
 A brief splash precedes the browser. A terminal-drawn anime girl blinks and waves beneath the ONTRACK wordmark; narrower terminals use a compact title, and very small terminals show text only. The animation lasts about 1.2 seconds and uses the selected theme. Issue loading starts in the background; quit keys work during startup too.
 
