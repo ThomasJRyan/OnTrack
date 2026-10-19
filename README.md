@@ -18,6 +18,7 @@ To remove the installed executable and OnTrack user settings, run `ontrack unins
 - Mark open Tasks Ready, or mark an Epic and all its open descendant Tasks Ready together. Press `r` again to unready an unsent Task; sent Tasks stay Ready until their Beads status becomes In Progress. The scheduler prepares a Ready Epic's checkout and hands eligible child Tasks to Herdr agents. Set a concurrent agent limit in Settings (five by default).
 - Press `Shift+N` on an open task to create a child task. Child issues appear indented beneath their parent within a status pane. Parent handoff waits for children, and completed child work automatically requests integration into the managed parent worktree by default; Settings can turn this off.
 - When creating an Epic, or later with `g` and confirmation, optionally generate child tasks with assessed P0–P4 priorities from its Description using a Herdr agent in a planning tab inside the current workspace at the same checkout.
+- Press `p` to discuss a new Task or Epic with an agent in OnTrack, answer its choices or type your own response, review the proposal, and confirm creation of Beads.
 - Two-pane browsing with scrollable, Markdown-rendered descriptions, notes, comments, relationships, and Beads details.
 - Paste PNG or JPEG screenshots into a Bead description with `Ctrl+V`; agent handoffs include the saved local image paths.
 - Automatic background refresh picks up external changes, with cached records and visible errors; no watcher setup required.
@@ -37,7 +38,7 @@ Source builds need Rust 1.88 or newer and the `bd` command-line tool. Launch the
 cargo run
 ```
 
-Issues are grouped into coloured, collapsible panes. Open, Ready, Blocked, Deferred, In Progress, and Closed remain visible with zero counts when empty; Closed starts collapsed after loading. Press `Ctrl+?` for hotkeys, `r` (or `Shift+R`) to toggle Ready for an open Task or Epic, `w` for tracked handoffs, `s` for settings, `n` to create a bead, `Shift+N` to create a child task, `e` to edit, and `d` to delete (confirmation required). `Esc` goes back or closes a dialog; `q` and `Ctrl+C` quit. See the [user guide](docs/user-guide.md) for controls and the [development guide](docs/development.md) for scheduling and tracked worktrees.
+Issues are grouped into coloured, collapsible panes. Open, Ready, Blocked, Deferred, In Progress, and Closed remain visible with zero counts when empty; Closed starts collapsed after loading. Press `Ctrl+?` for hotkeys, `r` (or `Shift+R`) to toggle Ready for an open Task or Epic, `p` to plan new work, `w` for tracked handoffs, `s` for settings, `n` to create a bead, `Shift+N` to create a child task, `e` to edit, and `d` to delete (confirmation required). `Esc` goes back or closes a dialog; `q` and `Ctrl+C` quit. See the [user guide](docs/user-guide.md) for controls and the [development guide](docs/development.md) for scheduling and tracked worktrees.
 
 See the [installation guide](docs/installation.md) for release installs, the [user guide](docs/user-guide.md) for controls, the [settings guide](docs/settings.md) for preferences, the [development guide](docs/development.md) for architecture and checks, the [release guide](docs/releases.md) for publishing, and the [official Beads documentation](https://beads.gascity.com) for workspace setup.
 

@@ -38,6 +38,16 @@ Ready group borders and Ready status text are blue in every theme. The label rem
 
 ## Browsing and controls
 
+### Plan new work with an agent
+
+Press `p` from the issue browser to plan a new Task or Epic. Type a proposal and press `Enter` to start the agent in a new tab of the current Herdr workspace. `Shift+Enter` adds a line break in the proposal on terminals that report modified Enter. Planning does not edit the selected issue or create Beads yet.
+
+When the agent asks a question, use `Up` / `Down` to select one of its answers and `Enter` to send it. Select **Custom answer** with `Tab` or `Down` and type your own answer. The agent continues in the background; its next question or proposed plan appears in OnTrack. The agent may take a while to respond. It is instructed to use a structured response, so an agent that ignores that instruction may need attention in its Herdr tab.
+
+Review the proposed title, description, acceptance criteria, priority, and any child Tasks. Scroll a long plan with `Up` / `Down` or `PageUp` / `PageDown`. Press `r` to request a revision, then type your instruction and press `Enter`. Press `y` only when the plan is ready: OnTrack then creates one Task, or an Epic with child Tasks. New Tasks start Open and Unassigned, so you can select an agent and mark them Ready later. Press `Esc` to cancel without creating Beads. The Herdr planning tab remains open for review; close it from Herdr when no longer needed.
+
+If creation reports an error, inspect the named Beads before planning again. An Epic and some children may already exist, and retrying the same plan could duplicate them. OnTrack refreshes the browser after a creation attempt.
+
 ### Ready tasks and scheduler
 
 Press `r` on an open Task to mark it Ready; press it again to return an unsent Ready Task to Open. `Shift+R` also works in the issue browser. A Task showing `· sent` stays Ready while its Beads status is open, and OnTrack shows a notice if you try to clear it. Ready also cannot be cleared while that Task's handoff is underway or before tracked handoffs have loaded. Prepared or uncertain handoffs without a confirmed sent prompt can still be turned off for recovery. On an open Epic, either key marks the Epic and all its open descendant Tasks Ready, including Tasks beneath intermediate children. Press it again on the Epic to clear Ready from the Epic and its unsent descendant Tasks; sent descendants stay Ready. Closed descendants and other issue types are left alone. Tasks already tracked as handed off are not marked Ready again. Ready is an OnTrack group between Open and the other Beads statuses. The underlying Beads status stays `open`; OnTrack stores the marker as the `ontrack:ready` label.

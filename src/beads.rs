@@ -98,6 +98,47 @@ pub fn create_bead(input: &CreateBead) -> io::Result<String> {
     parse_created_id(&run_bd(&args)?)
 }
 
+/// Create one reviewed planning item. Each CLI value stays a separate argv
+/// element, including agent-authored text that may contain shell metacharacters.
+pub fn create_planned(
+    item: &crate::planning::Item,
+    issue_type: &str,
+    parent: Option<&str>,
+) -> io::Result<String> {
+    let args = planned_args(item, issue_type, parent)?;
+    parse_created_id(&run_bd(
+        &args.iter().map(String::as_str).collect::<Vec<_>>(),
+    )?)
+}
+
+fn planned_args(
+    item: &crate::planning::Item,
+    issue_type: &str,
+    parent: Option<&str>,
+) -> io::Result<Vec<String>> {
+    if !matches!(issue_type, "task" | "epic") || item.acceptance.trim().is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid planned Bead",
+        ));
+    }
+    let input = CreateBead {
+        title: item.title.clone(),
+        description: item.description.clone(),
+        issue_type: issue_type.into(),
+        priority: item.priority,
+        harness: None,
+    };
+    let mut args = create_args(&input)?;
+    args.push(format!("--acceptance={}", item.acceptance));
+    if let Some(parent) = parent {
+        validate_id(parent)?;
+        args.push(format!("--parent={parent}"));
+        args.push("--no-inherit-labels".into());
+    }
+    Ok(args)
+}
+
 pub fn create_child(input: &CreateBead, parent_id: &str) -> io::Result<String> {
     validate_id(parent_id)?;
     let parent = show_bead(parent_id)?;
@@ -693,6 +734,21 @@ mod tests {
                 "--labels=ontrack:unassigned",
             ]
         );
+    }
+
+    #[test]
+    fn planned_creation_preserves_acceptance_and_parent_as_arguments() {
+        let item = crate::planning::Item {
+            title: "Plan child".into(),
+            description: "Do the work".into(),
+            acceptance: "Check $(touch ignored)\nthen test".into(),
+            priority: 1,
+        };
+        let args = planned_args(&item, "task", Some("epic-1")).unwrap();
+        assert!(args.contains(&"--acceptance=Check $(touch ignored)\nthen test".into()));
+        assert!(args.contains(&"--parent=epic-1".into()));
+        assert!(args.contains(&"--labels=ontrack:unassigned".into()));
+        assert!(planned_args(&item, "task", Some("-unsafe")).is_err());
     }
 
     #[test]

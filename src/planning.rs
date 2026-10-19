@@ -1,0 +1,424 @@
+//! Interactive planning session. Herdr carries the conversation; OnTrack owns issue creation.
+
+use std::{io, path::Path, process::Command};
+
+use serde_json::Value;
+
+use crate::{beads, epic::Session, herdr};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Item {
+    pub title: String,
+    pub description: String,
+    pub acceptance: String,
+    pub priority: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Plan {
+    pub kind: String,
+    pub root: Item,
+    pub tasks: Vec<Item>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    Question { text: String, options: Vec<String> },
+    Plan(Plan),
+}
+
+fn invalid(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+fn run(args: &[&str]) -> io::Result<Vec<u8>> {
+    let output = Command::new("herdr").args(args).output()?;
+    if !output.status.success() {
+        return Err(io::Error::other(format!(
+            "Herdr exited {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+fn envelope(bytes: &[u8], expected: &str) -> io::Result<Value> {
+    let value = herdr::envelope(bytes)?;
+    if value["type"] != expected {
+        return Err(invalid(format!("Expected Herdr {expected} response")));
+    }
+    Ok(value)
+}
+
+fn safe_id(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":_-".contains(&byte))
+}
+
+fn checked_session(session: &Session) -> io::Result<()> {
+    if !safe_id(&session.workspace_id)
+        || !safe_id(&session.tab_id)
+        || !safe_id(&session.pane_id)
+        || !session
+            .tab_id
+            .starts_with(&format!("{}:", session.workspace_id))
+        || !session
+            .pane_id
+            .starts_with(&format!("{}:", session.workspace_id))
+    {
+        return Err(invalid("Unsafe planning session identity"));
+    }
+    Ok(())
+}
+
+pub fn launch(proposal: &str, marker: &str) -> io::Result<Session> {
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    let source_id = std::env::var("HERDR_WORKSPACE_ID")
+        .map_err(|_| invalid("Open OnTrack inside a Herdr workspace to plan"))?;
+    launch_with(&cwd, &source_id, proposal, marker, run)
+}
+
+fn launch_with(
+    cwd: &Path,
+    source_id: &str,
+    proposal: &str,
+    marker: &str,
+    mut command: impl FnMut(&[&str]) -> io::Result<Vec<u8>>,
+) -> io::Result<Session> {
+    if proposal.trim().is_empty() || !safe_id(source_id) || !safe_id(marker) {
+        return Err(invalid(
+            "Planning needs a proposal and valid Herdr identity",
+        ));
+    }
+    let workspaces = envelope(&command(&["workspace", "list"])?, "workspace_list")?;
+    if !workspaces["workspaces"].as_array().is_some_and(|rows| {
+        rows.iter()
+            .any(|row| row["workspace_id"].as_str() == Some(source_id))
+    }) {
+        return Err(invalid("Source Herdr workspace is no longer open"));
+    }
+    let supported = herdr::supported_agents(&command(&["agent", "start", "--help"])?)?;
+    let available = herdr::available_agents(&command(&["integration", "status"])?, &supported)?;
+    let agent = available
+        .iter()
+        .find(|agent| agent.as_str() == "codex")
+        .unwrap_or(&available[0]);
+    let trust = if agent == "codex" {
+        Some(herdr::codex_startup_trust(cwd)?)
+    } else {
+        None
+    };
+    let cwd = cwd
+        .to_str()
+        .ok_or_else(|| invalid("Current checkout path is not UTF-8"))?;
+    let created = command(&[
+        "tab", "create", "--workspace", source_id, "--cwd", cwd, "--label", "OnTrack planning", "--no-focus",
+    ])
+    .and_then(|bytes| envelope(&bytes, "tab_created"))
+    .map_err(|error| io::Error::other(format!(
+        "Planning tab creation may have succeeded: {error}. Inspect workspace {source_id} before retrying"
+    )))?;
+    let field = |object: &Value, key: &str| -> io::Result<String> {
+        object[key]
+            .as_str()
+            .filter(|value| safe_id(value))
+            .map(str::to_owned)
+            .ok_or_else(|| invalid(format!("Herdr response lacks safe {key}")))
+    };
+    let session = Session {
+        workspace_id: field(&created["tab"], "workspace_id")?,
+        tab_id: field(&created["tab"], "tab_id")?,
+        pane_id: field(&created["root_pane"], "pane_id")?,
+    };
+    checked_session(&session)?;
+    if session.workspace_id != source_id
+        || created["root_pane"]["workspace_id"] != source_id
+        || created["root_pane"]["tab_id"] != session.tab_id
+    {
+        return Err(invalid("Herdr returned inconsistent planning tab IDs"));
+    }
+    let name = format!(
+        "ontrack-plan-{}",
+        marker.chars().take(20).collect::<String>()
+    );
+    let mut args = vec![
+        "agent",
+        "start",
+        &name,
+        "--kind",
+        agent,
+        "--pane",
+        &session.pane_id,
+        "--timeout",
+        "30000",
+    ];
+    if let Some(trust) = trust.as_deref() {
+        args.extend(["--", "-c", trust, "-c", "check_for_update_on_startup=false"]);
+    }
+    let started = command(&args)
+        .and_then(|bytes| envelope(&bytes, "agent_started"))
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "Agent start failed or its outcome is uncertain in Herdr tab {}: {error}. Inspect that tab before retrying",
+                    session.tab_id
+                ),
+            )
+        })?;
+    check_agent(&started, &session, "agent_started")?;
+    let prompt = format!(
+        "You are planning new Beads for this workspace. Read AGENTS.md and CLAUDE.md and inspect relevant project context. Discuss the proposal with the user through OnTrack. Do not create, update, close, or implement Beads. Do not call an interactive question tool; ask the user by ending your turn with exactly one single-line JSON message prefixed by {marker} followed by one space. For a question use keys kind=question, text (string), options (array of 2-5 concise strings). For a final plan use kind=plan, issue_type=task or epic, root (object with title, description, acceptance, priority integer 0-4), tasks (array of objects with the same four fields; empty for a task, at least two for an epic). Keep JSON on one line, without a code fence. The root and each task must have actionable descriptions and testable acceptance. Ask clarifying questions when needed. If the user requests a revision, issue another question or plan. Finish your turn after the JSON. Never write Beads; OnTrack presents the plan for explicit confirmation and creates them.\n\nProposal:\n{proposal}"
+    );
+    submit_with(&session, &prompt, &mut command)?;
+    Ok(session)
+}
+
+fn check_agent(value: &Value, session: &Session, expected: &str) -> io::Result<()> {
+    if value["type"] != expected
+        || value["agent"]["pane_id"] != session.pane_id
+        || value["agent"]["workspace_id"] != session.workspace_id
+        || value["agent"]["tab_id"] != session.tab_id
+    {
+        return Err(invalid("Herdr returned a different planning agent"));
+    }
+    Ok(())
+}
+
+fn submit_with(
+    session: &Session,
+    message: &str,
+    command: &mut impl FnMut(&[&str]) -> io::Result<Vec<u8>>,
+) -> io::Result<()> {
+    checked_session(session)?;
+    let result = command(&[
+        "agent",
+        "prompt",
+        &session.pane_id,
+        message,
+        "--wait",
+        "--until",
+        "working",
+    ])
+    .and_then(|bytes| envelope(&bytes, "agent_prompted"))
+    .map_err(|error| {
+        io::Error::other(format!(
+            "Prompt may have reached planning pane {}; inspect it before retrying: {error}",
+            session.pane_id
+        ))
+    })?;
+    check_agent(&result, session, "agent_prompted")
+}
+
+pub fn reply(session: &Session, message: &str, marker: &str) -> io::Result<()> {
+    if message.trim().is_empty() || !safe_id(marker) {
+        return Err(invalid("Planning reply is empty or marker invalid"));
+    }
+    let prompt = format!(
+        "User reply: {message}\nContinue planning. End this turn with one single-line JSON message prefixed by {marker} and one space. Use the question or plan shape specified earlier. Do not create Beads."
+    );
+    submit_with(session, &prompt, &mut run)
+}
+
+pub fn read(session: &Session, marker: &str) -> io::Result<Option<Message>> {
+    checked_session(session)?;
+    let bytes = run(&[
+        "agent",
+        "read",
+        &session.pane_id,
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        "300",
+    ])
+    .or_else(|_| {
+        run(&[
+            "pane",
+            "read",
+            &session.pane_id,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            "300",
+        ])
+    })?;
+    parse_output(&String::from_utf8_lossy(&bytes), marker)
+}
+
+fn item(value: &Value) -> io::Result<Item> {
+    let required = |key: &str| -> io::Result<String> {
+        value[key]
+            .as_str()
+            .filter(|text| !text.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| invalid(format!("Plan item lacks {key}")))
+    };
+    let priority = value["priority"]
+        .as_u64()
+        .filter(|value| *value <= 4)
+        .ok_or_else(|| invalid("Plan item priority must be P0–P4"))? as u8;
+    let title = required("title")?;
+    if title.contains(['\n', '\r']) {
+        return Err(invalid("Plan item title must be one line"));
+    }
+    Ok(Item {
+        title,
+        description: required("description")?,
+        acceptance: required("acceptance")?,
+        priority,
+    })
+}
+
+pub fn parse_output(output: &str, marker: &str) -> io::Result<Option<Message>> {
+    if !safe_id(marker) {
+        return Err(invalid("Invalid planning marker"));
+    }
+    let prefix = format!("{marker} ");
+    let Some(line) = output.lines().rev().find_map(|line| {
+        line.find(&prefix)
+            .map(|index| &line[index + prefix.len()..])
+    }) else {
+        return Ok(None);
+    };
+    let value: Value = serde_json::from_str(line)
+        .map_err(|error| invalid(format!("Agent planning response is invalid JSON: {error}")))?;
+    match value["kind"].as_str() {
+        Some("question") => {
+            let text = value["text"]
+                .as_str()
+                .filter(|text| !text.trim().is_empty())
+                .ok_or_else(|| invalid("Agent question has no text"))?
+                .to_owned();
+            let options = value["options"]
+                .as_array()
+                .ok_or_else(|| invalid("Agent question has no options"))?
+                .iter()
+                .map(|option| {
+                    option
+                        .as_str()
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_owned)
+                })
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| invalid("Agent question has an empty option"))?;
+            if !(2..=5).contains(&options.len()) {
+                return Err(invalid("Agent question must have 2–5 options"));
+            }
+            Ok(Some(Message::Question { text, options }))
+        }
+        Some("plan") => {
+            let kind = value["issue_type"]
+                .as_str()
+                .filter(|kind| *kind == "task" || *kind == "epic")
+                .ok_or_else(|| invalid("Plan must be a task or epic"))?
+                .to_owned();
+            let root = item(&value["root"])?;
+            let tasks = value["tasks"]
+                .as_array()
+                .ok_or_else(|| invalid("Plan lacks tasks array"))?
+                .iter()
+                .map(item)
+                .collect::<io::Result<Vec<_>>>()?;
+            if (kind == "task" && !tasks.is_empty()) || (kind == "epic" && tasks.len() < 2) {
+                return Err(invalid(
+                    "Task plans need no children; Epic plans need at least two child Tasks",
+                ));
+            }
+            Ok(Some(Message::Plan(Plan { kind, root, tasks })))
+        }
+        _ => Err(invalid("Agent planning response has unknown kind")),
+    }
+}
+
+pub fn create(plan: &Plan) -> Result<Vec<String>, String> {
+    create_with(plan, beads::create_planned)
+}
+
+fn create_with(
+    plan: &Plan,
+    mut create: impl FnMut(&Item, &str, Option<&str>) -> io::Result<String>,
+) -> Result<Vec<String>, String> {
+    let mut created = Vec::new();
+    let root = create(&plan.root, &plan.kind, None).map_err(|error| {
+        format!("Root creation failed or its outcome is uncertain: {error}. Inspect Beads before retrying")
+    })?;
+    created.push(root.clone());
+    for task in &plan.tasks {
+        match create(task, "task", Some(&root)) {
+            Ok(id) => created.push(id),
+            Err(error) => {
+                return Err(format!(
+                    "Created {}. Child creation failed: {error}. Do not retry this plan; inspect these Beads before continuing",
+                    created.join(", ")
+                ));
+            }
+        }
+    }
+    Ok(created)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_question_and_epic_and_rejects_incomplete_plan() {
+        let q = r#"ONTRACK_x {"kind":"question","text":"Scope?","options":["A","B"]}"#;
+        assert_eq!(
+            parse_output(q, "ONTRACK_x").unwrap(),
+            Some(Message::Question {
+                text: "Scope?".into(),
+                options: vec!["A".into(), "B".into()]
+            })
+        );
+        let plan = r#"ONTRACK_x {"kind":"plan","issue_type":"epic","root":{"title":"Epic","description":"Why","acceptance":"Check","priority":2},"tasks":[{"title":"Child","description":"Do","acceptance":"Test","priority":1},{"title":"Second","description":"Do more","acceptance":"Check more","priority":2}]}"#;
+        assert!(
+            matches!(parse_output(plan, "ONTRACK_x").unwrap(), Some(Message::Plan(Plan { tasks, .. })) if tasks.len() == 2)
+        );
+        assert!(
+            parse_output(
+                &plan.replace("\"acceptance\":\"Test\"", "\"acceptance\":\"\""),
+                "ONTRACK_x"
+            )
+            .is_err()
+        );
+        assert_eq!(parse_output(q, "ONTRACK_other").unwrap(), None);
+    }
+
+    #[test]
+    fn creates_epic_then_children_and_reports_partial_failure() {
+        let item = Item {
+            title: "Work".into(),
+            description: "Do work".into(),
+            acceptance: "Test work".into(),
+            priority: 2,
+        };
+        let plan = Plan {
+            kind: "epic".into(),
+            root: item.clone(),
+            tasks: vec![item.clone(), item],
+        };
+        let mut calls = Vec::new();
+        let result = create_with(&plan, |_, kind, parent| {
+            calls.push((kind.to_owned(), parent.map(str::to_owned)));
+            match calls.len() {
+                1 => Ok("epic-1".into()),
+                2 => Ok("child-1".into()),
+                _ => Err(io::Error::other("offline")),
+            }
+        });
+        assert_eq!(
+            calls,
+            [
+                ("epic".into(), None),
+                ("task".into(), Some("epic-1".into())),
+                ("task".into(), Some("epic-1".into()))
+            ]
+        );
+        assert!(result.unwrap_err().contains("epic-1, child-1"));
+    }
+}

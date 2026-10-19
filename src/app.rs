@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, mpsc},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 fn spawn_epic_planning(id: String, replies: mpsc::Sender<Response>) {
@@ -63,6 +63,10 @@ pub(super) enum Request {
     ReconcileWorktrees(CleanupPolicy),
     ObserveAgents,
     ReadScreenshot(u64),
+    PlanLaunch(u64, String, String),
+    PlanRead(u64, crate::epic::Session, String),
+    PlanReply(u64, crate::epic::Session, String, String),
+    PlanCreate(u64, crate::planning::Plan),
 }
 pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
@@ -83,6 +87,14 @@ pub(super) enum Response {
     WorktreeRestarted(std::io::Result<String>),
     AgentsObserved(std::io::Result<Vec<worktrees::AgentDisplay>>),
     ScreenshotRead(u64, std::io::Result<Vec<u8>>),
+    PlanLaunched(u64, std::io::Result<crate::epic::Session>),
+    PlanRead(
+        u64,
+        String,
+        std::io::Result<Option<crate::planning::Message>>,
+    ),
+    PlanReplied(u64, String, std::io::Result<()>),
+    PlanCreated(u64, Result<Vec<String>, String>),
 }
 pub(super) enum WorktreeFocusFeedback {
     Success(String),
@@ -143,6 +155,7 @@ pub struct App {
     /// Ready keeps mutation exclusion without locking browser input.
     pub ready_pending: bool,
     pub planning_epics: HashSet<String>,
+    pub(super) planning_seq: u64,
     pub modal_ready: bool,
     pub(crate) paste_seq: u64,
     pub(crate) paste_pending: bool,
@@ -156,6 +169,7 @@ pub struct App {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
+    Planning(PlanningForm),
     Create(CreateForm),
     EditLoading {
         id: String,
@@ -184,6 +198,56 @@ pub enum Modal {
         id: String,
         action: u8,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanningStage {
+    Draft,
+    Waiting,
+    Question { text: String, options: Vec<String> },
+    Review(crate::planning::Plan),
+    Revision,
+    Creating,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanningForm {
+    pub seq: u64,
+    pub proposal: String,
+    pub input: String,
+    pub marker: String,
+    pub round: u64,
+    pub session: Option<crate::epic::Session>,
+    pub stage: PlanningStage,
+    pub selected: usize,
+    pub poll_inflight: bool,
+    pub next_poll: Instant,
+    pub scroll: u16,
+}
+
+impl PlanningForm {
+    fn new(seq: u64) -> Self {
+        Self {
+            seq,
+            proposal: String::new(),
+            input: String::new(),
+            marker: format!(
+                "ONTRACK_PLAN_{seq}_{:x}",
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            ),
+            round: 0,
+            session: None,
+            stage: PlanningStage::Draft,
+            selected: 0,
+            poll_inflight: false,
+            next_poll: Instant::now(),
+            scroll: 0,
+        }
+    }
 }
 #[derive(Debug, Clone)]
 pub struct Toast {
@@ -403,6 +467,20 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
         Request::ReadScreenshot(seq) => {
             Response::ScreenshotRead(seq, screenshots::read_clipboard())
         }
+        Request::PlanLaunch(seq, proposal, marker) => {
+            Response::PlanLaunched(seq, crate::planning::launch(&proposal, &marker))
+        }
+        Request::PlanRead(seq, session, marker) => {
+            let result = crate::planning::read(&session, &marker);
+            Response::PlanRead(seq, marker, result)
+        }
+        Request::PlanReply(seq, session, message, marker) => {
+            let result = crate::planning::reply(&session, &message, &marker);
+            Response::PlanReplied(seq, marker, result)
+        }
+        Request::PlanCreate(seq, plan) => {
+            Response::PlanCreated(seq, crate::planning::create(&plan))
+        }
         Request::SetReady(id, ready) => Response::ReadySet(
             id.clone(),
             ready,
@@ -468,6 +546,9 @@ fn start_workers(
             if matches!(
                 request,
                 Request::Discover(_)
+                    | Request::PlanLaunch(..)
+                    | Request::PlanRead(..)
+                    | Request::PlanReply(..)
                     | Request::DiscoverHarnesses(_)
                     | Request::Launch(..)
                     | Request::LaunchReady(..)
@@ -571,6 +652,7 @@ impl App {
             mutation_busy: false,
             ready_pending: false,
             planning_epics: HashSet::new(),
+            planning_seq: 0,
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -599,6 +681,30 @@ impl App {
     fn poll_refresh(&mut self, now: Instant) {
         if !self.refresh_inflight && now >= self.next_refresh {
             self.start_refresh(now);
+        }
+    }
+    fn poll_planning(&mut self, now: Instant) {
+        let Some(Modal::Planning(form)) = self.modal.as_mut() else {
+            return;
+        };
+        if !matches!(form.stage, PlanningStage::Waiting)
+            || form.poll_inflight
+            || now < form.next_poll
+        {
+            return;
+        }
+        let Some(session) = form.session.clone() else {
+            return;
+        };
+        form.poll_inflight = true;
+        form.next_poll = now + Duration::from_secs(2);
+        if self
+            .requests
+            .send(Request::PlanRead(form.seq, session, form.marker.clone()))
+            .is_err()
+        {
+            form.poll_inflight = false;
+            form.stage = PlanningStage::Failed("Agent output read could not be queued".into());
         }
     }
     fn poll_scheduler(&mut self) {
@@ -1162,6 +1268,79 @@ impl App {
                     self.toast = Some(Toast::result(message, error));
                     self.refresh_at(now);
                 }
+                Response::PlanLaunched(seq, result) => {
+                    if let Some(Modal::Planning(form)) = self.modal.as_mut()
+                        && form.seq == seq
+                    {
+                        match result {
+                            Ok(session) => {
+                                form.session = Some(session);
+                                form.next_poll = now;
+                            }
+                            Err(error) => form.stage = PlanningStage::Failed(error.to_string()),
+                        }
+                    } else if let Ok(session) = result {
+                        self.notice = Some(format!(
+                            "Cancelled planning started in Herdr tab {}; inspect or close it there",
+                            session.tab_id
+                        ));
+                    }
+                }
+                Response::PlanRead(seq, marker, result) => {
+                    if let Some(Modal::Planning(form)) = self.modal.as_mut()
+                        && form.seq == seq
+                        && form.marker == marker
+                    {
+                        form.poll_inflight = false;
+                        match result {
+                            Ok(Some(crate::planning::Message::Question { text, options })) => {
+                                form.stage = PlanningStage::Question { text, options };
+                                form.selected = 0;
+                                form.input.clear();
+                                form.scroll = 0;
+                            }
+                            Ok(Some(crate::planning::Message::Plan(plan))) => {
+                                form.stage = PlanningStage::Review(plan);
+                                form.scroll = 0;
+                            }
+                            Ok(None) => {}
+                            Err(error) => form.stage = PlanningStage::Failed(error.to_string()),
+                        }
+                    }
+                }
+                Response::PlanReplied(seq, marker, result) => {
+                    if let Some(Modal::Planning(form)) = self.modal.as_mut()
+                        && form.seq == seq
+                        && form.marker == marker
+                    {
+                        if let Err(error) = result {
+                            form.stage = PlanningStage::Failed(error.to_string());
+                        } else {
+                            form.next_poll = now;
+                        }
+                    }
+                }
+                Response::PlanCreated(seq, result) => {
+                    if !matches!(self.modal, Some(Modal::Planning(ref form)) if form.seq == seq) {
+                        continue;
+                    }
+                    self.mutation_busy = false;
+                    match result {
+                        Ok(ids) => {
+                            self.notice =
+                                Some(format!("Created planned Beads: {}", ids.join(", ")));
+                            self.preferred_id = ids.first().cloned();
+                            self.modal = None;
+                        }
+                        Err(error) => {
+                            self.notice = Some(format!("Planning creation failed: {error}"));
+                            if let Some(Modal::Planning(form)) = self.modal.as_mut() {
+                                form.stage = PlanningStage::Failed(error);
+                            }
+                        }
+                    }
+                    self.refresh_at(now);
+                }
                 Response::Updated(id, result) => {
                     self.mutation_busy = false;
                     match result {
@@ -1665,7 +1844,7 @@ impl App {
             && matches!(
                 k.code,
                 KeyCode::Char(
-                    'n' | 'N' | 'e' | 'd' | 'g' | 'h' | 's' | 'u' | 'm' | 'c' | 'x' | 'R'
+                    'n' | 'N' | 'e' | 'd' | 'g' | 'h' | 'p' | 's' | 'u' | 'm' | 'c' | 'x' | 'R'
                 )
             )
         {
@@ -1709,6 +1888,12 @@ impl App {
             return false;
         }
         match k.code {
+            KeyCode::Char('p') => {
+                self.planning_seq = self.planning_seq.wrapping_add(1);
+                self.modal = Some(Modal::Planning(PlanningForm::new(self.planning_seq)));
+                self.modal_ready = false;
+                self.notice = None;
+            }
             KeyCode::Char('w') => {
                 self.worktrees_view = true;
                 self.worktrees_focus_feedback = None;
@@ -1910,12 +2095,146 @@ impl App {
         });
         self.modal_ready = false;
     }
+    fn planning_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        let Some(Modal::Planning(form)) = self.modal.as_mut() else {
+            return;
+        };
+        if key.code == Esc {
+            if form.session.is_some() {
+                self.notice = Some(format!(
+                    "Planning cancelled; Herdr tab remains open for review ({})",
+                    form.session.as_ref().map_or("", |session| &session.tab_id)
+                ));
+            }
+            self.modal = None;
+            return;
+        }
+        match &form.stage {
+            PlanningStage::Draft => match key.code {
+                Enter if key.modifiers.contains(KeyModifiers::SHIFT) => form.proposal.push('\n'),
+                Enter if !form.proposal.trim().is_empty() => {
+                    let request =
+                        Request::PlanLaunch(form.seq, form.proposal.clone(), form.marker.clone());
+                    if self.requests.send(request).is_ok() {
+                        form.stage = PlanningStage::Waiting;
+                    } else {
+                        form.stage =
+                            PlanningStage::Failed("Planning launch could not be queued".into());
+                    }
+                }
+                Backspace => {
+                    form.proposal.pop();
+                }
+                Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => form.proposal.push(c),
+                _ => {}
+            },
+            PlanningStage::Question { options, .. } => {
+                let options = options.clone();
+                match key.code {
+                    Up => form.selected = form.selected.saturating_sub(1),
+                    Down => form.selected = (form.selected + 1).min(options.len()),
+                    Tab => form.selected = options.len(),
+                    Backspace if form.selected == options.len() => {
+                        form.input.pop();
+                    }
+                    Char(c)
+                        if form.selected == options.len()
+                            && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                    {
+                        form.input.push(c)
+                    }
+                    Enter => {
+                        let answer = if form.selected == options.len() {
+                            form.input.trim().to_owned()
+                        } else {
+                            options[form.selected].clone()
+                        };
+                        if !answer.is_empty() {
+                            Self::submit_planning_reply(form, &self.requests, answer);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            PlanningStage::Review(plan) => match key.code {
+                Char('y' | 'Y') => {
+                    let request = Request::PlanCreate(form.seq, plan.clone());
+                    if self.requests.send(request).is_ok() {
+                        form.stage = PlanningStage::Creating;
+                        self.mutation_busy = true;
+                    } else {
+                        form.stage =
+                            PlanningStage::Failed("Bead creation could not be queued".into());
+                    }
+                }
+                Char('r') => {
+                    form.input.clear();
+                    form.stage = PlanningStage::Revision;
+                }
+                Up => form.scroll = form.scroll.saturating_sub(1),
+                Down => form.scroll = form.scroll.saturating_add(1),
+                PageUp => form.scroll = form.scroll.saturating_sub(10),
+                PageDown => form.scroll = form.scroll.saturating_add(10),
+                _ => {}
+            },
+            PlanningStage::Revision => match key.code {
+                Enter if key.modifiers.contains(KeyModifiers::SHIFT) => form.input.push('\n'),
+                Enter if !form.input.trim().is_empty() => {
+                    Self::submit_planning_reply(form, &self.requests, form.input.trim().to_owned());
+                }
+                Backspace => {
+                    form.input.pop();
+                }
+                Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => form.input.push(c),
+                _ => {}
+            },
+            PlanningStage::Failed(_) if key.code == Char('r') && form.session.is_some() => {
+                form.stage = PlanningStage::Waiting;
+                form.next_poll = Instant::now();
+            }
+            _ => {}
+        }
+    }
+
+    fn submit_planning_reply(
+        form: &mut PlanningForm,
+        requests: &mpsc::Sender<Request>,
+        answer: String,
+    ) {
+        let Some(session) = form.session.clone() else {
+            form.stage = PlanningStage::Failed("Planning agent session is unavailable".into());
+            return;
+        };
+        form.round = form.round.saturating_add(1);
+        form.marker = format!("{}_{}", form.marker, form.round);
+        if requests
+            .send(Request::PlanReply(
+                form.seq,
+                session,
+                answer,
+                form.marker.clone(),
+            ))
+            .is_ok()
+        {
+            form.stage = PlanningStage::Waiting;
+            form.poll_inflight = false;
+            form.next_poll = Instant::now() + Duration::from_secs(2);
+        } else {
+            form.stage = PlanningStage::Failed("Planning reply could not be queued".into());
+        }
+    }
+
     fn modal_key(&mut self, key: KeyEvent) -> bool {
         use crossterm::event::KeyCode::*;
         if self.mutation_busy {
             return false;
         }
         if !self.modal_ready && key.code != Esc {
+            return false;
+        }
+        if matches!(self.modal, Some(Modal::Planning(_))) {
+            self.planning_key(key);
             return false;
         }
         if key.code == Esc {
@@ -2757,6 +3076,7 @@ pub fn run(t: &mut Tui) -> std::io::Result<()> {
     loop {
         app.receive();
         app.poll_refresh(Instant::now());
+        app.poll_planning(Instant::now());
         app.poll_worktrees(Instant::now());
         app.poll_agent_observations(Instant::now());
         app.poll_scheduler();
@@ -2983,6 +3303,7 @@ mod tests {
             mutation_busy: false,
             ready_pending: false,
             planning_epics: HashSet::new(),
+            planning_seq: 0,
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -4235,6 +4556,108 @@ mod tests {
         a.requests = requests;
         a.responses = responses;
         (a, rx, tx)
+    }
+
+    #[test]
+    fn planning_asks_and_sends_custom_answer_without_creating_beads() {
+        let (mut a, requests, replies) = connected_app();
+        press(&mut a, KeyCode::Char('p'));
+        for c in "Improve search".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        assert!(requests.try_recv().is_err());
+        press(&mut a, KeyCode::Enter);
+        let (seq, marker) = match requests.try_recv().unwrap() {
+            Request::PlanLaunch(seq, proposal, marker) => {
+                assert_eq!(proposal, "Improve search");
+                (seq, marker)
+            }
+            _ => panic!("expected planning launch"),
+        };
+        let session = crate::epic::Session {
+            workspace_id: "w1".into(),
+            tab_id: "w1:t2".into(),
+            pane_id: "w1:p2".into(),
+        };
+        replies
+            .send(Response::PlanLaunched(seq, Ok(session.clone())))
+            .unwrap();
+        a.receive();
+        a.poll_planning(Instant::now());
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::PlanRead(read_seq, _, read_marker)) if read_seq == seq && read_marker == marker)
+        );
+        replies
+            .send(Response::PlanRead(
+                seq,
+                marker,
+                Ok(Some(crate::planning::Message::Question {
+                    text: "Which scope?".into(),
+                    options: vec!["Small".into(), "Large".into()],
+                })),
+            ))
+            .unwrap();
+        a.receive();
+        press(&mut a, KeyCode::Tab);
+        for c in "Only titles".chars() {
+            press(&mut a, KeyCode::Char(c));
+        }
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::PlanReply(reply_seq, reply_session, answer, _)) if reply_seq == seq && reply_session == session && answer == "Only titles")
+        );
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Planning(PlanningForm {
+                stage: PlanningStage::Waiting,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn planning_review_requires_explicit_confirmation_and_blocks_repeat_create() {
+        let (mut a, requests, replies) = connected_app();
+        press(&mut a, KeyCode::Char('p'));
+        let seq = a.planning_seq;
+        let plan = crate::planning::Plan {
+            kind: "task".into(),
+            root: crate::planning::Item {
+                title: "Search".into(),
+                description: "Implement search".into(),
+                acceptance: "Find a result".into(),
+                priority: 2,
+            },
+            tasks: vec![],
+        };
+        if let Some(Modal::Planning(form)) = a.modal.as_mut() {
+            form.stage = PlanningStage::Review(plan.clone());
+        }
+        assert!(requests.try_recv().is_err());
+        press(&mut a, KeyCode::Char('y'));
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::PlanCreate(create_seq, submitted)) if create_seq == seq && submitted == plan)
+        );
+        press(&mut a, KeyCode::Char('y'));
+        assert!(requests.try_recv().is_err());
+        replies
+            .send(Response::PlanCreated(
+                seq,
+                Err("Created b1; inspect".into()),
+            ))
+            .unwrap();
+        a.receive();
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Planning(PlanningForm {
+                stage: PlanningStage::Failed(_),
+                ..
+            }))
+        ));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        assert!(matches!(requests.try_recv(), Ok(Request::List)));
+        assert!(requests.try_recv().is_err());
     }
     fn take_show(rx: &mpsc::Receiver<Request>, expected_id: &str) -> u64 {
         match rx.try_recv() {

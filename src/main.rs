@@ -5,6 +5,7 @@ mod epic;
 mod event;
 mod herdr;
 mod hotkeys;
+mod planning;
 mod screenshots;
 mod settings;
 mod startup;

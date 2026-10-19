@@ -1,4 +1,4 @@
-use crate::app::{App, DisplayRow};
+use crate::app::{App, DisplayRow, PlanningForm, PlanningStage};
 use crate::settings::Theme;
 use ratatui::{
     Frame,
@@ -334,6 +334,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             a,
         );
         render_toast(f, app);
+        render_help(f, app);
+        return;
+    }
+    if let Some(crate::app::Modal::Planning(form)) = &app.modal {
+        app.modal_ready = a.width >= 50 && a.height >= 12;
+        render_planning(f, a, form, app.theme, app.modal_ready);
         render_help(f, app);
         return;
     }
@@ -997,6 +1003,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             _ => None,
         };
         let height = match modal {
+            crate::app::Modal::Planning(_) => 0,
             crate::app::Modal::Settings {
                 error,
                 dropdown_open,
@@ -1117,6 +1124,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             area.height.saturating_sub(2),
         );
         match modal {
+            crate::app::Modal::Planning(_) => {}
             crate::app::Modal::EditLoading { id, error, .. } => {
                 let message = error.as_ref().map_or_else(
                     || format!("Loading {id}…"),
@@ -1789,6 +1797,137 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     render_toast(f, app);
     render_help(f, app);
 }
+
+fn render_planning(f: &mut Frame, area: Rect, form: &PlanningForm, theme: Theme, ready: bool) {
+    let palette = crate::theme::definition(theme).palette;
+    let block = Block::default()
+        .title(" PLAN NEW WORK ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(palette.border))
+        .style(Style::default().fg(palette.foreground).bg(palette.panel));
+    f.render_widget(block, area);
+    let inner = Rect::new(
+        area.x.saturating_add(2),
+        area.y.saturating_add(1),
+        area.width.saturating_sub(4),
+        area.height.saturating_sub(2),
+    );
+    if !ready {
+        f.render_widget(
+            Paragraph::new("Expand terminal to at least 50 columns and 12 rows · Esc cancels")
+                .style(Style::default().fg(palette.warning)),
+            inner,
+        );
+        return;
+    }
+    let (text, hint) = match &form.stage {
+        PlanningStage::Draft => (
+            format!("Describe the work to plan:\n\n{}▌", form.proposal),
+            "Enter discuss with agent · Shift+Enter newline · Esc cancel",
+        ),
+        PlanningStage::Waiting => (
+            format!(
+                "Waiting for the planning agent…\n\nProposal:\n{}\n\nHerdr tab: {}",
+                form.proposal,
+                form.session
+                    .as_ref()
+                    .map_or("starting", |session| &session.tab_id)
+            ),
+            "Esc leaves the planning tab open for review",
+        ),
+        PlanningStage::Question { text, options } => {
+            let mut display = format!("Agent asks:\n\n{text}\n\n");
+            for (index, option) in options.iter().enumerate() {
+                display.push_str(&format!(
+                    "{} {}. {}\n",
+                    if form.selected == index { '›' } else { ' ' },
+                    index + 1,
+                    option
+                ));
+            }
+            display.push_str(&format!(
+                "{} Custom answer: {}{}",
+                if form.selected == options.len() {
+                    '›'
+                } else {
+                    ' '
+                },
+                form.input,
+                if form.selected == options.len() {
+                    "▌"
+                } else {
+                    ""
+                }
+            ));
+            (
+                display,
+                "↑/↓ choose · Tab custom answer · Enter send · Esc cancel",
+            )
+        }
+        PlanningStage::Review(plan) => {
+            let mut display = format!(
+                "Proposed {} · no Beads created yet\n\n{}  P{}\n{}\n\nAcceptance:\n{}",
+                plan.kind.to_uppercase(),
+                plan.root.title,
+                plan.root.priority,
+                plan.root.description,
+                plan.root.acceptance
+            );
+            for (index, task) in plan.tasks.iter().enumerate() {
+                display.push_str(&format!(
+                    "\n\n{}. {}  P{}\n{}\n\nAcceptance:\n{}",
+                    index + 1,
+                    task.title,
+                    task.priority,
+                    task.description,
+                    task.acceptance
+                ));
+            }
+            (
+                display,
+                "y create Beads · r request revision · ↑/↓ scroll · Esc cancel",
+            )
+        }
+        PlanningStage::Revision => (
+            format!("Tell the agent what to revise:\n\n{}▌", form.input),
+            "Enter send revision · Shift+Enter newline · Esc cancel",
+        ),
+        PlanningStage::Creating => (
+            "Creating the confirmed Beads…\n\nThis may take a moment.".into(),
+            "Creation in progress",
+        ),
+        PlanningStage::Failed(error) => (
+            format!("Planning needs attention:\n\n{error}"),
+            "r read the agent again (if available) · Esc close",
+        ),
+    };
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let scroll = if matches!(form.stage, PlanningStage::Draft | PlanningStage::Revision)
+        || matches!(&form.stage, PlanningStage::Question { options, .. } if form.selected == options.len())
+    {
+        wrap_words(&text, sections[0].width as usize)
+            .len()
+            .saturating_sub(sections[0].height as usize)
+            .min(u16::MAX as usize) as u16
+    } else {
+        form.scroll
+    };
+    f.render_widget(
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .style(Style::default().fg(palette.foreground)),
+        sections[0],
+    );
+    f.render_widget(
+        Paragraph::new(truncate_display(hint, sections[1].width as usize))
+            .style(Style::default().fg(palette.accent)),
+        sections[1],
+    );
+}
 fn render_help(f: &mut Frame, app: &mut App) {
     let Some(help) = app.help.as_mut() else {
         return;
@@ -1933,6 +2072,7 @@ fn footer_text(width: usize, epic: bool) -> String {
         width,
     );
     for hint in [
+        " · p plan",
         " · N child",
         " · s settings",
         " · w worktrees",
@@ -2375,6 +2515,7 @@ mod tests {
             mutation_busy: false,
             ready_pending: false,
             planning_epics: Default::default(),
+            planning_seq: 0,
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -3247,6 +3388,45 @@ mod tests {
             with_notice.chars().skip(120 * 23).collect::<String>()
         );
         assert!(with_notice.contains("Updated bead"));
+    }
+
+    #[test]
+    fn planning_view_shows_agent_choices_and_review_confirmation() {
+        let mut app = app();
+        let mut form = crate::app::PlanningForm {
+            seq: 1,
+            proposal: "Plan search".into(),
+            input: "My answer".into(),
+            marker: "ONTRACK_PLAN_1".into(),
+            round: 0,
+            session: None,
+            stage: crate::app::PlanningStage::Question {
+                text: "Which scope?".into(),
+                options: vec!["Titles".into(), "All fields".into()],
+            },
+            selected: 2,
+            poll_inflight: false,
+            next_poll: std::time::Instant::now(),
+            scroll: 0,
+        };
+        app.modal = Some(crate::app::Modal::Planning(form.clone()));
+        let rendered = draw((80, 24), &mut app).0;
+        assert!(rendered.contains("Which scope?"));
+        assert!(rendered.contains("Custom answer: My answer"));
+        form.stage = crate::app::PlanningStage::Review(crate::planning::Plan {
+            kind: "task".into(),
+            root: crate::planning::Item {
+                title: "Search".into(),
+                description: "Implement search".into(),
+                acceptance: "Result appears".into(),
+                priority: 2,
+            },
+            tasks: vec![],
+        });
+        app.modal = Some(crate::app::Modal::Planning(form));
+        let rendered = draw((80, 24), &mut app).0;
+        assert!(rendered.contains("Result appears"));
+        assert!(rendered.contains("y create Beads"));
     }
     #[test]
     fn outstanding_worktrees_render_target_state_and_pending_dispatch_on_compact_terminal() {

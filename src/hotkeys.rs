@@ -16,6 +16,7 @@ pub enum Context {
     Delete,
     GenerateEpic,
     WorktreeConfirm,
+    Planning,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,7 @@ pub struct Help {
 impl Context {
     pub fn current(app: &App) -> Self {
         match app.modal.as_ref() {
+            Some(Modal::Planning(_)) => Self::Planning,
             Some(Modal::Create(form) | Modal::Edit { form, .. }) if form.dropdown.is_some() => {
                 Self::FormChoices
             }
@@ -61,6 +63,7 @@ impl Context {
             Self::GenerateEpic => "Generate Epic tasks",
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
+            Self::Planning => "Plan new work",
         }
     }
 
@@ -78,6 +81,7 @@ impl Context {
                 ("e", "Edit selected bead"),
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
+                ("p", "Plan new Task or Epic with an agent"),
                 (
                     "Shift+R",
                     "Toggle Ready for an open Task or Epic and its tasks",
@@ -100,6 +104,7 @@ impl Context {
                 ("e", "Edit selected bead"),
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
+                ("p", "Plan new Task or Epic with an agent"),
                 ("w", "Open outstanding worktrees"),
                 ("Esc", "Stay in the issue browser"),
             ],
@@ -161,6 +166,14 @@ impl Context {
                 ("y / Y", "Confirm action"),
                 ("n / N / Enter", "Cancel action"),
                 ("Esc", "Cancel action"),
+            ],
+            Self::Planning => vec![
+                ("Enter", "Start, send answer, or send revision"),
+                ("↑ / ↓", "Choose an agent option or scroll the plan"),
+                ("Tab", "Write a custom answer"),
+                ("y", "Create the reviewed Beads"),
+                ("r", "Request a plan revision or retry reading output"),
+                ("Esc", "Cancel planning"),
             ],
         };
         if matches!(self, Self::EpicIssues | Self::EpicDetails) {
