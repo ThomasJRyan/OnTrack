@@ -1204,7 +1204,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     }
                 }
                 lines.push(settings_row(
-                    "Default agent for new tasks",
+                    "Default agent for new issues",
                     &format!("{} ▾", draft.default_agent.label()),
                     row_width,
                     if *focus == 1 {
@@ -3951,7 +3951,7 @@ mod tests {
             focus: 1,
         });
         let screen = draw((80, 24), &mut a).0;
-        assert!(screen.contains("Default agent for new tasks"));
+        assert!(screen.contains("Default agent for new issues"));
         assert!(screen.contains("› hermes"));
         assert!(screen.contains("↑ earlier agents"));
         assert!(screen.contains("↓ later agents"));

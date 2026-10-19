@@ -732,7 +732,7 @@ impl App {
                 let descendants = beads::open_descendants_in(&self.beads, &bead.id);
                 self.beads.iter().any(|child| {
                     beads::is_ready(child)
-                        && child.data["issue_type"] == "task"
+                        && child.data["issue_type"] != "epic"
                         && !beads::explicitly_unassigned(&child.data)
                         && (!beads::has_harness_label(&child.data)
                             || beads::harness(&child.data).is_some())
@@ -788,7 +788,7 @@ impl App {
             .iter()
             .filter(|bead| {
                 beads::is_ready(bead)
-                    && bead.data["issue_type"] == "task"
+                    && bead.data["issue_type"] != "epic"
                     && self.scheduler_eligible(bead)
                     && !self.scheduler_attempted.contains(&bead.id)
             })
@@ -2519,12 +2519,10 @@ impl App {
             }
             Enter if form.focus == 4 => {
                 if !form.title.trim().is_empty() {
-                    if edit_id.is_none()
-                        && form.harness_loading
-                        && beads::BEAD_TYPES[form.issue_type] == "task"
-                    {
-                        self.notice =
-                            Some("Checking Herdr integrations; wait before creating a task".into());
+                    if edit_id.is_none() && form.harness_loading {
+                        self.notice = Some(
+                            "Checking Herdr integrations; wait before creating an issue".into(),
+                        );
                         return false;
                     }
                     if edit_id.is_none()
@@ -2541,13 +2539,10 @@ impl App {
                         description: form.description.clone(),
                         issue_type: beads::BEAD_TYPES[form.issue_type].into(),
                         priority: form.priority as u8,
-                        harness: if beads::BEAD_TYPES[form.issue_type] == "task" {
-                            form.harness
-                                .checked_sub(1)
-                                .map(|index| form.harnesses[index].clone())
-                        } else {
-                            None
-                        },
+                        harness: form
+                            .harness
+                            .checked_sub(1)
+                            .map(|index| form.harnesses[index].clone()),
                     };
                     self.mutation_busy = true;
                     let request = if let Some(id) = edit_id {
@@ -2753,12 +2748,12 @@ impl App {
             return;
         }
         let Some(bead) = self.selected.and_then(|i| self.beads.get(i)) else {
-            self.notice = Some("Select an open Task or Epic first".into());
+            self.notice = Some("Select an open issue first".into());
             return;
         };
         let epic = bead.data["issue_type"] == "epic";
-        if bead.status != "open" || (!epic && bead.data["issue_type"] != "task") {
-            self.notice = Some("Only open Tasks and Epics can be marked Ready".into());
+        if bead.status != "open" {
+            self.notice = Some("Only open issues can be marked Ready".into());
             return;
         }
         let id = bead.id.clone();
@@ -2768,14 +2763,14 @@ impl App {
             return;
         }
         if self.known_handoffs.contains(&id) && ready {
-            self.notice = Some("This task already has a tracked handoff".into());
+            self.notice = Some("This issue already has a tracked handoff".into());
             return;
         }
         let mut protected_handoffs = self.accepted_handoffs.clone();
         protected_handoffs.extend(self.handoff.values().map(|pending| pending.bead.id.clone()));
         if !ready && !epic && protected_handoffs.contains(&id) {
             self.notice = Some(
-                "This task has been sent or is being handed off; Ready cannot be removed".into(),
+                "This issue has been sent or is being handed off; Ready cannot be removed".into(),
             );
             return;
         }
@@ -3402,7 +3397,7 @@ mod tests {
         a.responses = responses;
         a.beads[0].data["issue_type"] = json!("epic");
         a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
-        a.beads[1].data["issue_type"] = json!("task");
+        a.beads[1].data["issue_type"] = json!("bug");
         a.beads[1].data["parent"] = json!("b0");
         a.beads[1].data["labels"] = json!([beads::READY_LABEL]);
         a.settings.default_agent = DefaultAgent::Kind("opencode");
@@ -3663,6 +3658,61 @@ mod tests {
     }
 
     #[test]
+    fn non_task_types_toggle_ready_and_keep_handoff_protection() {
+        for issue_type in ["bug", "feature", "chore", "custom"] {
+            let (mut app, requests, _) = connected_app();
+            app.beads[0].data["issue_type"] = json!(issue_type);
+            press(&mut app, KeyCode::Char('r'));
+            assert!(matches!(requests.try_recv(), Ok(Request::SetReady(id, true)) if id == "b0"));
+            app.mutation_busy = false;
+            app.ready_pending = false;
+            app.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+            assert_eq!(display_status(&app.beads[0]), "ready");
+            assert!(
+                list_layout(&app.beads, &HashSet::new())
+                    .groups
+                    .iter()
+                    .any(|group| { group.status == "ready" && group.indices.contains(&0) })
+            );
+            app.accepted_handoffs.insert("b0".into());
+            press(&mut app, KeyCode::Char('R'));
+            assert!(requests.try_recv().is_err());
+            assert!(
+                app.notice
+                    .as_deref()
+                    .unwrap()
+                    .contains("Ready cannot be removed")
+            );
+            app.accepted_handoffs.clear();
+            press(&mut app, KeyCode::Char('R'));
+            assert!(matches!(requests.try_recv(), Ok(Request::SetReady(id, false)) if id == "b0"));
+            assert_eq!(app.beads[0].status, "open");
+        }
+    }
+
+    #[test]
+    fn non_task_ready_issue_enters_scheduled_handoff() {
+        for issue_type in ["bug", "feature", "custom"] {
+            let (mut app, requests, responses) = connected_app();
+            app.beads[0].data["issue_type"] = json!(issue_type);
+            app.beads[0].data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:opencode"]);
+            app.poll_scheduler();
+            let Request::Discover(seq) = requests.try_recv().unwrap() else {
+                panic!("Ready issue did not enter handoff discovery");
+            };
+            responses
+                .send(Response::Discovered(seq, Ok(launch_context())))
+                .unwrap();
+            app.receive();
+            assert!(matches!(
+                requests.try_recv(),
+                Ok(Request::LaunchReady(_, _, agent, bead))
+                    if agent.id == "opencode" && bead.id == "b0"
+            ));
+        }
+    }
+
+    #[test]
     fn pending_ready_keeps_browser_input_live_and_excludes_mutations() {
         for epic in [false, true] {
             for ready in [false, true] {
@@ -3782,22 +3832,24 @@ mod tests {
     }
 
     #[test]
-    fn ready_key_respects_task_and_handoff_guards() {
+    fn ready_key_respects_closed_and_handoff_guards() {
         let (mut a, rx, _) = connected_app();
         a.beads[0].data["issue_type"] = json!("bug");
+        a.beads[0].status = "closed".into();
         press(&mut a, KeyCode::Char('r'));
         assert_eq!(
             a.notice.as_deref(),
-            Some("Only open Tasks and Epics can be marked Ready")
+            Some("Only open issues can be marked Ready")
         );
         assert!(rx.try_recv().is_err());
 
+        a.beads[0].status = "open".into();
         a.beads[0].data["issue_type"] = json!("task");
         a.known_handoffs.insert("b0".into());
         press(&mut a, KeyCode::Char('r'));
         assert_eq!(
             a.notice.as_deref(),
-            Some("This task already has a tracked handoff")
+            Some("This issue already has a tracked handoff")
         );
         assert!(rx.try_recv().is_err());
     }
@@ -6331,7 +6383,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.requests = tx;
         press(&mut a, KeyCode::Char('n'));
-        take_harness_discovery(&rx);
+        let seq = take_harness_discovery(&rx);
+        supply_harnesses(&mut a, seq, &["codex"]);
         let Some(Modal::Create(form)) = a.modal.as_mut() else {
             panic!()
         };
@@ -6357,7 +6410,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         b.requests = tx;
         press(&mut b, KeyCode::Char('n'));
-        take_harness_discovery(&rx);
+        let seq = take_harness_discovery(&rx);
+        supply_harnesses(&mut b, seq, &["codex"]);
         let Some(Modal::Create(form)) = b.modal.as_mut() else {
             panic!()
         };
@@ -6376,14 +6430,15 @@ mod tests {
         form.focus = 4;
         press(&mut b, KeyCode::Enter);
         assert!(
-            matches!(rx.try_recv(), Ok(Request::Create(input)) if input.issue_type == "feature")
+            matches!(rx.try_recv(), Ok(Request::Create(input)) if input.issue_type == "feature" && input.harness.as_deref() == Some("codex"))
         );
 
         let mut empty = app();
         let (tx, rx) = mpsc::channel();
         empty.requests = tx;
         press(&mut empty, KeyCode::Char('n'));
-        take_harness_discovery(&rx);
+        let seq = take_harness_discovery(&rx);
+        supply_harnesses(&mut empty, seq, &["codex"]);
         let Some(Modal::Create(form)) = empty.modal.as_mut() else {
             panic!()
         };

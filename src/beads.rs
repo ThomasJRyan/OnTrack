@@ -288,14 +288,12 @@ fn epic_ready_targets_in(
 }
 
 pub fn is_ready(bead: &Bead) -> bool {
-    bead.status == "open"
-        && (bead.data["issue_type"] == "task" || bead.data["issue_type"] == "epic")
-        && labels(&bead.data).any(|label| label == READY_LABEL)
+    bead.status == "open" && labels(&bead.data).any(|label| label == READY_LABEL)
 }
 
 pub fn ready_record(data: &Value) -> bool {
     data["status"] == "open"
-        && data["issue_type"] == "task"
+        && data["issue_type"] != "epic"
         && labels(data).any(|label| label == READY_LABEL)
 }
 
@@ -338,12 +336,10 @@ fn create_args(input: &CreateBead) -> io::Result<Vec<String>> {
         format!("--priority={}", input.priority),
         "--json".to_owned(),
     ];
-    if input.issue_type == "task" {
-        args.push(match &input.harness {
-            Some(harness) => format!("--labels={HARNESS_PREFIX}{harness}"),
-            None => format!("--labels={UNASSIGNED_LABEL}"),
-        });
-    }
+    args.push(match &input.harness {
+        Some(harness) => format!("--labels={HARNESS_PREFIX}{harness}"),
+        None => format!("--labels={UNASSIGNED_LABEL}"),
+    });
     Ok(args)
 }
 
@@ -367,7 +363,7 @@ fn update_args(input: &UpdateBead) -> io::Result<Vec<String>> {
             args.push(format!("--add-label={HARNESS_PREFIX}{new}"));
         }
     }
-    if input.fields.issue_type == "task" && input.fields.harness.is_none() {
+    if input.fields.harness.is_none() {
         args.push(format!("--add-label={UNASSIGNED_LABEL}"));
     } else {
         args.push(format!("--remove-label={UNASSIGNED_LABEL}"));
@@ -617,10 +613,16 @@ mod tests {
             status: "closed".into(),
             ..bead.clone()
         }));
-        assert!(!is_ready(&Bead {
-            data: json!({"issue_type":"feature", "labels":[READY_LABEL]}),
-            ..bead
-        }));
+        for issue_type in ["bug", "feature", "chore", "custom"] {
+            let other = Bead {
+                data: json!({"issue_type":issue_type, "labels":[READY_LABEL]}),
+                ..bead.clone()
+            };
+            assert!(is_ready(&other));
+            assert!(ready_record(&json!({
+                "status":"open", "issue_type":issue_type, "labels":[READY_LABEL]
+            })));
+        }
         assert!(is_ready(&Bead {
             id: "epic".into(),
             title: "Epic".into(),
@@ -628,6 +630,9 @@ mod tests {
             priority: 2,
             data: json!({"issue_type":"epic", "labels":[READY_LABEL]}),
         }));
+        assert!(!ready_record(&json!({
+            "status":"open", "issue_type":"epic", "labels":[READY_LABEL]
+        })));
     }
 
     #[test]
@@ -834,6 +839,7 @@ mod tests {
                 let args = create_args(&input).unwrap();
                 assert_eq!(args[4], format!("--type={issue_type}"));
                 assert_eq!(args[5], format!("--priority={priority}"));
+                assert!(args.contains(&"--labels=ontrack:unassigned".into()));
             }
         }
     }

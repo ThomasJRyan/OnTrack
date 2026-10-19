@@ -233,7 +233,7 @@ pub fn discover() -> io::Result<LaunchContext> {
         .into())
 }
 
-/// Current Herdr integrations that OnTrack can store as task harness labels.
+/// Current Herdr integrations that OnTrack can store as issue harness labels.
 /// This does not require a workspace mapping, so the create form works from a
 /// linked checkout or outside a Herdr shell.
 pub fn installed_harnesses() -> io::Result<Vec<String>> {
@@ -738,7 +738,7 @@ fn launch_with_mode(
     if require_ready {
         if !crate::beads::ready_record(&bead) {
             return Err(io::Error::other(
-                "Scheduled Bead is no longer an open Ready task; nothing created",
+                "Scheduled Bead is no longer an open Ready issue; nothing created",
             ));
         }
         if crate::beads::explicitly_unassigned(&bead)
@@ -752,7 +752,7 @@ fn launch_with_mode(
     }
     let open_children = executor
         .open_descendants(request.id)
-        .map_err(|error| stage("Child task check (nothing created)", error))?;
+        .map_err(|error| stage("Child issue check (nothing created)", error))?;
     let pending = executor
         .pending_child_handoffs(request.id)
         .map_err(|error| stage("Child worktree check (nothing created)", error))?;
@@ -807,7 +807,7 @@ fn launch_with_mode(
     )?;
     if let Some(parent_branch) = journal.as_ref().and_then(|record| record.base_branch()) {
         prompt.push_str(&format!(
-            "\n\nThis is a child task. Your worktree was based on the managed parent branch {parent_branch}. Its integration target is that parent branch/worktree. Do not merge this child directly into the default branch."
+            "\n\nThis is a child Bead. Your worktree was based on the managed parent branch {parent_branch}. Its integration target is that parent branch/worktree. Do not merge this child directly into the default branch."
         ));
     }
     let result = create_and_prompt(
@@ -2076,14 +2076,14 @@ mod tests {
     fn scheduled_launch_rechecks_live_ready_marker_before_any_herdr_mutation() {
         let mut executor = FakeExecutor::launch();
         let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
-        assert!(error.to_string().contains("no longer an open Ready task"));
+        assert!(error.to_string().contains("no longer an open Ready issue"));
         assert_eq!(executor.calls, vec![vec!["show_bead", "OnTrack-z2y"]]);
         assert!(executor.mutations().is_empty());
 
         let mut executor = FakeExecutor::launch();
         let mut changed = bead();
         changed["status"] = json!("open");
-        changed["issue_type"] = json!("task");
+        changed["issue_type"] = json!("bug");
         changed["labels"] = json!([crate::beads::READY_LABEL, "ontrack:agent:gemini"]);
         executor.bead = Some(Ok(changed));
         let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
@@ -2094,7 +2094,7 @@ mod tests {
             let mut executor = FakeExecutor::launch();
             let mut changed = bead();
             changed["status"] = json!("open");
-            changed["issue_type"] = json!("task");
+            changed["issue_type"] = json!("feature");
             changed["labels"] = json!([crate::beads::READY_LABEL, label]);
             executor.bead = Some(Ok(changed));
             let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
@@ -2105,14 +2105,23 @@ mod tests {
         let mut executor = FakeExecutor::launch();
         let mut changed = bead();
         changed["status"] = json!("open");
-        changed["issue_type"] = json!("task");
+        changed["issue_type"] = json!("custom");
         changed["labels"] = json!([crate::beads::READY_LABEL]);
         executor.bead = Some(Ok(changed));
         let _ = launch_with_mode(&mut executor, &cwd(), &request(), true);
         assert!(
             executor.calls.len() > 1,
-            "legacy Ready task passed the harness guard"
+            "legacy Ready issue passed the harness guard"
         );
+        let mut executor = FakeExecutor::launch();
+        let mut changed = bead();
+        changed["status"] = json!("open");
+        changed["issue_type"] = json!("epic");
+        changed["labels"] = json!([crate::beads::READY_LABEL]);
+        executor.bead = Some(Ok(changed));
+        let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
+        assert!(error.to_string().contains("no longer an open Ready issue"));
+        assert!(executor.mutations().is_empty());
     }
 
     #[test]

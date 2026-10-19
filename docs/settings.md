@@ -71,18 +71,18 @@ non-object JSON, unknown themes, and non-string theme values are errors.
 
 `default_agent` accepts `automatic`, `unassigned`, or a supported agent kind such
 as `codex` or `hermes`. Existing files without this field use `automatic`.
-Settings lists the supported kinds; the new-task form checks current Herdr
+Settings lists the supported kinds; the new-issue form checks current Herdr
 integrations when it opens. `automatic` selects Codex when available, otherwise
 the first available integration. A saved kind that is not currently available
 uses that same fallback in the form while retaining the saved preference.
-`unassigned` starts new Tasks without a selected agent. New child Tasks use the
+`unassigned` starts new issues without a selected agent. New child Tasks use the
 same preference. The form choice can always be changed; editing an existing
 Bead keeps its stored agent choice.
 
 ## Changing settings
 
 Press `s` to open Settings. `Up` / `Down` moves among Theme, Default agent for
-new tasks, Agent limit, top-level merge, child merge, workspace close, checkout
+new issues, Agent limit, top-level merge, child merge, workspace close, checkout
 removal, and Close.
 The dialog places setting titles in a wider, left-aligned column and centers
 theme, agent, limit, and cleanup controls in the right column. The choice lists open beneath
