@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
 use std::collections::HashMap;
 use std::time::Duration;
@@ -494,6 +494,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
                         .title(" TRACKED HANDOFFS ")
                         .border_style(Style::default().fg(palette.border)),
                 )
@@ -578,6 +579,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 .block(
                     Block::default()
                         .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
                         .title(" HANDOFF DETAILS ")
                         .border_style(Style::default().fg(palette.border)),
                 )
@@ -621,6 +623,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             " CONFIRM WORKTREE ACTION "
                         })
                         .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(palette.border))
                         .style(Style::default().bg(palette.panel)),
                     area,
@@ -953,7 +956,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(if app.focus_detail {
             teal
         } else {
@@ -1114,6 +1117,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 _ => " DELETE BEAD? ",
             })
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(palette.border))
             .style(Style::default().bg(palette.panel));
         f.render_widget(frame, area);
@@ -1418,6 +1422,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                                     None => " Title ".to_owned(),
                                 })
                                 .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
                                 .border_style(Style::default().fg(if form.focus == 0 {
                                     teal
                                 } else {
@@ -1496,6 +1501,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     let block = Block::default()
                         .title(title)
                         .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(border));
                     f.render_widget(block, area);
                     if dropdown == Some(which) {
@@ -1579,8 +1585,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 };
                 f.render_widget(
                     Block::default()
-                        .title(format!("Agent harness (tasks): {harness_name}  ▾"))
+                        .title(format!("Agent harness: {harness_name}  ▾"))
                         .borders(Borders::ALL)
+                        .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(harness_border)),
                     harness_area,
                 );
@@ -1653,6 +1660,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                                     " Description · Ctrl+V image · Shift+Enter newline · Enter Create "
                                 })
                                 .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
                                 .border_style(Style::default().fg(if form.focus == 1 {
                                     teal
                                 } else {
@@ -1803,6 +1811,7 @@ fn render_planning(f: &mut Frame, area: Rect, form: &PlanningForm, theme: Theme,
     let block = Block::default()
         .title(" PLAN NEW WORK ")
         .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(palette.border))
         .style(Style::default().fg(palette.foreground).bg(palette.panel));
     f.render_widget(block, area);
@@ -1994,6 +2003,7 @@ fn render_help(f: &mut Frame, app: &mut App) {
         Block::default()
             .title(format!(" HOTKEYS · {} ", help.context.title()))
             .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(palette.accent))
             .style(Style::default().bg(palette.panel)),
         area,
@@ -2055,6 +2065,7 @@ fn render_toast(f: &mut Frame, app: &App) {
             .block(
                 Block::default()
                     .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
                     .title(" HERDR ")
                     .border_style(Style::default().fg(border)),
             )
@@ -2551,6 +2562,27 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+    #[test]
+    fn bordered_screens_render_without_square_corners() {
+        let mut app = app();
+        for screen in ["issues", "worktrees", "form", "help"] {
+            app.worktrees_view = screen == "worktrees";
+            app.modal = (screen == "form")
+                .then(|| crate::app::Modal::Create(crate::app::CreateForm::default()));
+            app.help = (screen == "help").then_some(crate::hotkeys::Help {
+                context: crate::hotkeys::Context::Form,
+                offset: 0,
+            });
+            let rendered = draw((100, 30), &mut app).0;
+            assert!(rendered.contains('╭'), "{screen} has no rounded border");
+            assert!(
+                !rendered
+                    .chars()
+                    .any(|corner| matches!(corner, '┌' | '┐' | '└' | '┘')),
+                "{screen} contains a square corner"
+            );
+        }
     }
     #[test]
     fn splash_animates_girl_without_moving_her_or_delaying_browser() {

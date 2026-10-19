@@ -33,6 +33,8 @@ Interactive `p` planning uses a dedicated Herdr tab in the inherited workspace. 
 
 `src/ui.rs` renders the supplied centered ONTRACK wordmark and a terminal-drawn anime girl during the 1.2-second startup splash. `girl_frame` chooses the blink and wave pose from elapsed time supplied by `app::run`'s existing redraw loop, so the animation needs no separate timer or state. If the full wordmark and character do not fit, the renderer uses the compact ONTRACK title with the character when possible, then a text-only fallback. Width checks use terminal cell widths; preserve the wordmark verbatim, keep the splash centered and theme-aware, and ensure it yields to the normal browser view after startup.
 
+Every `Block` in `src/ui.rs` that draws a full border sets `BorderType::Rounded`. This includes worktree panes, modal frames, form fields, planning, help, and the issue detail pane. Keep borderless backgrounds and compact-terminal fallbacks borderless; preserve existing titles, colours, and layout when adding a bordered widget.
+
 `ontrack update` handles release discovery before Herdr, Beads, or terminal browser initialization. Browser startup does not make a release request.
 
 In the managed-worktree view, Enter queues `herdr workspace focus WORKSPACE_ID` on the existing background worker. The ID comes from the selected OnTrack handoff, never global focus. The adapter passes arguments separately, rejects unsafe IDs, and requires Herdr's `workspace_focused` result to repeat the selected ID. Closed workspaces and removed checkouts are rejected before dispatch. Focus success and errors are shown in the view without changing Git, Beads, or the handoff registry.
