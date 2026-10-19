@@ -37,6 +37,8 @@ pub(crate) struct AgentDisplay {
     pub id: String,
     pub workspace_id: String,
     pub detail: String,
+    /// Verified Herdr state only; never used by merge or cleanup decisions.
+    pub blocked: bool,
 }
 
 /// Read-only presentation evidence, never passed to merge/cleanup eligibility.
@@ -55,6 +57,7 @@ fn observe_agents_with(cwd: &Path, executor: &mut impl Executor) -> io::Result<V
             id: entry["id"].as_str().unwrap_or_default().into(),
             workspace_id: entry["workspace_id"].as_str().unwrap_or_default().into(),
             detail: format!("Agent observation (display only): {status} · {identity}. Not completion, retry, merge, or cleanup authorization."),
+            blocked: matches!(status.as_str(), "blocked" | "error"),
         }
     }).collect())
 }
@@ -95,6 +98,7 @@ fn observe_entry(entry: &Value, executor: &mut impl Executor) -> io::Result<Stri
 pub enum WorktreeStatus {
     Reserved,
     InProgress,
+    Blocked,
     Unmerged,
     MergeQueued,
     MergeRequested,
@@ -3204,6 +3208,7 @@ mod tests {
                     mode
                 }
             ));
+            assert_eq!(rows[0].blocked, matches!(mode, "blocked" | "error"));
             assert_eq!(
                 fs::read(fixture.main.join(".git/ontrack-worktrees/registry.json")).unwrap(),
                 before

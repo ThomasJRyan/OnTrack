@@ -1616,15 +1616,11 @@ impl App {
                                     ) {
                                         continue;
                                     }
-                                    if let Some(line) = self
-                                        .worktrees
-                                        .iter()
-                                        .find(|previous| {
-                                            previous.id == item.id
-                                                && previous.workspace_id == item.workspace_id
-                                        })
-                                        .and_then(|previous| previous.detail.as_deref())
-                                        .and_then(|detail| {
+                                    if let Some(previous) = self.worktrees.iter().find(|previous| {
+                                        previous.id == item.id
+                                            && previous.workspace_id == item.workspace_id
+                                    }) && let Some(line) =
+                                        previous.detail.as_deref().and_then(|detail| {
                                             detail.lines().find(|line| {
                                                 line.starts_with(
                                                     "Agent observation (display only):",
@@ -1632,6 +1628,11 @@ impl App {
                                             })
                                         })
                                     {
+                                        if item.status == worktrees::WorktreeStatus::InProgress
+                                            && previous.status == worktrees::WorktreeStatus::Blocked
+                                        {
+                                            item.status = worktrees::WorktreeStatus::Blocked;
+                                        }
                                         let base = item.detail.as_deref().unwrap_or("");
                                         item.detail = Some(if base.is_empty() {
                                             line.into()
@@ -1706,14 +1707,27 @@ impl App {
                         ) {
                             continue;
                         }
+                        let observation = match &result {
+                            Ok(observations) => observations.iter().find(|observation| {
+                                observation.id == item.id
+                                    && observation.workspace_id == item.workspace_id
+                            }),
+                            Err(_) => None,
+                        };
+                        if matches!(
+                            item.status,
+                            worktrees::WorktreeStatus::InProgress
+                                | worktrees::WorktreeStatus::Blocked
+                        ) {
+                            item.status =
+                                if observation.is_some_and(|observation| observation.blocked) {
+                                    worktrees::WorktreeStatus::Blocked
+                                } else {
+                                    worktrees::WorktreeStatus::InProgress
+                                };
+                        }
                         let line = match &result {
-                            Ok(observations) => observations
-                                .iter()
-                                .find(|observation| {
-                                    observation.id == item.id
-                                        && observation.workspace_id == item.workspace_id
-                                })
-                                .map(|observation| observation.detail.clone()),
+                            Ok(_) => observation.map(|observation| observation.detail.clone()),
                             Err(error) => Some(format!(
                                 "Agent observation (display only): unknown — poll failed: {error}"
                             )),
@@ -2105,6 +2119,7 @@ impl App {
             && !matches!(
                 item.status,
                 worktrees::WorktreeStatus::InProgress
+                    | worktrees::WorktreeStatus::Blocked
                     | worktrees::WorktreeStatus::Unmerged
                     | worktrees::WorktreeStatus::MergeQueued
                     | worktrees::WorktreeStatus::NeedsResolution
@@ -2945,6 +2960,7 @@ pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'stat
     match status {
         Reserved => "PREPARED",
         InProgress => "IN PROGRESS",
+        Blocked => "BLOCKED",
         Unmerged => "READY TO MERGE",
         MergeQueued => "MERGE QUEUED",
         MergeRequested => "MERGE PENDING",
@@ -4341,7 +4357,7 @@ mod tests {
     }
 
     #[test]
-    fn display_only_agent_polling_is_bounded_preserves_rows_and_cannot_change_worktree_state() {
+    fn display_only_agent_polling_is_bounded_and_preserves_nonactive_worktree_state() {
         let (mut a, rx, tx) = connected_app();
         a.worktrees.push(observed_row(
             "b0",
@@ -4379,6 +4395,7 @@ mod tests {
                 id: "handoff-b0".into(),
                 workspace_id: "wTask".into(),
                 detail: "Agent observation (display only): working".into(),
+                blocked: false,
             },
         ])))
         .unwrap();
@@ -4401,6 +4418,102 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .contains("Agent observation (display only): working")
+        );
+    }
+    #[test]
+    fn verified_agent_failure_blocks_only_an_in_progress_worktree() {
+        let (mut app, _requests, responses) = connected_app();
+        app.worktrees.push(observed_row(
+            "active",
+            worktrees::WorktreeStatus::InProgress,
+        ));
+        app.worktrees.push(observed_row(
+            "dirty",
+            worktrees::WorktreeStatus::DirtyCheckout,
+        ));
+        let now = Instant::now();
+
+        for state in ["error", "blocked"] {
+            app.agent_observation_inflight = true;
+            responses
+                .send(Response::AgentsObserved(Ok(vec![
+                    worktrees::AgentDisplay {
+                        id: "handoff-active".into(),
+                        workspace_id: "wTask".into(),
+                        detail: format!("Agent observation (display only): {state}"),
+                        blocked: true,
+                    },
+                    worktrees::AgentDisplay {
+                        id: "handoff-dirty".into(),
+                        workspace_id: "wTask".into(),
+                        detail: format!("Agent observation (display only): {state}"),
+                        blocked: true,
+                    },
+                ])))
+                .unwrap();
+            app.receive_at(now);
+            assert_eq!(app.worktrees[0].status, worktrees::WorktreeStatus::Blocked);
+            assert_eq!(worktree_status_label(app.worktrees[0].status), "BLOCKED");
+            assert!(app.worktrees[0].detail.as_deref().unwrap().contains(state));
+            assert_eq!(
+                app.worktrees[1].status,
+                worktrees::WorktreeStatus::DirtyCheckout
+            );
+        }
+
+        app.agent_observation_inflight = true;
+        responses
+            .send(Response::Worktrees(Ok(vec![
+                observed_row("active", worktrees::WorktreeStatus::InProgress),
+                observed_row("dirty", worktrees::WorktreeStatus::DirtyCheckout),
+            ])))
+            .unwrap();
+        app.receive_at(now);
+        assert_eq!(app.worktrees[0].status, worktrees::WorktreeStatus::Blocked);
+
+        responses
+            .send(Response::AgentsObserved(Err(std::io::Error::other(
+                "offline",
+            ))))
+            .unwrap();
+        app.receive_at(now);
+        assert_eq!(
+            app.worktrees[0].status,
+            worktrees::WorktreeStatus::InProgress
+        );
+        assert!(
+            app.worktrees[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("unknown")
+        );
+        app.agent_observation_inflight = true;
+        responses
+            .send(Response::AgentsObserved(Ok(vec![
+                worktrees::AgentDisplay {
+                    id: "handoff-active".into(),
+                    workspace_id: "wTask".into(),
+                    detail: "Agent observation (display only): working".into(),
+                    blocked: false,
+                },
+            ])))
+            .unwrap();
+        app.receive_at(now);
+        assert_eq!(
+            app.worktrees[0].status,
+            worktrees::WorktreeStatus::InProgress
+        );
+        assert!(
+            app.worktrees[0]
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("working")
+        );
+        assert_eq!(
+            app.worktrees[1].status,
+            worktrees::WorktreeStatus::DirtyCheckout
         );
     }
     #[test]

@@ -352,6 +352,7 @@ pub fn worktree_status_color(theme: Theme, status: WorktreeStatus) -> Color {
     match status {
         WorktreeStatus::Reserved => p.info,
         WorktreeStatus::InProgress => p.warning,
+        WorktreeStatus::Blocked => p.danger,
         WorktreeStatus::Unmerged => p.info,
         WorktreeStatus::MergeQueued => p.info,
         WorktreeStatus::MergeRequested | WorktreeStatus::MergeInProgress => p.warning,
@@ -562,6 +563,7 @@ mod tests {
             );
             for status in [
                 WorktreeStatus::InProgress,
+                WorktreeStatus::Blocked,
                 WorktreeStatus::Unmerged,
                 WorktreeStatus::MergeQueued,
                 WorktreeStatus::MergeRequested,
