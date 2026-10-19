@@ -116,6 +116,7 @@ impl Context {
                 ("m", "Request merge for selected handoff"),
                 ("c", "Close integrated Herdr workspace"),
                 ("x", "Remove integrated checkout"),
+                ("a", "Ask original idle agent to continue in this checkout"),
                 ("Shift+R", "Restart selected active task"),
                 ("r", "Refresh outstanding worktrees"),
                 ("w / Esc / Backspace", "Return to issue browser"),

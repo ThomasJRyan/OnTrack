@@ -267,6 +267,18 @@ List results are sorted deterministically by status (open first, closed last, ot
 The list row's first line derives issue type from the retained `Bead.data` (`issue_type`, with `type` as a fallback); it does not replace the internal bead ID. Type, priority, and status spans each have a semantic colour helper in `src/ui.rs`; the display-width-aware metadata columns are shared across the list. Preserve white title text independently of selection emphasis and keep missing/custom types safe to display.
 ## Tracked worktree lifecycle
 
+`a` in the tracked-worktree view requests one continuation prompt for the same
+recorded agent and checkout. `continue_task_with` verifies canonical Git and
+Herdr ownership, the live open Bead, the original native session, an idle/done
+agent, and its current checkout paths. Dirty task edits are allowed and kept.
+The journal stores `continue_prompt_pending` before dispatch. A transport or
+response error leaves that fence and a Needs Attention row after app restart,
+so no prompt is resent blindly. A matching acknowledgement clears the fence,
+but the pre-prompt lifecycle sequence prevents another prompt until the agent
+has reported later activity.
+The existing confirmed `Shift+R` path remains the fallback when the original
+agent cannot be verified; it refuses an uncertain continuation fence.
+
 OnTrack records only worktrees created by its own explicit Herdr actions; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
 from Beads: a closed or missing Bead does not remove the managed-worktree record.

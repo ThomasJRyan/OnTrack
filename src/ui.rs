@@ -595,7 +595,13 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         );
         if let Some(crate::app::Modal::ConfirmWorktree { id, action }) = &app.modal {
             let restart = *action == 3;
-            let height = if restart { 12 } else { 8 };
+            let height = if restart {
+                12
+            } else if *action == 4 {
+                11
+            } else {
+                8
+            };
             if a.width < 50 || a.height < height {
                 app.modal_ready = false;
                 f.render_widget(Clear, a);
@@ -619,6 +625,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     Block::default()
                         .title(if restart {
                             " RESTART TASK? "
+                        } else if *action == 4 {
+                            " CONTINUE TASK? "
                         } else {
                             " CONFIRM WORKTREE ACTION "
                         })
@@ -635,6 +643,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     1 => "Close the integrated Herdr workspace?",
                     2 => {
                         "Remove integrated checkout and close its Herdr workspace? Branch is preserved."
+                    }
+                    4 => {
+                        "Ask the original idle agent to continue in this checkout? Existing changes are preserved. Verify its work before merging."
                     }
                     _ => {
                         "Restart this task from scratch?\n\nDiscard all uncommitted checkout changes.\nThe current Herdr workspace will close.\nThe old branch is kept. A fresh worktree\nand agent will start for this Bead."
@@ -1787,6 +1798,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     2 => {
                         "Remove integrated checkout and close its Herdr workspace? Branch is preserved."
                     }
+                    4 => {
+                        "Ask the original idle agent to continue in this checkout? Existing changes are preserved. Verify its work before merging."
+                    }
                     _ => {
                         "Restart this task from scratch?\n\nDiscard all uncommitted checkout changes.\nThe current Herdr workspace will close.\nThe old branch is kept. A fresh worktree\nand agent will start for this Bead."
                     }
@@ -2102,6 +2116,7 @@ fn worktree_footer_text(width: usize) -> String {
         " · m merge",
         " · c close",
         " · x remove",
+        " · a continue",
         " · R restart",
         " · PgUp/PgDn scroll",
         " · Ctrl+? keys",
@@ -3378,6 +3393,19 @@ mod tests {
         assert!(rendered.contains("y confirm"));
     }
     #[test]
+    fn continue_dialog_names_existing_checkout_and_keeps_confirmation_visible() {
+        let mut app = app();
+        app.worktrees_view = true;
+        app.modal = Some(crate::app::Modal::ConfirmWorktree {
+            id: "ot-selected".into(),
+            action: 4,
+        });
+        let rendered = draw((100, 30), &mut app).0;
+        assert!(rendered.contains("CONTINUE TASK?"));
+        assert!(rendered.contains("Existing changes are preserved"));
+        assert!(rendered.contains("y confirm"));
+    }
+    #[test]
     fn browser_footer_keeps_action_hints_without_routine_state_or_arrow_tips() {
         for width in [64, 90, 120] {
             let footer = footer_text(width, false);
@@ -3513,6 +3541,7 @@ mod tests {
             "m merge",
             "c close",
             "x remove",
+            "a continue",
             "R restart",
             "PgUp/PgDn scroll",
             "Ctrl+? keys",

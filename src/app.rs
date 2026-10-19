@@ -60,6 +60,7 @@ pub(super) enum Request {
     FocusWorkspace(String),
     WorktreeAction(String, WorktreeAction),
     RestartWorktree(String),
+    ContinueWorktree(String),
     ReconcileWorktrees(CleanupPolicy),
     ObserveAgents,
     ReadScreenshot(u64),
@@ -85,6 +86,7 @@ pub(super) enum Response {
     WorkspaceFocused(String, std::io::Result<()>),
     WorktreeChanged(std::io::Result<ManagedWorktree>),
     WorktreeRestarted(std::io::Result<String>),
+    WorktreeContinued(std::io::Result<String>),
     AgentsObserved(std::io::Result<Vec<worktrees::AgentDisplay>>),
     ScreenshotRead(u64, std::io::Result<Vec<u8>>),
     PlanLaunched(u64, std::io::Result<crate::epic::Session>),
@@ -510,6 +512,7 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
             Response::WorktreeChanged(worktrees::act(&id, action))
         }
         Request::RestartWorktree(id) => Response::WorktreeRestarted(worktrees::restart(&id)),
+        Request::ContinueWorktree(id) => Response::WorktreeContinued(worktrees::continue_task(&id)),
         Request::ReconcileWorktrees(policy) => Response::Worktrees(worktrees::reconcile(policy)),
         Request::ObserveAgents => Response::AgentsObserved(worktrees::observe_agents()),
     };
@@ -564,6 +567,7 @@ fn start_workers(
                 Request::ListWorktrees
                     | Request::WorktreeAction(..)
                     | Request::RestartWorktree(_)
+                    | Request::ContinueWorktree(_)
                     | Request::ReconcileWorktrees(_)
             ) {
                 if managed.send(request).is_err() {
@@ -1800,6 +1804,23 @@ impl App {
                         self.worktrees_next_refresh = now;
                     }
                 }
+                Response::WorktreeContinued(result) => {
+                    self.mutation_busy = false;
+                    self.modal = None;
+                    self.worktree_action_pending = false;
+                    self.worktrees_focus_feedback = Some(match result {
+                        Ok(message) => WorktreeFocusFeedback::Success(message),
+                        Err(error) => {
+                            WorktreeFocusFeedback::Error(format!("Continue failed: {error}"))
+                        }
+                    });
+                    if self.worktrees_inflight {
+                        self.worktrees_refresh_pending = true;
+                    } else {
+                        self.worktrees_discovered = false;
+                        self.worktrees_next_refresh = now;
+                    }
+                }
             }
         }
     }
@@ -1844,7 +1865,19 @@ impl App {
             && matches!(
                 k.code,
                 KeyCode::Char(
-                    'n' | 'N' | 'e' | 'd' | 'g' | 'h' | 'p' | 's' | 'u' | 'm' | 'c' | 'x' | 'R'
+                    'n' | 'N'
+                        | 'e'
+                        | 'd'
+                        | 'g'
+                        | 'h'
+                        | 'p'
+                        | 's'
+                        | 'u'
+                        | 'm'
+                        | 'c'
+                        | 'x'
+                        | 'R'
+                        | 'a'
                 )
             )
         {
@@ -1883,6 +1916,7 @@ impl App {
                 KeyCode::Char('c') => self.confirm_worktree_action(1),
                 KeyCode::Char('x') => self.confirm_worktree_action(2),
                 KeyCode::Char('R') => self.confirm_worktree_action(3),
+                KeyCode::Char('a') => self.confirm_worktree_action(4),
                 _ => {}
             }
             return false;
@@ -2089,6 +2123,15 @@ impl App {
             self.worktrees_error = Some("Select an active checkout to restart".into());
             return;
         }
+        if action == 4
+            && !matches!(
+                item.status,
+                worktrees::WorktreeStatus::InProgress | worktrees::WorktreeStatus::DirtyCheckout
+            )
+        {
+            self.worktrees_error = Some("Select an active task checkout to continue".into());
+            return;
+        }
         self.modal = Some(Modal::ConfirmWorktree {
             id: item.id.clone(),
             action,
@@ -2277,7 +2320,8 @@ impl App {
                     0 => Request::WorktreeAction(id, WorktreeAction::RequestMerge),
                     1 => Request::WorktreeAction(id, WorktreeAction::CloseWorkspace),
                     2 => Request::WorktreeAction(id, WorktreeAction::RemoveCheckout),
-                    _ => Request::RestartWorktree(id),
+                    3 => Request::RestartWorktree(id),
+                    _ => Request::ContinueWorktree(id),
                 };
                 self.mutation_busy = true;
                 if self.requests.send(request).is_err() {
@@ -7401,6 +7445,32 @@ mod tests {
         press(&mut app, KeyCode::Char('y'));
         assert!(matches!(requests.try_recv(), Ok(Request::RestartWorktree(id)) if id == "wt-1"));
         assert!(app.mutation_busy);
+    }
+    #[test]
+    fn continue_requires_confirmation_and_queues_active_handoff() {
+        let (mut app, requests, _) = connected_app();
+        app.worktrees_view = true;
+        app.worktrees.push(ManagedWorktree {
+            id: "wt-1".into(),
+            bead_id: "b1".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: Some("Task".into()),
+            bead_description: None,
+            branch: "ontrack/b1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws1".into(),
+            status: worktrees::WorktreeStatus::DirtyCheckout,
+            detail: None,
+        });
+        press(&mut app, KeyCode::Char('a'));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConfirmWorktree { action: 4, .. })
+        ));
+        assert!(requests.try_recv().is_err());
+        press(&mut app, KeyCode::Char('y'));
+        assert!(matches!(requests.try_recv(), Ok(Request::ContinueWorktree(id)) if id == "wt-1"));
     }
     #[test]
     fn worktree_worker_polls_without_queue_growth_and_surfaces_errors() {
