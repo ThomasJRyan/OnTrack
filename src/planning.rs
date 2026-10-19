@@ -141,9 +141,12 @@ fn launch_with(
     {
         return Err(invalid("Herdr returned inconsistent planning tab IDs"));
     }
+    // Keep the marker's changing tail, while Herdr gets a lowercase alias of
+    // at most 32 bytes. The response marker itself must remain untouched.
+    let suffix = &marker[marker.len().saturating_sub(19)..];
     let name = format!(
         "ontrack-plan-{}",
-        marker.chars().take(20).collect::<String>()
+        suffix.replace(':', "_").to_ascii_lowercase()
     );
     let mut args = vec![
         "agent",
@@ -364,6 +367,60 @@ fn create_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn launch_uses_herdr_alias_and_preserves_response_marker() {
+        let marker = "ONTRACK_PLAN_1_0123456789ABCDEF";
+        let mut calls = Vec::<Vec<String>>::new();
+        let session = launch_with(
+            Path::new("/tmp/ontrack-planning-test"),
+            "wSource",
+            "Plan a release",
+            marker,
+            |args| {
+                let response = match calls.len() {
+                    0 => json!({"result":{"type":"workspace_list","workspaces":[{"workspace_id":"wSource"}]}}).to_string(),
+                    1 => "--kind <KIND> [possible values: opencode]".to_owned(),
+                    2 => "opencode: current (v1) (/tmp/opencode)".to_owned(),
+                    3 => json!({"result":{"type":"tab_created","tab":{"workspace_id":"wSource","tab_id":"wSource:t2"},"root_pane":{"workspace_id":"wSource","tab_id":"wSource:t2","pane_id":"wSource:p2"}}}).to_string(),
+                    4 => {
+                        let alias = args[2];
+                        if alias.len() > 32
+                            || !alias.starts_with(|c: char| c.is_ascii_lowercase())
+                            || !alias.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_' || c == b'-')
+                        {
+                            return Err(io::Error::other("agent name needs to be lowercase"));
+                        }
+                        json!({"result":{"type":"agent_started","agent":{"workspace_id":"wSource","tab_id":"wSource:t2","pane_id":"wSource:p2"}}}).to_string()
+                    }
+                    5 => json!({"result":{"type":"agent_prompted","agent":{"workspace_id":"wSource","tab_id":"wSource:t2","pane_id":"wSource:p2"}}}).to_string(),
+                    _ => panic!("unexpected Herdr call"),
+                };
+                calls.push(args.iter().map(|arg| (*arg).to_owned()).collect());
+                Ok(response.into_bytes())
+            },
+        )
+        .unwrap();
+        assert_eq!(session.tab_id, "wSource:t2");
+        assert_eq!(calls.len(), 6);
+        assert_eq!(&calls[4][..2], ["agent", "start"]);
+        assert!(calls[4][2].ends_with("0123456789abcdef"));
+        assert_eq!(&calls[5][..3], ["agent", "prompt", "wSource:p2"]);
+        assert!(calls[5][3].contains(marker));
+        assert!(calls[5][3].contains("Plan a release"));
+        assert_eq!(
+            parse_output(
+                &format!("{marker} {{\"kind\":\"question\",\"text\":\"Scope?\",\"options\":[\"A\",\"B\"]}}"),
+                marker,
+            )
+            .unwrap(),
+            Some(Message::Question {
+                text: "Scope?".into(),
+                options: vec!["A".into(), "B".into()],
+            })
+        );
+    }
 
     #[test]
     fn parses_question_and_epic_and_rejects_incomplete_plan() {
