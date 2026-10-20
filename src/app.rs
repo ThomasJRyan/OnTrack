@@ -4791,6 +4791,76 @@ mod tests {
         }
     }
 
+    #[test]
+    fn legacy_planning_repolls_pending_output_until_agent_asks() {
+        let (mut app, requests, replies) = connected_app();
+        let seq = 1;
+        let marker = "ONTRACK_PLAN_TEST".to_owned();
+        app.modal = Some(Modal::Planning(PlanningForm {
+            seq,
+            proposal: String::new(),
+            input: String::new(),
+            marker: marker.clone(),
+            round: 0,
+            session: None,
+            stage: PlanningStage::Waiting,
+            selected: 0,
+            poll_inflight: false,
+            next_poll: Instant::now(),
+            scroll: 0,
+        }));
+        let session = crate::epic::Session {
+            workspace_id: "w1".into(),
+            tab_id: "w1:t2".into(),
+            pane_id: "w1:p2".into(),
+        };
+        let now = Instant::now();
+        replies
+            .send(Response::PlanLaunched(seq, Ok(session.clone())))
+            .unwrap();
+        app.receive_at(now);
+        app.poll_planning(now);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Request::PlanRead(read_seq, read_session, read_marker))
+                if read_seq == seq && read_session == session && read_marker == marker
+        ));
+        app.poll_planning(now + Duration::from_secs(2));
+        assert!(requests.try_recv().is_err(), "one read at a time");
+
+        replies
+            .send(Response::PlanRead(seq, marker.clone(), Ok(None)))
+            .unwrap();
+        app.receive_at(now);
+        app.poll_planning(now + Duration::from_secs(2) - Duration::from_nanos(1));
+        assert!(requests.try_recv().is_err());
+        app.poll_planning(now + Duration::from_secs(2));
+        assert!(matches!(requests.try_recv(), Ok(Request::PlanRead(..))));
+
+        replies
+            .send(Response::PlanRead(
+                seq,
+                marker,
+                Ok(Some(crate::planning::Message::Question {
+                    text: "Which scope?".into(),
+                    options: vec!["Small".into(), "Large".into()],
+                })),
+            ))
+            .unwrap();
+        app.receive_at(now + Duration::from_secs(2));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Planning(PlanningForm {
+                stage: PlanningStage::Question { .. },
+                ..
+            }))
+        ));
+        assert!(
+            requests.try_recv().is_err(),
+            "polling stops for the question"
+        );
+    }
+
     fn take_show(rx: &mpsc::Receiver<Request>, expected_id: &str) -> u64 {
         match rx.try_recv() {
             Ok(Request::Show(id, seq)) => {
