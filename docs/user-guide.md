@@ -43,7 +43,7 @@ Press `Ctrl+?` whenever you need the controls for the current view. See the sche
 
 ## Status groups
 
-All bordered panes and dialogs, including tracked handoffs, forms, planning, and hotkey help, use rounded corners.
+All bordered panes and dialogs, including tracked handoffs, forms, and hotkey help, use rounded corners.
 
 Issues are shown in rounded, colour-coded panes. Open, Ready, Blocked, Deferred, In Progress, and Closed remain visible with a count of zero when empty, even when the workspace has no issues. Open appears first and Closed last; other and unrecognized statuses appear alphabetically between Ready and Closed when issues have those statuses. An empty status is labelled Unknown only when an issue has one. The Closed group starts collapsed after the first list loads; other groups start expanded. Pane titles show the status and count. Each issue's type, priority, and status columns align across groups; the selected issue's details pane title shows its ID, status, and priority. Use `↑` / `↓` to move through visible issues, empty group headers, and collapsed group headers. Expanded headers with issues are skipped. Movement clamps at the first and last target. A focused header is highlighted and does not select an issue or retain detail/delete identity. Press `Right` or `Space` on a collapsed header to expand the group and select its first issue when one exists; an empty header stays focused. `Left` collapses a group. Press `Space` on a selected issue or use `←` / `→` to collapse or expand its group; clicking a pane title also toggles that group. Collapsing a selected issue's group selects its collapsed header. Mouse title clicks can reopen any group. Refresh preserves focus on a collapsed or empty header while that group exists.
 
@@ -51,17 +51,7 @@ Ready group borders and Ready status text are blue in every theme. The label rem
 
 ## Browsing and controls
 
-### Plan new work with an agent
-
-Press `p` from the issue browser to plan a new Task or Epic. Type a proposal and press `Enter` to start the agent in a new tab of the current Herdr workspace. `Shift+Enter` adds a line break in the proposal on terminals that report modified Enter. Planning does not edit the selected issue or create Beads yet.
-
-OnTrack gives the planning agent a Herdr-compatible lowercase name when it starts. For Codex, it passes a session-only trust setting for the verified main Git repository, including when planning from a linked worktree, and defers the startup update check. It also trusts enabled hooks for this invocation, avoiding folder and hook trust prompts without changing your saved Codex settings or permission policy. If agent startup fails for another reason, the new tab stays open so you can inspect it before retrying.
-
-When the agent asks a question, use `Up` / `Down` to select one of its answers and `Enter` to send it. Select **Custom answer** with `Tab` or `Down` and type your own answer. The agent continues in the background; its next question or proposed plan appears in OnTrack. Questions that span several terminal rows still appear in this dialog. The agent may take a while to respond. If OnTrack reports an invalid planning response, inspect the agent's Herdr tab; press `r` in the error dialog to read its output again after the agent corrects it. The agent is instructed to use a structured response.
-
-Review the proposed title, description, acceptance criteria, priority, and any child Tasks. Scroll a long plan with `Up` / `Down` or `PageUp` / `PageDown`. Press `r` to request a revision, then type your instruction and press `Enter`. Press `y` only when the plan is ready: OnTrack then creates one Task, or an Epic with child Tasks. New Tasks start Open and Unassigned, so you can select an agent and mark them Ready later. Press `Esc` to cancel without creating Beads. The Herdr planning tab remains open for review; close it from Herdr when no longer needed.
-
-If creation reports an error, inspect the named Beads before planning again. An Epic and some children may already exist, and retrying the same plan could duplicate them. OnTrack refreshes the browser after a creation attempt.
+Create Tasks and Epics with `n`, or use `Shift+N` on an open Task to create a child. The create form saves the issue without starting an agent.
 
 ### Ready issues and scheduler
 
@@ -101,7 +91,6 @@ An Open or Ready issue shows `· sent` beside its status after Herdr confirms th
 | `Shift+N` | On a selected open task, open the same form for a child task. The form names its parent; creation records a Beads parent-child relationship. |
 | `e` | Load the selected bead's current details and open the edit form. Edit Title, Type, Priority, Agent harness, and Description with the same controls as the new-bead form; Save updates that bead, while Esc or Cancel discards the draft. The loading dialog offers `e` to retry a failed detail load. |
 | `d` | Ask to permanently delete the selected bead. `y` confirms; `n` or Enter cancels. Deletion does not cascade; dependency links are removed and dependents may be orphaned. |
-| `g` on an Epic | Confirm generation of child tasks from its live Description using a Herdr agent. `y` confirms; `n`, Enter, or Esc cancels. Available with either issue pane focused. |
 | `h` | Immediately hand the selected bead to Herdr in the background. The top-right toast shows discovery, launch, and the result. No dialog or second confirmation appears. Repeated `h` for the same pending Bead is ignored; different Beads can launch concurrently. |
 | `Shift+R` in the issue browser | Same Ready toggle as `r`. |
 | `w` | Open outstanding tracked worktrees. This list is independent of Beads statuses, so closing or deleting a Bead does not hide unfinished work. A checkout disappears after removal is verified, including when it was removed outside OnTrack; uncertain cleanup stays visible for recovery. Select an item and press Enter to focus its recorded Herdr workspace. A merge is a request, not proof of integration; inspect conflict/error states and recover in Git before retrying. Cleanup is separately confirmed and available only after verified integration. In this view, `a` asks the original idle agent to continue in the existing checkout, and `Shift+R` opens a restart confirmation for the selected active handoff. |
@@ -115,16 +104,6 @@ With Description focused, copy a PNG or JPEG screenshot and press `Ctrl+V`. OnTr
 The hotkey reference accepts terminal reports of `Ctrl+?`, `Ctrl+Shift+/`, and `Ctrl+/`. Some terminals send the same unmodified Backspace code for `Ctrl+?`; on those terminals the app cannot distinguish the keys, so use a terminal with modified-key reporting. The reference is unavailable while a mutation locks its dialog.
 
 The settings dialog captures input until it closes, so `q` cannot quit while it is open. Theme, default-agent, agent-limit, and cleanup changes save immediately. Child auto-merge defaults on; top-level auto-merge, workspace closing, and checkout removal default off. Automatic merge may defer when there is no trustworthy evidence that the agent is idle; a closed Bead alone never proves it is safe to merge. Removing a checkout also closes its Herdr workspace. Settings load/save errors remain visible; failed saves preserve the last successfully saved settings. See the [settings guide](settings.md) for recovery.
-
-## Generate tasks for an Epic
-
-In the create form, choose **Epic** to reveal **Generate child tasks with a Herdr agent** below Description. Tab moves from Agent harness through Description to this option, then Create. The option starts off. Enter the proposal in Description, turn on the option, and create the Epic. OnTrack saves the Epic first, then opens a planning tab inside the current Herdr workspace at the current checkout, starts an available agent, and asks it to create direct child Beads with descriptions, acceptance criteria, and explicit P0–P4 priorities. The agent compares impact, urgency, and enabling work to distinguish priorities when the proposal supports it; comparable or unclear tasks may share a priority. Review the generated priorities before scheduling tasks. It does not create another Git worktree or top-level Herdr workspace. The form hides and clears this option for other issue types; editing a Bead does not run generation.
-
-To generate tasks after creation, select an Epic in either issue pane and press `g`. The shortcut appears only for Epics. The confirmation names the Epic and warns that existing children remain and another run may add duplicates. Press `y` to start or `n`, Enter, or Esc to cancel. Add a Description first if the proposal is empty. Repeated requests for the same Epic are blocked while planning runs in this OnTrack process. Editing alone still does not trigger generation.
-
-For Codex, OnTrack handles the first-directory trust check for the verified main Git repository and defers the startup update check for this planning session. This also works when the current checkout is a linked worktree. Enabled hooks are also trusted for this invocation. These settings apply only to the launched process; update Codex separately when convenient. Other agent integrations keep their normal startup settings. Authentication, administrator policy, or an unfamiliar startup dialog can still require your input. If startup fails, the error identifies the workspace, tab, and pane and confirms that no planning prompt was sent. Inspect that pane and resolve the input before retrying generation.
-
-Keep OnTrack open while planning runs. The top-right message reports launch, completion, or a recovery error. After the agent finishes, OnTrack checks that at least one direct child exists and closes only the planning tab. If the agent exits after creating children, OnTrack also accepts completion when Herdr confirms that its original pane is still present with no agent. If creation, agent start, prompt delivery, or child verification fails, the Epic remains. An already created planning tab stays open so you can inspect its agent and Beads. Check that tab before retrying; a prompt failure may still have delivered the proposal, and another run can duplicate children. If the planning tab becomes the last tab in the workspace, OnTrack leaves it open to preserve the workspace. This workflow requires OnTrack to run inside Herdr with a current agent integration.
 
 ## Details, loading, and refresh
 

@@ -979,7 +979,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         split[1],
     );
     f.render_widget(
-        Paragraph::new(footer_text(v[2].width as usize, app.selected_is_epic()))
+        Paragraph::new(footer_text(v[2].width as usize))
             .style(Style::default().fg(muted).bg(palette.panel_alt)),
         v[2],
     );
@@ -1054,9 +1054,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 (11 + option_lines + error_lines + hint_lines + 2) as u16
             }
             crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
-                let epic_toggle = matches!(modal, crate::app::Modal::Create(_))
-                    && crate::beads::BEAD_TYPES[form.issue_type] == "epic";
-                (if form.dropdown.is_some() { 22 } else { 18 }) + u16::from(epic_toggle)
+                if form.dropdown.is_some() { 22 } else { 18 }
             }
             crate::app::Modal::EditLoading { .. } => 8,
             crate::app::Modal::ConfirmGenerateEpic { .. }
@@ -1402,7 +1400,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             }
             crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
                 let editing = matches!(modal, crate::app::Modal::Edit { .. });
-                let epic_toggle = !editing && crate::beads::BEAD_TYPES[form.issue_type] == "epic";
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -1414,7 +1411,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         }),
                         Constraint::Length(if form.dropdown == Some(6) { 7 } else { 3 }),
                         Constraint::Min(3),
-                        Constraint::Length(u16::from(epic_toggle)),
+                        Constraint::Length(0),
                         Constraint::Length(1),
                         Constraint::Length(1),
                     ])
@@ -1688,22 +1685,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             desc_area.y + 1 + row,
                         ));
                     }
-                }
-                if epic_toggle {
-                    let label = format!(
-                        "[{}] Generate child tasks with a Herdr agent",
-                        if form.generate_children { "x" } else { " " }
-                    );
-                    f.render_widget(
-                        Paragraph::new(label).style(if form.focus == 7 {
-                            Style::default()
-                                .fg(palette.selected_foreground)
-                                .bg(palette.selected_background)
-                        } else {
-                            Style::default().fg(teal)
-                        }),
-                        rows[4],
-                    );
                 }
                 let actions = Paragraph::new(Line::from(vec![
                     Span::styled(
@@ -2083,17 +2064,12 @@ fn render_toast(f: &mut Frame, app: &App) {
         box_area,
     );
 }
-fn footer_text(width: usize, epic: bool) -> String {
+fn footer_text(width: usize) -> String {
     let mut footer = truncate_display(
-        if epic {
-            " g generate · n new · e edit · d delete · h hand off · r ready · q quit"
-        } else {
-            " n new · e edit · d delete · h hand off · r ready · q quit"
-        },
+        " n new · e edit · d delete · h hand off · r ready · q quit",
         width,
     );
     for hint in [
-        " · p plan",
         " · N child",
         " · s settings",
         " · w worktrees",
@@ -2537,7 +2513,6 @@ mod tests {
             mutation_busy: false,
             ready_pending: false,
             planning_epics: Default::default(),
-            planning_seq: 0,
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -3254,94 +3229,35 @@ mod tests {
         assert!(error_delete.contains("[y] Delete"));
     }
     #[test]
-    fn existing_epic_generation_dialog_and_hints_are_contextual_and_responsive() {
-        let mut state = app();
-        state.selected = Some(0);
-        state.beads[0].data["issue_type"] = serde_json::json!("task");
-        assert!(!draw((130, 30), &mut state).0.contains("g generate"));
-        assert!(
-            !crate::hotkeys::Context::current(&state)
-                .entries()
-                .iter()
-                .any(|(key, _)| *key == "g")
-        );
-        state.beads[0].data["issue_type"] = serde_json::json!("epic");
-        assert!(draw((130, 30), &mut state).0.contains("g generate"));
-        for details in [false, true] {
-            state.focus_detail = details;
+    fn planning_controls_are_absent_from_epic_screen_and_create_form() {
+        let mut app = app();
+        app.selected = Some(0);
+        app.beads[0].data["issue_type"] = serde_json::json!("epic");
+        let screen = draw((130, 30), &mut app).0;
+        assert!(!screen.contains("g generate"));
+        assert!(!screen.contains("p plan"));
+        for focus_detail in [false, true] {
+            app.focus_detail = focus_detail;
             assert!(
-                crate::hotkeys::Context::current(&state)
+                !crate::hotkeys::Context::current(&app)
                     .entries()
                     .iter()
-                    .any(|(key, _)| *key == "g")
+                    .any(|(key, _)| *key == "g" || *key == "p")
             );
         }
-        state.modal = Some(crate::app::Modal::ConfirmGenerateEpic {
-            id: "epic-1".into(),
-            title: "Plan release 界".into(),
-        });
-        for size in [(100, 30), (50, 24)] {
-            let screen = draw(size, &mut state).0;
-            assert!(state.modal_ready);
-            for text in [
-                "GENERATE EPIC TASKS?",
-                "Epic: epic-1",
-                "Plan release 界",
-                "Herdr agent?",
-                "duplicate tasks.",
-                "y confirm",
-                "Esc cancel",
-            ] {
-                assert!(screen.contains(text), "missing {text} at {size:?}");
-            }
-        }
-        for size in [(40, 24), (100, 8)] {
-            assert!(draw(size, &mut state).0.contains("Expand terminal"));
-            assert!(!state.modal_ready);
-        }
-        state.modal = Some(crate::app::Modal::ConfirmGenerateEpic {
-            id: "epic-1".into(),
-            title: "Long proposal 界 ".repeat(100),
-        });
-        assert!(
-            draw((80, 24), &mut state)
-                .0
-                .contains("Expand terminal height")
-        );
-        assert!(!state.modal_ready);
-    }
-
-    #[test]
-    fn epic_generation_toggle_is_visible_only_when_creating_epic() {
-        let mut app = app();
-        let mut form = crate::app::CreateForm {
+        app.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
             issue_type: crate::beads::BEAD_TYPES
                 .iter()
                 .position(|kind| *kind == "epic")
                 .unwrap(),
-            generate_children: true,
-            focus: 7,
             ..Default::default()
-        };
-        app.modal = Some(crate::app::Modal::Create(form.clone()));
-        let epic = draw((100, 30), &mut app).0;
-        assert!(epic.contains("[x] Generate child tasks"));
-        assert!(epic.contains("Agent harness"));
-        assert!(epic.contains("Description"));
-        assert!(epic.contains("[ Create ]"));
-        form.issue_type = 0;
-        app.modal = Some(crate::app::Modal::Create(form.clone()));
-        assert!(!draw((100, 30), &mut app).0.contains("Generate child tasks"));
-        form.issue_type = crate::beads::BEAD_TYPES
-            .iter()
-            .position(|kind| *kind == "epic")
-            .unwrap();
-        app.modal = Some(crate::app::Modal::Edit {
-            id: "e1".into(),
-            form,
-        });
-        assert!(!draw((100, 30), &mut app).0.contains("Generate child tasks"));
+        }));
+        let form = draw((100, 30), &mut app).0;
+        assert!(!form.contains("Generate child tasks"));
+        assert!(form.contains("Agent harness"));
+        assert!(form.contains("[ Create ]"));
     }
+
     #[test]
     fn create_harness_picker_shows_only_discovered_kinds_and_discovery_states() {
         let mut app = app();
@@ -3404,7 +3320,7 @@ mod tests {
     #[test]
     fn browser_footer_keeps_action_hints_without_routine_state_or_arrow_tips() {
         for width in [64, 90, 120] {
-            let footer = footer_text(width, false);
+            let footer = footer_text(width);
             for action in ["n new", "d delete", "h hand off", "r ready", "q quit"] {
                 assert!(
                     footer.contains(action),
@@ -3416,9 +3332,9 @@ mod tests {
             assert!(!footer.contains("←"));
             assert!(!footer.contains("READY"));
         }
-        assert!(footer_text(120, false).contains("N child"));
-        assert!(!footer_text(120, false).contains("u update"));
-        assert!(footer_text(120, false).contains("Ctrl+? keys"));
+        assert!(footer_text(120).contains("N child"));
+        assert!(!footer_text(120).contains("u update"));
+        assert!(footer_text(120).contains("Ctrl+? keys"));
         let mut app = app();
         let original = draw((120, 24), &mut app).0;
         app.list_error = Some("current failure".into());
@@ -3446,44 +3362,6 @@ mod tests {
         assert!(with_notice.contains("Updated bead"));
     }
 
-    #[test]
-    fn planning_view_shows_agent_choices_and_review_confirmation() {
-        let mut app = app();
-        let mut form = crate::app::PlanningForm {
-            seq: 1,
-            proposal: "Plan search".into(),
-            input: "My answer".into(),
-            marker: "ONTRACK_PLAN_1".into(),
-            round: 0,
-            session: None,
-            stage: crate::app::PlanningStage::Question {
-                text: "Which scope?".into(),
-                options: vec!["Titles".into(), "All fields".into()],
-            },
-            selected: 2,
-            poll_inflight: false,
-            next_poll: std::time::Instant::now(),
-            scroll: 0,
-        };
-        app.modal = Some(crate::app::Modal::Planning(form.clone()));
-        let rendered = draw((80, 24), &mut app).0;
-        assert!(rendered.contains("Which scope?"));
-        assert!(rendered.contains("Custom answer: My answer"));
-        form.stage = crate::app::PlanningStage::Review(crate::planning::Plan {
-            kind: "task".into(),
-            root: crate::planning::Item {
-                title: "Search".into(),
-                description: "Implement search".into(),
-                acceptance: "Result appears".into(),
-                priority: 2,
-            },
-            tasks: vec![],
-        });
-        app.modal = Some(crate::app::Modal::Planning(form));
-        let rendered = draw((80, 24), &mut app).0;
-        assert!(rendered.contains("Result appears"));
-        assert!(rendered.contains("y create Beads"));
-    }
     #[test]
     fn outstanding_worktrees_render_target_state_and_pending_dispatch_on_compact_terminal() {
         let mut app = app();

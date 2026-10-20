@@ -81,7 +81,6 @@ impl Context {
                 ("e", "Edit selected bead"),
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
-                ("p", "Plan new Task or Epic with an agent"),
                 (
                     "Shift+R",
                     "Toggle Ready for an open issue; Epic includes tasks",
@@ -104,7 +103,6 @@ impl Context {
                 ("e", "Edit selected bead"),
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
-                ("p", "Plan new Task or Epic with an agent"),
                 ("w", "Open outstanding worktrees"),
                 ("Esc", "Stay in the issue browser"),
             ],
@@ -177,9 +175,6 @@ impl Context {
                 ("Esc", "Cancel planning"),
             ],
         };
-        if matches!(self, Self::EpicIssues | Self::EpicDetails) {
-            rows.push(("g", "Generate Epic child tasks after confirmation"));
-        }
         rows.extend([
             ("Ctrl+?", "Open or close this hotkey reference"),
             ("↑ / k · ↓ / j", "Scroll this reference while it is open"),

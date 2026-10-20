@@ -16,7 +16,7 @@ use std::{
     path::PathBuf,
     sync::{Arc, mpsc},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 fn spawn_epic_planning(id: String, replies: mpsc::Sender<Response>) {
@@ -45,7 +45,6 @@ pub(super) enum Request {
     Show(String, u64),
     LoadEdit(String, u64),
     Create(CreateBead),
-    CreateEpic(CreateBead, Option<String>),
     GenerateEpic(String),
     CreateChild(CreateBead, String),
     Update(UpdateBead),
@@ -157,7 +156,6 @@ pub struct App {
     /// Ready keeps mutation exclusion without locking browser input.
     pub ready_pending: bool,
     pub planning_epics: HashSet<String>,
-    pub(super) planning_seq: u64,
     pub modal_ready: bool,
     pub(crate) paste_seq: u64,
     pub(crate) paste_pending: bool,
@@ -171,6 +169,7 @@ pub struct App {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Modal {
+    #[allow(dead_code)] // Legacy modal is retained but has no browser entry point.
     Planning(PlanningForm),
     Create(CreateForm),
     EditLoading {
@@ -182,6 +181,7 @@ pub enum Modal {
         id: String,
         form: CreateForm,
     },
+    #[allow(dead_code)] // Legacy confirmation is retained but has no browser entry point.
     ConfirmGenerateEpic {
         id: String,
         title: String,
@@ -204,9 +204,13 @@ pub enum Modal {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanningStage {
+    #[allow(dead_code)] // No launch path constructs this legacy stage.
     Draft,
     Waiting,
-    Question { text: String, options: Vec<String> },
+    Question {
+        text: String,
+        options: Vec<String>,
+    },
     Review(crate::planning::Plan),
     Revision,
     Creating,
@@ -228,29 +232,6 @@ pub struct PlanningForm {
     pub scroll: u16,
 }
 
-impl PlanningForm {
-    fn new(seq: u64) -> Self {
-        Self {
-            seq,
-            proposal: String::new(),
-            input: String::new(),
-            marker: format!(
-                "ONTRACK_PLAN_{seq}_{:x}",
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            ),
-            round: 0,
-            session: None,
-            stage: PlanningStage::Draft,
-            selected: 0,
-            poll_inflight: false,
-            next_poll: Instant::now(),
-            scroll: 0,
-        }
-    }
-}
 #[derive(Debug, Clone)]
 pub struct Toast {
     pub message: String,
@@ -296,7 +277,6 @@ pub struct CreateForm {
     pub harness_error: Option<String>,
     pub harness_seq: u64,
     pub previous_harness: Option<String>,
-    pub generate_children: bool,
     pub focus: usize,
     pub cursor: usize,
     pub description_cursor: usize,
@@ -318,7 +298,6 @@ impl Default for CreateForm {
             harness_error: None,
             harness_seq: 0,
             previous_harness: None,
-            generate_children: false,
             focus: 0,
             cursor: 0,
             description_cursor: 0,
@@ -445,19 +424,6 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
         Request::Show(id, seq) => Response::Show(id.clone(), seq, beads::show_bead(&id)),
         Request::LoadEdit(id, seq) => Response::EditLoaded(id.clone(), seq, beads::show_bead(&id)),
         Request::Create(input) => Response::Created(beads::create_bead(&input)),
-        Request::CreateEpic(input, parent) => match parent.as_deref().map_or_else(
-            || beads::create_bead(&input),
-            |id| beads::create_child(&input, id),
-        ) {
-            Ok(id) => {
-                if out.send(Response::Created(Ok(id.clone()))).is_err() {
-                    return;
-                }
-                spawn_epic_planning(id, out.clone());
-                return;
-            }
-            Err(error) => Response::Created(Err(error)),
-        },
         Request::GenerateEpic(id) => {
             spawn_epic_planning(id, out.clone());
             return;
@@ -656,7 +622,6 @@ impl App {
             mutation_busy: false,
             ready_pending: false,
             planning_epics: HashSet::new(),
-            planning_seq: 0,
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -1220,13 +1185,6 @@ impl App {
                     self.mutation_busy = false;
                     match result {
                         Ok(id) => {
-                            if matches!(&self.modal, Some(Modal::Create(form)) if form.generate_children && beads::BEAD_TYPES[form.issue_type] == "epic")
-                            {
-                                self.planning_epics.insert(id.clone());
-                                self.toast = Some(Toast::progress(format!(
-                                    "Created Epic {id}; starting sub-task agent…"
-                                )));
-                            }
                             self.notice = Some(format!("Created {id}"));
                             self.created_screenshots.clear();
                             self.modal = None;
@@ -1938,12 +1896,6 @@ impl App {
             return false;
         }
         match k.code {
-            KeyCode::Char('p') => {
-                self.planning_seq = self.planning_seq.wrapping_add(1);
-                self.modal = Some(Modal::Planning(PlanningForm::new(self.planning_seq)));
-                self.modal_ready = false;
-                self.notice = None;
-            }
             KeyCode::Char('w') => {
                 self.worktrees_view = true;
                 self.worktrees_focus_feedback = None;
@@ -2031,7 +1983,6 @@ impl App {
                     self.notice = None;
                 }
             }
-            KeyCode::Char('g') => self.open_epic_generation(),
             KeyCode::Char('h') => self.open_launch(),
             KeyCode::Tab => self.focus_detail = !self.focus_detail,
             KeyCode::Left if !self.focus_detail => {
@@ -2532,27 +2483,21 @@ impl App {
         }
         match key.code {
             Tab => {
-                let epic = edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic";
                 form.focus = match form.focus {
                     0 => 2,
                     2 => 3,
                     3 => 6,
                     6 => 1,
-                    1 if epic => 7,
                     1 => 4,
-                    7 => 4,
                     4 => 5,
                     _ => 0,
                 }
             }
             BackTab => {
-                let epic = edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic";
                 form.focus = match form.focus {
                     0 => 5,
                     5 => 4,
-                    4 if epic => 7,
                     4 => 1,
-                    7 => 1,
                     1 => 6,
                     6 => 3,
                     3 => 2,
@@ -2586,15 +2531,6 @@ impl App {
                         );
                         return false;
                     }
-                    if edit_id.is_none()
-                        && form.generate_children
-                        && beads::BEAD_TYPES[form.issue_type] == "epic"
-                        && form.description.trim().is_empty()
-                    {
-                        self.notice =
-                            Some("Describe the Epic proposal before generating child tasks".into());
-                        return false;
-                    }
                     let input = CreateBead {
                         title: form.title.trim().into(),
                         description: form.description.clone(),
@@ -2612,8 +2548,6 @@ impl App {
                             fields: input,
                             previous_harness: form.previous_harness.clone(),
                         })
-                    } else if form.generate_children && input.issue_type == "epic" {
-                        Request::CreateEpic(input, form.parent_id.clone())
                     } else if let Some(parent) = &form.parent_id {
                         Request::CreateChild(input, parent.clone())
                     } else {
@@ -2630,9 +2564,6 @@ impl App {
             Enter if form.focus == 5 => {
                 self.modal = None;
                 return false;
-            }
-            Enter | Char(' ') if form.focus == 7 => {
-                form.generate_children = !form.generate_children;
             }
             Char(' ') if matches!(form.focus, 2 | 3 | 6) => {
                 form.dropdown = Some(form.focus);
@@ -2652,11 +2583,7 @@ impl App {
                 form.description_cursor = i + 1;
             }
             Enter if form.focus == 1 && key.modifiers.is_empty() => {
-                form.focus = if edit_id.is_none() && beads::BEAD_TYPES[form.issue_type] == "epic" {
-                    7
-                } else {
-                    4
-                };
+                form.focus = 4;
             }
             Up if form.focus == 1 => {
                 form.description_cursor = crate::ui::move_description_vertical(
@@ -2739,12 +2666,6 @@ impl App {
             }
             _ => {}
         }
-        if beads::BEAD_TYPES[form.issue_type] != "epic" {
-            form.generate_children = false;
-            if form.focus == 7 {
-                form.focus = 4;
-            }
-        }
         false
     }
     fn save_settings(&mut self, proposed: Settings) {
@@ -2774,22 +2695,6 @@ impl App {
         self.selected
             .and_then(|i| self.beads.get(i))
             .is_some_and(|bead| bead.data["issue_type"] == "epic")
-    }
-    fn open_epic_generation(&mut self) {
-        if !self.selected_is_epic() {
-            return;
-        }
-        let bead = &self.beads[self.selected.unwrap()];
-        if self.planning_epics.contains(&bead.id) {
-            self.notice = Some(format!("Epic {} is already being planned", bead.id));
-            return;
-        }
-        self.modal = Some(Modal::ConfirmGenerateEpic {
-            id: bead.id.clone(),
-            title: bead.title.clone(),
-        });
-        self.modal_ready = false;
-        self.notice = None;
     }
     fn open_launch(&mut self) {
         let Some(bead) = self
@@ -3463,7 +3368,6 @@ mod tests {
             mutation_busy: false,
             ready_pending: false,
             planning_epics: HashSet::new(),
-            planning_seq: 0,
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -4873,106 +4777,20 @@ mod tests {
     }
 
     #[test]
-    fn planning_asks_and_sends_custom_answer_without_creating_beads() {
-        let (mut a, requests, replies) = connected_app();
-        press(&mut a, KeyCode::Char('p'));
-        for c in "Improve search".chars() {
-            press(&mut a, KeyCode::Char(c));
-        }
-        assert!(requests.try_recv().is_err());
-        press(&mut a, KeyCode::Enter);
-        let (seq, marker) = match requests.try_recv().unwrap() {
-            Request::PlanLaunch(seq, proposal, marker) => {
-                assert_eq!(proposal, "Improve search");
-                (seq, marker)
+    fn planning_shortcuts_do_not_open_dialogs_or_queue_requests() {
+        let (mut app, requests, _) = connected_app();
+        app.selected = Some(0);
+        app.beads[0].data["issue_type"] = json!("epic");
+        for focus_detail in [false, true] {
+            app.focus_detail = focus_detail;
+            for key in ['p', 'g'] {
+                press(&mut app, KeyCode::Char(key));
+                assert!(app.modal.is_none());
+                assert!(requests.try_recv().is_err());
             }
-            _ => panic!("expected planning launch"),
-        };
-        let session = crate::epic::Session {
-            workspace_id: "w1".into(),
-            tab_id: "w1:t2".into(),
-            pane_id: "w1:p2".into(),
-        };
-        replies
-            .send(Response::PlanLaunched(seq, Ok(session.clone())))
-            .unwrap();
-        a.receive();
-        a.poll_planning(Instant::now());
-        assert!(
-            matches!(requests.try_recv(), Ok(Request::PlanRead(read_seq, _, read_marker)) if read_seq == seq && read_marker == marker)
-        );
-        replies
-            .send(Response::PlanRead(
-                seq,
-                marker,
-                Ok(Some(crate::planning::Message::Question {
-                    text: "Which scope?".into(),
-                    options: vec!["Small".into(), "Large".into()],
-                })),
-            ))
-            .unwrap();
-        a.receive();
-        press(&mut a, KeyCode::Tab);
-        for c in "Only titles".chars() {
-            press(&mut a, KeyCode::Char(c));
         }
-        press(&mut a, KeyCode::Enter);
-        assert!(
-            matches!(requests.try_recv(), Ok(Request::PlanReply(reply_seq, reply_session, answer, _)) if reply_seq == seq && reply_session == session && answer == "Only titles")
-        );
-        assert!(matches!(
-            a.modal,
-            Some(Modal::Planning(PlanningForm {
-                stage: PlanningStage::Waiting,
-                ..
-            }))
-        ));
     }
 
-    #[test]
-    fn planning_review_requires_explicit_confirmation_and_blocks_repeat_create() {
-        let (mut a, requests, replies) = connected_app();
-        press(&mut a, KeyCode::Char('p'));
-        let seq = a.planning_seq;
-        let plan = crate::planning::Plan {
-            kind: "task".into(),
-            root: crate::planning::Item {
-                title: "Search".into(),
-                description: "Implement search".into(),
-                acceptance: "Find a result".into(),
-                priority: 2,
-            },
-            tasks: vec![],
-        };
-        if let Some(Modal::Planning(form)) = a.modal.as_mut() {
-            form.stage = PlanningStage::Review(plan.clone());
-        }
-        assert!(requests.try_recv().is_err());
-        press(&mut a, KeyCode::Char('y'));
-        assert!(
-            matches!(requests.try_recv(), Ok(Request::PlanCreate(create_seq, submitted)) if create_seq == seq && submitted == plan)
-        );
-        press(&mut a, KeyCode::Char('y'));
-        assert!(requests.try_recv().is_err());
-        replies
-            .send(Response::PlanCreated(
-                seq,
-                Err("Created b1; inspect".into()),
-            ))
-            .unwrap();
-        a.receive();
-        assert!(matches!(
-            a.modal,
-            Some(Modal::Planning(PlanningForm {
-                stage: PlanningStage::Failed(_),
-                ..
-            }))
-        ));
-        press(&mut a, KeyCode::Esc);
-        assert!(a.modal.is_none());
-        assert!(matches!(requests.try_recv(), Ok(Request::List)));
-        assert!(requests.try_recv().is_err());
-    }
     fn take_show(rx: &mpsc::Receiver<Request>, expected_id: &str) -> u64 {
         match rx.try_recv() {
             Ok(Request::Show(id, seq)) => {
@@ -6539,223 +6357,34 @@ mod tests {
         assert_eq!(a.selected, Some(0));
     }
     #[test]
-    fn existing_epic_generation_requires_readable_confirmation_and_prevents_repeats() {
-        let mut a = app();
-        let (tx, rx) = mpsc::channel();
-        a.requests = tx;
-        a.selected = None;
-        press(&mut a, KeyCode::Char('g'));
-        assert!(a.modal.is_none());
-        a.selected = Some(0);
-        a.beads[0].data["issue_type"] = json!("task");
-        press(&mut a, KeyCode::Char('g'));
-        assert!(a.modal.is_none());
-        assert!(rx.try_recv().is_err());
-        a.beads[0].data["issue_type"] = json!("epic");
-        for cancel in [
-            KeyCode::Esc,
-            KeyCode::Enter,
-            KeyCode::Char('n'),
-            KeyCode::Char('N'),
-        ] {
-            press(&mut a, KeyCode::Char('g'));
-            assert!(matches!(&a.modal, Some(Modal::ConfirmGenerateEpic { id, .. }) if id == "b0"));
-            a.modal_ready = false;
-            a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
-            assert!(rx.try_recv().is_err()); // No render yet.
-            a.modal_ready = true;
-            press(&mut a, cancel);
-            assert!(a.modal.is_none());
-            assert!(rx.try_recv().is_err());
-        }
-        a.focus_detail = true;
-        press(&mut a, KeyCode::Char('g'));
-        a.modal_ready = true;
-        // The confirmation remains bound to the original Epic if selection changes.
-        a.selected = Some(1);
-        press(&mut a, KeyCode::Char('y'));
-        assert!(matches!(rx.try_recv(), Ok(Request::GenerateEpic(id)) if id == "b0"));
-        assert!(a.modal.is_none());
-        assert!(a.planning_epics.contains("b0"));
-        assert!(!a.mutation_busy);
-        a.selected = Some(0);
-        press(&mut a, KeyCode::Char('g'));
-        assert!(a.modal.is_none());
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn epic_planning_failure_completion_and_queue_errors_allow_recovery() {
-        let mut a = app();
-        let (tx, rx) = mpsc::channel();
-        a.requests = tx;
-        let (out, responses) = mpsc::channel();
-        a.responses = responses;
-        a.planning_epics.insert("b0".into());
-        out.send(Response::EpicLaunched(
-            "b0".into(),
-            Err(std::io::Error::other("proposal is empty")),
-        ))
-        .unwrap();
-        a.receive();
-        assert!(!a.planning_epics.contains("b0"));
-        assert!(a.notice.as_deref().unwrap().contains("proposal is empty"));
-        assert!(!a.notice.as_deref().unwrap().contains("created"));
-        out.send(Response::EpicLaunched(
-            "b0".into(),
-            Ok(crate::epic::Session {
-                workspace_id: "w1".into(),
-                tab_id: "w1:t2".into(),
-                pane_id: "w1:p1".into(),
-            }),
-        ))
-        .unwrap();
-        a.receive();
-        assert!(a.planning_epics.contains("b0"));
-        assert!(a.notice.as_deref().unwrap().contains("tab w1:t2"));
-        out.send(Response::EpicFinished("b0".into(), Ok(vec!["b0.1".into()])))
-            .unwrap();
-        a.receive();
-        assert!(!a.planning_epics.contains("b0"));
-        assert!(a.notice.as_deref().unwrap().contains("1 child Beads"));
-        assert!(matches!(rx.try_recv(), Ok(Request::List)));
-        a.planning_epics.insert("b0".into());
-        out.send(Response::EpicFinished(
-            "b0".into(),
-            Err(std::io::Error::other("agent blocked")),
-        ))
-        .unwrap();
-        a.receive();
-        assert!(!a.planning_epics.contains("b0"));
-        assert!(a.notice.as_deref().unwrap().contains("agent blocked"));
-        drop(rx);
-        a.selected = Some(0);
-        a.beads[0].data["issue_type"] = json!("epic");
-        press(&mut a, KeyCode::Char('g'));
-        a.modal_ready = true;
-        press(&mut a, KeyCode::Char('y'));
-        assert!(!a.planning_epics.contains("b0"));
-        assert!(a.modal.is_some());
-        assert!(a.notice.as_deref().unwrap().contains("could not be queued"));
-    }
-
-    #[test]
-    fn epic_toggle_only_dispatches_opted_in_epics() {
-        let mut a = app();
-        let (tx, rx) = mpsc::channel();
-        a.requests = tx;
-        press(&mut a, KeyCode::Char('n'));
-        let seq = take_harness_discovery(&rx);
-        supply_harnesses(&mut a, seq, &["codex"]);
-        let Some(Modal::Create(form)) = a.modal.as_mut() else {
+    fn epic_form_creates_ordinary_bead_without_planning() {
+        let mut app = app();
+        let (tx, requests) = mpsc::channel();
+        app.requests = tx;
+        press(&mut app, KeyCode::Char('n'));
+        let seq = take_harness_discovery(&requests);
+        supply_harnesses(&mut app, seq, &["codex"]);
+        let Some(Modal::Create(form)) = app.modal.as_mut() else {
             panic!()
         };
-        form.title = "Plan launch".into();
-        form.description = "Large proposal".into();
+        form.title = "Release".into();
         form.issue_type = beads::BEAD_TYPES
             .iter()
-            .position(|value| *value == "epic")
+            .position(|kind| *kind == "epic")
             .unwrap();
-        form.focus = 7;
-        press(&mut a, KeyCode::Enter);
-        let Some(Modal::Create(form)) = a.modal.as_ref() else {
-            panic!()
-        };
-        assert!(form.generate_children);
-        press(&mut a, KeyCode::Tab);
-        press(&mut a, KeyCode::Enter);
-        assert!(
-            matches!(rx.try_recv(), Ok(Request::CreateEpic(input, None)) if input.issue_type == "epic" && input.description == "Large proposal")
-        );
-
-        let mut b = app();
-        let (tx, rx) = mpsc::channel();
-        b.requests = tx;
-        press(&mut b, KeyCode::Char('n'));
-        let seq = take_harness_discovery(&rx);
-        supply_harnesses(&mut b, seq, &["codex"]);
-        let Some(Modal::Create(form)) = b.modal.as_mut() else {
-            panic!()
-        };
-        form.title = "Ordinary".into();
-        form.issue_type = beads::BEAD_TYPES
-            .iter()
-            .position(|value| *value == "epic")
-            .unwrap();
-        form.generate_children = true;
-        form.focus = 2;
-        press(&mut b, KeyCode::Left);
-        let Some(Modal::Create(form)) = b.modal.as_mut() else {
-            panic!()
-        };
-        assert!(!form.generate_children);
-        form.focus = 4;
-        press(&mut b, KeyCode::Enter);
-        assert!(
-            matches!(rx.try_recv(), Ok(Request::Create(input)) if input.issue_type == "feature" && input.harness.as_deref() == Some("codex"))
-        );
-
-        let mut empty = app();
-        let (tx, rx) = mpsc::channel();
-        empty.requests = tx;
-        press(&mut empty, KeyCode::Char('n'));
-        let seq = take_harness_discovery(&rx);
-        supply_harnesses(&mut empty, seq, &["codex"]);
-        let Some(Modal::Create(form)) = empty.modal.as_mut() else {
-            panic!()
-        };
-        form.title = "Needs proposal".into();
-        form.issue_type = beads::BEAD_TYPES
-            .iter()
-            .position(|value| *value == "epic")
-            .unwrap();
-        form.generate_children = true;
-        form.focus = 4;
-        press(&mut empty, KeyCode::Enter);
-        assert!(rx.try_recv().is_err());
-        assert!(empty.notice.as_deref().unwrap().contains("proposal"));
-    }
-    #[test]
-    fn epic_form_keeps_harness_and_generation_controls_separate() {
-        let mut a = app();
-        press(&mut a, KeyCode::Char('n'));
-        let Some(Modal::Create(form)) = a.modal.as_mut() else {
-            panic!()
-        };
-        form.issue_type = beads::BEAD_TYPES
-            .iter()
-            .position(|value| *value == "epic")
-            .unwrap();
-        form.focus = 3;
-        press(&mut a, KeyCode::Tab);
-        let Some(Modal::Create(form)) = a.modal.as_ref() else {
-            panic!()
-        };
-        assert_eq!(form.focus, 6);
-        press(&mut a, KeyCode::Tab);
-        let Some(Modal::Create(form)) = a.modal.as_ref() else {
-            panic!()
-        };
-        assert_eq!(form.focus, 1);
-        press(&mut a, KeyCode::Tab);
-        press(&mut a, KeyCode::Enter);
-        let Some(Modal::Create(form)) = a.modal.as_ref() else {
-            panic!()
-        };
-        assert_eq!(form.focus, 7);
-        assert!(form.generate_children);
-        assert!(form.dropdown.is_none());
-        press(&mut a, KeyCode::Tab);
-        let Some(Modal::Create(form)) = a.modal.as_ref() else {
+        form.focus = 1;
+        press(&mut app, KeyCode::Tab);
+        let Some(Modal::Create(form)) = app.modal.as_ref() else {
             panic!()
         };
         assert_eq!(form.focus, 4);
-        press(&mut a, KeyCode::BackTab);
-        let Some(Modal::Create(form)) = a.modal.as_ref() else {
-            panic!()
-        };
-        assert_eq!(form.focus, 7);
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::Create(input)) if input.issue_type == "epic")
+        );
+        assert!(requests.try_recv().is_err());
     }
+
     #[test]
     fn description_accepts_shortcut_letters_and_shift_enter_but_not_control_chars() {
         let mut a = app();
