@@ -41,6 +41,8 @@ Every `Block` in `src/ui.rs` that draws a full border sets `BorderType::Rounded`
 
 In the managed-worktree view, Enter queues `herdr workspace focus WORKSPACE_ID` on the existing background worker. The ID comes from the selected OnTrack handoff, never global focus. The adapter passes arguments separately, rejects unsafe IDs, and requires Herdr's `workspace_focused` result to repeat the selected ID. Closed workspaces and removed checkouts are rejected before dispatch. Focus success and errors are shown in the view without changing Git, Beads, or the handoff registry.
 
+Worktree discovery has no progress placeholder in `ui::render`: empty-state list guidance is gated on an empty list and `!app.worktrees_loading`. Existing rows render during refresh, and header errors and action feedback render independently of loading state.
+
 `theme::worktree_status_color` maps every `WorktreeStatus` to a semantic palette role. `ui::worktree_status_style` applies that colour to the label's foreground characters and leaves the pane background intact; the surrounding selected-row highlight remains separate. Keep list and detail labels in sync when adding a worktree state. Theme tests enforce that pending and attention colours differ from integrated in every bundled theme, and UI buffer tests check all list labels and selected details across bundled themes.
 
 `worktrees::inspect` recognizes a source checkout's `MERGE_HEAD` only when it equals the verified target HEAD, the target checkout is clean, and no OnTrack merge request is active. It displays `MERGE IN PROGRESS` without changing `verify` or action eligibility. `ontrack status <working|merging|blocked|clear> [detail]` writes an advisory `agent_report` to the existing locked registry after matching the caller's canonical Git top level to exactly one active managed checkout and verifying its identity. Reports expire from display after 15 minutes and are skipped for completed or identity-error states. `list_with` and reconciliation append them only to display details; merge and cleanup paths never consume them. Tests should keep these boundaries explicit.
@@ -282,6 +284,13 @@ but the pre-prompt lifecycle sequence prevents another prompt until the agent
 has reported later activity.
 The existing confirmed `Shift+R` path remains the fallback when the original
 agent cannot be verified; it refuses an uncertain continuation fence.
+
+`worktrees_inflight` bounds pending scans independently of `worktrees_loading`,
+which hides empty-state guidance only during initial discovery without a prior
+scan error. Background refreshes and retries retain the settled empty view.
+The refresh regression renders terminal buffers at normal and compact sizes
+across initial discovery, repeated polls, manual refresh, failure/retry, and
+the arrival of a new handoff to catch text disappearing between frames.
 
 OnTrack records only worktrees created by its own explicit Herdr actions; it
 does not adopt pre-existing Git worktrees. Outstanding work is a separate view
