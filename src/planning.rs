@@ -288,14 +288,35 @@ pub fn parse_output(output: &str, marker: &str) -> io::Result<Option<Message>> {
         return Err(invalid("Invalid planning marker"));
     }
     let prefix = format!("{marker} ");
-    let Some(line) = output.lines().rev().find_map(|line| {
+    let lines: Vec<_> = output.lines().collect();
+    let Some((index, start)) = lines.iter().enumerate().rev().find_map(|(index, line)| {
         line.find(&prefix)
-            .map(|index| &line[index + prefix.len()..])
+            .map(|offset| (index, &line[offset + prefix.len()..]))
     }) else {
         return Ok(None);
     };
-    let value: Value = serde_json::from_str(line)
-        .map_err(|error| invalid(format!("Agent planning response is invalid JSON: {error}")))?;
+    // Herdr may return a visual terminal row break even with recent-unwrapped.
+    // Join only while JSON is incomplete, so later agent/status text is ignored.
+    let mut response = start.to_owned();
+    let mut continuation = lines[index + 1..].iter();
+    let value: Value = loop {
+        match serde_json::from_str(&response) {
+            Ok(value) => break value,
+            Err(error) if error.is_eof() => {
+                let Some(next) = continuation.next() else {
+                    return Err(invalid(format!(
+                        "Agent planning response is invalid JSON: {error}"
+                    )));
+                };
+                response.push_str(next);
+            }
+            Err(error) => {
+                return Err(invalid(format!(
+                    "Agent planning response is invalid JSON: {error}"
+                )));
+            }
+        }
+    };
     match value["kind"].as_str() {
         Some("question") => {
             let text = value["text"]
@@ -543,6 +564,34 @@ mod tests {
             .is_err()
         );
         assert_eq!(parse_output(q, "ONTRACK_other").unwrap(), None);
+    }
+
+    #[test]
+    fn parses_question_wrapped_across_herdr_terminal_rows() {
+        let output = concat!(
+            "› Planning prompt mentioning ONTRACK_x followed by JSON\n",
+            "• ONTRACK_x {\"kind\":\"question\",\"text\":\"What scope should the TODO app have?\",",
+            "\"options\":[\"Single-user app with task CRUD and storage\",\"Single-user app with\n",
+            "  due dates, priorities, and filters too\",\"Multi-user app with accounts\"]}\n",
+            "Worked for 34s\n",
+        );
+        assert_eq!(
+            parse_output(output, "ONTRACK_x").unwrap(),
+            Some(Message::Question {
+                text: "What scope should the TODO app have?".into(),
+                options: vec![
+                    "Single-user app with task CRUD and storage".into(),
+                    "Single-user app with  due dates, priorities, and filters too".into(),
+                    "Multi-user app with accounts".into(),
+                ],
+            })
+        );
+        assert!(
+            parse_output("ONTRACK_x {\"kind\":oops}", "ONTRACK_x")
+                .unwrap_err()
+                .to_string()
+                .contains("invalid JSON")
+        );
     }
 
     #[test]
