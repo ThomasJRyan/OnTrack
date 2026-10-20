@@ -399,7 +399,7 @@ mod tests {
             if self.trust_error {
                 Err(invalid("metadata missing"))
             } else {
-                Ok(r#"projects."/verified/main root".trust_level="trusted""#.into())
+                Ok(r#"projects={"/verified/main root"={trust_level="trusted"}}"#.into())
             }
         }
 
@@ -500,7 +500,7 @@ mod tests {
                 "30000",
                 "--",
                 "-c",
-                r#"projects."/verified/main root".trust_level="trusted""#,
+                r#"projects={"/verified/main root"={trust_level="trusted"}}"#,
                 "-c",
                 "check_for_update_on_startup=false",
             ]

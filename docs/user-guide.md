@@ -55,7 +55,7 @@ Ready group borders and Ready status text are blue in every theme. The label rem
 
 Press `p` from the issue browser to plan a new Task or Epic. Type a proposal and press `Enter` to start the agent in a new tab of the current Herdr workspace. `Shift+Enter` adds a line break in the proposal on terminals that report modified Enter. Planning does not edit the selected issue or create Beads yet.
 
-OnTrack gives the planning agent a Herdr-compatible lowercase name when it starts. If agent startup fails for another reason, the new tab stays open so you can inspect it before retrying.
+OnTrack gives the planning agent a Herdr-compatible lowercase name when it starts. For Codex, it passes a session-only trust setting for the verified main Git repository, including when planning from a linked worktree, and defers the startup update check. This avoids the initial folder-trust dialog without changing your saved Codex settings or permission policy. If agent startup fails for another reason, the new tab stays open so you can inspect it before retrying.
 
 When the agent asks a question, use `Up` / `Down` to select one of its answers and `Enter` to send it. Select **Custom answer** with `Tab` or `Down` and type your own answer. The agent continues in the background; its next question or proposed plan appears in OnTrack. The agent may take a while to respond. It is instructed to use a structured response, so an agent that ignores that instruction may need attention in its Herdr tab.
 

@@ -535,7 +535,9 @@ fn codex_trust_override(root: &Path) -> io::Result<String> {
             key.push(ch);
         }
     }
-    Ok(format!("projects.{key}.trust_level=\"trusted\""))
+    // Codex splits CLI override keys on dots without decoding quoted keys.
+    // Put the path in the TOML value so quotes, dots and '=' stay in the key.
+    Ok(format!("projects={{{key}={{trust_level=\"trusted\"}}}}"))
 }
 
 fn current_dir() -> io::Result<PathBuf> {
@@ -2503,9 +2505,9 @@ mod tests {
         let root = "/tmp/雪 🦀 \".trust_level=\"untrusted\" # \\ $();\n\r\t\u{0}\u{b}\u{7f}\u{85}";
         let option = codex_trust_override(Path::new(root)).unwrap();
         let quoted = option
-            .strip_prefix("projects.")
+            .strip_prefix("projects={")
             .unwrap()
-            .strip_suffix(".trust_level=\"trusted\"")
+            .strip_suffix("={trust_level=\"trusted\"}}")
             .unwrap();
         assert_eq!(serde_json::from_str::<String>(quoted).unwrap(), root);
         assert!(quoted.starts_with('"') && quoted.ends_with('"'));
@@ -2516,6 +2518,17 @@ mod tests {
         assert!(option.contains("\\u007f"));
         assert!(option.contains("\\u0085"));
         assert!(codex_trust_override(Path::new("relative/path")).is_err());
+    }
+
+    #[test]
+    fn codex_trust_path_is_in_toml_value_instead_of_dotted_override_key() {
+        for root in ["/tmp/todo", "/tmp/project.with.dots", "/tmp/key=value"] {
+            let option = codex_trust_override(Path::new(root)).unwrap();
+            // Match Codex's key/value split: only the value is parsed as TOML.
+            let (key, value) = option.split_once('=').unwrap();
+            assert_eq!(key, "projects");
+            assert_eq!(value, format!("{{\"{root}\"={{trust_level=\"trusted\"}}}}"));
+        }
     }
 
     #[test]

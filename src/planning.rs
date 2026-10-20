@@ -370,6 +370,87 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn codex_launch_passes_trust_and_never_prompts_after_failed_or_mismatched_start() {
+        let root = std::env::temp_dir().join(format!(
+            "ontrack-planning-{}.{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        struct Cleanup(std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(root.clone());
+        assert!(
+            Command::new("git")
+                .arg("init")
+                .arg("--quiet")
+                .arg(&root)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let root = root.canonicalize().unwrap();
+        let expected_trust = format!(
+            "projects={{{}={{trust_level=\"trusted\"}}}}",
+            serde_json::to_string(root.to_str().unwrap()).unwrap()
+        );
+        for mode in ["ready", "blocked", "workspace", "tab", "pane"] {
+            let mut calls = Vec::<Vec<String>>::new();
+            let result = launch_with(
+                &root,
+                "wSource",
+                "Plan a release",
+                "ONTRACK_PLAN_1",
+                |args| {
+                    calls.push(args.iter().map(|arg| (*arg).to_owned()).collect());
+                    let response = match calls.len() {
+                    1 => json!({"result":{"type":"workspace_list","workspaces":[{"workspace_id":"wSource"}]}}),
+                    2 => return Ok(b"--kind <KIND> [possible values: codex, opencode]".to_vec()),
+                    3 => return Ok(b"codex: current (v8) (/tmp/codex)\nopencode: current (v1) (/tmp/opencode)".to_vec()),
+                    4 => json!({"result":{"type":"tab_created","tab":{"workspace_id":"wSource","tab_id":"wSource:t2"},"root_pane":{"workspace_id":"wSource","tab_id":"wSource:t2","pane_id":"wSource:p2"}}}),
+                    5 => {
+                        assert_eq!(&args[3..], ["--kind", "codex", "--pane", "wSource:p2", "--timeout", "30000", "--", "-c", &expected_trust, "-c", "check_for_update_on_startup=false"]);
+                        if mode == "blocked" {
+                            return Err(io::Error::other("agent_not_ready: blocked during startup"));
+                        }
+                        let mut agent = json!({"workspace_id":"wSource","tab_id":"wSource:t2","pane_id":"wSource:p2"});
+                        match mode {
+                            "workspace" => agent["workspace_id"] = json!("wOther"),
+                            "tab" => agent["tab_id"] = json!("wSource:t3"),
+                            "pane" => agent["pane_id"] = json!("wSource:p3"),
+                            _ => {}
+                        }
+                        json!({"result":{"type":"agent_started","agent":agent}})
+                    }
+                    6 => json!({"result":{"type":"agent_prompted","agent":{"workspace_id":"wSource","tab_id":"wSource:t2","pane_id":"wSource:p2"}}}),
+                    _ => panic!("unexpected call: {args:?}"),
+                };
+                    Ok(response.to_string().into_bytes())
+                },
+            );
+            if mode == "ready" {
+                assert_eq!(result.unwrap().pane_id, "wSource:p2");
+                assert_eq!(&calls[5][..3], ["agent", "prompt", "wSource:p2"]);
+                assert!(calls[5][3].contains("Plan a release"));
+                assert_eq!(calls.len(), 6);
+            } else {
+                let error = result.unwrap_err().to_string();
+                if mode == "blocked" {
+                    assert!(error.contains("wSource:t2"));
+                    assert!(error.contains("Inspect that tab before retrying"));
+                }
+                assert_eq!(calls.len(), 5, "no prompt, retry, or tab close: {mode}");
+            }
+        }
+    }
+
+    #[test]
     fn launch_uses_herdr_alias_and_preserves_response_marker() {
         let marker = "ONTRACK_PLAN_1_0123456789ABCDEF";
         let mut calls = Vec::<Vec<String>>::new();
