@@ -978,14 +978,15 @@ fn create_and_prompt(
         "30000",
     ];
     if let Some(trust_override) = trust_override.as_deref() {
-        // Invocation-local trust of the verified main repository only. The
-        // separate prompt dispatch remains pane-targeted; no positional prompt.
+        // Invocation-local repository and enabled-hook trust. The separate
+        // prompt dispatch remains pane-targeted; no positional prompt.
         start_args.extend([
             "--",
             "-c",
             trust_override,
             "-c",
             "check_for_update_on_startup=false",
+            "--dangerously-bypass-hook-trust",
         ]);
     }
     if let Some(journal) = journal.as_mut() {
@@ -2045,7 +2046,8 @@ mod tests {
                 "-c",
                 &trust_override,
                 "-c",
-                "check_for_update_on_startup=false"
+                "check_for_update_on_startup=false",
+                "--dangerously-bypass-hook-trust"
             ]
         );
         assert_eq!(mutations[2].len(), 4);
@@ -2549,12 +2551,13 @@ mod tests {
                 "-c",
                 &codex_trust_override(&main_root).unwrap(),
                 "-c",
-                "check_for_update_on_startup=false"
+                "check_for_update_on_startup=false",
+                "--dangerously-bypass-hook-trust"
             ]
         );
         assert_eq!(
             mutations[1].len(),
-            14,
+            15,
             "No positional prompt or extra parsed options"
         );
         assert_eq!(&mutations[2][..3], ["agent", "prompt", "wNew:p1"]);

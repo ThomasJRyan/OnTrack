@@ -181,6 +181,7 @@ fn launch_with(
             trust_override,
             "-c",
             "check_for_update_on_startup=false",
+            "--dangerously-bypass-hook-trust",
         ]);
     }
     let started = backend.herdr(&start_args);
@@ -503,6 +504,7 @@ mod tests {
                 r#"projects={"/verified/main root"={trust_level="trusted"}}"#,
                 "-c",
                 "check_for_update_on_startup=false",
+                "--dangerously-bypass-hook-trust",
             ]
         );
         assert_eq!(backend.calls.len(), 6);

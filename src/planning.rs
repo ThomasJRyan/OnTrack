@@ -160,7 +160,14 @@ fn launch_with(
         "30000",
     ];
     if let Some(trust) = trust.as_deref() {
-        args.extend(["--", "-c", trust, "-c", "check_for_update_on_startup=false"]);
+        args.extend([
+            "--",
+            "-c",
+            trust,
+            "-c",
+            "check_for_update_on_startup=false",
+            "--dangerously-bypass-hook-trust",
+        ]);
     }
     let started = command(&args)
         .and_then(|bytes| envelope(&bytes, "agent_started"))
@@ -415,7 +422,7 @@ mod tests {
                     3 => return Ok(b"codex: current (v8) (/tmp/codex)\nopencode: current (v1) (/tmp/opencode)".to_vec()),
                     4 => json!({"result":{"type":"tab_created","tab":{"workspace_id":"wSource","tab_id":"wSource:t2"},"root_pane":{"workspace_id":"wSource","tab_id":"wSource:t2","pane_id":"wSource:p2"}}}),
                     5 => {
-                        assert_eq!(&args[3..], ["--kind", "codex", "--pane", "wSource:p2", "--timeout", "30000", "--", "-c", &expected_trust, "-c", "check_for_update_on_startup=false"]);
+                        assert_eq!(&args[3..], ["--kind", "codex", "--pane", "wSource:p2", "--timeout", "30000", "--", "-c", &expected_trust, "-c", "check_for_update_on_startup=false", "--dangerously-bypass-hook-trust"]);
                         if mode == "blocked" {
                             return Err(io::Error::other("agent_not_ready: blocked during startup"));
                         }
@@ -487,6 +494,17 @@ mod tests {
         assert_eq!(calls.len(), 6);
         assert_eq!(&calls[4][..2], ["agent", "start"]);
         assert!(calls[4][2].ends_with("0123456789abcdef"));
+        assert_eq!(
+            &calls[4][3..],
+            [
+                "--kind",
+                "opencode",
+                "--pane",
+                "wSource:p2",
+                "--timeout",
+                "30000"
+            ]
+        );
         assert_eq!(&calls[5][..3], ["agent", "prompt", "wSource:p2"]);
         assert!(calls[5][3].contains(marker));
         assert!(calls[5][3].contains("Plan a release"));
