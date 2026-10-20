@@ -3051,6 +3051,15 @@ pub(crate) fn issue_path(
     path
 }
 
+fn closed_recency(bead: &Bead) -> Option<time::OffsetDateTime> {
+    ["closed_at", "updated_at", "created_at"]
+        .into_iter()
+        .filter_map(|field| bead.data.get(field).and_then(|value| value.as_str()))
+        .find_map(|value| {
+            time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
+        })
+}
+
 fn order_worktrees(items: &mut [ManagedWorktree]) {
     let positions: HashMap<_, _> = items
         .iter()
@@ -3094,7 +3103,16 @@ pub fn list_layout(beads: &[Bead], collapsed: &HashSet<String>) -> ListLayout {
             .filter(|(_, b)| display_status(b) == status)
             .map(|(i, _)| i)
             .collect::<Vec<_>>();
-        indices.sort_by_cached_key(|&index| issue_path(beads, &positions, index));
+        if status == "closed" {
+            indices.sort_by_cached_key(|&index| {
+                (
+                    std::cmp::Reverse(closed_recency(&beads[index])),
+                    beads[index].id.clone(),
+                )
+            });
+        } else {
+            indices.sort_by_cached_key(|&index| issue_path(beads, &positions, index));
+        }
         let is_collapsed = collapsed.contains(&status);
         let y = layout.height;
         let height = if is_collapsed {
@@ -3296,6 +3314,91 @@ mod tests {
             7 + parent_row as u16,
         );
         assert_eq!(app.selected, Some(5));
+    }
+
+    #[test]
+    fn closed_group_uses_completion_recency_instead_of_id_or_parent_order() {
+        let bead = |id: &str, status: &str, data: serde_json::Value| Bead {
+            id: id.into(),
+            title: id.into(),
+            status: status.into(),
+            priority: 2,
+            data,
+        };
+        let beads = vec![
+            bead(
+                "a-old",
+                "closed",
+                json!({"closed_at": "2026-10-20T15:00:00Z", "updated_at": "2026-10-21T15:00:00Z"}),
+            ),
+            bead(
+                "b-fallback",
+                "closed",
+                json!({"closed_at": "invalid", "updated_at": "2026-10-20T14:00:00Z"}),
+            ),
+            bead(
+                "z-new",
+                "closed",
+                json!({"parent": "a-old", "closed_at": "2026-10-20T17:30:00+02:00"}),
+            ),
+            bead(
+                "d-tie",
+                "closed",
+                json!({"closed_at": "2026-10-20T15:00:00Z"}),
+            ),
+            bead("c-undated", "closed", json!({"closed_at": "invalid"})),
+            bead(
+                "e-created",
+                "closed",
+                json!({"created_at": "2026-10-20T13:00:00Z"}),
+            ),
+            bead("open", "open", json!({})),
+        ];
+        let layout = list_layout(&beads, &HashSet::new());
+        let closed = layout
+            .groups
+            .iter()
+            .find(|group| group.status == "closed")
+            .unwrap();
+        assert_eq!(closed.indices, [2, 0, 3, 1, 5, 4]);
+        assert_eq!(
+            layout
+                .targets
+                .iter()
+                .filter_map(|target| match target.row {
+                    DisplayRow::Bead(index) if beads[index].status == "closed" => Some(index),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            closed.indices
+        );
+    }
+
+    #[test]
+    fn closed_refresh_reorders_rows_and_keeps_selected_issue() {
+        let mut a = app();
+        let mut items = a.beads[..2].to_vec();
+        for item in &mut items {
+            item.status = "closed".into();
+        }
+        items[0].data["closed_at"] = json!("2026-10-20T15:00:00Z");
+        items[1].data["closed_at"] = json!("2026-10-20T14:00:00Z");
+        respond(&mut a, Response::List(Ok(items.clone())));
+        assert_eq!(a.beads[a.selected.unwrap()].id, "b0");
+        assert_eq!(
+            list_layout(&a.beads, &a.collapsed).groups[5].indices,
+            [0, 1]
+        );
+
+        items[1].data["closed_at"] = json!("2026-10-20T16:00:00Z");
+        respond(&mut a, Response::List(Ok(items)));
+        assert_eq!(a.beads[a.selected.unwrap()].id, "b0");
+        assert_eq!(
+            list_layout(&a.beads, &a.collapsed).groups[5].indices,
+            [1, 0]
+        );
+        a.step(-1);
+        assert_eq!(a.beads[a.selected.unwrap()].id, "b1");
     }
     fn app() -> App {
         let (tx, _rx) = mpsc::channel();
