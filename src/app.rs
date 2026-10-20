@@ -4930,6 +4930,69 @@ mod tests {
     }
 
     #[test]
+    fn planning_repolls_pending_output_until_agent_asks() {
+        let (mut a, requests, replies) = connected_app();
+        press(&mut a, KeyCode::Char('p'));
+        let (seq, marker) = match a.modal.as_ref() {
+            Some(Modal::Planning(form)) => (form.seq, form.marker.clone()),
+            _ => panic!("expected planning form"),
+        };
+        if let Some(Modal::Planning(form)) = a.modal.as_mut() {
+            form.stage = PlanningStage::Waiting;
+        }
+        let session = crate::epic::Session {
+            workspace_id: "w1".into(),
+            tab_id: "w1:t2".into(),
+            pane_id: "w1:p2".into(),
+        };
+        let now = Instant::now();
+        replies
+            .send(Response::PlanLaunched(seq, Ok(session.clone())))
+            .unwrap();
+        a.receive_at(now);
+        a.poll_planning(now);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Request::PlanRead(read_seq, read_session, read_marker))
+                if read_seq == seq && read_session == session && read_marker == marker
+        ));
+        a.poll_planning(now + Duration::from_secs(2));
+        assert!(requests.try_recv().is_err(), "one read at a time");
+
+        replies
+            .send(Response::PlanRead(seq, marker.clone(), Ok(None)))
+            .unwrap();
+        a.receive_at(now);
+        a.poll_planning(now + Duration::from_secs(2) - Duration::from_nanos(1));
+        assert!(requests.try_recv().is_err());
+        a.poll_planning(now + Duration::from_secs(2));
+        assert!(matches!(requests.try_recv(), Ok(Request::PlanRead(..))));
+
+        replies
+            .send(Response::PlanRead(
+                seq,
+                marker,
+                Ok(Some(crate::planning::Message::Question {
+                    text: "Which scope?".into(),
+                    options: vec!["Small".into(), "Large".into()],
+                })),
+            ))
+            .unwrap();
+        a.receive_at(now + Duration::from_secs(2));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Planning(PlanningForm {
+                stage: PlanningStage::Question { .. },
+                ..
+            }))
+        ));
+        assert!(
+            requests.try_recv().is_err(),
+            "polling stops for the question"
+        );
+    }
+
+    #[test]
     fn planning_review_requires_explicit_confirmation_and_blocks_repeat_create() {
         let (mut a, requests, replies) = connected_app();
         press(&mut a, KeyCode::Char('p'));

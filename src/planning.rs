@@ -235,8 +235,16 @@ pub fn reply(session: &Session, message: &str, marker: &str) -> io::Result<()> {
 }
 
 pub fn read(session: &Session, marker: &str) -> io::Result<Option<Message>> {
+    read_with(session, marker, run)
+}
+
+fn read_with(
+    session: &Session,
+    marker: &str,
+    mut command: impl FnMut(&[&str]) -> io::Result<Vec<u8>>,
+) -> io::Result<Option<Message>> {
     checked_session(session)?;
-    let bytes = run(&[
+    let bytes = command(&[
         "agent",
         "read",
         &session.pane_id,
@@ -246,7 +254,7 @@ pub fn read(session: &Session, marker: &str) -> io::Result<Option<Message>> {
         "300",
     ])
     .or_else(|_| {
-        run(&[
+        command(&[
             "pane",
             "read",
             &session.pane_id,
@@ -290,8 +298,14 @@ pub fn parse_output(output: &str, marker: &str) -> io::Result<Option<Message>> {
     let prefix = format!("{marker} ");
     let lines: Vec<_> = output.lines().collect();
     let Some((index, start)) = lines.iter().enumerate().rev().find_map(|(index, line)| {
-        line.find(&prefix)
-            .map(|offset| (index, &line[offset + prefix.len()..]))
+        let offset = line.find(&prefix)?;
+        let start = &line[offset + prefix.len()..];
+        // The agent's submitted prompt also contains the marker in prose.
+        // Until a JSON response appears, that echo is not an agent answer.
+        start
+            .trim_start()
+            .starts_with('{')
+            .then_some((index, start))
     }) else {
         return Ok(None);
     };
@@ -304,9 +318,9 @@ pub fn parse_output(output: &str, marker: &str) -> io::Result<Option<Message>> {
             Ok(value) => break value,
             Err(error) if error.is_eof() => {
                 let Some(next) = continuation.next() else {
-                    return Err(invalid(format!(
-                        "Agent planning response is invalid JSON: {error}"
-                    )));
+                    // A terminal snapshot can catch the agent midway through
+                    // streaming its JSON. The next poll will read it again.
+                    return Ok(None);
                 };
                 response.push_str(next);
             }
@@ -592,6 +606,70 @@ mod tests {
                 .to_string()
                 .contains("invalid JSON")
         );
+    }
+
+    #[test]
+    fn prompt_echo_and_streaming_response_keep_polling_pending() {
+        let prompt = "› End your turn prefixed by ONTRACK_x followed by one space.";
+        assert_eq!(parse_output(prompt, "ONTRACK_x").unwrap(), None);
+        let partial = format!("{prompt}\n• ONTRACK_x {{\"kind\":\"question\",\"text\":\"Scope?\"");
+        assert_eq!(parse_output(&partial, "ONTRACK_x").unwrap(), None);
+        let complete = format!("{partial},\"options\":[\"A\",\"B\"]}}\nWorked for 2s");
+        assert_eq!(
+            parse_output(&complete, "ONTRACK_x").unwrap(),
+            Some(Message::Question {
+                text: "Scope?".into(),
+                options: vec!["A".into(), "B".into()],
+            })
+        );
+    }
+
+    #[test]
+    fn reads_recorded_agent_pane_as_plain_terminal_text() {
+        let session = Session {
+            workspace_id: "w1".into(),
+            tab_id: "w1:t2".into(),
+            pane_id: "w1:p2".into(),
+        };
+        let output =
+            b"ONTRACK_x {\"kind\":\"question\",\"text\":\"Scope?\",\"options\":[\"A\",\"B\"]}";
+        for agent_read_succeeds in [true, false] {
+            let mut calls = Vec::new();
+            let message = read_with(&session, "ONTRACK_x", |args| {
+                calls.push(args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>());
+                if args[0] == "agent" && !agent_read_succeeds {
+                    Err(io::Error::other("agent read unavailable"))
+                } else {
+                    Ok(output.to_vec())
+                }
+            })
+            .unwrap();
+            assert_eq!(
+                message,
+                Some(Message::Question {
+                    text: "Scope?".into(),
+                    options: vec!["A".into(), "B".into()],
+                })
+            );
+            assert_eq!(
+                calls[0],
+                [
+                    "agent",
+                    "read",
+                    "w1:p2",
+                    "--source",
+                    "recent-unwrapped",
+                    "--lines",
+                    "300"
+                ]
+            );
+            if agent_read_succeeds {
+                assert_eq!(calls.len(), 1);
+            } else {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[1][..3], ["pane", "read", "w1:p2"]);
+            }
+        }
     }
 
     #[test]
