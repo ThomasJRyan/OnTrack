@@ -161,6 +161,7 @@ fn launch_with(
             .chars()
             .filter(char::is_ascii_alphanumeric)
             .take(16)
+            .map(|ch| ch.to_ascii_lowercase())
             .collect::<String>()
     );
     let mut start_args = vec![
@@ -534,6 +535,44 @@ mod tests {
         assert!(backend.calls[5][3].contains("meaningful priority distinctions"));
         assert!(backend.calls[5][3].contains("Equal priorities are fine"));
         assert_eq!(&backend.calls[5][4..], ["--wait", "--until", "working"]);
+    }
+
+    #[test]
+    fn launch_normalizes_agent_name_without_changing_epic_id() {
+        for epic_id in [
+            "OCA_Genie-4ao",
+            "OnTrack-7ma",
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZ-1234567890",
+            "é_项目-ABC123",
+            "___",
+        ] {
+            let mut backend = LaunchMock {
+                live: json!({"issue_type":"epic", "description":"Proposal"}),
+                ..Default::default()
+            };
+            launch_with(
+                &mut backend,
+                &std::env::current_dir().unwrap(),
+                "wSource",
+                epic_id,
+            )
+            .unwrap();
+            let name = &backend.calls[4][2];
+            assert!(name.len() <= 32, "{name}");
+            assert!(name.as_bytes()[0].is_ascii_lowercase(), "{name}");
+            assert!(
+                name.bytes().all(|byte| {
+                    byte.is_ascii_lowercase() || byte.is_ascii_digit() || b"-_".contains(&byte)
+                }),
+                "{name}"
+            );
+            if epic_id == "OCA_Genie-4ao" {
+                assert_eq!(name, "epic-ocagenie4ao");
+            }
+            assert_eq!(backend.calls[3][7], format!("Epic {epic_id} planning"));
+            assert!(backend.calls[5][3].contains(&format!("for Epic {epic_id} ")));
+            assert!(backend.calls[5][3].contains(&format!("--parent={epic_id} ")));
+        }
     }
 
     #[test]

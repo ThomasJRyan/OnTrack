@@ -118,6 +118,8 @@ The settings dialog captures input until it closes, so `q` cannot quit while it 
 
 ## Generate tasks for an Epic
 
+Mixed-case Epic IDs are supported. OnTrack uses a lowercase agent alias for Herdr while retaining the original Epic ID for the generated tasks' parent.
+
 In the create form, choose **Epic** to reveal **Generate child tasks with a Herdr agent** below Description. Tab moves from Agent harness through Description to this option, then Create. The option starts off. Enter the proposal in Description, turn on the option, and create the Epic. OnTrack saves the Epic first, then opens a planning tab inside the current Herdr workspace at the current checkout, starts an available agent, and asks it to create direct child Beads with descriptions, acceptance criteria, and explicit P0–P4 priorities. The agent compares impact, urgency, and enabling work to distinguish priorities when the proposal supports it; comparable or unclear tasks may share a priority. Review the generated priorities before scheduling tasks. It does not create another Git worktree or top-level Herdr workspace. The form hides and clears this option for other issue types; editing a Bead does not run generation.
 
 To generate tasks after creation, select an Epic in either issue pane and press `g`. The shortcut appears only for Epics. The confirmation names the Epic and warns that existing children remain and another run may add duplicates. Press `y` to start or `n`, Enter, or Esc to cancel. Add a Description first if the proposal is empty. Repeated requests for the same Epic are blocked while planning runs in this OnTrack process. Editing alone still does not trigger generation.

@@ -119,6 +119,8 @@ Detail parsing selects the requested ID, rejects duplicate matching records, and
 
 ## Epic planning tab
 
+Epic agent aliases use `epic-` plus at most 16 ASCII alphanumeric characters from the Epic ID, folded to lowercase. This keeps aliases within Herdr's `[a-z][a-z0-9_-]{0,31}` name contract even for mixed-case project prefixes such as `OCA_Genie`. The original Epic ID remains unchanged in tab labels, prompts, and `--parent` instructions. Launch regression coverage checks mixed-case, long, Unicode, and punctuation-only IDs through mocked Herdr commands.
+
 Existing Epic task generation uses `Request::GenerateEpic` after a readable `Modal::ConfirmGenerateEpic` receives explicit confirmation. Both this request and creation-time `Request::CreateEpic` call `spawn_epic_planning`, keeping Herdr work off the sequential request worker. `App::planning_epics` guards repeated generation for each Epic until launch failure or completion; creation-time planning also registers its ID. This guard is process-local. `epic::launch` fetches the live issue and rejects non-Epics or empty proposals before creating a tab. Launch and finish responses share progress/error feedback and completion refresh. The confirmation retains the original Epic ID, wraps its title and warnings to compute required height, and disables confirmation until fully renderable. Epic-specific hotkey contexts expose `g` in either issue pane, with a separate confirmation context for its controls.
 
 
