@@ -3096,6 +3096,38 @@ mod tests {
         );
     }
     #[test]
+    fn dependency_chart_renders_and_scrolls_after_resize() {
+        let mut a = app();
+        a.detail = Some(json!({
+            "id": "demo-1", "title": "Ship", "status": "open",
+            "dependencies": [{"id": "base", "dependency_type": "blocks", "title": "Build", "status": "closed"}],
+            "dependents": [{"id": "next", "dependency_type": "blocks", "title": "FINAL_NODE"}]
+        }));
+        let (wide, _) = draw((120, 40), &mut a);
+        for expected in [
+            "DEPENDENCY FLOW",
+            "+--<-- blocks",
+            "+----> blocks",
+            "base [closed]",
+            "FINAL_NODE",
+        ] {
+            assert!(wide.contains(expected), "missing {expected}: {wide}");
+        }
+        for size in [(50, 14), (80, 18), (120, 24)] {
+            a.detail_offset = u16::MAX;
+            let (scrolled, _) = draw(size, &mut a);
+            if size.0 == 50 {
+                assert!(a.detail_offset > 0);
+            }
+            assert!(scrolled.contains("FINAL_NODE"), "{scrolled}");
+        }
+        a.detail_offset = 0;
+        let (top, _) = draw((120, 40), &mut a);
+        assert!(top.contains("DEPENDENCY FLOW"));
+        assert!(top.contains("+--<-- blocks"));
+    }
+
+    #[test]
     fn tiny_terminal_startup_and_wrapped_detail_are_safe() {
         let mut a = app();
         a.list_rect = Rect::new(1, 1, 10, 10);
