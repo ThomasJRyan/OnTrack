@@ -2721,7 +2721,7 @@ mod tests {
         assert!(compact.contains("Esc"));
     }
     #[test]
-    fn renders_exact_two_line_issue_with_status_and_full_nested_data() {
+    fn renders_two_line_issue_with_status_comments_and_narrative() {
         let mut a = app();
         let (s, _) = draw((120, 40), &mut a);
         assert!(s.contains("task     P1  closed"));
@@ -2798,9 +2798,11 @@ mod tests {
         let bottom = a.list_rect.y + (group.y + group.height - 1 - a.list_offset) as u16;
         assert_eq!(buffer[(a.list_rect.x, bottom)].symbol(), "╰");
         assert!(line(bottom).contains("╯"));
-        for x in ["unknown", "comments", "hello comment", "界", "5"] {
+        for x in ["comments", "hello comment"] {
             assert!(s.contains(x), "{x}")
         }
+        assert!(!s.contains("unknown"));
+        assert!(!s.contains("界"));
     }
 
     #[test]
@@ -3263,6 +3265,54 @@ mod tests {
     }
 
     #[test]
+    fn issue_details_hide_fallback_sections_at_all_scroll_positions() {
+        let mut a = app();
+        let detail = json!({
+            "id": "demo-1", "title": "Ship",
+            "description": "Useful description",
+            "notes": "Useful notes", "design": "Useful design",
+            "acceptance_criteria": "Useful acceptance",
+            "comments": [{"body": "Useful comment"}],
+            "owner": "HIDDEN_OWNER", "custom": {"nested": "HIDDEN_CUSTOM"},
+            "dependencies": [
+                {"id": "base", "type": "blocks", "title": "Build", "extra": "HIDDEN_EXTRA"},
+                {"unsupported": "HIDDEN_RECORD"}
+            ]
+        });
+        a.detail = Some(detail.clone());
+        for size in [(50, 14), (120, 40)] {
+            let mut visible = String::new();
+            for offset in 0..40 {
+                a.detail_offset = offset;
+                let (screen, _) = draw(size, &mut a);
+                for omitted in [
+                    "RELATIONSHIP DETAILS",
+                    "OTHER DETAILS",
+                    "HIDDEN_OWNER",
+                    "HIDDEN_CUSTOM",
+                    "HIDDEN_EXTRA",
+                    "HIDDEN_RECORD",
+                ] {
+                    assert!(!screen.contains(omitted), "{screen}");
+                }
+                visible.push_str(&screen);
+            }
+            for expected in [
+                "Useful description",
+                "Useful notes",
+                "Useful design",
+                "Useful acceptance",
+                "Useful comment",
+                "base",
+                "Build",
+            ] {
+                assert!(visible.contains(expected), "missing {expected}: {visible}");
+            }
+        }
+        assert_eq!(a.detail.as_ref(), Some(&detail));
+    }
+
+    #[test]
     fn tiny_terminal_startup_and_wrapped_detail_are_safe() {
         let mut a = app();
         a.list_rect = Rect::new(1, 1, 10, 10);
@@ -3292,11 +3342,10 @@ mod tests {
             title: "long".into(),
             status: "open".into(),
             priority: 2,
-            data: json!({"text":"界".repeat(700)}),
+            data: json!({"description":"界".repeat(700)}),
         });
         a.selected = Some(0);
-        a.beads[0].data =
-            json!({"unknown_multiline": format!("{}FINAL_SENTINEL", "word\n".repeat(800))});
+        a.beads[0].data = json!({"description": format!("{}FINAL_SENTINEL", "word\n".repeat(800))});
         a.detail = Some(a.beads[0].data.clone());
         a.detail_offset = u16::MAX;
         let (rendered, rect) = draw((50, 14), &mut a);

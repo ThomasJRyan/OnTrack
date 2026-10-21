@@ -248,14 +248,12 @@ fn node_label(value: &Value) -> Option<String> {
 fn relationship_chart(value: &Value, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width);
     let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
-    let mut fallback = Vec::new();
     for key in RELATION_FIELDS {
         let Some(relations) = value.get(key) else {
             continue;
         };
         for relation in entries(relations) {
             let Some(_) = node_label(relation) else {
-                fallback.extend(metadata(key, relation));
                 continue;
             };
             let kind_key = if relation
@@ -288,23 +286,6 @@ fn relationship_chart(value: &Value, width: u16) -> Vec<Line<'static>> {
             } else {
                 groups.push((group, vec![relation]));
             }
-            if let Some(object) = relation.as_object() {
-                let extras = object
-                    .iter()
-                    .filter(|(key, v)| {
-                        !(["id", "title", "status", kind_key].contains(&key.as_str())
-                            && v.is_string()
-                            || key.as_str() == "priority" && v.as_u64().is_some())
-                    })
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect::<serde_json::Map<_, _>>();
-                if !extras.is_empty() {
-                    fallback.extend(metadata(
-                        &format!("{key} / {}", relation["id"].as_str().unwrap_or_default()),
-                        &Value::Object(extras),
-                    ));
-                }
-            }
         }
     }
     let mut out = Vec::new();
@@ -330,30 +311,22 @@ fn relationship_chart(value: &Value, width: u16) -> Vec<Line<'static>> {
                 ));
             }
         }
-    } else if fallback.is_empty() {
+    } else if RELATION_FIELDS
+        .iter()
+        .filter_map(|key| value.get(key))
+        .all(|relations| relations.as_array().is_some_and(Vec::is_empty))
+    {
         out.push(Line::from("No dependency links returned."));
-    }
-    if !fallback.is_empty() {
-        out.push(heading("RELATIONSHIP DETAILS"));
-        out.extend(fallback);
     }
     out
 }
 
-/// Human-readable presentation of the Beads response, retaining unrecognized fields.
-/// The top-level revision is hidden because it is not useful in the details pane.
+/// Present narrative fields, comments, and supported dependency links.
+/// Miscellaneous issue metadata and relationship extras stay in the source JSON only.
 pub fn render(value: &Value, selected_title: Option<&str>, width: u16) -> Text<'static> {
     let mut out = Vec::new();
     let object = value.as_object();
     let narrative = ["description", "notes", "design", "acceptance_criteria"];
-    let excluded = [
-        "comments",
-        "dependencies",
-        "dependents",
-        "blocks",
-        "blocked_by",
-        "revision",
-    ];
     if let Some(title) = selected_title {
         let field = |name: &str| object.and_then(|o| o.get(name));
         let shown_title = field("title").and_then(Value::as_str).unwrap_or(title);
@@ -381,31 +354,13 @@ pub fn render(value: &Value, selected_title: Option<&str>, width: u16) -> Text<'
             out.extend(comments(v, width));
         }
         if RELATION_FIELDS.iter().any(|key| obj.contains_key(*key)) {
-            if !out.is_empty() {
-                out.push(Line::default());
-            }
-            out.push(heading("DEPENDENCY FLOW"));
-            out.extend(relationship_chart(value, width));
-        }
-        let mut remaining: Vec<_> = obj
-            .iter()
-            .filter(|(k, _)| {
-                !(narrative.contains(&k.as_str())
-                    || excluded.contains(&k.as_str())
-                    || selected_title.is_some()
-                        && (["id", "status", "priority"].contains(&k.as_str())
-                            || k.as_str() == "title"
-                                && obj.get("title").and_then(Value::as_str).is_some()))
-            })
-            .collect();
-        remaining.sort_by_key(|(k, _)| *k);
-        if !remaining.is_empty() {
-            if !out.is_empty() {
-                out.push(Line::default());
-            }
-            out.push(heading("OTHER DETAILS"));
-            for (key, v) in remaining {
-                out.extend(metadata(key, v));
+            let chart = relationship_chart(value, width);
+            if !chart.is_empty() {
+                if !out.is_empty() {
+                    out.push(Line::default());
+                }
+                out.push(heading("DEPENDENCY FLOW"));
+                out.extend(chart);
             }
         }
     } else {
@@ -520,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn chart_wraps_literal_unicode_labels_and_keeps_unknown_fields() {
+    fn chart_wraps_literal_unicode_labels_and_omits_relationship_extras() {
         let value = json!({"id": "selected", "dependencies": [{
             "id": "base", "dependency_type": "blocks", "type": "task",
             "title": "**literal** 界界 é title with a long ending", "status": "open",
@@ -528,19 +483,19 @@ mod tests {
         }, {"unexpected": "fallback"}, null, 7]});
         for width in [2, 8, 12, 18, 40, 80] {
             let chart = relationship_chart(&value, width);
-            let details = chart
-                .iter()
-                .position(|line| line.to_string() == "RELATIONSHIP DETAILS")
-                .unwrap();
             assert!(
-                chart[..details]
-                    .iter()
-                    .all(|line| line.width() <= usize::from(width)),
+                chart.iter().all(|line| line.width() <= usize::from(width)),
                 "width {width}: {chart:?}"
             );
             let plain = Text::from(chart).to_string();
-            for expected in ["task", "keep-me", "unexpected", "fallback", "null", "7"] {
-                assert!(plain.contains(expected), "{plain}");
+            for omitted in [
+                "RELATIONSHIP DETAILS",
+                "keep-me",
+                "unexpected",
+                "fallback",
+                "null",
+            ] {
+                assert!(!plain.contains(omitted), "{plain}");
             }
             let label = "**literal** 界界 é title with a long ending";
             assert_eq!(chart_wrap(label, usize::from(width)).concat(), label);
@@ -564,12 +519,12 @@ mod tests {
         assert!(!empty.contains("Selected Bead"));
         let malformed =
             render(&json!({"dependencies": {"unexpected": true}}), None, 40).to_string();
-        assert!(malformed.contains("unexpected"));
+        assert!(malformed.is_empty());
         assert!(!malformed.contains("No dependency links"));
     }
 
     #[test]
-    fn markdown_markup_is_rendered_and_complete_record_stays_visible() {
+    fn markdown_markup_comments_and_dependency_nodes_stay_visible() {
         let value = json!({
             "description": "# Plan\n\nA **bold** and *emphasized* note with `code` and [guide](https://example.test).\n\n- first",
             "notes": "## Notes\n\n- retain this",
@@ -583,16 +538,7 @@ mod tests {
         assert!(plain.contains("bold") && !plain.contains("**bold**"));
         assert!(plain.contains("code") && !plain.contains("`code`"));
         assert!(plain.contains("https://example.test"));
-        for expected in [
-            "hello comment",
-            "other-1",
-            "unknown",
-            "nested",
-            "true",
-            "null",
-            "5",
-            "Title",
-        ] {
+        for expected in ["hello comment", "other-1", "Title"] {
             assert!(plain.contains(expected), "missing {expected}: {plain}");
         }
         assert!(
@@ -605,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_typed_optional_fields_and_multiline_unknown_metadata() {
+    fn preserves_typed_narrative_fields() {
         let value = serde_json::json!({
             "title": null,
             "description": null,
@@ -618,7 +564,6 @@ mod tests {
             let rendered = render(&value, selected, 18);
             let plain = rendered.to_string();
             for expected in [
-                "title",
                 "null",
                 "DESCRIPTION",
                 "NOTES",
@@ -626,10 +571,6 @@ mod tests {
                 "DESIGN",
                 "[]",
                 "ACCEPTANCE CRITERIA",
-                "unknown",
-                "line one",
-                "line two",
-                "FINAL_SENTINEL",
             ] {
                 assert!(plain.contains(expected), "missing {expected}: {plain}");
             }
@@ -638,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn hides_top_level_revision_but_keeps_other_details() {
+    fn hides_miscellaneous_metadata_without_changing_source_json() {
         let value = json!({
             "id": "demo-1",
             "title": "Title",
@@ -650,8 +591,15 @@ mod tests {
         for selected in [Some("Title"), None] {
             let plain = render(&value, selected, 50).to_string();
             assert!(!plain.contains("stale-revision"), "{plain}");
-            assert!(plain.contains("created_at: today"), "{plain}");
-            assert!(plain.contains("nested-revision"), "{plain}");
+            for omitted in [
+                "OTHER DETAILS",
+                "created_at",
+                "today",
+                "unknown",
+                "nested-revision",
+            ] {
+                assert!(!plain.contains(omitted), "{plain}");
+            }
         }
         assert_eq!(value["revision"], "stale-revision");
     }
@@ -672,7 +620,6 @@ mod tests {
         for expected in [
             "Live title",
             "Useful description",
-            "owner: Ada",
             "Keep this comment",
             "other-1",
         ] {
@@ -698,7 +645,6 @@ mod tests {
             "Blocked by ← prerequisites",
             "Other",
             "extra",
-            "kept",
             "Alternate body retained",
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
