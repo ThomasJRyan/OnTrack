@@ -9,7 +9,7 @@ OnTrack brings [Beads](https://beads.gascity.com) and [Herdr](https://herdr.dev)
 
 ## From idea to implementation
 
-Browse your backlog beside its Markdown descriptions, comments, and ASCII dependency flow charts. Create a task, break it into children, or have an agent turn an Epic's description into prioritized tasks. Discuss a new Task or Epic with an agent, review its proposal, and confirm creation in Beads. Paste PNG or JPEG screenshots into descriptions with `Ctrl+V`; handoffs include the saved local image paths.
+Browse your backlog beside its Markdown descriptions, comments, and compact, priority-colored dependency charts. Create a task, break it into children, or have an agent turn an Epic's description into prioritized tasks. Discuss a new Task or Epic with an agent, review its proposal, and confirm creation in Beads. Paste PNG or JPEG screenshots into descriptions with `Ctrl+V`; handoffs include the saved local image paths.
 
 Mark tasks **Ready** and let OnTrack dispatch eligible work to Herdr agents in separate Git worktrees, with a concurrency limit you control. Need to start something immediately? Hand the selected Bead to an agent with `h`.
 

@@ -184,24 +184,46 @@ fn chart_wrap(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-fn chart_node(label: &str, prefix: &str, width: usize) -> Vec<Line<'static>> {
-    let content_width = width.saturating_sub(prefix.len() + 4).max(2);
-    let lines = chart_wrap(label, content_width);
-    let border = format!("{prefix}+{}+", "-".repeat(content_width + 2));
-    let mut out = vec![Line::styled(border.clone(), Style::default().fg(MUTED))];
-    for line in lines {
-        let padding = content_width.saturating_sub(Span::raw(line.clone()).width());
-        out.push(Line::from(vec![
-            Span::styled(format!("{prefix}| "), Style::default().fg(MUTED)),
-            Span::styled(line, Style::default().fg(INK)),
-            Span::styled(
-                format!("{} |", " ".repeat(padding)),
-                Style::default().fg(MUTED),
-            ),
-        ]));
-    }
-    out.push(Line::styled(border, Style::default().fg(MUTED)));
-    out
+// Indexed semantic colors are mapped to the active palette by the details pane.
+fn node_style(value: &Value) -> Style {
+    let color = match value.get("priority").and_then(Value::as_u64) {
+        Some(0) => Color::Indexed(1),
+        Some(1 | 2) => Color::Indexed(3),
+        Some(3) => Color::Indexed(2),
+        _ => MUTED,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn chart_row(value: &Value, prefix: &str, continuation: &str, width: usize) -> Vec<Line<'static>> {
+    let label = node_label(value).unwrap_or_else(|| "Selected Bead".to_owned());
+    // Tiny panes spend their limited width on content rather than indentation.
+    let (prefix, continuation) = if width < 12 {
+        ("", "")
+    } else {
+        (prefix, continuation)
+    };
+    let available = width.saturating_sub(Span::raw(prefix).width()).max(2);
+    chart_wrap(&label, available)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            Line::from(vec![
+                Span::styled(
+                    if index == 0 { prefix } else { continuation }.to_owned(),
+                    node_style(value),
+                ),
+                Span::styled(
+                    line,
+                    if index == 0 {
+                        node_style(value)
+                    } else {
+                        Style::default().fg(INK)
+                    },
+                ),
+            ])
+        })
+        .collect()
 }
 
 fn node_label(value: &Value) -> Option<String> {
@@ -210,6 +232,9 @@ fn node_label(value: &Value) -> Option<String> {
     }
     let id = value.get("id")?.as_str().filter(|s| !s.trim().is_empty())?;
     let mut label = id.to_owned();
+    if let Some(priority) = value.get("priority").and_then(Value::as_u64) {
+        label.push_str(&format!(" · P{priority}"));
+    }
     if let Some(status) = value.get("status").and_then(Value::as_str) {
         label.push_str(&format!(" [{status}]"));
     }
@@ -222,14 +247,14 @@ fn node_label(value: &Value) -> Option<String> {
 
 fn relationship_chart(value: &Value, width: u16) -> Vec<Line<'static>> {
     let width = usize::from(width);
-    let mut edges = Vec::new();
+    let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
     let mut fallback = Vec::new();
     for key in RELATION_FIELDS {
         let Some(relations) = value.get(key) else {
             continue;
         };
         for relation in entries(relations) {
-            let Some(label) = node_label(relation) else {
+            let Some(_) = node_label(relation) else {
                 fallback.extend(metadata(key, relation));
                 continue;
             };
@@ -249,27 +274,27 @@ fn relationship_chart(value: &Value, width: u16) -> Vec<Line<'static>> {
                     "unspecified"
                 },
             );
-            let connector = if kind == "blocks" {
-                if matches!(key, "dependencies" | "blocked_by") {
-                    "+--<--"
-                } else {
-                    "+---->"
+            let group = match (kind, key) {
+                ("blocks", "dependencies" | "blocked_by") => {
+                    "Blocked by ← prerequisites".to_owned()
                 }
-            } else {
-                "+....."
+                ("blocks", _) => "Blocks → dependents".to_owned(),
+                ("parent-child", "dependencies") => "Parents".to_owned(),
+                ("parent-child", "dependents") => "Children".to_owned(),
+                _ => format!("{kind} ({key})"),
             };
-            let edge = if kind == "blocks" {
-                format!("{connector} blocks")
+            if let Some((_, nodes)) = groups.iter_mut().find(|(label, _)| *label == group) {
+                nodes.push(relation);
             } else {
-                format!("{connector} {kind} ({key})")
-            };
-            edges.push((edge, label));
+                groups.push((group, vec![relation]));
+            }
             if let Some(object) = relation.as_object() {
                 let extras = object
                     .iter()
                     .filter(|(key, v)| {
                         !(["id", "title", "status", kind_key].contains(&key.as_str())
-                            && v.is_string())
+                            && v.is_string()
+                            || key.as_str() == "priority" && v.as_u64().is_some())
                     })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect::<serde_json::Map<_, _>>();
@@ -283,28 +308,26 @@ fn relationship_chart(value: &Value, width: u16) -> Vec<Line<'static>> {
         }
     }
     let mut out = Vec::new();
-    if !edges.is_empty() {
-        let root = node_label(value).unwrap_or_else(|| "Selected Bead".to_owned());
-        if width >= 12 {
-            out.extend(chart_node(&root, "", width));
-            for (index, (edge, label)) in edges.iter().enumerate() {
-                out.push(Line::styled("|", Style::default().fg(MUTED)));
-                for line in chart_wrap(edge, width) {
-                    out.push(Line::styled(line, Style::default().fg(TEAL)));
-                }
-                let prefix = if index + 1 == edges.len() {
-                    "   "
-                } else {
-                    "|  "
-                };
-                out.extend(chart_node(label, prefix, width));
-            }
-        } else {
-            // Tiny panes use the same labels and arrows without box overhead.
-            for label in
-                std::iter::once(&root).chain(edges.iter().flat_map(|(edge, label)| [edge, label]))
-            {
-                out.extend(chart_wrap(label, width).into_iter().map(Line::from));
+    if !groups.is_empty() {
+        out.extend(chart_row(value, "── ", "   ", width));
+        // Blocking links come first, even when hierarchy data was returned first.
+        groups.sort_by_key(|(label, _)| match label.as_str() {
+            "Blocked by ← prerequisites" => 0,
+            "Blocks → dependents" => 1,
+            _ => 2,
+        });
+        for (label, nodes) in groups {
+            out.extend(chart_wrap(&label, width).into_iter().map(|line| {
+                Line::styled(line, Style::default().fg(TEAL).add_modifier(Modifier::BOLD))
+            }));
+            for (index, node) in nodes.iter().enumerate() {
+                let last = index + 1 == nodes.len();
+                out.extend(chart_row(
+                    node,
+                    if last { "└─ " } else { "├─ " },
+                    if last { "   " } else { "│  " },
+                    width,
+                ));
             }
         }
     } else if fallback.is_empty() {
@@ -407,23 +430,73 @@ mod tests {
         assert_eq!(
             chart,
             concat!(
-                "+----------------------+\n",
-                "| task [open]          |\n",
-                "| Ship                 |\n",
-                "+----------------------+\n",
-                "|\n",
-                "+--<-- blocks\n",
-                "|  +-------------------+\n",
-                "|  | base [closed]     |\n",
-                "|  | Build             |\n",
-                "|  +-------------------+\n",
-                "|\n",
-                "+----> blocks\n",
-                "   +-------------------+\n",
-                "   | next              |\n",
-                "   +-------------------+"
+                "── task [open]\n",
+                "   Ship\n",
+                "Blocked by ← prerequisit\n",
+                "es\n",
+                "└─ base [closed]\n",
+                "   Build\n",
+                "Blocks → dependents\n",
+                "└─ next"
             )
         );
+    }
+
+    #[test]
+    fn eight_children_fit_one_screen_with_priority_and_solid_branches() {
+        let children: Vec<_> = (0..8)
+            .map(|i| {
+                json!({
+                    "id": format!("OCA_Genie-4ao.{i}"), "priority": i % 5,
+                    "status": "open", "dependency_type": "parent-child",
+                    "title": "Decode the complete recording into an ordered replay timeline"
+                })
+            })
+            .collect();
+        let value = json!({"id": "OCA_Genie-4ao", "priority": 1,
+            "title": "Implement frame by frame replayability", "dependents": children});
+        let chart = relationship_chart(&value, 100);
+        assert_eq!(chart.len(), 19);
+        let plain = Text::from(chart.clone()).to_string();
+        assert_eq!(plain.matches("Children").count(), 1);
+        assert_eq!(plain.matches("├─").count(), 7);
+        assert_eq!(plain.matches("└─").count(), 1);
+        assert!(!plain.contains("RELATIONSHIP DETAILS"));
+        for (priority, color) in [
+            (0, Color::Indexed(1)),
+            (1, Color::Indexed(3)),
+            (2, Color::Indexed(3)),
+            (3, Color::Indexed(2)),
+            (4, MUTED),
+        ] {
+            let row = chart
+                .iter()
+                .find(|line| {
+                    line.to_string()
+                        .contains(&format!("4ao.{priority} · P{priority}"))
+                })
+                .unwrap();
+            assert_eq!(row.spans[0].style.fg, Some(color));
+        }
+        assert_eq!(node_style(&json!({"priority": "invalid"})).fg, Some(MUTED));
+        assert_eq!(node_style(&json!({})).fg, Some(MUTED));
+    }
+
+    #[test]
+    fn blockers_precede_hierarchy_and_nonblocking_groups_keep_source_direction() {
+        let chart = Text::from(relationship_chart(
+            &json!({"id": "task",
+                "dependencies": [{"id": "parent", "dependency_type": "parent-child"}],
+                "dependents": [{"id": "child", "dependency_type": "parent-child"}],
+                "blocked_by": ["base"], "blocks": ["next"]
+            }),
+            100,
+        ))
+        .to_string();
+        assert!(chart.find("Blocked by").unwrap() < chart.find("Blocks →").unwrap());
+        assert!(chart.find("Blocks →").unwrap() < chart.find("Parents").unwrap());
+        assert!(chart.contains("Parents\n└─ parent"));
+        assert!(chart.contains("Children\n└─ child"));
     }
 
     #[test]
@@ -435,15 +508,15 @@ mod tests {
         });
         let chart = Text::from(relationship_chart(&value, 60)).to_string();
         for expected in [
-            "+--<-- blocks",
-            "+----> blocks",
-            "+..... parent-child",
-            "+..... related",
-            "+..... unspecified",
+            "Blocked by ← prerequisites",
+            "Blocks → dependents",
+            "Parents",
+            "related (dependencies)",
+            "unspecified (dependencies)",
         ] {
             assert!(chart.contains(expected), "{chart}");
         }
-        assert_eq!(chart.matches("blocks").count(), 2);
+        assert_eq!(chart.matches("prerequisites").count(), 1);
     }
 
     #[test]
@@ -466,15 +539,7 @@ mod tests {
                 "width {width}: {chart:?}"
             );
             let plain = Text::from(chart).to_string();
-            for expected in [
-                "priority",
-                "task",
-                "keep-me",
-                "unexpected",
-                "fallback",
-                "null",
-                "7",
-            ] {
+            for expected in ["task", "keep-me", "unexpected", "fallback", "null", "7"] {
                 assert!(plain.contains(expected), "{plain}");
             }
             let label = "**literal** 界界 é title with a long ending";
@@ -630,7 +695,7 @@ mod tests {
             "today",
             "bold",
             "other-1",
-            "blocks",
+            "Blocked by ← prerequisites",
             "Other",
             "extra",
             "kept",

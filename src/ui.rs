@@ -3154,6 +3154,44 @@ mod tests {
         );
     }
     #[test]
+    fn dependency_chart_priority_colors_follow_every_theme() {
+        for theme in crate::settings::Theme::ALL {
+            let mut a = app();
+            a.theme = theme;
+            a.detail = Some(json!({"id": "demo-1", "title": "Release", "priority": 2,
+                "blocked_by": [{"id": "CRITICAL", "priority": 0}],
+                "blocks": [{"id": "FOLLOWUP", "priority": 3}],
+                "dependents": (0..8).map(|i| json!({"id": format!("child-{i}"),
+                    "priority": i % 5, "status": "open", "dependency_type": "parent-child",
+                    "title": "Decode the complete recording into an ordered replay timeline"
+                })).collect::<Vec<_>>()
+            }));
+            let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for (name, priority) in [("CRITICAL", 0), ("FOLLOWUP", 3)] {
+                let row = (0..40)
+                    .find(|y| {
+                        (0..180)
+                            .map(|x| buffer[(x, *y)].symbol())
+                            .collect::<String>()
+                            .contains(name)
+                    })
+                    .unwrap();
+                let cell = (a.list_rect.width..180)
+                    .find(|x| buffer[(*x, row)].symbol() == &name[..1])
+                    .unwrap();
+                assert_eq!(
+                    buffer[(cell, row)].fg,
+                    crate::theme::priority_color(theme, priority)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dependency_chart_renders_and_scrolls_after_resize() {
         let mut a = app();
         a.detail = Some(json!({
@@ -3164,8 +3202,8 @@ mod tests {
         let (wide, _) = draw((120, 40), &mut a);
         for expected in [
             "DEPENDENCY FLOW",
-            "+--<-- blocks",
-            "+----> blocks",
+            "Blocked by ← prerequisites",
+            "Blocks → dependents",
             "base [closed]",
             "FINAL_NODE",
         ] {
@@ -3182,7 +3220,7 @@ mod tests {
         a.detail_offset = 0;
         let (top, _) = draw((120, 40), &mut a);
         assert!(top.contains("DEPENDENCY FLOW"));
-        assert!(top.contains("+--<-- blocks"));
+        assert!(top.contains("Blocked by ← prerequisites"));
     }
 
     #[test]
