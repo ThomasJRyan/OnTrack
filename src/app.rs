@@ -441,7 +441,7 @@ fn cycle_theme(theme: Theme, forward: bool) -> Theme {
 }
 fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
     let response = match request {
-        Request::List => Response::List(beads::list_beads()),
+        Request::List => Response::List(beads::list_browser_beads()),
         Request::Show(id, seq) => Response::Show(id.clone(), seq, beads::show_bead(&id)),
         Request::LoadEdit(id, seq) => Response::EditLoaded(id.clone(), seq, beads::show_bead(&id)),
         Request::Create(input) => Response::Created(beads::create_bead(&input)),
@@ -712,7 +712,7 @@ impl App {
         }
     }
     fn poll_scheduler(&mut self) {
-        if !self.worktrees_discovered || self.mutation_busy {
+        if !self.worktrees_discovered || self.mutation_busy || self.list_error.is_some() {
             return;
         }
         // A child must branch from its managed parent checkout. Preparing a
@@ -736,6 +736,7 @@ impl App {
                 let descendants = beads::open_descendants_in(&self.beads, &bead.id);
                 self.beads.iter().any(|child| {
                     beads::is_ready(child)
+                        && child.dependency_ready
                         && child.data["issue_type"] != "epic"
                         && !beads::explicitly_unassigned(&child.data)
                         && (!beads::has_harness_label(&child.data)
@@ -747,7 +748,7 @@ impl App {
             .cloned()
         {
             self.scheduler_attempted.insert(parent.id.clone());
-            self.start_launch(parent, false);
+            self.start_launch(parent, true);
             return;
         }
         let active_agents =
@@ -792,6 +793,7 @@ impl App {
             .iter()
             .filter(|bead| {
                 beads::is_ready(bead)
+                    && bead.dependency_ready
                     && bead.data["issue_type"] != "epic"
                     && self.scheduler_eligible(bead)
                     && !self.scheduler_attempted.contains(&bead.id)
@@ -3238,6 +3240,8 @@ mod tests {
     #[test]
     fn issue_layout_groups_children_under_visible_parents() {
         let bead = |id: &str, parent: Option<&str>, status: &str| Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: id.into(),
             title: id.into(),
             status: status.into(),
@@ -3303,6 +3307,8 @@ mod tests {
         App {
             beads: (0..4)
                 .map(|i| Bead {
+                    dependency_ready: true,
+                    blocked_by: Vec::new(),
                     id: format!("b{i}"),
                     title: format!("issue {i}"),
                     status: "open".into(),
@@ -3408,6 +3414,49 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_waits_for_dependencies_then_resumes_without_ready_toggle() {
+        let (mut a, rx, _) = connected_app();
+        a.beads.truncate(1);
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.beads[0].dependency_ready = false;
+        a.beads[0].blocked_by = vec!["prerequisite".into()];
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        assert!(!a.scheduler_attempted.contains("b0"));
+        assert!(beads::is_ready(&a.beads[0]));
+        a.beads[0].dependency_ready = true;
+        a.beads[0].blocked_by.clear();
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+    }
+
+    #[test]
+    fn scheduler_pauses_on_failed_browser_snapshot_and_skips_blocked_children() {
+        let (mut a, rx, _) = connected_app();
+        a.beads.truncate(2);
+        for bead in &mut a.beads {
+            bead.data["issue_type"] = json!("task");
+            bead.data["labels"] = json!([beads::READY_LABEL]);
+        }
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[1].dependency_ready = false;
+        a.poll_scheduler();
+        assert!(
+            rx.try_recv().is_err(),
+            "blocked child must not trigger parent preparation"
+        );
+        a.beads[1].dependency_ready = true;
+        a.list_error = Some("readiness lookup failed".into());
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        a.list_error = None;
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+    }
+
+    #[test]
     fn scheduler_uses_selected_harness_once_and_keeps_ready_after_launch() {
         let mut a = app();
         let (tx, rx) = mpsc::channel();
@@ -3488,7 +3537,9 @@ mod tests {
             .send(Response::Discovered(parent_seq, Ok(launch_context())))
             .unwrap();
         a.receive();
-        assert!(matches!(queued.try_recv(), Ok(Request::Launch(_, _, _, bead)) if bead.id == "b0"));
+        assert!(
+            matches!(queued.try_recv(), Ok(Request::LaunchReady(_, _, _, bead)) if bead.id == "b0")
+        );
         replies
             .send(Response::Launched(
                 parent_seq,
@@ -4075,7 +4126,7 @@ mod tests {
             };
             let pending = a.handoff.remove(&seq).unwrap();
             assert_eq!(pending.bead.id, id);
-            assert!(!pending.scheduled);
+            assert!(pending.scheduled);
             a.scheduler_attempted.remove(id);
             a.known_handoffs.insert(id.into());
             let mut row = observed_row(id, worktrees::WorktreeStatus::Reserved);
@@ -6289,6 +6340,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.responses = rx;
         tx.send(Response::List(Ok(vec![Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "c".into(),
             title: "closed issue".into(),
             status: "closed".into(),
@@ -7223,6 +7276,8 @@ mod tests {
         a.receive();
         assert!(matches!(rx.try_recv(), Ok(Request::List)));
         out.send(Response::List(Ok(vec![Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "new-id".into(),
             title: "fresh".into(),
             status: "open".into(),

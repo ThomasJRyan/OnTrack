@@ -69,6 +69,8 @@ pub struct Bead {
     pub status: String,
     pub priority: u64,
     pub data: Value,
+    pub dependency_ready: bool,
+    pub blocked_by: Vec<String>,
 }
 
 const LIST_ARGS: &[&str] = &[
@@ -83,6 +85,65 @@ const LIST_ARGS: &[&str] = &[
 
 pub fn list_beads() -> io::Result<Vec<Bead>> {
     parse_list(&run_bd(LIST_ARGS)?)
+}
+
+const READY_ARGS: &[&str] = &[
+    "--readonly",
+    "--no-color",
+    "ready",
+    "--limit",
+    "0",
+    "--json",
+];
+const BLOCKED_ARGS: &[&str] = &["--readonly", "--no-color", "blocked", "--json"];
+
+/// Fetch graph eligibility together with the browser snapshot. Any failed read
+/// rejects the snapshot so scheduling never treats an unknown graph as ready.
+pub fn list_browser_beads() -> io::Result<Vec<Bead>> {
+    let mut beads = list_beads()?;
+    let ready = parse_records(&run_bd(READY_ARGS)?)?;
+    let blocked = parse_records(&run_bd(BLOCKED_ARGS)?)?;
+    apply_readiness(&mut beads, &ready, &blocked)?;
+    Ok(beads)
+}
+
+fn apply_readiness(beads: &mut [Bead], ready: &[Value], blocked: &[Value]) -> io::Result<()> {
+    let ready_ids = ready
+        .iter()
+        .map(|record| required_string(record, "id"))
+        .collect::<io::Result<std::collections::HashSet<_>>>()?;
+    let mut blockers = std::collections::HashMap::new();
+    for record in blocked {
+        let id = required_string(record, "id")?;
+        let ids = record["blocked_by"]
+            .as_array()
+            .ok_or_else(|| invalid_data("Blocked Bead is missing blocked_by IDs"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid_data("Invalid blocking Bead ID"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        blockers.insert(id, ids);
+    }
+    for bead in beads {
+        bead.blocked_by = blockers.remove(&bead.id).unwrap_or_default();
+        bead.dependency_ready = ready_ids.contains(&bead.id) && bead.blocked_by.is_empty();
+    }
+    Ok(())
+}
+
+pub fn dependency_ready(id: &str) -> io::Result<bool> {
+    validate_id(id)?;
+    let records = parse_records(&run_bd(READY_ARGS)?)?;
+    let ids = records
+        .iter()
+        .map(|record| required_string(record, "id"))
+        .collect::<io::Result<std::collections::HashSet<_>>>()?;
+    Ok(ids.contains(id))
 }
 
 pub fn show_bead(id: &str) -> io::Result<Value> {
@@ -313,7 +374,7 @@ pub fn has_harness_label(data: &Value) -> bool {
     labels(data).any(|label| label.starts_with(HARNESS_PREFIX))
 }
 
-fn labels(data: &Value) -> impl Iterator<Item = &str> {
+pub(crate) fn labels(data: &Value) -> impl Iterator<Item = &str> {
     data.get("labels")
         .and_then(Value::as_array)
         .into_iter()
@@ -514,6 +575,8 @@ fn parse_list(bytes: &[u8]) -> io::Result<Vec<Bead>> {
                 title,
                 status,
                 priority,
+                dependency_ready: false,
+                blocked_by: Vec::new(),
                 data,
             })
         })
@@ -542,6 +605,73 @@ fn parse_show(bytes: &[u8], id: &str) -> io::Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn graph_readiness_is_authoritative_and_preserves_ready_intent() {
+        let mut beads = parse_list(
+            br#"[
+            {"id":"waiting","title":"Waiting","status":"open","labels":["ontrack:ready"]},
+            {"id":"free","title":"Free","status":"open","labels":["ontrack:ready"]},
+            {"id":"deferred","title":"Later","status":"open","labels":["ontrack:ready"]}
+        ]"#,
+        )
+        .unwrap();
+        assert!(beads.iter().all(|bead| !bead.dependency_ready));
+        apply_readiness(
+            &mut beads,
+            &[json!({"id":"free"})],
+            &[json!({"id":"waiting","blocked_by":["base", "other"]})],
+        )
+        .unwrap();
+        assert!(!beads[0].dependency_ready);
+        assert_eq!(beads[0].blocked_by, ["base", "other"]);
+        assert!(beads[1].dependency_ready);
+        assert!(!beads[2].dependency_ready);
+        assert!(beads.iter().all(is_ready));
+        apply_readiness(
+            &mut beads,
+            &[json!({"id":"waiting"}), json!({"id":"free"})],
+            &[],
+        )
+        .unwrap();
+        assert!(beads[0].dependency_ready);
+        assert!(beads[0].blocked_by.is_empty());
+        // A dependency added between the ready and blocked reads wins.
+        apply_readiness(
+            &mut beads,
+            &[json!({"id":"free"})],
+            &[json!({"id":"free","blocked_by":["new"]})],
+        )
+        .unwrap();
+        assert!(!beads[1].dependency_ready);
+    }
+
+    #[test]
+    fn readiness_queries_are_readonly_uncapped_and_reject_invalid_records() {
+        assert_eq!(
+            READY_ARGS,
+            [
+                "--readonly",
+                "--no-color",
+                "ready",
+                "--limit",
+                "0",
+                "--json"
+            ]
+        );
+        assert_eq!(
+            BLOCKED_ARGS,
+            ["--readonly", "--no-color", "blocked", "--json"]
+        );
+        for bad in [
+            json!({}),
+            json!({"id":"x"}),
+            json!({"id":"x","blocked_by":[null]}),
+        ] {
+            assert!(apply_readiness(&mut [], &[], &[bad]).is_err());
+        }
+        assert!(apply_readiness(&mut [], &[json!({})], &[]).is_err());
+    }
+
     #[test]
     fn child_creation_keeps_parent_and_user_text_in_separate_arguments() {
         let args = create_child_args(
@@ -603,6 +733,8 @@ mod tests {
     fn ready_and_harness_labels_are_app_state_without_changing_beads_status() {
         let data = json!({"issue_type":"task", "labels":["team:core", READY_LABEL, "ontrack:agent:opencode"]});
         let bead = Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "b1".into(),
             title: "Task".into(),
             status: "open".into(),
@@ -626,6 +758,8 @@ mod tests {
             })));
         }
         assert!(is_ready(&Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "epic".into(),
             title: "Epic".into(),
             status: "open".into(),
