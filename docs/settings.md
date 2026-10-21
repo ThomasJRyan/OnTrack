@@ -65,6 +65,11 @@ A missing `agent_limit` defaults to 5.
 It accepts a positive integer or `"unlimited"`; zero, negative, fractional, and
 other values are invalid. Child merge requests are on by default; top-level
 merge requests, workspace closing, and checkout removal are off by default.
+Child auto-merge keeps background worktree discovery running even when the
+tracked list is empty and the worktrees view is hidden. Epic subtasks merge
+into their recorded parent checkout. Workspace closing and checkout removal
+preferences also apply to integrated child worktrees, with the same safety
+checks as top-level tasks; parent cleanup waits for child checkouts to be removed.
 Unknown additional keys
 are accepted for future expansion. Invalid JSON,
 non-object JSON, unknown themes, and non-string theme values are errors.

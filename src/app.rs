@@ -874,6 +874,7 @@ impl App {
     }
     fn poll_worktrees(&mut self, now: Instant) {
         let automatic = self.settings.auto_merge
+            || self.settings.auto_merge_children
             || self.settings.auto_close_workspace
             || self.settings.auto_remove_checkout;
         let should_poll = !self.worktrees_discovered
@@ -7879,6 +7880,51 @@ mod tests {
             }))
         ));
         assert!(!a.worktrees_view);
+    }
+    #[test]
+    fn child_automation_discovers_worktrees_after_an_empty_scan() {
+        let (mut app, requests, responses) = connected_app();
+        assert!(!app.settings.auto_merge);
+        assert!(app.settings.auto_merge_children);
+        assert!(!app.settings.auto_close_workspace);
+        assert!(!app.settings.auto_remove_checkout);
+        assert!(!app.worktrees_view);
+        app.worktrees_discovered = false;
+        let now = Instant::now();
+        app.poll_worktrees(now);
+        assert!(matches!(requests.try_recv(), Ok(Request::ListWorktrees)));
+        responses.send(Response::Worktrees(Ok(vec![]))).unwrap();
+        app.receive_at(now);
+
+        app.poll_worktrees(now + REFRESH_INTERVAL);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Request::ReconcileWorktrees(CleanupPolicy {
+                auto_merge: false,
+                auto_merge_children: true,
+                auto_close_workspace: false,
+                auto_remove_checkout: false,
+            }))
+        ));
+        let mut child = observed_row("child", worktrees::WorktreeStatus::Unmerged);
+        child.parent_bead_id = Some("epic".into());
+        responses
+            .send(Response::Worktrees(Ok(vec![child])))
+            .unwrap();
+        app.receive_at(now + REFRESH_INTERVAL);
+        assert_eq!(app.worktrees[0].parent_bead_id.as_deref(), Some("epic"));
+        app.poll_worktrees(now + REFRESH_INTERVAL * 2);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Request::ReconcileWorktrees(_))
+        ));
+    }
+    #[test]
+    fn empty_settled_worktrees_do_not_poll_when_all_automation_is_disabled() {
+        let (mut app, requests, _) = connected_app();
+        app.settings.auto_merge_children = false;
+        app.poll_worktrees(Instant::now());
+        assert!(requests.try_recv().is_err());
     }
     #[test]
     fn tracked_worktree_reconciles_with_cleanup_preferences_disabled() {
