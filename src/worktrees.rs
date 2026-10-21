@@ -3435,6 +3435,10 @@ mod tests {
     }
 
     impl Executor for Fake {
+        fn dependency_ready(&mut self, _id: &str) -> io::Result<bool> {
+            Ok(true)
+        }
+
         fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
             self.calls
                 .push(args.iter().map(|s| (*s).to_owned()).collect());

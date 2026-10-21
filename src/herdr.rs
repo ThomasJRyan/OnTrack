@@ -129,6 +129,7 @@ impl LaunchRecord for crate::worktrees::LaunchJournal {
 pub(crate) trait Executor {
     fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>>;
     fn show_bead(&mut self, id: &str) -> io::Result<Value>;
+    fn dependency_ready(&mut self, id: &str) -> io::Result<bool>;
     fn open_descendants(&mut self, _id: &str) -> io::Result<Vec<String>> {
         Ok(Vec::new())
     }
@@ -187,6 +188,10 @@ impl Executor for SystemExecutor {
 
     fn show_bead(&mut self, id: &str) -> io::Result<Value> {
         crate::beads::show_bead(id)
+    }
+
+    fn dependency_ready(&mut self, id: &str) -> io::Result<bool> {
+        crate::beads::dependency_ready(id)
     }
 
     fn open_descendants(&mut self, id: &str) -> io::Result<Vec<String>> {
@@ -738,7 +743,11 @@ fn launch_with_mode(
         ));
     }
     if require_ready {
-        if !crate::beads::ready_record(&bead) {
+        if !crate::beads::ready_record(&bead)
+            && !(bead["status"] == "open"
+                && bead["issue_type"] == "epic"
+                && crate::beads::labels(&bead).any(|label| label == crate::beads::READY_LABEL))
+        {
             return Err(io::Error::other(
                 "Scheduled Bead is no longer an open Ready issue; nothing created",
             ));
@@ -759,6 +768,21 @@ fn launch_with_mode(
         .pending_child_handoffs(request.id)
         .map_err(|error| stage("Child worktree check (nothing created)", error))?;
     let reserve_for_children = !open_children.is_empty() || !pending.is_empty();
+    if require_ready && !reserve_for_children {
+        if bead["issue_type"] == "epic" {
+            return Err(io::Error::other(
+                "Scheduled Epic has no children to prepare; nothing created",
+            ));
+        }
+        if !executor
+            .dependency_ready(request.id)
+            .map_err(|error| stage("Dependency readiness check (nothing created)", error))?
+        {
+            return Err(io::Error::other(
+                "Scheduled Bead is not dependency-ready; nothing created",
+            ));
+        }
+    }
     let mut prompt = prompt(request, &bead)?;
     let source = discover_with(executor, cwd)?;
     if source.discovery.workspace_id != request.workspace_id {
@@ -1416,9 +1440,15 @@ mod tests {
         pending_children: Vec<String>,
         resume_target: Option<PathBuf>,
         journal_fault: Option<&'static str>,
+        dependency_readiness: Option<io::Result<bool>>,
     }
 
     impl Executor for FakeExecutor {
+        fn dependency_ready(&mut self, id: &str) -> io::Result<bool> {
+            self.calls.push(vec!["dependency_ready".into(), id.into()]);
+            self.dependency_readiness.take().unwrap_or(Ok(true))
+        }
+
         fn open_descendants(&mut self, _id: &str) -> io::Result<Vec<String>> {
             Ok(self.open_children.clone())
         }
@@ -2077,6 +2107,53 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_graph_blocked_parent_can_only_reserve_for_children() {
+        for kind in ["task", "epic"] {
+            let mut executor = FakeExecutor::launch();
+            let mut ready = bead();
+            ready["status"] = json!("open");
+            ready["issue_type"] = json!(kind);
+            ready["labels"] = json!([crate::beads::READY_LABEL]);
+            executor.bead = Some(Ok(ready));
+            executor.open_children = vec!["child-1".into()];
+            executor.dependency_readiness = Some(Ok(false));
+            let outcome = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap();
+            assert!(outcome.reserved);
+            assert_eq!(executor.mutations().len(), 1);
+            assert_eq!(executor.mutations()[0][..2], ["worktree", "create"]);
+            assert!(
+                !executor
+                    .calls
+                    .iter()
+                    .any(|call| call[0] == "dependency_ready")
+            );
+        }
+    }
+
+    #[test]
+    fn scheduled_launch_rechecks_dependencies_and_fails_closed_before_mutation() {
+        for readiness in [Ok(false), Err(io::Error::other("graph unavailable"))] {
+            let mut executor = FakeExecutor::launch();
+            let mut ready = bead();
+            ready["status"] = json!("open");
+            ready["issue_type"] = json!("task");
+            ready["labels"] = json!([crate::beads::READY_LABEL]);
+            executor.bead = Some(Ok(ready));
+            executor.dependency_readiness = Some(readiness);
+            let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
+            assert!(error.to_string().contains("nothing created"));
+            assert_eq!(
+                executor.calls,
+                vec![
+                    vec!["show_bead", "OnTrack-z2y"],
+                    vec!["dependency_ready", "OnTrack-z2y"],
+                ]
+            );
+            assert!(executor.mutations().is_empty());
+        }
+    }
+
+    #[test]
     fn scheduled_launch_rechecks_live_ready_marker_before_any_herdr_mutation() {
         let mut executor = FakeExecutor::launch();
         let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
@@ -2124,7 +2201,11 @@ mod tests {
         changed["labels"] = json!([crate::beads::READY_LABEL]);
         executor.bead = Some(Ok(changed));
         let error = launch_with_mode(&mut executor, &cwd(), &request(), true).unwrap_err();
-        assert!(error.to_string().contains("no longer an open Ready issue"));
+        assert!(
+            error
+                .to_string()
+                .contains("Epic has no children to prepare")
+        );
         assert!(executor.mutations().is_empty());
     }
 
@@ -2264,6 +2345,8 @@ mod tests {
         }
         .into();
         let selected = Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: request().id.into(),
             title: request().title.into(),
             status: "open".into(),

@@ -876,6 +876,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             Style::default().fg(themed_status_color(status, app.theme)),
                         ),
                     ];
+                    if !bead.blocked_by.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" · waiting on {}", bead.blocked_by.join(", ")),
+                            Style::default().fg(gold),
+                        ));
+                    }
                     if handed_off {
                         spans.push(Span::styled(
                             " · sent",
@@ -2436,6 +2442,8 @@ mod tests {
     fn issue_rows_indent_nested_children_and_identify_split_parents() {
         let mut app = app();
         let bead = |id: &str, title: &str, parent: Option<&str>, status: &str| Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: id.into(),
             title: title.into(),
             status: status.into(),
@@ -2500,6 +2508,8 @@ mod tests {
         let mut app = app();
         app.beads = (0..32)
             .map(|index| Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
                 id: format!("task-{index}"),
                 title: "Nested title".into(),
                 status: "open".into(),
@@ -2539,6 +2549,8 @@ mod tests {
         let (_, responses) = mpsc::channel();
         App {
             beads: vec![Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
                 id: "demo-1".into(),
                 title: "Title is visible".into(),
                 status: "closed".into(),
@@ -2792,6 +2804,25 @@ mod tests {
     }
 
     #[test]
+    fn ready_issue_shows_waiting_bead_ids_beside_status_and_clears_on_refresh() {
+        let mut a = app();
+        a.beads[0].status = "open".into();
+        a.beads[0].data["labels"] = json!([crate::beads::READY_LABEL]);
+        a.beads[0].dependency_ready = false;
+        a.beads[0].blocked_by = vec!["base-1".into(), "base-2".into()];
+        assert!(
+            draw((150, 30), &mut a)
+                .0
+                .contains("ready · waiting on base-1, base-2")
+        );
+        // Compact terminals must keep rendering and navigation functional.
+        draw((40, 12), &mut a);
+        a.beads[0].dependency_ready = true;
+        a.beads[0].blocked_by.clear();
+        assert!(!draw((150, 30), &mut a).0.contains("waiting on"));
+    }
+
+    #[test]
     fn open_issue_shows_confirmed_agent_handoff_only() {
         let mut a = app();
         a.beads[0].status = "open".into();
@@ -2947,6 +2978,8 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, kind)| crate::beads::Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
                 id: format!("aligned-{i}"),
                 title: format!("title-{i}"),
                 status: "open".into(),
@@ -2994,6 +3027,8 @@ mod tests {
         let mut a = app();
         a.beads = (0..15)
             .map(|i| crate::beads::Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
                 id: format!("b{i}"),
                 title: format!("item {i}"),
                 status: if i == 14 { "closed" } else { "open" }.into(),
@@ -3048,6 +3083,8 @@ mod tests {
         let mut a = app();
         a.beads[0].status = "closed".into();
         a.beads.push(crate::beads::Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "open-2".into(),
             title: "open title".into(),
             status: "open".into(),
@@ -3099,6 +3136,8 @@ mod tests {
         let mut a = app();
         a.beads = (0..8)
             .map(|i| crate::beads::Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
                 id: format!("long-{i}"),
                 title: format!("visible-title-{i}"),
                 status: "open".into(),
@@ -3209,6 +3248,8 @@ mod tests {
         a.detail_error = None;
         assert!(draw((80, 24), &mut a).0.contains("No issues"));
         a.beads.push(Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "long".into(),
             title: "long".into(),
             status: "open".into(),
