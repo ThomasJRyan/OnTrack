@@ -810,6 +810,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 continue;
             };
             let bead = &app.beads[i];
+            let depth = crate::app::issue_path(&app.beads, &bead_positions, i)
+                .len()
+                .saturating_sub(1);
+            let inner_width = split[0].width.saturating_sub(2);
+            let indent = depth.min(inner_width.saturating_sub(4) as usize / 2) as u16 * 2;
+            let row_width = inner_width.saturating_sub(indent);
             for line in 0..target.height {
                 let natural_y = target.y + line;
                 if natural_y < app.list_offset
@@ -878,13 +884,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     }
                     Line::from(spans)
                 } else {
-                    let path = crate::app::issue_path(&app.beads, &bead_positions, i);
-                    let depth = path.len().saturating_sub(1);
-                    let width = split[0].width.saturating_sub(2) as usize;
+                    let width = row_width as usize;
                     let parent = bead.data.get("parent").and_then(|value| value.as_str());
-                    let prefix = if depth > 0 {
-                        format!("{}↳ ", "  ".repeat(depth.min(width.saturating_sub(4) / 2)))
-                    } else if let Some(parent) = parent.filter(|parent| !parent.trim().is_empty()) {
+                    let prefix = if let Some(parent) =
+                        parent.filter(|parent| depth == 0 && !parent.trim().is_empty())
+                    {
                         format!(
                             "  ↳ {} · ",
                             truncate_display(parent, width.saturating_sub(8) / 2)
@@ -899,12 +903,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 };
                 f.render_widget(
                     Paragraph::new(content),
-                    Rect::new(
-                        split[0].x + 1,
-                        screen_y,
-                        split[0].width.saturating_sub(2),
-                        1,
-                    ),
+                    Rect::new(split[0].x + 1 + indent, screen_y, row_width, 1),
                 );
             }
         }
@@ -2448,33 +2447,92 @@ mod tests {
             bead("grandchild", "Grandchild", Some("child"), "open"),
             bead("parent", "Parent", None, "open"),
             bead("split", "Split child", Some("parent"), "closed"),
+            bead(
+                "great-grandchild",
+                "Great grandchild",
+                Some("grandchild"),
+                "open",
+            ),
+            bead("unrelated", "Unrelated root", None, "open"),
+            bead("orphan", "Missing parent", Some("absent"), "closed"),
         ];
         app.selected = Some(2);
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
         terminal
             .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
             .unwrap();
         let layout = crate::app::list_layout(&app.beads, &app.collapsed);
-        let row = |index: usize| {
+        let row = |index: usize, line: usize| {
             let target = layout
                 .targets
                 .iter()
                 .find(|target| target.row == DisplayRow::Bead(index))
                 .unwrap();
-            let y = app.list_rect.y + (target.y + 1 - app.list_offset) as u16;
+            let y = app.list_rect.y + (target.y + line - app.list_offset) as u16;
             (0..app.list_rect.width)
                 .map(|x| terminal.backend().buffer()[(app.list_rect.x + x, y)].symbol())
                 .collect::<String>()
         };
-        assert!(row(2).contains("  Parent"));
-        assert!(row(0).contains("  ↳ Child"));
-        assert!(row(1).contains("    ↳ Grandchild"));
-        assert!(row(3).contains("↳ parent · Split child"));
+        let column_of =
+            |row: String, text: &str| row.find(text).map(|byte| row[..byte].chars().count());
+        for (index, title, depth) in [
+            (2, "Parent", 0),
+            (0, "Child", 1),
+            (1, "Grandchild", 2),
+            (4, "Great grandchild", 3),
+            (5, "Unrelated root", 0),
+        ] {
+            let column = 3 + 2 * depth; // Border and common two-column row gutter.
+            assert_eq!(column_of(row(index, 0), "task"), Some(column));
+            assert_eq!(column_of(row(index, 1), title), Some(column));
+        }
+        assert_eq!(column_of(row(2, 0), "›"), Some(1));
+        assert_eq!(column_of(row(3, 1), "↳ parent · Split child"), Some(3));
+        assert_eq!(column_of(row(6, 1), "↳ absent · Missing parent"), Some(3));
 
         let mut compact = Terminal::new(TestBackend::new(40, 16)).unwrap();
         compact
             .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
             .unwrap();
+    }
+    #[test]
+    fn deeply_nested_issue_indentation_stays_inside_narrow_group_borders() {
+        let mut app = app();
+        app.beads = (0..32)
+            .map(|index| Bead {
+                id: format!("task-{index}"),
+                title: "Nested title".into(),
+                status: "open".into(),
+                priority: 2,
+                data: json!({
+                    "issue_type": "task",
+                    "parent": (index > 0).then(|| format!("task-{}", index - 1)),
+                }),
+            })
+            .collect();
+        app.selected = Some(31);
+        for width in [40, 24] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            terminal
+                .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let layout = crate::app::list_layout(&app.beads, &app.collapsed);
+            let target = layout
+                .targets
+                .iter()
+                .find(|target| target.row == DisplayRow::Bead(31))
+                .unwrap();
+            let y = app.list_rect.y + (target.y - app.list_offset) as u16;
+            let inner_width = app.list_rect.width - 2;
+            let indent = inner_width.saturating_sub(4) / 2 * 2;
+            let x = app.list_rect.x + 1 + indent;
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(x, y)].symbol(), "›");
+            assert_eq!(buffer[(x + 2, y + 1)].symbol(), "N");
+            for row in [y, y + 1] {
+                assert_eq!(buffer[(app.list_rect.right() - 1, row)].symbol(), "│");
+            }
+        }
     }
     fn app() -> App {
         let (tx, _) = mpsc::channel();
