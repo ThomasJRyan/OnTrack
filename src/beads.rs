@@ -234,50 +234,52 @@ fn set_ready_many(ids: &[String], ready: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Change an Epic and its open descendant Tasks in one CLI invocation.
+/// Change an open issue and its open descendants in one CLI invocation.
 /// Beads applies updates per ID, so callers must refresh after any error.
-pub fn set_epic_ready(
-    epic_id: &str,
+pub fn set_tree_ready(
+    parent_id: &str,
     ready: bool,
     known_handoffs: &std::collections::HashSet<String>,
     protected_handoffs: &std::collections::HashSet<String>,
 ) -> io::Result<Vec<String>> {
-    validate_id(epic_id)?;
+    validate_id(parent_id)?;
     let beads = list_beads()?;
-    let ids = epic_ready_targets_in(&beads, epic_id, ready, known_handoffs, protected_handoffs)?;
+    let ids = tree_ready_targets_in(&beads, parent_id, ready, known_handoffs, protected_handoffs)?;
     set_ready_many(&ids, ready)?;
     Ok(ids)
 }
 
-fn epic_ready_targets_in(
+fn tree_ready_targets_in(
     beads: &[Bead],
-    epic_id: &str,
+    parent_id: &str,
     ready: bool,
     known_handoffs: &std::collections::HashSet<String>,
     protected_handoffs: &std::collections::HashSet<String>,
 ) -> io::Result<Vec<String>> {
-    let epic = beads
+    let parent = beads
         .iter()
-        .find(|bead| bead.id == epic_id)
+        .find(|bead| bead.id == parent_id)
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "Selected Epic is no longer listed")
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Selected issue is no longer listed",
+            )
         })?;
-    if epic.status != "open" || epic.data["issue_type"] != "epic" {
+    if parent.status != "open" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Only open Epics can change descendant Ready markers",
+            "Only open issues can change descendant Ready markers",
         ));
     }
     let descendants: std::collections::HashSet<_> =
-        open_descendants_in(beads, epic_id).into_iter().collect();
-    let mut ids = vec![epic_id.to_owned()];
+        open_descendants_in(beads, parent_id).into_iter().collect();
+    let mut ids = vec![parent_id.to_owned()];
     ids.extend(
         beads
             .iter()
             .filter(|bead| {
                 descendants.contains(&bead.id)
                     && bead.status == "open"
-                    && bead.data["issue_type"] == "task"
                     && (!ready || !known_handoffs.contains(&bead.id))
                     && (ready || !protected_handoffs.contains(&bead.id))
                     && (ready != is_ready(bead))
@@ -636,7 +638,7 @@ mod tests {
     }
 
     #[test]
-    fn epic_ready_targets_include_nested_open_tasks_and_skip_existing_handoffs() {
+    fn tree_ready_targets_include_nested_open_tasks_and_skip_existing_handoffs() {
         let rows = json!([
             {"id":"epic","title":"Epic","status":"open","issue_type":"epic"},
             {"id":"direct","title":"Direct","status":"open","issue_type":"task","parent":"epic"},
@@ -652,14 +654,50 @@ mod tests {
         let handoffs = std::collections::HashSet::from(["sent".to_owned(), "reserved".to_owned()]);
         let accepted = std::collections::HashSet::from(["sent".to_owned()]);
         assert_eq!(
-            epic_ready_targets_in(&beads, "epic", true, &handoffs, &accepted).unwrap(),
+            tree_ready_targets_in(&beads, "epic", true, &handoffs, &accepted).unwrap(),
             ["epic", "direct", "nested"]
         );
         assert_eq!(
-            epic_ready_targets_in(&beads, "epic", false, &handoffs, &accepted).unwrap(),
+            tree_ready_targets_in(&beads, "epic", false, &handoffs, &accepted).unwrap(),
             ["epic", "ready", "reserved"]
         );
-        assert!(epic_ready_targets_in(&beads, "other", true, &handoffs, &accepted).is_err());
+        assert_eq!(
+            tree_ready_targets_in(&beads, "other", true, &handoffs, &accepted).unwrap(),
+            ["other"]
+        );
+    }
+
+    #[test]
+    fn task_ready_cascades_across_types_and_preserves_handoffs() {
+        let rows = serde_json::json!([
+            {"id":"parent","title":"Parent","status":"open","issue_type":"task"},
+            {"id":"child","title":"Child","status":"open","issue_type":"feature","parent":"parent"},
+            {"id":"leaf","title":"Leaf","status":"open","issue_type":"bug","parent":"child"},
+            {"id":"closed","title":"Closed","status":"closed","parent":"parent"},
+            {"id":"under-closed","title":"Open","status":"open","parent":"closed"},
+            {"id":"active","title":"Active","status":"in_progress","parent":"parent"},
+            {"id":"deferred","title":"Deferred","status":"deferred","parent":"parent"},
+            {"id":"sent","title":"Sent","status":"open","parent":"parent","labels":[READY_LABEL]},
+            {"id":"pending","title":"Pending","status":"open","parent":"child","labels":[READY_LABEL]},
+            {"id":"unrelated","title":"Unrelated","status":"open"}
+        ]);
+        let mut beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        let known = std::collections::HashSet::from(["sent".into()]);
+        let protected = std::collections::HashSet::from(["sent".into(), "pending".into()]);
+        let marked = tree_ready_targets_in(&beads, "parent", true, &known, &protected).unwrap();
+        assert_eq!(marked, ["parent", "child", "leaf", "under-closed"]);
+        for bead in &mut beads {
+            if marked.contains(&bead.id) {
+                bead.data["labels"] = serde_json::json!([READY_LABEL]);
+            }
+        }
+        assert_eq!(
+            tree_ready_targets_in(&beads, "parent", false, &known, &protected).unwrap(),
+            marked
+        );
+        for id in ["closed", "active", "deferred", "missing"] {
+            assert!(tree_ready_targets_in(&beads, id, true, &known, &protected).is_err());
+        }
     }
 
     #[test]
@@ -675,12 +713,12 @@ mod tests {
         }));
         let mut beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
         let empty = std::collections::HashSet::new();
-        let marked = epic_ready_targets_in(&beads, "epic", true, &empty, &empty).unwrap();
+        let marked = tree_ready_targets_in(&beads, "epic", true, &empty, &empty).unwrap();
         assert_eq!(marked.len(), 101);
         for bead in &mut beads {
             bead.data["labels"] = serde_json::json!([READY_LABEL]);
         }
-        let cleared = epic_ready_targets_in(&beads, "epic", false, &empty, &empty).unwrap();
+        let cleared = tree_ready_targets_in(&beads, "epic", false, &empty, &empty).unwrap();
         assert_eq!(marked, cleared);
     }
 

@@ -50,7 +50,7 @@ pub(super) enum Request {
     CreateChild(CreateBead, String),
     Update(UpdateBead),
     SetReady(String, bool),
-    SetEpicReady(String, bool, HashSet<String>, HashSet<String>),
+    SetTreeReady(String, bool, HashSet<String>, HashSet<String>),
     Delete(String),
     DiscoverHarnesses(u64),
     Discover(u64),
@@ -488,10 +488,10 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
             ready,
             beads::set_ready(&id, ready).map(|()| vec![id]),
         ),
-        Request::SetEpicReady(id, ready, known_handoffs, protected_handoffs) => Response::ReadySet(
+        Request::SetTreeReady(id, ready, known_handoffs, protected_handoffs) => Response::ReadySet(
             id.clone(),
             ready,
-            beads::set_epic_ready(&id, ready, &known_handoffs, &protected_handoffs),
+            beads::set_tree_ready(&id, ready, &known_handoffs, &protected_handoffs),
         ),
         Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
         Request::DiscoverHarnesses(seq) => {
@@ -573,7 +573,7 @@ fn start_workers(
                 if managed.send(request).is_err() {
                     break;
                 }
-            } else if matches!(request, Request::SetReady(..) | Request::SetEpicReady(..)) {
+            } else if matches!(request, Request::SetReady(..) | Request::SetTreeReady(..)) {
                 if ready.send(request).is_err() {
                     break;
                 }
@@ -715,14 +715,14 @@ impl App {
         if !self.worktrees_discovered || self.mutation_busy {
             return;
         }
-        // A child must branch from its managed parent checkout. Preparing an
-        // Epic only reserves that checkout; it does not occupy an agent slot.
-        if let Some(epic) = self
+        // A child must branch from its managed parent checkout. Preparing a
+        // parent only reserves that checkout; it does not occupy an agent slot.
+        if let Some(parent) = self
             .beads
             .iter()
             .find(|bead| {
                 if !beads::is_ready(bead)
-                    || bead.data["issue_type"] != "epic"
+                    || !self.scheduler_eligible(bead)
                     || self.scheduler_attempted.contains(&bead.id)
                     || self.known_handoffs.contains(&bead.id)
                     || self.worktrees.iter().any(|item| item.bead_id == bead.id)
@@ -746,8 +746,8 @@ impl App {
             })
             .cloned()
         {
-            self.scheduler_attempted.insert(epic.id.clone());
-            self.start_launch(epic, false);
+            self.scheduler_attempted.insert(parent.id.clone());
+            self.start_launch(parent, false);
             return;
         }
         let active_agents =
@@ -2838,8 +2838,8 @@ impl App {
         self.mutation_busy = true;
         self.ready_pending = true;
         self.notice = Some(format!("Updating Ready for {id}…"));
-        let request = if epic {
-            Request::SetEpicReady(id, ready, self.known_handoffs.clone(), protected_handoffs)
+        let request = if epic || !beads::open_descendants_in(&self.beads, &id).is_empty() {
+            Request::SetTreeReady(id, ready, self.known_handoffs.clone(), protected_handoffs)
         } else {
             Request::SetReady(id, ready)
         };
@@ -3790,7 +3790,7 @@ mod tests {
                 assert!(a.notice.as_deref().unwrap().contains("Updating Ready"));
                 assert!(matches!(
                     requests.try_recv(),
-                    Ok(Request::SetReady(..) | Request::SetEpicReady(..))
+                    Ok(Request::SetReady(..) | Request::SetTreeReady(..))
                 ));
                 for key in ['r', 'R', 'n', 'N', 'e', 'd', 'g', 'h', 's', 'u'] {
                     press(&mut a, KeyCode::Char(key));
@@ -3845,7 +3845,7 @@ mod tests {
             let (entered, started) = mpsc::channel();
             let (requests, responses, _) = start_workers(move |request, out| {
                 let response = match request {
-                    Request::SetReady(id, ready) | Request::SetEpicReady(id, ready, ..) => {
+                    Request::SetReady(id, ready) | Request::SetTreeReady(id, ready, ..) => {
                         entered.send(()).unwrap();
                         // Timeout also releases the worker if a regression fails the test.
                         blocked
@@ -3864,7 +3864,7 @@ mod tests {
             });
             requests
                 .send(if epic {
-                    Request::SetEpicReady("epic".into(), true, HashSet::new(), HashSet::new())
+                    Request::SetTreeReady("epic".into(), true, HashSet::new(), HashSet::new())
                 } else {
                     Request::SetReady("task".into(), false)
                 })
@@ -3986,7 +3986,7 @@ mod tests {
         press(&mut a, KeyCode::Char('r'));
         assert!(matches!(
             rx.try_recv(),
-            Ok(Request::SetEpicReady(id, true, handoffs, protected))
+            Ok(Request::SetTreeReady(id, true, handoffs, protected))
                 if id == "b0" && handoffs.contains("b2") && protected.is_empty()
         ));
         assert_eq!(a.beads[0].status, "open");
@@ -4029,6 +4029,105 @@ mod tests {
         assert!(matches!(queued.try_recv(), Ok(Request::List)));
         assert!(a.notice.as_deref().unwrap().contains("partial update"));
         assert!(!a.ready_pending && !a.mutation_busy);
+    }
+
+    #[test]
+    fn task_ready_toggle_queues_tree_with_pending_and_accepted_protection() {
+        let (mut a, rx, _) = connected_app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[2].data["parent"] = json!("b1");
+        a.accepted_handoffs.insert("b1".into());
+        a.known_handoffs.insert("b1".into());
+        let pending = a.beads[2].clone();
+        a.start_launch(pending, false);
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Request::SetTreeReady(id, true, known, protected))
+                if id == "b0" && known.contains("b1")
+                    && protected.contains("b1") && protected.contains("b2")
+        ));
+    }
+
+    #[test]
+    fn nested_ready_tasks_reserve_ancestors_then_run_agents_from_leaves_up() {
+        let (mut a, rx, _) = connected_app();
+        a.beads.truncate(3);
+        for (i, bead) in a.beads.iter_mut().enumerate() {
+            bead.data["issue_type"] = json!("task");
+            bead.data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+            // Ancestors have higher priority, but still must wait for descendants.
+            bead.priority = i as u64;
+            if i > 0 {
+                bead.data["parent"] = json!(format!("b{}", i - 1));
+            }
+        }
+        a.settings.agent_limit = settings::AgentLimit::Limited(1);
+        a.worktrees
+            .push(observed_row("other", worktrees::WorktreeStatus::InProgress));
+        // Checkouts must be prepared root first, even at the agent limit.
+        for (id, parent) in [("b0", None), ("b1", Some("b0"))] {
+            a.poll_scheduler();
+            let Request::Discover(seq) = rx.try_recv().unwrap() else {
+                panic!("ancestor preparation was not queued");
+            };
+            let pending = a.handoff.remove(&seq).unwrap();
+            assert_eq!(pending.bead.id, id);
+            assert!(!pending.scheduled);
+            a.scheduler_attempted.remove(id);
+            a.known_handoffs.insert(id.into());
+            let mut row = observed_row(id, worktrees::WorktreeStatus::Reserved);
+            row.handoff_accepted = false;
+            row.parent_bead_id = parent.map(str::to_owned);
+            a.worktrees.push(row);
+        }
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err(), "leaf must wait for an agent slot");
+        a.worktrees.remove(0);
+        a.poll_scheduler();
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!("leaf launch was not queued");
+        };
+        let pending = a.handoff.remove(&seq).unwrap();
+        assert_eq!(pending.bead.id, "b2");
+        assert!(pending.scheduled);
+        a.known_handoffs.insert("b2".into());
+        let mut leaf = observed_row("b2", worktrees::WorktreeStatus::InProgress);
+        leaf.parent_bead_id = Some("b1".into());
+        a.worktrees.push(leaf);
+        assert!(!a.scheduler_eligible(&a.beads[0]));
+        assert!(!a.scheduler_eligible(&a.beads[1]));
+        a.beads[2].status = "closed".into();
+        a.worktrees[2].status = worktrees::WorktreeStatus::Unmerged;
+        assert!(
+            !a.scheduler_eligible(&a.beads[1]),
+            "closed leaf must integrate first"
+        );
+        a.worktrees[2].status = worktrees::WorktreeStatus::Integrated;
+        a.poll_scheduler();
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!("intermediate parent did not resume");
+        };
+        let pending = a.handoff.remove(&seq).unwrap();
+        assert_eq!(pending.bead.id, "b1");
+        assert!(pending.scheduled);
+        assert!(!a.scheduler_eligible(&a.beads[0]));
+        a.beads[1].status = "closed".into();
+        a.worktrees[1].status = worktrees::WorktreeStatus::Unmerged;
+        assert!(
+            !a.scheduler_eligible(&a.beads[0]),
+            "closed child must integrate first"
+        );
+        a.worktrees[1].status = worktrees::WorktreeStatus::Integrated;
+        a.poll_scheduler();
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!("root parent did not resume");
+        };
+        let pending = a.handoff.remove(&seq).unwrap();
+        assert_eq!(pending.bead.id, "b0");
+        assert!(pending.scheduled);
     }
 
     #[test]
@@ -4354,7 +4453,7 @@ mod tests {
         a.selected = Some(0);
         a.toggle_ready();
         assert!(
-            matches!(rx.try_recv(), Ok(Request::SetEpicReady(_,false,_,protected)) if protected.contains("b0") && protected.contains("b2"))
+            matches!(rx.try_recv(), Ok(Request::SetTreeReady(_,false,_,protected)) if protected.contains("b0") && protected.contains("b2"))
         );
     }
 
