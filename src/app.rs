@@ -51,6 +51,7 @@ pub(super) enum Request {
     Update(UpdateBead),
     SetReady(String, bool),
     SetTreeReady(String, bool, HashSet<String>, HashSet<String>),
+    Close(String),
     Delete(String),
     DiscoverHarnesses(u64),
     Discover(u64),
@@ -78,6 +79,7 @@ pub(super) enum Response {
     EpicFinished(String, std::io::Result<Vec<String>>),
     Updated(String, std::io::Result<()>),
     ReadySet(String, bool, std::io::Result<Vec<String>>),
+    Closed(String, std::io::Result<()>),
     Deleted(std::io::Result<()>),
     HarnessesDiscovered(u64, std::io::Result<Vec<String>>),
     Discovered(u64, std::io::Result<LaunchContext>),
@@ -183,6 +185,10 @@ pub enum Modal {
         form: CreateForm,
     },
     ConfirmGenerateEpic {
+        id: String,
+        title: String,
+    },
+    ConfirmClose {
         id: String,
         title: String,
     },
@@ -493,6 +499,7 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
             ready,
             beads::set_tree_ready(&id, ready, &known_handoffs, &protected_handoffs),
         ),
+        Request::Close(id) => Response::Closed(id.clone(), beads::close_bead(&id)),
         Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
         Request::DiscoverHarnesses(seq) => {
             Response::HarnessesDiscovered(seq, crate::herdr::installed_harnesses())
@@ -1433,6 +1440,17 @@ impl App {
                         }
                     }
                 }
+                Response::Closed(id, result) => {
+                    self.mutation_busy = false;
+                    match result {
+                        Ok(()) => {
+                            self.notice = Some(format!("Bead {id} closed"));
+                            self.modal = None;
+                            self.refresh_at(now);
+                        }
+                        Err(error) => self.notice = Some(format!("Close failed for {id}: {error}")),
+                    }
+                }
                 Response::Deleted(result) => {
                     self.mutation_busy = false;
                     match result {
@@ -2024,6 +2042,18 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('c') if k.modifiers.is_empty() => {
+                if let Some(b) = self.selected.and_then(|i| self.beads.get(i))
+                    && b.status != "closed"
+                {
+                    self.modal = Some(Modal::ConfirmClose {
+                        id: b.id.clone(),
+                        title: b.title.clone(),
+                    });
+                    self.modal_ready = false;
+                    self.notice = None;
+                }
+            }
             KeyCode::Char('d') => {
                 if let Some(b) = self.selected.and_then(|i| self.beads.get(i)) {
                     self.modal = Some(Modal::ConfirmDelete {
@@ -2433,6 +2463,19 @@ impl App {
                     } else {
                         self.notice = Some("Epic planning could not be queued; try again".into());
                     }
+                }
+            } else if matches!(key.code, Char('n') | Char('N') | Enter) {
+                self.modal = None;
+            }
+            return false;
+        }
+        if let Some(Modal::ConfirmClose { id, .. }) = self.modal.as_ref() {
+            if matches!(key.code, Char('y') | Char('Y')) {
+                let id = id.clone();
+                self.mutation_busy = true;
+                if self.requests.send(Request::Close(id)).is_err() {
+                    self.mutation_busy = false;
+                    self.notice = Some("Close could not be queued; try again".into());
                 }
             } else if matches!(key.code, Char('n') | Char('N') | Enter) {
                 self.modal = None;
@@ -7148,6 +7191,90 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(a.mutation_busy);
     }
+    #[test]
+    fn close_captures_target_locks_duplicates_and_refreshes_after_retry() {
+        for focus_detail in [false, true] {
+            let (mut a, rx, tx) = connected_app();
+            a.focus_detail = focus_detail;
+            press(&mut a, KeyCode::Char('c'));
+            assert!(matches!(&a.modal, Some(Modal::ConfirmClose { id, title })
+                if id == "b0" && title == "issue 0"));
+            a.selected = Some(2);
+            press(&mut a, KeyCode::Char('y'));
+            assert!(matches!(rx.try_recv(), Ok(Request::Close(id)) if id == "b0"));
+            press(&mut a, KeyCode::Char('y'));
+            press(&mut a, KeyCode::Esc);
+            assert!(rx.try_recv().is_err());
+            assert!(a.mutation_busy && a.modal.is_some());
+            tx.send(Response::Closed(
+                "b0".into(),
+                Err(std::io::Error::other("blocked")),
+            ))
+            .unwrap();
+            a.receive();
+            assert!(!a.mutation_busy);
+            assert!(a.notice.as_deref().unwrap().contains("blocked"));
+            assert!(a.modal.is_some());
+            press(&mut a, KeyCode::Char('y'));
+            assert!(matches!(rx.try_recv(), Ok(Request::Close(id)) if id == "b0"));
+            tx.send(Response::Closed("b0".into(), Ok(()))).unwrap();
+            a.receive();
+            assert!(!a.mutation_busy && a.modal.is_none());
+            assert!(a.notice.as_deref().unwrap().contains("b0 closed"));
+            assert!(matches!(rx.try_recv(), Ok(Request::List)));
+            tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+            a.receive();
+            take_show(&rx, "b2");
+        }
+    }
+
+    #[test]
+    fn close_cancel_guards_and_queue_failure_preserve_issue() {
+        for cancel in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+        ] {
+            let (mut a, rx, _) = connected_app();
+            press(&mut a, KeyCode::Char('c'));
+            press(&mut a, cancel);
+            assert!(a.modal.is_none());
+            assert!(rx.try_recv().is_err());
+        }
+        let (mut a, rx, _) = connected_app();
+        a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(rx.try_recv().is_err(), "must render before confirming");
+        a.modal_ready = true;
+        drop(rx);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(!a.mutation_busy && a.modal.is_some());
+        assert!(a.notice.as_deref().unwrap().contains("could not be queued"));
+        a.modal = None;
+        a.beads[0].status = "closed".into();
+        press(&mut a, KeyCode::Char('c'));
+        assert!(a.modal.is_none());
+        a.selected = None;
+        press(&mut a, KeyCode::Char('c'));
+        assert!(a.modal.is_none());
+        assert!(a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        a.selected = Some(1);
+        a.ready_pending = true;
+        a.mutation_busy = true;
+        press(&mut a, KeyCode::Char('c'));
+        assert!(a.modal.is_none());
+        a.ready_pending = false;
+        a.mutation_busy = false;
+        a.modal = Some(Modal::Create(CreateForm::default()));
+        press(&mut a, KeyCode::Char('c'));
+        assert!(matches!(&a.modal, Some(Modal::Create(form)) if form.title == "c"));
+        a.modal = None;
+        a.worktrees_view = true;
+        press(&mut a, KeyCode::Char('c'));
+        assert!(!matches!(a.modal, Some(Modal::ConfirmClose { .. })));
+    }
+
     #[test]
     fn unreadable_delete_dialog_cannot_be_confirmed() {
         let mut a = app();

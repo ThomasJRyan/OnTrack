@@ -1008,6 +1008,24 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 ),
                 width.saturating_sub(4) as usize,
             )),
+            crate::app::Modal::ConfirmClose { id, title } => Some(if app.mutation_busy {
+                vec![
+                    format!("Closing bead {id}…"),
+                    "Command running · dialog locked".into(),
+                ]
+            } else {
+                wrap_words(
+                    &format!(
+                        "Close this bead?\nID: {id}\n{}\n\nOnly this issue will be closed.\n\n[y] Close · [n / Enter / Esc] Cancel{}",
+                        truncate_display(title, width.saturating_sub(4) as usize),
+                        app.notice
+                            .as_ref()
+                            .map(|text| format!("\n\n{text}"))
+                            .unwrap_or_default()
+                    ),
+                    width.saturating_sub(4) as usize,
+                )
+            }),
             crate::app::Modal::ConfirmDelete { id, title } => Some(delete_dialog_lines(
                 id,
                 title,
@@ -1065,6 +1083,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             }
             crate::app::Modal::EditLoading { .. } => 8,
             crate::app::Modal::ConfirmGenerateEpic { .. }
+            | crate::app::Modal::ConfirmClose { .. }
             | crate::app::Modal::ConfirmDelete { .. } => confirmation_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
@@ -1123,6 +1142,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     " EDIT BEAD "
                 }
                 crate::app::Modal::ConfirmGenerateEpic { .. } => " GENERATE EPIC TASKS? ",
+                crate::app::Modal::ConfirmClose { .. } => " CLOSE BEAD? ",
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
                 crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
@@ -1768,7 +1788,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     rows[6],
                 );
             }
-            crate::app::Modal::ConfirmGenerateEpic { .. } => {
+            crate::app::Modal::ConfirmClose { .. }
+            | crate::app::Modal::ConfirmGenerateEpic { .. } => {
                 f.render_widget(
                     Paragraph::new(confirmation_lines.unwrap_or_default().join("\n"))
                         .style(Style::default().fg(ink)),
@@ -2103,6 +2124,7 @@ fn footer_text(width: usize, epic: bool) -> String {
         " · s settings",
         " · w worktrees",
         " · Ctrl+? keys",
+        " · c close",
     ] {
         if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
             footer.push_str(hint);
@@ -3356,6 +3378,50 @@ mod tests {
         assert!(resized.contains("FINAL_SENTINEL"));
     }
     #[test]
+    fn close_confirmation_renders_target_errors_and_locks_small_terminals() {
+        let mut a = app();
+        a.modal = Some(crate::app::Modal::ConfirmClose {
+            id: "test-1".into(),
+            title: "Close selected task 界".into(),
+        });
+        for size in [(100, 30), (50, 24)] {
+            let screen = draw(size, &mut a).0;
+            for text in [
+                "CLOSE BEAD?",
+                "ID: test-1",
+                "Close selected task 界",
+                "[y] Close",
+                "Esc] Cancel",
+            ] {
+                assert!(screen.contains(text), "missing {text} at {size:?}");
+            }
+            assert!(a.modal_ready);
+        }
+        a.notice = Some("Close failed: blocked by task".into());
+        assert!(draw((100, 30), &mut a).0.contains("blocked by task"));
+        a.mutation_busy = true;
+        assert!(draw((100, 30), &mut a).0.contains("Closing bead test-1"));
+        a.mutation_busy = false;
+        for size in [(40, 24), (100, 8)] {
+            assert!(draw(size, &mut a).0.contains("Expand terminal"));
+            assert!(!a.modal_ready);
+        }
+        for context in [
+            crate::hotkeys::Context::Issues,
+            crate::hotkeys::Context::Details,
+            crate::hotkeys::Context::EpicIssues,
+            crate::hotkeys::Context::EpicDetails,
+        ] {
+            assert!(
+                context
+                    .entries()
+                    .iter()
+                    .any(|(key, text)| *key == "c" && text.contains("Close selected"))
+            );
+        }
+    }
+
+    #[test]
     fn create_and_delete_modals_render_at_normal_and_tiny_sizes() {
         let mut a = app();
         a.notice = Some("Created previous".into());
@@ -3634,6 +3700,7 @@ mod tests {
             assert!(!footer.contains("←"));
             assert!(!footer.contains("READY"));
         }
+        assert!(footer_text(140, false).contains("c close"));
         assert!(footer_text(120, false).contains("N child"));
         assert!(!footer_text(120, false).contains("u update"));
         assert!(footer_text(120, false).contains("Ctrl+? keys"));

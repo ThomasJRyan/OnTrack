@@ -382,6 +382,17 @@ pub(crate) fn labels(data: &Value) -> impl Iterator<Item = &str> {
         .filter_map(Value::as_str)
 }
 
+/// Close only the selected issue, retaining Beads' normal dependency guards.
+pub fn close_bead(id: &str) -> io::Result<()> {
+    run_bd(&close_args(id)?)?;
+    Ok(())
+}
+
+fn close_args(id: &str) -> io::Result<[&str; 5]> {
+    validate_id(id)?;
+    Ok(["--no-color", "close", "--json", "--", id])
+}
+
 /// Permanently delete only this issue, never cascading to dependent issues.
 pub fn delete_bead(id: &str) -> io::Result<()> {
     run_bd(&delete_args(id)?)?;
@@ -1083,6 +1094,14 @@ mod tests {
     }
 
     #[test]
+    fn close_args_target_only_one_issue_without_force() {
+        assert_eq!(
+            close_args("ontrack-70t").unwrap(),
+            ["--no-color", "close", "--json", "--", "ontrack-70t"]
+        );
+    }
+
+    #[test]
     fn delete_args_force_only_selected_issue_without_cascade() {
         assert_eq!(
             delete_args("ontrack-70t").unwrap(),
@@ -1106,6 +1125,11 @@ mod tests {
             "", " ", "--force", "-a", "a b", "a\nb", "a\tb", "a\0b", "a\u{7f}b", "a\u{a0}b",
         ] {
             assert_eq!(
+                close_bead(id).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "id: {id:?}"
+            );
+            assert_eq!(
                 delete_bead(id).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput,
                 "id: {id:?}"
@@ -1126,7 +1150,12 @@ mod tests {
         let owned_args = create_args(&create_input()).unwrap();
         let create_args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         let delete_args = delete_args("ontrack-70t").unwrap();
-        for args in [create_args.as_slice(), delete_args.as_slice()] {
+        let close_args = close_args("ontrack-70t").unwrap();
+        for args in [
+            create_args.as_slice(),
+            delete_args.as_slice(),
+            close_args.as_slice(),
+        ] {
             let error = run_bd_with(args, |actual| {
                 assert_eq!(actual, args);
                 Ok(Output {

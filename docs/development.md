@@ -1,6 +1,6 @@
 # Development guide
 
-ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only. Create, edit, delete, and Ready toggles are user actions; the scheduler automatically hands off eligible Ready issues through the existing tracked Herdr path. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
+ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only. Create, edit, close, delete, and Ready toggles are user actions; the scheduler automatically hands off eligible Ready issues through the existing tracked Herdr path. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
 Tagged builds and release asset naming are documented in the [release guide](releases.md); installer behavior and offline checks are in the [installation guide](installation.md#release-asset-contract-for-maintainers). The workflow uses `scripts/release_asset.py` for tag validation, archive creation, and checksum verification; keep its target list aligned with the native runner matrix in `.github/workflows/release.yml`.
 
@@ -98,10 +98,14 @@ bd --no-color create --title=TITLE --description=DESCRIPTION --type=task --prior
 bd --no-color update --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json -- ISSUE_ID
 bd --no-color update --add-label ontrack:ready --if-status open --status open -- ISSUE_ID
 bd --no-color update --remove-label ontrack:ready -- ISSUE_ID
+bd --no-color close --json -- ISSUE_ID
 bd --no-color delete --force --json -- ISSUE_ID
 ```
 
-Create returns a JSON object containing the created ID; update and delete are successful on a successful command exit. Mutations are not passed `--readonly`; update sends the form fields and changes the harness label only when its choice changes, and delete uses `--force` for the selected issue only and never requests cascading deletion. The worker processes queued requests sequentially, preserving mutation order. Edit opening fetches the current `bd show` record on that worker, validates the editable type and priority, and ignores stale load responses using a request sequence. A failed update leaves the draft open; success triggers an immediate refresh and reselects the same ID.
+Create returns a JSON object containing the created ID; update, close, and delete are successful on a successful command exit. Mutations are not passed `--readonly`; update sends the form fields and changes the harness label only when its choice changes, and delete uses `--force` for the selected issue only and never requests cascading deletion. The worker processes queued requests sequentially, preserving mutation order. Edit opening fetches the current `bd show` record on that worker, validates the editable type and priority, and ignores stale load responses using a request sequence. A failed update leaves the draft open; success triggers an immediate refresh and reselects the same ID.
+
+The issue-browser `c` shortcut captures the selected non-closed ID and title in `ConfirmClose`, available from both panes. Confirmation queues `Request::Close` on the browser worker and locks input until `Response::Closed` arrives. Success dismisses the modal and refreshes list/details; failure retains the captured target and exposes the error for retry. The command validates the ID and passes it after `--`, without force or cascade flags. Group headers and closed issues do nothing; form input, Ctrl+C, and worktree controls retain their existing behavior. Confirmation requires a rendered dialog with enough terminal space.
+
 
 Issue-list rendering uses `app::issue_path` to determine visible ancestry within each status group. Both metadata and title lines share a two-column offset per level, relative to the common row gutter. The offset is capped to leave at least four interior columns when available, and the render width shrinks with the offset to preserve the group border. Split or missing parents start a visible root and retain the parent ID cue. Rendered-buffer tests verify exact metadata and title columns over four generations, unrelated roots, and split/missing parents.
 
