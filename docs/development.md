@@ -1,6 +1,6 @@
 # Development guide
 
-ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browse operations are read-only. Create, edit, close, delete, and Ready toggles are user actions; the scheduler automatically hands off eligible Ready issues through the existing tracked Herdr path. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
+ontrack is a single Rust 2024 binary requiring Rust 1.88 or newer. Runtime workspace integration uses the public Beads CLI; no direct database integration is needed. Browser refresh automatically clears closed parent links from unfinished children. Create, edit, close, delete, and Ready toggles are user actions; the scheduler automatically hands off eligible Ready issues through the existing tracked Herdr path. Consult the [official Beads documentation](https://beads.gascity.com) for CLI and workspace behavior and the [user guide](user-guide.md) for running the browser.
 
 Tagged builds and release asset naming are documented in the [release guide](releases.md); installer behavior and offline checks are in the [installation guide](installation.md#release-asset-contract-for-maintainers). The workflow uses `scripts/release_asset.py` for tag validation, archive creation, and checksum verification; keep its target list aligned with the native runner matrix in `.github/workflows/release.yml`.
 
@@ -98,6 +98,7 @@ bd --no-color create --title=TITLE --description=DESCRIPTION --type=task --prior
 bd --no-color update --title=TITLE --description=DESCRIPTION --type=task --priority=2 --json -- ISSUE_ID
 bd --no-color update --add-label ontrack:ready --if-status open --status open -- ISSUE_ID
 bd --no-color update --remove-label ontrack:ready -- ISSUE_ID
+bd --no-color update --parent= --if-status STATUS --json -- CHILD_ID
 bd --no-color close --json -- ISSUE_ID
 bd --no-color delete --force --json -- ISSUE_ID
 ```
@@ -213,7 +214,9 @@ The separate agent-observation response may relabel only an `InProgress` managed
 
 Ready mutations (`SetReady` and `SetTreeReady`) use their own serial worker lane so bulk label updates never hold up list/detail requests. `mutation_busy` still excludes conflicting actions and pauses scheduling; `ready_pending` permits browser navigation, help, worktree browsing, and quit through that exclusion. Pending feedback is a header notice. Completion clears both flags, applies only confirmed IDs, and invalidates list/detail snapshots on success or error. Existing refresh sequencing schedules a trailing read when an older snapshot is already in flight. Queue failure clears both flags immediately. Workers remain detached on exit; quitting does not cancel a Beads update already running.
 
-Automatic refresh uses the same public read-only list/show commands above. Schedule the next poll roughly one second after the previous refresh completes, including reloading the selected detail; do not accumulate timer-driven requests while refresh work is in flight. This is polling, not an event stream: slow CLI calls extend refresh latency. No watcher, extra dependency, configuration, or optional Beads events setup is required. Successful create/edit/delete operations still request an immediate refresh. In the worktrees view, `r` separately refreshes tracked worktrees.
+Automatic refresh uses the public list/show commands above and repairs unfinished children of closed parents. `list_browser_beads` selects candidates from the uncapped list, revalidates each child's status and direct parent with `bd show`, confirms the parent is still closed, and runs `bd --no-color update --parent= --if-status STATUS --json -- CHILD_ID`. Closed children, roots, and children of active or missing parents are preserved. After any repair it reloads the list before reading readiness and blockers; any read or write failure rejects the snapshot and follows normal refresh error/retry handling. `list_beads` remains read-only for other callers. Beads offers no atomic parent/revision guard: concurrent reparenting or parent reopening between revalidation and update remains possible. Recorded worktree ancestry and targets are untouched. Adapter tests inject CLI responses to verify command order, safe arguments, preservation, stale snapshots, and retries.
+
+Schedule the next poll roughly one second after the previous refresh completes, including reloading the selected detail; do not accumulate timer-driven requests while refresh work is in flight. This is polling, not an event stream: slow CLI calls extend refresh latency. No watcher, extra dependency, configuration, or optional Beads events setup is required. Successful create/edit/delete operations still request an immediate refresh. In the worktrees view, `r` separately refreshes tracked worktrees.
 
 Each serial queue retains request order without dropping mutations. Launches and managed reconciliation also perform authoritative read-only `bd show` calls outside the browser queue; not all `bd` calls are serialized. Responses for a show ID other than the current selection are ignored. Independent jobs may complete out of order and are correlated by their sequence/Bead identity.
 
