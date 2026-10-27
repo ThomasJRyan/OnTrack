@@ -2042,7 +2042,11 @@ impl App {
                 self.focus_detail = !self.focus_detail && self.selected.is_some();
                 self.drawer_opened_at = self.focus_detail.then(Instant::now);
             }
-            KeyCode::Enter if !self.focus_detail && self.selected.is_some() => {
+            KeyCode::Enter if self.focus_detail => {
+                self.focus_detail = false;
+                self.drawer_opened_at = None;
+            }
+            KeyCode::Enter if self.selected.is_some() => {
                 self.focus_detail = true;
                 self.drawer_opened_at = Some(Instant::now());
             }
@@ -3713,6 +3717,11 @@ mod tests {
         ];
         press(&mut a, KeyCode::Enter);
         assert!(a.focus_detail && !a.worktrees_view);
+        let selected = a.selected;
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.focus_detail && a.selected == selected);
+        press(&mut a, KeyCode::Enter);
+        assert!(a.focus_detail && a.selected == selected);
         a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
         press(&mut a, KeyCode::Char('m'));
         press(&mut a, KeyCode::Down);
@@ -3733,6 +3742,13 @@ mod tests {
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Esc);
         assert!(!a.focus_detail);
+        a.beads[0].data["issue_type"] = json!("epic");
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.focus_detail && a.selected == Some(0));
+        press(&mut a, KeyCode::Char('w'));
+        press(&mut a, KeyCode::Enter);
+        assert!(a.worktrees_view && !a.focus_detail);
     }
 
     #[test]
@@ -6376,6 +6392,13 @@ mod tests {
         press(&mut a, KeyCode::Enter);
         assert!(a.focus_detail);
         assert!(a.drawer_opened_at.is_some());
+        let enter_start = a.drawer_opened_at.unwrap();
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.focus_detail);
+        assert!(a.drawer_opened_at.is_none());
+        press(&mut a, KeyCode::Enter);
+        assert!(a.focus_detail);
+        assert!(a.drawer_opened_at.unwrap() >= enter_start);
         press(&mut a, KeyCode::Char('w'));
         assert!(a.worktrees_view);
         assert!(!a.focus_detail);

@@ -34,7 +34,7 @@ A brief splash precedes the browser. A terminal-drawn anime girl blinks and wave
 
 Once the browser opens in your Herdr project workspace:
 
-1. Use `←` / `→` to choose a column and `↑` / `↓` to select a Bead. Press `Enter` to open its detail drawer; arrows and Page keys scroll the description, comments, and relationships. `Esc` restores your board selection.
+1. Use `←` / `→` to choose a column and `↑` / `↓` to select a Bead. Press `Enter` to open its detail drawer; press `Enter` again, `Tab`, or `Esc` to return to the same board selection. Arrows and Page keys scroll the description, comments, and relationships.
 2. Press `n` to create a task, or `e` to refine the selected Bead. Give the agent a clear description and choose its harness. Use `Shift+N` on an open task to split off a child task.
 3. Move the task to Ready with `Shift+←` / `Shift+→` or choose Ready with `m`. Run the scheduler from the main checkout; it waits for eligible work, an available agent slot, and a usable harness. For an immediate manual handoff, press `h`.
 4. Press `w` to open the worktree drawer. `Enter` focuses its Herdr workspace; within this drawer, `m` requests a merge. The agent commits and checks work before signalling Ready To Merge. OnTrack closes the Bead after verified integration, independently of automatic merge/cleanup preferences. Use drawer actions `c` or `x` only to close the integrated workspace or remove its checkout. `Esc` returns to your board selection.
@@ -45,6 +45,8 @@ Press `Ctrl+?` whenever you need the controls for the current view. See the sche
 
 All bordered panes and dialogs, including tracked handoffs, forms, and hotkey help, use rounded corners.
 
+Rounded card outlines use issue type colours: bugs are red and features are blue. The selected card keeps its highlighted fill and type-coloured outline, so selection remains clear without hiding the type.
+
 When a dialog is open, the board and any open drawer darken behind it so the
 dialog stands out in both Dark and Light themes. Closing the dialog restores the
 normal view; standalone help and handoff toasts do not dim the screen.
@@ -52,6 +54,8 @@ normal view; standalone help and handoff toasts do not dim the screen.
 The selected task card keeps a visible rounded outline against its highlighted fill in every bundled theme.
 
 The full board has six fixed vertical columns, in this order: **Open, Ready, Blocked, In Progress, Ready To Merge, Closed**. Every column shows a count, including zero, and none collapses. There is no Deferred column. Legacy `deferred` and custom statuses remain visible under Open without rewriting existing Beads; the detail drawer retains the raw Beads status. Narrow terminals scroll horizontally to keep columns legible instead of squeezing all six into unreadable widths. Each column scrolls vertically to keep its selection visible. Cards remain fully inside the rounded column border; terminals too short for a complete card show a resize hint instead.
+
+The rounded bottom edge of each column stays status-colored in both empty and populated columns. Cards and compact-height guidance remain inside that outline as the terminal is resized.
 
 Use `↑` / `↓` or the mouse wheel to move one card at a time within the focused column, without wrapping at the first or last card. Crossing a viewport edge scrolls only enough to keep the selected card visible, rather than jumping to the top. Each column retains its own scroll position when you switch columns with `←` / `→`, including empty ones. An empty column has no selected Bead for issue actions. `Shift+←` / `Shift+→` moves only the selected Bead to the adjacent column; `m` opens a destination chooser. Moving a parent this way never cascades to children. Moving to Ready allows the existing scheduler to start eligible work; other moves do not start, stop, or restart agents. A confirmed `· sent` handoff marker does not prevent manual backward board moves and still prevents duplicate handoffs through the tracked registry.
 
@@ -90,7 +94,7 @@ An Open or Ready issue shows `· sent` beside its status after Herdr confirms th
 | `←` / `→` on the board | Switch columns, including empty ones; scroll horizontally when needed. |
 | `Shift+←` / `Shift+→` on the board | Move the selected Bead to an adjacent column without moving its children. Closed requires verified integration. |
 | `m` on the board | Choose a destination column for the selected Bead. |
-| `Enter` on the board | Open the selected Bead in the right-side detail drawer. |
+| `Enter` | Open or close the selected Bead's right-side detail drawer. |
 | `Tab` | Open or close the selected Bead's detail drawer. |
 | Arrow keys / `PageUp` / `PageDown` in Bead details | Scroll drawer content. |
 | `r` / `Shift+R` on the board or in Bead details | Toggle Ready for an open issue and its open descendants, subject to handoff guards. |

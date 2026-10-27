@@ -376,7 +376,7 @@ pub fn issue_type_color(theme: Theme, kind: &str) -> Color {
     match kind.to_ascii_lowercase().as_str() {
         "task" => p.success,
         "bug" => p.danger,
-        "feature" | "story" => p.info,
+        "feature" | "story" => status_color(theme, "ready"),
         "epic" | "decision" => p.accent_alt,
         "chore" | "unknown" => p.muted,
         "spike" => p.warning,
@@ -549,6 +549,29 @@ mod tests {
                 entry.id
             );
             assert_ne!(ready, status_color(entry.theme, "open"));
+        }
+    }
+
+    #[test]
+    fn issue_type_colors_keep_bug_red_feature_blue_and_safe_fallbacks() {
+        for entry in CATALOG {
+            assert_eq!(issue_type_color(entry.theme, "bug"), entry.palette.danger);
+            assert_eq!(
+                issue_type_color(entry.theme, "feature"),
+                status_color(entry.theme, "ready")
+            );
+            assert_eq!(
+                issue_type_color(entry.theme, "missing"),
+                entry.palette.muted
+            );
+            let Color::Rgb(red, green, blue) = issue_type_color(entry.theme, "feature") else {
+                panic!("feature must have an RGB color")
+            };
+            assert!(
+                blue > green && green > red,
+                "{} feature is not blue",
+                entry.id
+            );
         }
     }
 
