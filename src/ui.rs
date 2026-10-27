@@ -334,11 +334,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     };
     render_header_feedback(f, v[0], feedback.as_deref(), app.theme);
     render_kanban(f, v[1], app);
-    if app.focus_detail {
-        render_detail_drawer(f, a, app, Instant::now());
-    } else if app.worktrees_view {
-        render_worktree_drawer(f, a, app, Instant::now());
-    }
+    render_drawer(f, a, app, Instant::now());
     f.render_widget(
         Paragraph::new(footer_text(v[2].width as usize))
             .style(Style::default().fg(muted).bg(palette.panel_alt)),
@@ -720,7 +716,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "Remove checkout + close Herdr workspace",
                         draft.auto_remove_checkout,
                     ),
-                    ("Animate drawer opening", draft.animate_drawers),
+                    ("Animate drawers", draft.animate_drawers),
                 ]
                 .into_iter()
                 .enumerate()
@@ -1420,9 +1416,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                     .bg(palette.selected_background)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
-                    .fg(palette.foreground)
-                    .bg(palette.panel_alt)
+                Style::default().fg(palette.foreground).bg(palette.panel)
             };
             let kind = row_issue_type(bead);
             let title_width = card.width.saturating_sub(2) as usize;
@@ -1475,7 +1469,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                                 Style::default()
                                     .fg(crate::theme::issue_type_color(app.theme, &kind)),
                             )
-                            .style(Style::default().bg(palette.panel_alt)),
+                            .style(Style::default().bg(palette.panel)),
                     )
                     .style(style),
                 card,
@@ -1484,24 +1478,30 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-fn drawer_width(screen_width: u16, started: Option<Instant>, enabled: bool, now: Instant) -> u16 {
+fn render_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
+    let closing = app.drawer_animation.as_ref().filter(|animation| {
+        app.settings.animate_drawers && animation.to == 0.0 && animation.fraction(now) > 0.0
+    });
+    if app.focus_detail || closing.is_some_and(|animation| !animation.worktrees) {
+        render_detail_drawer(f, screen, app, now);
+    } else if app.worktrees_view || closing.is_some_and(|animation| animation.worktrees) {
+        render_worktree_drawer(f, screen, app, now);
+    }
+}
+
+fn drawer_width(screen_width: u16, app: &App, now: Instant) -> u16 {
     let target = screen_width.min((screen_width * 2 / 5).max(36));
-    let Some(started) = started.filter(|_| enabled) else {
-        return target;
-    };
-    let progress = (now.saturating_duration_since(started).as_secs_f32() / 0.22).clamp(0.0, 1.0);
-    let eased = 1.0 - (1.0 - progress).powi(3);
-    (f32::from(target) * eased).round() as u16
+    let fraction = app
+        .drawer_animation
+        .as_ref()
+        .filter(|_| app.settings.animate_drawers)
+        .map_or(1.0, |animation| animation.fraction(now));
+    (f32::from(target) * fraction).round() as u16
 }
 
 fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
     let palette = crate::theme::definition(app.theme).palette;
-    let width = drawer_width(
-        screen.width,
-        app.drawer_opened_at,
-        app.settings.animate_drawers,
-        now,
-    );
+    let width = drawer_width(screen.width, app, now);
     let area = Rect::new(
         screen.x + screen.width.saturating_sub(width),
         screen.y + 2,
@@ -1600,12 +1600,7 @@ fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant
 
 fn render_worktree_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
     let palette = crate::theme::definition(app.theme).palette;
-    let width = drawer_width(
-        screen.width,
-        app.drawer_opened_at,
-        app.settings.animate_drawers,
-        now,
-    );
+    let width = drawer_width(screen.width, app, now);
     let area = Rect::new(
         screen.x + screen.width.saturating_sub(width),
         screen.y + 2,
@@ -2016,7 +2011,7 @@ fn render_help(f: &mut Frame, app: &mut App) {
     let footer = if area.width < 45 {
         "Esc close · ↑↓ scroll"
     } else {
-        "Esc / Ctrl+? close · ↑↓ / PgUp PgDn scroll"
+        "Esc / Shift+? close · ↑↓ / PgUp PgDn scroll"
     };
     f.render_widget(
         Paragraph::new(truncate_display(
@@ -2375,7 +2370,7 @@ mod tests {
             detail: None,
             focus_detail: false,
             detail_offset: 0,
-            drawer_opened_at: None,
+            drawer_animation: None,
             list_loading: false,
             detail_loading: false,
             list_error: None,
@@ -2459,11 +2454,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let screen = frame.area();
-                if app.focus_detail {
-                    render_detail_drawer(frame, screen, app, now);
-                } else {
-                    render_worktree_drawer(frame, screen, app, now);
-                }
+                render_drawer(frame, screen, app, now);
             })
             .unwrap();
         terminal
@@ -2658,6 +2649,7 @@ mod tests {
         });
         let (wide, _) = draw((80, 15), &mut a);
         assert!(wide.contains("HOTKEYS · Create / edit form"));
+        assert!(wide.contains("Esc / Shift+? close"));
         assert!(wide.contains("Text / Space"));
         assert!(wide.contains("Type in title or description"));
         a.help.as_mut().unwrap().offset = usize::MAX;
@@ -2837,7 +2829,7 @@ mod tests {
                 let cell = &buffer[(x, y)];
                 assert_eq!(cell.symbol(), glyph);
                 assert_eq!(cell.fg, crate::theme::issue_type_color(theme, "task"));
-                assert_eq!(cell.bg, palette.panel_alt);
+                assert_eq!(cell.bg, palette.panel);
                 assert_ne!(cell.fg, cell.bg);
             }
             let unselected_card = a
@@ -2911,7 +2903,7 @@ mod tests {
                 let cell = &terminal.backend().buffer()[(card.x, card.y)];
                 assert_eq!(cell.symbol(), "╭");
                 assert_eq!(cell.fg, crate::theme::issue_type_color(theme, expected));
-                assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel_alt);
+                assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel);
             }
         }
     }
@@ -4469,7 +4461,7 @@ mod tests {
                     total_cards += cards;
                 }
                 assert_eq!(total_cards, a.board_cards.len());
-                for (_, card) in &a.board_cards {
+                for (index, card) in &a.board_cards {
                     let column = a
                         .board_columns
                         .iter()
@@ -4482,6 +4474,26 @@ mod tests {
                         card.bottom() < column.bottom(),
                         "card overlaps bottom border at {size:?}"
                     );
+                    let palette = crate::theme::definition(theme).palette;
+                    for y in card.y..card.bottom() {
+                        for x in card.x..card.right() {
+                            let selected_interior = a.selected == Some(*index)
+                                && x > card.x
+                                && x + 1 < card.right()
+                                && y > card.y
+                                && y + 1 < card.bottom();
+                            let expected = if selected_interior {
+                                palette.selected_background
+                            } else {
+                                buffer[(column.x, column.y + 1)].bg
+                            };
+                            assert_eq!(
+                                buffer[(x, y)].bg,
+                                expected,
+                                "{theme:?} {size:?} card {index} at ({x}, {y})"
+                            );
+                        }
+                    }
                 }
                 a.beads.clear();
                 terminal
@@ -4881,15 +4893,60 @@ mod tests {
     }
 
     #[test]
-    fn drawer_width_eases_from_right_to_final_width_and_can_be_disabled() {
+    fn drawer_width_eases_in_both_directions_and_can_be_disabled() {
         let start = Instant::now();
-        assert_eq!(drawer_width(100, Some(start), true, start), 0);
-        assert!(drawer_width(100, Some(start), true, start + Duration::from_millis(110)) > 0);
-        assert_eq!(
-            drawer_width(100, Some(start), true, start + Duration::from_millis(220)),
-            40
-        );
-        assert_eq!(drawer_width(100, Some(start), false, start), 40);
+        let mut a = app();
+        for (from, to) in [(0.0, 1.0), (1.0, 0.0)] {
+            a.drawer_animation = Some(crate::app::DrawerAnimation {
+                worktrees: false,
+                started: start,
+                from,
+                to,
+            });
+            assert_eq!(drawer_width(100, &a, start), (40.0 * from) as u16);
+            let middle = drawer_width(100, &a, start + Duration::from_millis(110));
+            assert!(middle > 0 && middle < 40);
+            assert_eq!(
+                drawer_width(100, &a, start + Duration::from_millis(220)),
+                (40.0 * to) as u16
+            );
+        }
+        a.settings.animate_drawers = false;
+        assert_eq!(drawer_width(100, &a, start), 40);
+    }
+
+    #[test]
+    fn both_drawers_remain_visible_while_closing_then_disappear() {
+        for worktrees in [false, true] {
+            let mut a = app();
+            let start = Instant::now();
+            a.drawer_animation = Some(crate::app::DrawerAnimation {
+                worktrees,
+                started: start,
+                from: 1.0,
+                to: 0.0,
+            });
+            let title = if worktrees {
+                "WORKTREES"
+            } else {
+                "BEAD DETAILS"
+            };
+            assert!(draw_drawer((100, 30), &mut a, start).contains(title));
+            assert_eq!(a.detail_rect.width, if worktrees { 38 } else { 40 });
+            let middle = start + Duration::from_millis(40);
+            assert!(draw_drawer((100, 30), &mut a, middle).contains(title));
+            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 40);
+            for size in [(60, 18), (20, 8), (100, 30)] {
+                draw_drawer(size, &mut a, middle);
+                assert!(a.detail_rect.width > 0 && a.detail_rect.width <= size.0);
+                assert!(a.detail_rect.right() <= size.0);
+            }
+            let complete = start + Duration::from_millis(220);
+            assert_eq!(drawer_width(100, &a, complete), 0);
+            assert!(!draw_drawer((100, 30), &mut a, complete).contains(title));
+            a.settings.animate_drawers = false;
+            assert!(!draw_drawer((100, 30), &mut a, start).contains(title));
+        }
     }
 
     #[test]
@@ -4900,7 +4957,12 @@ mod tests {
             a.worktrees_view = worktrees;
             a.detail_offset = 7;
             let start = Instant::now();
-            a.drawer_opened_at = Some(start);
+            a.drawer_animation = Some(crate::app::DrawerAnimation {
+                worktrees,
+                started: start,
+                from: 0.0,
+                to: 1.0,
+            });
 
             let initial_text = draw_drawer((100, 30), &mut a, start);
             let initial = a.detail_rect;
@@ -4915,7 +4977,12 @@ mod tests {
             }));
 
             let halfway = start + Duration::from_millis(110);
-            a.drawer_opened_at = Some(start);
+            a.drawer_animation = Some(crate::app::DrawerAnimation {
+                worktrees,
+                started: start,
+                from: 0.0,
+                to: 1.0,
+            });
             let middle_text = draw_drawer((60, 18), &mut a, halfway);
             assert!(a.detail_rect.width > 0 && a.detail_rect.width < 36);
             assert!(a.detail_rect.x + a.detail_rect.width <= 60);
