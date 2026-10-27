@@ -1268,6 +1268,22 @@ fn column_heading_parts(
 fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
     let statuses = crate::app::BOARD_STATUSES;
     let palette = crate::theme::definition(app.theme).palette;
+    let previous_card_capacity = std::array::from_fn::<_, 6, _>(|column| {
+        app.board_cards
+            .iter()
+            .filter(|(index, _)| {
+                app.beads.get(*index).is_some_and(|bead| {
+                    statuses
+                        .iter()
+                        .position(|status| *status == crate::app::display_status(bead))
+                        == Some(column)
+                })
+            })
+            .count()
+    });
+    let previously_visible_selection = app
+        .selected
+        .is_some_and(|selected| app.board_cards.iter().any(|(index, _)| *index == selected));
     let visible = (area.width / 18).clamp(1, 6) as usize;
     if app.focused_column < app.board_column_offset {
         app.board_column_offset = app.focused_column;
@@ -1297,15 +1313,28 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
         let card_height = 5usize;
         let can_show_cards = rect.height.saturating_sub(3) >= card_height as u16;
         let visible_cards = if can_show_cards {
-            (rect.height.saturating_sub(2) as usize / card_height).max(1)
+            (rect.height.saturating_sub(3) as usize / card_height).max(1)
         } else {
             0
         };
-        let offset = if can_show_cards {
+        let mut offset = if can_show_cards {
             app.column_offsets[column].min(indices.len().saturating_sub(visible_cards))
         } else {
             0
         };
+        if can_show_cards
+            && previously_visible_selection
+            && previous_card_capacity[column] > visible_cards
+            && let Some(row) = app
+                .selected
+                .and_then(|selected| indices.iter().position(|&index| index == selected))
+        {
+            if row < offset {
+                offset = row;
+            } else if row >= offset + visible_cards {
+                offset = row + 1 - visible_cards;
+            }
+        }
         app.column_offsets[column] = offset;
         let border = crate::theme::status_color(app.theme, status);
         f.render_widget(
@@ -1365,7 +1394,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
             rect.x + 1,
             rect.y + 2,
             rect.width.saturating_sub(2),
-            rect.height.saturating_sub(2),
+            rect.height.saturating_sub(3),
         );
         if indices.is_empty() {
             f.render_widget(
@@ -1383,6 +1412,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                 .style(Style::default().fg(palette.muted)),
                 inner,
             );
+            x += col_width;
             continue;
         }
         for (n, &index) in indices.iter().enumerate().skip(offset).take(visible_cards) {
@@ -4143,6 +4173,111 @@ mod tests {
                     .any(|(_, column)| { rect.x >= column.x && rect.right() <= column.right() })
             );
         }
+    }
+
+    #[test]
+    fn board_cards_and_hit_rectangles_stay_inside_bottom_column_border() {
+        for height in 8..=24 {
+            let mut a = overflowing_board();
+            let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+            terminal
+                .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+                .unwrap();
+            for (_, card) in &a.board_cards {
+                let column = a
+                    .board_columns
+                    .iter()
+                    .find(|(_, column)| card.x > column.x && card.right() < column.right())
+                    .unwrap()
+                    .1;
+                assert!(
+                    card.y > column.y && card.bottom() < column.bottom(),
+                    "height {height}: {card:?} in {column:?}"
+                );
+            }
+            let buffer = terminal.backend().buffer();
+            for (_, column) in &a.board_columns {
+                assert_eq!(buffer[(column.x, column.bottom() - 1)].symbol(), "╰");
+                assert_eq!(
+                    buffer[(column.right() - 1, column.bottom() - 1)].symbol(),
+                    "╯"
+                );
+                for x in column.x + 1..column.right() - 1 {
+                    assert_eq!(buffer[(x, column.bottom() - 1)].symbol(), "─");
+                }
+            }
+        }
+
+        let mut a = overflowing_board();
+        let mut terminal = Terminal::new(TestBackend::new(72, 7)).unwrap();
+        terminal
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        assert!(a.board_cards.is_empty());
+        for pair in a.board_columns.windows(2) {
+            assert_eq!(pair[0].1.right(), pair[1].1.x);
+        }
+        let buffer = terminal.backend().buffer();
+        for (_, column) in &a.board_columns {
+            assert_eq!(buffer[(column.x, column.y)].symbol(), "╭");
+        }
+    }
+
+    #[test]
+    fn resizing_keeps_selected_card_visible_across_board_boundaries() {
+        use crossterm::event::KeyCode;
+
+        let mut a = overflowing_board();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        for _ in 0..3 {
+            board_key(&mut a, KeyCode::Down);
+            terminal
+                .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+                .unwrap();
+        }
+        assert_eq!(a.selected, Some(3));
+        let mut small = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        small
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        assert!(
+            a.board_cards
+                .iter()
+                .any(|(index, _)| Some(*index) == a.selected)
+        );
+        assert_eq!(a.column_offsets[0], 3);
+        board_event(&mut a, board_navigation_events()[0].0.clone());
+        small
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        assert_eq!(a.selected, Some(4));
+        assert!(
+            a.board_cards
+                .iter()
+                .any(|(index, _)| Some(*index) == a.selected)
+        );
+        let mut large = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        large
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        assert!(
+            a.board_cards
+                .iter()
+                .any(|(index, _)| Some(*index) == a.selected)
+        );
+        board_event(&mut a, board_navigation_events()[1].0.clone());
+        small
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        assert_eq!(a.selected, Some(5));
+        assert!(
+            a.board_cards
+                .iter()
+                .any(|(index, _)| Some(*index) == a.selected)
+        );
     }
 
     #[test]
