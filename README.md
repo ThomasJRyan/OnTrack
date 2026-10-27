@@ -19,6 +19,11 @@ The board refreshes automatically, scrolls horizontally on narrow terminals, and
 
 ## Get started
 
+OnTrack requires both commands on your `PATH`:
+
+- **Beads (`bd`)** for issue tracking — [install Beads](https://beads.gascity.com/getting-started/installation).
+- **Herdr (`herdr`)** for the shell and agent workspaces — [install Herdr](https://herdr.dev/docs/install/).
+
 For macOS or Ubuntu 24.04-compatible Linux, with Bash, `curl`, and Python 3:
 
 ```sh
@@ -45,7 +50,7 @@ See [installation and updates](docs/installation.md) for supported architectures
 | `n` / `Shift+N`, `e` | Create a Bead / child task, or edit the selection |
 | `h` | Hand the selected Bead to a Herdr agent |
 | `w` | Open worktree drawer; `Enter` focuses the selected Herdr workspace |
-| `s`, `Ctrl+?` | Open settings or context-specific hotkey help |
+| `s`, `Shift+?` | Open settings or context-specific hotkey help |
 | `Esc`, `q` / `Ctrl+C` | Go back; quit when no dialog is open |
 
 All six columns retain empty counts. Moving to Ready schedules eligible agents; other moves do not start or stop them, and individual moves never cascade to children. Closed moves and `c` require fresh tracked integration proof; `d` permanently deletes after confirmation. See the [user guide](docs/user-guide.md), [settings](docs/settings.md), [development guide](docs/development.md), [CI checks](docs/ci.md), and [release guide](docs/releases.md).
