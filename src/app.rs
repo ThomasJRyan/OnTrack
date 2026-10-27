@@ -1937,6 +1937,7 @@ impl App {
                 KeyCode::Char('m') => self.confirm_worktree_action(0),
                 KeyCode::Char('c') => self.confirm_worktree_action(1),
                 KeyCode::Char('x') => self.confirm_worktree_action(2),
+                KeyCode::Char('X') => self.confirm_worktree_action(5),
                 KeyCode::Char('R') => self.confirm_worktree_action(3),
                 KeyCode::Char('a') => self.confirm_worktree_action(4),
                 _ => {}
@@ -2174,14 +2175,15 @@ impl App {
             self.worktrees_error = Some("This worktree is not ready for a merge request".into());
             return;
         }
-        if action == 3
+        if matches!(action, 3 | 5)
             && matches!(
                 item.status,
                 worktrees::WorktreeStatus::CheckoutRemoved
                     | worktrees::WorktreeStatus::WorkspaceClosed
             )
         {
-            self.worktrees_error = Some("Select an active checkout to restart".into());
+            self.worktrees_error =
+                Some("Select an active checkout to restart or force remove".into());
             return;
         }
         if action == 4
@@ -2399,6 +2401,7 @@ impl App {
                     1 => Request::WorktreeAction(id, WorktreeAction::CloseWorkspace),
                     2 => Request::WorktreeAction(id, WorktreeAction::RemoveCheckout),
                     3 => Request::RestartWorktree(id),
+                    5 => Request::WorktreeAction(id, WorktreeAction::ForceRemoveCheckout),
                     _ => Request::ContinueWorktree(id),
                 };
                 self.mutation_busy = true;
@@ -7639,6 +7642,39 @@ mod tests {
         press(&mut app, KeyCode::Char('R'));
         press(&mut app, KeyCode::Char('y'));
         assert!(matches!(requests.try_recv(), Ok(Request::RestartWorktree(id)) if id == "wt-1"));
+        assert!(app.mutation_busy);
+    }
+    #[test]
+    fn force_remove_requires_explicit_confirmation_and_captures_selected_handoff() {
+        let (mut app, requests, _) = connected_app();
+        app.worktrees_view = true;
+        app.worktrees.push(ManagedWorktree {
+            id: "wt-1".into(),
+            bead_id: "b1".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: Some("Task".into()),
+            bead_description: None,
+            branch: "ontrack/b1".into(),
+            target_branch: "main".into(),
+            workspace_id: "ws1".into(),
+            status: worktrees::WorktreeStatus::NeedsAttention,
+            detail: None,
+        });
+        press(&mut app, KeyCode::Char('X'));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConfirmWorktree { action: 5, .. })
+        ));
+        assert!(requests.try_recv().is_err());
+        press(&mut app, KeyCode::Esc);
+        assert!(requests.try_recv().is_err());
+        press(&mut app, KeyCode::Char('X'));
+        app.worktrees[0].id = "changed-selection".into();
+        press(&mut app, KeyCode::Char('y'));
+        assert!(
+            matches!(requests.try_recv(), Ok(Request::WorktreeAction(id, WorktreeAction::ForceRemoveCheckout)) if id == "wt-1")
+        );
         assert!(app.mutation_busy);
     }
     #[test]

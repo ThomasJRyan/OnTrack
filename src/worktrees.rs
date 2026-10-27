@@ -177,6 +177,7 @@ pub enum Action {
     RequestMerge,
     CloseWorkspace,
     RemoveCheckout,
+    ForceRemoveCheckout,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1088,7 +1089,7 @@ fn inspect(repo: &RepositoryIdentity, entry: &Value) -> ManagedWorktree {
         );
     }
     if entry["checkout_removed"] == true {
-        if entry["checkout_removed_externally"] == true {
+        if entry["checkout_removed_externally"] == true || entry["force_removed"] == true {
             return match checkout_missing(entry) {
                 Ok(true) => view(entry, CheckoutRemoved, None),
                 Ok(false) => view(
@@ -2297,6 +2298,54 @@ fn close_integrated(
     registry.save()
 }
 
+fn force_remove(
+    registry: &mut Registry,
+    index: usize,
+    executor: &mut impl Executor,
+) -> io::Result<()> {
+    let entry = &registry.entries[index];
+    if entry["phase"] != "active"
+        || entry["checkout_removed"] == true
+        || entry["workspace_closed"] == true
+        || entry["restart_pending"] == true
+        || entry["restarted"] == true
+        || entry["continue_prompt_pending"] == true
+        || entry["cleanup_pending"].is_string()
+        || entry["merge_request"].is_object()
+        || entry["merge_queue"].is_object()
+    {
+        return Err(error(
+            "Handoff has a pending operation or is unavailable for force removal",
+        ));
+    }
+    if registry.entries.iter().any(|child| {
+        child["parent_bead_id"] == entry["bead_id"] && child["checkout_removed"] != true
+    }) {
+        return Err(error("Remove tracked child checkouts first"));
+    }
+    verify_identity(&registry.repo, entry)?;
+    let cwd = std::env::current_dir()?.canonicalize()?;
+    if cwd.starts_with(Path::new(field(entry, "path")?)) {
+        return Err(error(
+            "Cannot force remove the checkout containing this OnTrack process",
+        ));
+    }
+    verify_open_workspace(&registry.repo, entry, executor)?;
+    // Recheck Git identity after the external ownership query, before dispatch.
+    verify_identity(&registry.repo, entry)?;
+    let workspace = field(entry, "workspace_id")?.to_owned();
+    registry.entries[index]["cleanup_pending"] = json!("force-remove");
+    registry.entries[index]["detail"] = json!(
+        "Force removal may have been sent; inspect Herdr and Git before recovery. Never retry blindly."
+    );
+    registry.save()?;
+    let bytes = executor.run(&["worktree", "remove", "--workspace", &workspace, "--force"])?;
+    registry.entries[index]["cleanup_response"] = json!(String::from_utf8_lossy(&bytes));
+    registry.save()?;
+    envelope(&bytes)?;
+    confirm_cleanup(registry, index, executor)
+}
+
 fn cleanup(
     registry: &mut Registry,
     index: usize,
@@ -2362,7 +2411,9 @@ fn cleanup(
             vec!["worktree", "remove", "--workspace", workspace.as_str()],
             "remove",
         ),
-        Action::RequestMerge => return Err(error("Not a cleanup action")),
+        Action::RequestMerge | Action::ForceRemoveCheckout => {
+            return Err(error("Not a cleanup action"));
+        }
     };
     registry.entries[index]["cleanup_pending"] = json!(operation);
     registry.entries[index]["cleanup_source_tip"] = json!(verified.source_tip);
@@ -2481,20 +2532,22 @@ fn confirm_cleanup(
     }
     let source_ref = format!("refs/heads/{}", field(entry, "branch")?);
     let current_source = tip(&registry.repo.main_root, &source_ref)?;
-    task_commits(&registry.repo, entry, &current_source)?;
-    let target = target_checkout(&registry.repo, entry)?;
-    if !ancestor(
-        &registry.repo.main_root,
-        &current_source,
-        &tip(&target, "HEAD")?,
-    )? {
-        return Err(error(
-            "Source advanced during cleanup; new work is outstanding",
-        ));
+    if operation != "force-remove" {
+        task_commits(&registry.repo, entry, &current_source)?;
+        let target = target_checkout(&registry.repo, entry)?;
+        if !ancestor(
+            &registry.repo.main_root,
+            &current_source,
+            &tip(&target, "HEAD")?,
+        )? {
+            return Err(error(
+                "Source advanced during cleanup; new work is outstanding",
+            ));
+        }
     }
-    if operation == "remove" {
+    if operation == "remove" || operation == "force-remove" {
         let path = Path::new(field(entry, "path")?);
-        if path.exists() || rows.iter().any(|row| row["path"] == entry["path"]) {
+        if !checkout_missing(entry)? || rows.iter().any(|row| row["path"] == entry["path"]) {
             return Err(error("Checkout removal unconfirmed; checkout still exists"));
         }
         let inventory = git(
@@ -2512,6 +2565,9 @@ fn confirm_cleanup(
         registry.entries[index]["checkout_removed"] = json!(true);
     } else {
         verify(&registry.repo, entry)?;
+    }
+    if operation == "force-remove" {
+        registry.entries[index]["force_removed"] = json!(true);
     }
     registry.entries[index]["workspace_closed"] = json!(true);
     registry.entries[index]["cleanup_pending"] = Value::Null;
@@ -2549,6 +2605,7 @@ fn act_with(
                 dispatch_next_merge(&mut registry, executor)
             }
         }
+        Action::ForceRemoveCheckout => force_remove(&mut registry, index, executor),
         _ => cleanup(&mut registry, index, action, executor),
     };
     if let Err(e) = result {
@@ -4862,6 +4919,161 @@ mod tests {
         assert_eq!(executor.calls[2], ["workspace", "close", "wTask"]);
         assert!(fixture.source.exists());
         assert!(tip(&fixture.main, &format!("refs/heads/{BRANCH}")).is_ok());
+    }
+
+    #[test]
+    fn force_remove_preserves_unmerged_branch_and_never_closes_bead() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "unmerged work\n");
+        let source_tip = tip(&fixture.source, "HEAD").unwrap();
+        fs::write(fixture.source.join("uncommitted"), "discard me").unwrap();
+        let main = fixture.main.clone();
+        let source = fixture.source.clone();
+        let journal_root = main.clone();
+        let mut executor = Fake {
+            hook: Some(Box::new(move |args| {
+                if args.starts_with(&["worktree", "remove"]) {
+                    let registry_path = journal_root.join(".git/ontrack-worktrees/registry.json");
+                    let journal: Value =
+                        serde_json::from_slice(&fs::read(registry_path).unwrap()).unwrap();
+                    assert!(journal.to_string().contains("force-remove"));
+                    git(
+                        &main,
+                        &["worktree", "remove", "--force", source.to_str().unwrap()],
+                    )
+                    .unwrap();
+                }
+            })),
+            ..Default::default()
+        };
+        executor.json(fixture.inventory(true, true));
+        executor.json(json!({"result":{"type":"worktree_removed"}}));
+        executor.json(fixture.inventory(false, false));
+        let outcome = act_with(
+            &fixture.main,
+            ID,
+            Action::ForceRemoveCheckout,
+            &mut executor,
+        )
+        .unwrap();
+        assert_eq!(outcome.status, WorktreeStatus::CheckoutRemoved);
+        assert!(!fixture.source.exists());
+        assert_eq!(
+            tip(&fixture.main, &format!("refs/heads/{BRANCH}")).unwrap(),
+            source_tip
+        );
+        assert_eq!(
+            executor.calls[1],
+            ["worktree", "remove", "--workspace", "wTask", "--force"]
+        );
+        assert_eq!(executor.calls.len(), 3);
+        assert!(executor.closed.is_empty());
+        assert_eq!(fixture.status().status, WorktreeStatus::CheckoutRemoved);
+    }
+
+    #[test]
+    fn force_remove_rejects_wrong_ownership_and_tracked_children() {
+        let fixture = Fixture::managed();
+        let mut wrong = fixture.inventory(true, true);
+        wrong["result"]["worktrees"][1]["branch"] = json!("other");
+        let mut executor = Fake::default();
+        executor.json(wrong);
+        assert!(
+            act_with(
+                &fixture.main,
+                ID,
+                Action::ForceRemoveCheckout,
+                &mut executor
+            )
+            .is_err()
+        );
+        assert_eq!(executor.calls.len(), 1);
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        registry
+            .entries
+            .push(json!({"id":"child", "parent_bead_id":"Bead-1"}));
+        registry.save().unwrap();
+        drop(registry);
+        let mut executor = Fake::default();
+        assert!(
+            act_with(
+                &fixture.main,
+                ID,
+                Action::ForceRemoveCheckout,
+                &mut executor
+            )
+            .is_err()
+        );
+        assert!(executor.calls.is_empty());
+        assert!(fixture.source.exists());
+    }
+
+    #[test]
+    fn force_remove_requires_absence_and_recovers_without_resending() {
+        let fixture = Fixture::managed();
+        let mut executor = Fake::default();
+        executor.json(fixture.inventory(true, true));
+        executor.json(json!({"result":{"type":"worktree_removed"}}));
+        executor.json(fixture.inventory(false, false));
+        assert!(
+            act_with(
+                &fixture.main,
+                ID,
+                Action::ForceRemoveCheckout,
+                &mut executor
+            )
+            .is_err()
+        );
+        assert!(fixture.source.exists());
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        git(
+            &fixture.main,
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                fixture.source.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut recovery = Fake::default();
+        recovery.json(fixture.inventory(false, false));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut recovery).unwrap();
+        assert_eq!(rows[0].status, WorktreeStatus::CheckoutRemoved);
+        assert_eq!(recovery.calls.len(), 1);
+        assert_eq!(recovery.calls[0][..2], ["worktree", "list"]);
+        assert!(recovery.closed.is_empty());
+    }
+
+    #[test]
+    fn force_remove_timeout_is_fenced_and_not_retried() {
+        let fixture = Fixture::managed();
+        let mut executor = Fake::default();
+        executor.json(fixture.inventory(true, true));
+        executor.outputs.push_back(Err(error("removal timed out")));
+        assert!(
+            act_with(
+                &fixture.main,
+                ID,
+                Action::ForceRemoveCheckout,
+                &mut executor
+            )
+            .is_err()
+        );
+        assert_eq!(fixture.status().status, WorktreeStatus::NeedsAttention);
+        let mut retry = Fake::default();
+        assert!(act_with(&fixture.main, ID, Action::ForceRemoveCheckout, &mut retry).is_err());
+        assert!(retry.calls.is_empty());
+        let mut recovery = Fake::default();
+        recovery.json(fixture.inventory(true, true));
+        reconcile_with(&fixture.main, CleanupPolicy::default(), &mut recovery).unwrap();
+        assert!(
+            recovery
+                .calls
+                .iter()
+                .all(|args| args[0] != "close_bead" && !args.iter().any(|arg| arg == "remove"))
+        );
+        assert!(fixture.source.exists());
     }
 
     #[test]

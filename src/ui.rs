@@ -441,7 +441,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             | crate::app::Modal::ConfirmDelete { .. } => confirmation_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
-            crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
+            crate::app::Modal::ConfirmWorktree { action: 3 | 5, .. } => 12,
             crate::app::Modal::ConfirmWorktree { action: 4, .. } => 11,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
         };
@@ -502,6 +502,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
                 crate::app::Modal::ConfirmWorktree { action: 4, .. } => " CONTINUE TASK? ",
+                crate::app::Modal::ConfirmWorktree { action: 5, .. } => " FORCE REMOVE WORKTREE? ",
                 crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
                 _ => " DELETE BEAD? ",
             })
@@ -1160,6 +1161,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     2 => {
                         "Remove integrated checkout and close its Herdr workspace? Branch is preserved."
                     }
+                    5 => {
+                        "Discard all uncommitted checkout changes?\n\nThe Herdr workspace will close and its\ncheckout will be removed without merging.\nThe branch is kept. The Bead stays open.\nNo replacement agent will start."
+                    }
                     4 => {
                         "Ask the original idle agent to continue in this checkout? Existing changes are preserved. Verify its work before merging."
                     }
@@ -1793,7 +1797,7 @@ fn render_worktree_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Insta
                 footer.width as usize,
             )),
             Line::from(truncate_display(
-                "x remove · a continue · R restart",
+                "x remove · X force · a continue · R restart",
                 footer.width as usize,
             )),
         ])
@@ -3346,6 +3350,21 @@ mod tests {
         assert!(rendered.contains("Discard all uncommitted checkout changes."));
         assert!(rendered.contains("Worktree: ot-selected"));
         assert!(rendered.contains("y confirm"));
+    }
+    #[test]
+    fn force_remove_dialog_shows_data_loss_warning_and_handoff_id() {
+        let mut app = app();
+        app.worktrees_view = true;
+        app.modal = Some(crate::app::Modal::ConfirmWorktree {
+            id: "ot-selected".into(),
+            action: 5,
+        });
+        let rendered = draw((100, 30), &mut app).0;
+        assert!(rendered.contains("FORCE REMOVE WORKTREE?"));
+        assert!(rendered.contains("Discard all uncommitted checkout changes?"));
+        assert!(rendered.contains("Worktree: ot-selected"));
+        assert!(rendered.contains("y confirm"));
+        assert!(rendered.contains("The branch is kept. The Bead stays open."));
     }
     #[test]
     fn continue_dialog_names_existing_checkout_and_keeps_confirmation_visible() {
