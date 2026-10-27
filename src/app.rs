@@ -113,6 +113,20 @@ pub(super) enum WorktreeFocusFeedback {
     Success(String),
     Error(String),
 }
+pub(super) struct DrawerAnimation {
+    pub worktrees: bool,
+    pub started: Instant,
+    pub from: f32,
+    pub to: f32,
+}
+impl DrawerAnimation {
+    pub fn fraction(&self, now: Instant) -> f32 {
+        let progress =
+            (now.saturating_duration_since(self.started).as_secs_f32() / 0.22).clamp(0.0, 1.0);
+        let eased = 1.0 - (1.0 - progress).powi(3);
+        self.from + (self.to - self.from) * eased
+    }
+}
 pub struct App {
     pub beads: Vec<Bead>,
     pub focused_column: usize,
@@ -125,7 +139,7 @@ pub struct App {
     pub detail: Option<serde_json::Value>,
     pub focus_detail: bool,
     pub detail_offset: u16,
-    pub drawer_opened_at: Option<Instant>,
+    pub drawer_animation: Option<DrawerAnimation>,
     pub list_loading: bool,
     pub detail_loading: bool,
     pub list_error: Option<String>,
@@ -583,6 +597,29 @@ fn start_workers(
 }
 
 impl App {
+    fn set_drawer(&mut self, worktrees: bool, open: bool, now: Instant) {
+        let from = self
+            .drawer_animation
+            .as_ref()
+            .filter(|animation| animation.worktrees == worktrees)
+            .map(|animation| animation.fraction(now))
+            .unwrap_or(
+                if (worktrees && self.worktrees_view) || (!worktrees && self.focus_detail) {
+                    1.0
+                } else {
+                    0.0
+                },
+            );
+        self.drawer_animation = self.settings.animate_drawers.then_some(DrawerAnimation {
+            worktrees,
+            started: now,
+            from,
+            to: if open { 1.0 } else { 0.0 },
+        });
+        self.worktrees_view = worktrees && open;
+        self.focus_detail = !worktrees && open;
+    }
+
     fn new() -> Self {
         let (tx, responses, _) = start_workers(execute_request);
         let (settings, settings_path, settings_error) = match settings::config_path() {
@@ -613,7 +650,7 @@ impl App {
             detail: None,
             focus_detail: false,
             detail_offset: 0,
-            drawer_opened_at: None,
+            drawer_animation: None,
             list_loading: true,
             detail_loading: false,
             list_error: None,
@@ -1873,9 +1910,7 @@ impl App {
         if self.worktrees_view {
             match k.code {
                 KeyCode::Char('w') | KeyCode::Esc | KeyCode::Backspace => {
-                    self.worktrees_view = false;
-                    self.focus_detail = false;
-                    self.drawer_opened_at = None;
+                    self.set_drawer(true, false, Instant::now());
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.selected_worktree = self.selected_worktree.saturating_sub(1);
@@ -1912,9 +1947,7 @@ impl App {
         }
         match k.code {
             KeyCode::Char('w') => {
-                self.worktrees_view = true;
-                self.focus_detail = false;
-                self.drawer_opened_at = Some(Instant::now());
+                self.set_drawer(true, true, Instant::now());
                 if let Some(index) =
                     self.selected
                         .and_then(|i| self.beads.get(i))
@@ -2034,21 +2067,17 @@ impl App {
                 }
             }
             KeyCode::Char('h') => self.open_launch(),
-            KeyCode::Esc => {
-                self.focus_detail = false;
-                self.drawer_opened_at = None;
+            KeyCode::Esc if self.focus_detail => {
+                self.set_drawer(false, false, Instant::now());
             }
-            KeyCode::Tab => {
-                self.focus_detail = !self.focus_detail && self.selected.is_some();
-                self.drawer_opened_at = self.focus_detail.then(Instant::now);
+            KeyCode::Tab if self.focus_detail || self.selected.is_some() => {
+                self.set_drawer(false, !self.focus_detail, Instant::now());
             }
             KeyCode::Enter if self.focus_detail => {
-                self.focus_detail = false;
-                self.drawer_opened_at = None;
+                self.set_drawer(false, false, Instant::now());
             }
             KeyCode::Enter if self.selected.is_some() => {
-                self.focus_detail = true;
-                self.drawer_opened_at = Some(Instant::now());
+                self.set_drawer(false, true, Instant::now());
             }
             KeyCode::Left | KeyCode::Right
                 if !self.focus_detail && k.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -2445,7 +2474,7 @@ impl App {
             if let Some(settings) = save_settings {
                 self.save_settings(settings);
                 if !self.settings.animate_drawers {
-                    self.drawer_opened_at = None;
+                    self.drawer_animation = None;
                 }
             }
             return false;
@@ -3459,7 +3488,7 @@ mod tests {
             detail: Some(json!({"id": "b0", "description": "detail 0"})),
             focus_detail: false,
             detail_offset: 0,
-            drawer_opened_at: None,
+            drawer_animation: None,
             list_loading: false,
             detail_loading: false,
             list_error: None,
@@ -3798,7 +3827,7 @@ mod tests {
     #[test]
     fn board_move_keys_do_not_leak_through_help_or_move_modal() {
         let (mut a, rx, _) = connected_app();
-        a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+        a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
         a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
         press(&mut a, KeyCode::Char('m'));
         assert!(a.help.is_some() && a.modal.is_none());
@@ -4325,8 +4354,8 @@ mod tests {
                 press(&mut a, KeyCode::Down);
                 assert!(a.focus_detail);
                 assert_eq!(a.detail_offset, 1);
-                // Ctrl+? opens help while a Ready update is still blocked.
-                a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+                // Shift+? opens help while a Ready update is still blocked.
+                a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
                 assert!(a.help.is_some());
                 press(&mut a, KeyCode::Esc);
                 assert!(a.help.is_none());
@@ -6228,10 +6257,10 @@ mod tests {
         for _ in 0..7 {
             press(&mut a, KeyCode::Down);
         }
-        a.drawer_opened_at = Some(Instant::now());
+        a.set_drawer(false, true, Instant::now());
         press(&mut a, KeyCode::Enter);
         assert!(!a.settings.animate_drawers);
-        assert!(a.drawer_opened_at.is_none());
+        assert!(a.drawer_animation.is_none());
         assert!(!settings::load_from(&path).unwrap().animate_drawers);
         press(&mut a, KeyCode::Esc);
         press(&mut a, KeyCode::Char('s'));
@@ -6378,39 +6407,78 @@ mod tests {
         assert!(a.focus_detail);
     }
     #[test]
-    fn drawer_open_keys_reset_and_clear_transition_for_both_drawers() {
-        let mut a = app();
-        press(&mut a, KeyCode::Tab);
-        let tab_start = a.drawer_opened_at.unwrap();
-        press(&mut a, KeyCode::Tab);
-        assert!(a.drawer_opened_at.is_none());
-        press(&mut a, KeyCode::Tab);
-        assert!(a.drawer_opened_at.unwrap() >= tab_start);
-        press(&mut a, KeyCode::Esc);
-        assert!(a.drawer_opened_at.is_none());
+    fn every_drawer_close_key_starts_a_closing_transition_and_restores_board_input() {
+        for (worktrees, close_keys) in [
+            (false, vec![KeyCode::Esc, KeyCode::Tab, KeyCode::Enter]),
+            (
+                true,
+                vec![KeyCode::Esc, KeyCode::Backspace, KeyCode::Char('w')],
+            ),
+        ] {
+            for close_key in close_keys {
+                let mut a = app();
+                let selected = a.selected;
+                press(
+                    &mut a,
+                    if worktrees {
+                        KeyCode::Char('w')
+                    } else {
+                        KeyCode::Enter
+                    },
+                );
+                let opening = a.drawer_animation.as_mut().unwrap();
+                assert_eq!(opening.to, 1.0);
+                opening.started -= Duration::from_millis(300);
+                press(&mut a, close_key);
+                assert!(!a.focus_detail && !a.worktrees_view);
+                assert_eq!(a.selected, selected);
+                let closing = a.drawer_animation.as_ref().unwrap();
+                assert_eq!(closing.worktrees, worktrees);
+                assert_eq!(closing.from, 1.0);
+                assert_eq!(closing.to, 0.0);
+                press(&mut a, KeyCode::Right);
+                assert_eq!(a.focused_column, 1);
+            }
+        }
+    }
 
-        press(&mut a, KeyCode::Enter);
-        assert!(a.focus_detail);
-        assert!(a.drawer_opened_at.is_some());
-        let enter_start = a.drawer_opened_at.unwrap();
-        press(&mut a, KeyCode::Enter);
-        assert!(!a.focus_detail);
-        assert!(a.drawer_opened_at.is_none());
-        press(&mut a, KeyCode::Enter);
-        assert!(a.focus_detail);
-        assert!(a.drawer_opened_at.unwrap() >= enter_start);
-        press(&mut a, KeyCode::Char('w'));
-        assert!(a.worktrees_view);
-        assert!(!a.focus_detail);
-        let worktree_start = a.drawer_opened_at.unwrap();
-        press(&mut a, KeyCode::Esc);
-        assert!(!a.worktrees_view);
-        assert!(a.drawer_opened_at.is_none());
-        press(&mut a, KeyCode::Char('w'));
-        assert!(a.worktrees_view);
-        assert!(a.drawer_opened_at.unwrap() >= worktree_start);
-        press(&mut a, KeyCode::Esc);
-        assert!(a.drawer_opened_at.is_none());
+    #[test]
+    fn drawer_reversals_preserve_fraction_and_disabled_animation_is_immediate() {
+        for worktrees in [false, true] {
+            let mut a = app();
+            let start = Instant::now();
+            a.set_drawer(worktrees, true, start);
+            let closing_at = start + Duration::from_millis(80);
+            let fraction = a.drawer_animation.as_ref().unwrap().fraction(closing_at);
+            a.set_drawer(worktrees, false, closing_at);
+            assert_eq!(
+                a.drawer_animation.as_ref().unwrap().fraction(closing_at),
+                fraction
+            );
+            let reopening_at = closing_at + Duration::from_millis(80);
+            let fraction = a.drawer_animation.as_ref().unwrap().fraction(reopening_at);
+            assert!(fraction > 0.0 && fraction < 1.0);
+            a.set_drawer(worktrees, true, reopening_at);
+            assert_eq!(
+                a.drawer_animation.as_ref().unwrap().fraction(reopening_at),
+                fraction
+            );
+            assert_eq!(
+                a.drawer_animation
+                    .as_ref()
+                    .unwrap()
+                    .fraction(reopening_at + Duration::from_millis(220)),
+                1.0
+            );
+            a.settings.animate_drawers = false;
+            a.set_drawer(worktrees, false, reopening_at);
+            assert!(a.drawer_animation.is_none());
+            assert!(!a.focus_detail && !a.worktrees_view);
+            a.set_drawer(worktrees, true, reopening_at);
+            assert!(a.drawer_animation.is_none());
+            assert_eq!(a.worktrees_view, worktrees);
+            assert_eq!(a.focus_detail, !worktrees);
+        }
     }
     #[test]
     fn board_arrows_are_safe_when_empty_and_modal_arrows_remain_form_controls() {
@@ -6773,7 +6841,7 @@ mod tests {
     #[test]
     fn help_tracks_active_view_and_preserves_underlying_form() {
         let mut a = app();
-        let help_key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
+        let help_key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT);
         a.key(help_key);
         assert_eq!(a.help.unwrap().context, hotkeys::Context::Issues);
         press(&mut a, KeyCode::Down);
@@ -6787,11 +6855,11 @@ mod tests {
         a.key(help_key);
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Char('/'));
         press(&mut a, KeyCode::Char('?'));
-        a.key(help_key);
         assert_eq!(a.help.unwrap().context, hotkeys::Context::Form);
         press(&mut a, KeyCode::Esc);
-        assert!(matches!(a.modal, Some(Modal::Create(ref form)) if form.title == "?"));
+        assert!(matches!(a.modal, Some(Modal::Create(ref form)) if form.title == "/"));
         a.mutation_busy = true;
         a.key(help_key);
         assert!(a.help.is_none());
@@ -6801,7 +6869,7 @@ mod tests {
     fn help_lists_view_specific_commands() {
         let mut a = app();
         a.worktrees_view = true;
-        a.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        a.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::SHIFT));
         let context = a.help.unwrap().context;
         assert_eq!(context, hotkeys::Context::Worktrees);
         assert!(context.entries().iter().any(|(key, _)| *key == "Shift+R"));
