@@ -1264,7 +1264,7 @@ fn column_heading_parts(
 fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
     let statuses = crate::app::BOARD_STATUSES;
     let palette = crate::theme::definition(app.theme).palette;
-    let columns: u16 = if area.width >= 108 {
+    let columns: u16 = if area.width >= 144 {
         6
     } else if area.width >= 54 {
         3
@@ -3134,17 +3134,17 @@ mod tests {
         a.focused_column = 0;
         for height in [7, 8, 9] {
             a.board_cards.push((99, Rect::new(1, 1, 1, 1)));
-            let screen = draw((120, height), &mut a).0;
+            let screen = draw((144, height), &mut a).0;
             assert!(
                 screen.contains("Resize to 11 rows"),
                 "height {height}: {screen}"
             );
             assert!(a.board_cards.is_empty(), "stale cards at height {height}");
         }
-        let screen = draw((120, 10), &mut a).0;
+        let screen = draw((144, 10), &mut a).0;
         assert!(screen.contains("Resize to 11 rows"), "{screen}");
         assert!(a.board_cards.is_empty());
-        let screen = draw((120, 12), &mut a).0;
+        let screen = draw((144, 12), &mut a).0;
         assert!(screen.contains("Title is visible"), "{screen}");
         assert!(
             a.board_cards
@@ -4192,6 +4192,19 @@ mod tests {
     }
 
     #[test]
+    fn split_pane_board_keeps_full_headings_and_cards_readable() {
+        let mut a = overflowing_board();
+        let (screen, _) = draw((112, 55), &mut a);
+        for (column, status) in crate::app::BOARD_STATUSES.iter().enumerate() {
+            assert!(screen.contains(status_label(status)));
+            assert!(screen.contains(&format!("Card {column}-00")));
+            let rect = a.board_columns[column].1;
+            assert!(rect.width >= 37);
+            assert_eq!(rect.y, if column < 3 { 2 } else { 28 });
+        }
+    }
+
+    #[test]
     fn board_grid_reflows_at_width_boundaries_and_tiles_offset_area() {
         for (width, columns) in [
             (24, 2),
@@ -4199,8 +4212,13 @@ mod tests {
             (54, 3),
             (55, 3),
             (107, 3),
-            (108, 6),
-            (109, 6),
+            (108, 3),
+            (109, 3),
+            (112, 3),
+            (120, 3),
+            (143, 3),
+            (144, 6),
+            (145, 6),
         ] {
             let mut a = overflowing_board();
             let area = Rect::new(3, 2, width, 49);
@@ -4231,7 +4249,7 @@ mod tests {
             }
             assert_eq!(cells.len(), usize::from(width) * 49);
         }
-        for width in [0, 1, 2, 24, 53, 54, 107, 108] {
+        for width in [0, 1, 2, 24, 53, 54, 107, 108, 143, 144] {
             for height in 0..8 {
                 let mut a = overflowing_board();
                 a.board_cards.push((999, Rect::new(1, 1, 1, 1)));
@@ -4253,7 +4271,16 @@ mod tests {
         a.selected = Some(56);
         a.column_rows[4] = 8;
         a.column_offsets[4] = 7;
-        for size in [(120, 50), (80, 50), (40, 50), (40, 9), (80, 50), (120, 50)] {
+        for size in [
+            (144, 50),
+            (143, 50),
+            (112, 50),
+            (80, 50),
+            (40, 50),
+            (40, 9),
+            (112, 50),
+            (144, 50),
+        ] {
             draw(size, &mut a);
             assert_eq!(a.selected, Some(56));
             assert_eq!(a.focused_column, 4);
@@ -4263,7 +4290,7 @@ mod tests {
                 assert!(a.board_cards.is_empty());
             }
         }
-        for size in [(80, 50), (40, 50)] {
+        for size in [(112, 50), (80, 50), (40, 50)] {
             draw(size, &mut a);
             let (index, card) = *a.board_cards.iter().find(|(i, _)| i / 12 == 5).unwrap();
             a.mouse(
@@ -4294,11 +4321,14 @@ mod tests {
                 let column = a
                     .board_columns
                     .iter()
-                    .find(|(_, column)| card.x > column.x && card.right() < column.right())
+                    .find(|(_, column)| column.contains((card.x, card.y).into()))
                     .unwrap()
                     .1;
                 assert!(
-                    card.y > column.y && card.bottom() < column.bottom(),
+                    card.x > column.x
+                        && card.right() < column.right()
+                        && card.y > column.y
+                        && card.bottom() < column.bottom(),
                     "height {height}: {card:?} in {column:?}"
                 );
             }
@@ -4337,7 +4367,7 @@ mod tests {
         use crossterm::event::KeyCode;
 
         let mut a = overflowing_board();
-        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(144, 24)).unwrap();
         terminal
             .draw(|frame| render_kanban(frame, frame.area(), &mut a))
             .unwrap();
@@ -4348,7 +4378,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(a.selected, Some(3));
-        let mut small = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        let mut small = Terminal::new(TestBackend::new(144, 12)).unwrap();
         small
             .draw(|frame| render_kanban(frame, frame.area(), &mut a))
             .unwrap();
@@ -4368,7 +4398,7 @@ mod tests {
                 .iter()
                 .any(|(index, _)| Some(*index) == a.selected)
         );
-        let mut large = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut large = Terminal::new(TestBackend::new(144, 24)).unwrap();
         large
             .draw(|frame| render_kanban(frame, frame.area(), &mut a))
             .unwrap();
@@ -4529,18 +4559,18 @@ mod tests {
         (down, up): (crossterm::event::Event, crossterm::event::Event),
     ) {
         let mut a = overflowing_board();
-        draw((120, 24), &mut a);
+        draw((144, 24), &mut a);
         assert_board_viewport(&a, 0, 0);
         for row in 1..=2 {
             board_event(&mut a, down.clone());
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(row), "after {down:?}");
             assert_board_viewport(&a, 0, 0);
         }
         let bottom = a.board_cards.iter().find(|(i, _)| *i == 2).unwrap().1;
         for row in 3..=4 {
             board_event(&mut a, down.clone());
-            let screen = draw((120, 24), &mut a).0;
+            let screen = draw((144, 24), &mut a).0;
             assert_eq!(a.selected, Some(row), "after {down:?}");
             assert_board_viewport(&a, 0, row - 2);
             assert_eq!(
@@ -4551,7 +4581,7 @@ mod tests {
         }
         for row in (0..4).rev() {
             board_event(&mut a, up.clone());
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(row), "after {up:?}");
             assert_board_viewport(&a, 0, row.min(2));
             if row < 2 {
@@ -4562,7 +4592,7 @@ mod tests {
             }
         }
         board_event(&mut a, up);
-        draw((120, 24), &mut a);
+        draw((144, 24), &mut a);
         assert_eq!(a.selected, Some(0));
         assert_board_viewport(&a, 0, 0);
     }
@@ -4571,10 +4601,10 @@ mod tests {
     fn board_navigation_does_not_wrap_at_first_or_last_card() {
         for (down, up) in board_navigation_events() {
             let mut a = overflowing_board();
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             for step in 1usize..=14 {
                 board_event(&mut a, down.clone());
-                draw((120, 24), &mut a);
+                draw((144, 24), &mut a);
                 let row = step.min(11);
                 assert_eq!(a.selected, Some(row));
                 assert_board_viewport(&a, 0, row.saturating_sub(2));
@@ -4582,7 +4612,7 @@ mod tests {
             }
             for step in 1usize..=14 {
                 board_event(&mut a, up.clone());
-                draw((120, 24), &mut a);
+                draw((144, 24), &mut a);
                 let row = 11usize.saturating_sub(step);
                 assert_eq!(a.selected, Some(row));
                 assert_board_viewport(&a, 0, row.min(9));
@@ -4595,23 +4625,23 @@ mod tests {
     fn board_navigation_batches_events_without_using_stale_card_positions() {
         for (down, up) in board_navigation_events() {
             let mut a = overflowing_board();
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             for _ in 0..2 {
                 board_event(&mut a, down.clone());
             }
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(2));
             assert_board_viewport(&a, 0, 0);
             for _ in 0..3 {
                 board_event(&mut a, down.clone());
             }
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(5));
             assert_board_viewport(&a, 0, 3);
             for _ in 0..5 {
                 board_event(&mut a, up.clone());
             }
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(0));
             assert_board_viewport(&a, 0, 0);
         }
@@ -4621,7 +4651,7 @@ mod tests {
     fn board_navigation_retains_independent_offsets_across_grid_rows() {
         use crossterm::event::KeyCode;
 
-        for size in [(120, 24), (60, 45), (36, 66)] {
+        for size in [(144, 24), (120, 45), (60, 45), (36, 66)] {
             let mut a = overflowing_board();
             draw(size, &mut a);
             for _ in 0..6 {
@@ -4686,7 +4716,7 @@ mod tests {
                     assert!(a.column_offsets.iter().all(|offset| *offset < 12));
                 }
             }
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(0));
             assert_board_viewport(&a, 0, 0);
         }
