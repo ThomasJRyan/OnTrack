@@ -7,7 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 const ASCII_LOGO: [&str; 8] = [
     "    ███████               ███████████                              █████     ",
     "  ███▒▒▒▒▒███            ▒█▒▒▒███▒▒▒█                             ▒▒███      ",
@@ -137,7 +137,7 @@ fn row_issue_type(bead: &crate::beads::Bead) -> String {
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
         "↑ / ↓ move · ← / → choice · Enter / Space select · Tab moves · Esc close"
-    } else if focus == 7 {
+    } else if focus == 8 {
         "↑ / ↓ move · Enter / Space close · Tab moves · Esc close"
     } else if focus >= 3 {
         "↑ / ↓ move · Enter / Space toggle · Tab moves · Esc close"
@@ -335,9 +335,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     render_header_feedback(f, v[0], feedback.as_deref(), app.theme);
     render_kanban(f, v[1], app);
     if app.focus_detail {
-        render_detail_drawer(f, a, app);
+        render_detail_drawer(f, a, app, Instant::now());
     } else if app.worktrees_view {
-        render_worktree_drawer(f, a, app);
+        render_worktree_drawer(f, a, app, Instant::now());
     }
     f.render_widget(
         Paragraph::new(footer_text(v[2].width as usize))
@@ -717,6 +717,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "Remove checkout + close Herdr workspace",
                         draft.auto_remove_checkout,
                     ),
+                    ("Animate drawer opening", draft.animate_drawers),
                 ]
                 .into_iter()
                 .enumerate()
@@ -745,11 +746,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     ))
                     .alignment(Alignment::Center),
                 );
-                lines.push(Line::from(""));
                 lines.push(
                     Line::from(Span::styled(
                         "[ Close ]",
-                        if *focus == 7 {
+                        if *focus == 8 {
                             selected_style
                         } else {
                             value_style
@@ -1439,17 +1439,35 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App) {
+fn drawer_width(screen_width: u16, started: Option<Instant>, enabled: bool, now: Instant) -> u16 {
+    let target = screen_width.min((screen_width * 2 / 5).max(36));
+    let Some(started) = started.filter(|_| enabled) else {
+        return target;
+    };
+    let progress = (now.saturating_duration_since(started).as_secs_f32() / 0.22).clamp(0.0, 1.0);
+    let eased = 1.0 - (1.0 - progress).powi(3);
+    (f32::from(target) * eased).round() as u16
+}
+
+fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
     let palette = crate::theme::definition(app.theme).palette;
-    let width = screen.width.min((screen.width * 2 / 5).max(36));
+    let width = drawer_width(
+        screen.width,
+        app.drawer_opened_at,
+        app.settings.animate_drawers,
+        now,
+    );
     let area = Rect::new(
         screen.x + screen.width.saturating_sub(width),
         screen.y + 2,
         width,
         screen.height.saturating_sub(3),
     );
-    f.render_widget(Clear, area);
     app.detail_rect = area;
+    if width < 4 {
+        return;
+    }
+    f.render_widget(Clear, area);
     let selected = app.selected.and_then(|i| app.beads.get(i));
     let title = selected
         .map(|b| {
@@ -1535,15 +1553,25 @@ fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App) {
     );
 }
 
-fn render_worktree_drawer(f: &mut Frame, screen: Rect, app: &mut App) {
+fn render_worktree_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
     let palette = crate::theme::definition(app.theme).palette;
-    let width = screen.width.min((screen.width * 2 / 5).max(36));
+    let width = drawer_width(
+        screen.width,
+        app.drawer_opened_at,
+        app.settings.animate_drawers,
+        now,
+    );
     let area = Rect::new(
         screen.x + screen.width.saturating_sub(width),
         screen.y + 2,
         width,
         screen.height.saturating_sub(3),
     );
+    if width < 4 {
+        app.list_rect = Rect::default();
+        app.detail_rect = area;
+        return;
+    }
     f.render_widget(Clear, area);
     f.render_widget(
         Block::default()
@@ -2303,6 +2331,7 @@ mod tests {
             detail: None,
             focus_detail: false,
             detail_offset: 0,
+            drawer_opened_at: None,
             list_loading: false,
             detail_loading: false,
             list_error: None,
@@ -2373,6 +2402,26 @@ mod tests {
     fn draw_at(size: (u16, u16), elapsed: Duration, app: &mut App) -> String {
         let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
         terminal.draw(|frame| render(frame, elapsed, app)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+    fn draw_drawer(size: (u16, u16), app: &mut App, now: Instant) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let screen = frame.area();
+                if app.focus_detail {
+                    render_detail_drawer(frame, screen, app, now);
+                } else {
+                    render_worktree_drawer(frame, screen, app, now);
+                }
+            })
+            .unwrap();
         terminal
             .backend()
             .buffer()
@@ -3958,5 +4007,71 @@ mod tests {
         assert!(screen.contains("READY TO MERGE"));
         assert!(screen.contains("↑/↓ choose · Enter move · Esc cancel"));
         assert!(screen.contains("CLOSED"));
+    }
+
+    #[test]
+    fn drawer_width_eases_from_right_to_final_width_and_can_be_disabled() {
+        let start = Instant::now();
+        assert_eq!(drawer_width(100, Some(start), true, start), 0);
+        assert!(drawer_width(100, Some(start), true, start + Duration::from_millis(110)) > 0);
+        assert_eq!(
+            drawer_width(100, Some(start), true, start + Duration::from_millis(220)),
+            40
+        );
+        assert_eq!(drawer_width(100, Some(start), false, start), 40);
+    }
+
+    #[test]
+    fn both_drawers_render_through_animation_resize_and_static_geometry() {
+        for worktrees in [false, true] {
+            let mut a = app();
+            a.focus_detail = !worktrees;
+            a.worktrees_view = worktrees;
+            a.detail_offset = 7;
+            let start = Instant::now();
+            a.drawer_opened_at = Some(start);
+
+            let initial_text = draw_drawer((100, 30), &mut a, start);
+            let initial = a.detail_rect;
+            assert!(initial.width < 4);
+            assert_eq!(a.detail_offset, 7, "unusable frames must not clamp scroll");
+            assert!(initial.x + initial.width <= 100);
+            assert!(a.list_rect.x + a.list_rect.width <= 100);
+            assert!(!initial_text.contains(if worktrees {
+                "WORKTREES ·"
+            } else {
+                "BEAD DETAILS"
+            }));
+
+            let halfway = start + Duration::from_millis(110);
+            a.drawer_opened_at = Some(start);
+            let middle_text = draw_drawer((60, 18), &mut a, halfway);
+            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 36);
+            assert!(a.detail_rect.x + a.detail_rect.width <= 60);
+            assert!(a.list_rect.x + a.list_rect.width <= 60);
+            assert!(middle_text.contains(if worktrees {
+                "WORKTREES"
+            } else {
+                "BEAD DETAILS"
+            }));
+
+            let _ = draw_drawer((100, 30), &mut a, halfway);
+            assert!(a.detail_rect.x + a.detail_rect.width <= 100);
+            assert!(a.list_rect.x + a.list_rect.width <= 100);
+
+            let complete = start + Duration::from_millis(300);
+            let final_text = draw_drawer((100, 30), &mut a, complete);
+            let animated_final = a.detail_rect;
+            assert!(animated_final.width > 0);
+            assert!(final_text.contains(if worktrees {
+                "WORKTREES"
+            } else {
+                "BEAD DETAILS"
+            }));
+            a.settings.animate_drawers = false;
+            let static_text = draw_drawer((100, 30), &mut a, start);
+            assert_eq!(a.detail_rect, animated_final);
+            assert_eq!(static_text, final_text);
+        }
     }
 }
