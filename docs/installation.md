@@ -6,9 +6,10 @@ The installer supports macOS and Ubuntu 24.04-compatible glibc Linux on x86_64 o
 building from source. A terminal with alternate-screen support is needed to run
 OnTrack.
 
-The installer checks for [Beads (`bd`)](https://beads.gascity.com/) and
-[Herdr](https://herdr.dev/docs/install/). If either command is missing, it asks
-before running that project's official installer:
+OnTrack requires [Beads (`bd`)](https://beads.gascity.com/getting-started/installation)
+and [Herdr (`herdr`)](https://herdr.dev/docs/install/) on your `PATH` and must run
+inside a Herdr shell. The installer checks for both commands. If either is
+missing, it asks before running that project's official installer:
 
 ```sh
 # Beads

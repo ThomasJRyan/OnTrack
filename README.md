@@ -19,6 +19,11 @@ The board refreshes automatically, scrolls horizontally on narrow terminals, and
 
 ## Get started
 
+OnTrack requires both commands on your `PATH`:
+
+- **Beads (`bd`)** for issue tracking — [install Beads](https://beads.gascity.com/getting-started/installation).
+- **Herdr (`herdr`)** for the shell and agent workspaces — [install Herdr](https://herdr.dev/docs/install/).
+
 For macOS or Ubuntu 24.04-compatible Linux, with Bash, `curl`, and Python 3:
 
 ```sh
