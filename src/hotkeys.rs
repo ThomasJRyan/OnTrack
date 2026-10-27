@@ -13,6 +13,7 @@ pub enum Context {
     Settings,
     SettingsChoices,
     EditLoading,
+    Close,
     Delete,
     GenerateEpic,
     WorktreeConfirm,
@@ -40,6 +41,7 @@ impl Context {
             Some(Modal::Settings { .. }) => Self::Settings,
             Some(Modal::EditLoading { .. }) => Self::EditLoading,
             Some(Modal::ConfirmGenerateEpic { .. }) => Self::GenerateEpic,
+            Some(Modal::ConfirmClose { .. }) => Self::Close,
             Some(Modal::ConfirmDelete { .. }) => Self::Delete,
             Some(Modal::ConfirmWorktree { .. }) => Self::WorktreeConfirm,
             None if app.worktrees_view => Self::Worktrees,
@@ -61,6 +63,7 @@ impl Context {
             Self::SettingsChoices => "Setting choices",
             Self::EditLoading => "Loading edit",
             Self::GenerateEpic => "Generate Epic tasks",
+            Self::Close => "Close confirmation",
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
             Self::Planning => "Plan new work",
@@ -79,6 +82,7 @@ impl Context {
                 ("n", "Create a bead"),
                 ("Shift+N", "Create child of selected open task"),
                 ("e", "Edit selected bead"),
+                ("c", "Close selected non-closed bead after confirmation"),
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
                 (
@@ -101,6 +105,7 @@ impl Context {
                 ("n", "Create a bead"),
                 ("Shift+N", "Create child of selected open task"),
                 ("e", "Edit selected bead"),
+                ("c", "Close selected non-closed bead after confirmation"),
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
                 ("w", "Open outstanding worktrees"),
@@ -161,7 +166,7 @@ impl Context {
                 ("e", "Retry a failed edit load"),
                 ("Esc", "Cancel edit loading"),
             ],
-            Self::Delete | Self::WorktreeConfirm | Self::GenerateEpic => vec![
+            Self::Close | Self::Delete | Self::WorktreeConfirm | Self::GenerateEpic => vec![
                 ("y / Y", "Confirm action"),
                 ("n / N / Enter", "Cancel action"),
                 ("Esc", "Cancel action"),

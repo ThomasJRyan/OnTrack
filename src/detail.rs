@@ -161,48 +161,172 @@ fn comments(v: &Value, width: u16) -> Vec<Line<'static>> {
     output
 }
 
-fn relationships(v: &Value, width: u16) -> Vec<Line<'static>> {
-    let mut output = Vec::new();
-    for (index, relation) in entries(v).into_iter().enumerate() {
-        if index > 0 {
-            output.push(Line::default());
+const RELATION_FIELDS: [&str; 4] = ["dependencies", "dependents", "blocks", "blocked_by"];
+
+// Wrap by terminal cells, keeping literal labels out of the Markdown parser.
+fn chart_wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(2);
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut cells = 0;
+    for ch in text.chars() {
+        let size = Span::raw(ch.to_string()).width();
+        if ch == '\n' || cells + size > width {
+            lines.push(std::mem::take(&mut line));
+            cells = 0;
         }
-        if let Some(object) = relation.as_object() {
-            let mut fields: Vec<_> = object.iter().collect();
-            fields.sort_by_key(|(key, _)| {
-                (
-                    if ["id", "type", "title"].contains(&key.as_str()) {
-                        0
-                    } else {
-                        1
-                    },
-                    *key,
-                )
-            });
-            for (key, value) in fields {
-                output.extend(metadata(key, value));
-            }
-        } else {
-            output.extend(json_value(relation, width));
+        if !ch.is_control() {
+            line.push(ch);
+            cells += size;
         }
     }
-    output
+    lines.push(line);
+    lines
 }
 
-/// Human-readable presentation of the Beads response, retaining unrecognized fields.
-/// The top-level revision is hidden because it is not useful in the details pane.
+// Indexed semantic colors are mapped to the active palette by the details pane.
+fn node_style(value: &Value) -> Style {
+    let color = match value.get("priority").and_then(Value::as_u64) {
+        Some(0) => Color::Indexed(1),
+        Some(1 | 2) => Color::Indexed(3),
+        Some(3) => Color::Indexed(2),
+        _ => MUTED,
+    };
+    Style::default().fg(color).add_modifier(Modifier::BOLD)
+}
+
+fn chart_row(value: &Value, prefix: &str, continuation: &str, width: usize) -> Vec<Line<'static>> {
+    let label = node_label(value).unwrap_or_else(|| "Selected Bead".to_owned());
+    // Tiny panes spend their limited width on content rather than indentation.
+    let (prefix, continuation) = if width < 12 {
+        ("", "")
+    } else {
+        (prefix, continuation)
+    };
+    let available = width.saturating_sub(Span::raw(prefix).width()).max(2);
+    chart_wrap(&label, available)
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| {
+            Line::from(vec![
+                Span::styled(
+                    if index == 0 { prefix } else { continuation }.to_owned(),
+                    node_style(value),
+                ),
+                Span::styled(
+                    line,
+                    if index == 0 {
+                        node_style(value)
+                    } else {
+                        Style::default().fg(INK)
+                    },
+                ),
+            ])
+        })
+        .collect()
+}
+
+fn node_label(value: &Value) -> Option<String> {
+    if let Some(id) = value.as_str().filter(|s| !s.trim().is_empty()) {
+        return Some(id.to_owned());
+    }
+    let id = value.get("id")?.as_str().filter(|s| !s.trim().is_empty())?;
+    let mut label = id.to_owned();
+    if let Some(priority) = value.get("priority").and_then(Value::as_u64) {
+        label.push_str(&format!(" · P{priority}"));
+    }
+    if let Some(status) = value.get("status").and_then(Value::as_str) {
+        label.push_str(&format!(" [{status}]"));
+    }
+    if let Some(title) = value.get("title").and_then(Value::as_str) {
+        label.push('\n');
+        label.push_str(title);
+    }
+    Some(label)
+}
+
+fn relationship_chart(value: &Value, width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width);
+    let mut groups: Vec<(String, Vec<&Value>)> = Vec::new();
+    for key in RELATION_FIELDS {
+        let Some(relations) = value.get(key) else {
+            continue;
+        };
+        for relation in entries(relations) {
+            let Some(_) = node_label(relation) else {
+                continue;
+            };
+            let kind_key = if relation
+                .get("dependency_type")
+                .and_then(Value::as_str)
+                .is_some()
+            {
+                "dependency_type"
+            } else {
+                "type"
+            };
+            let kind = relation.get(kind_key).and_then(Value::as_str).unwrap_or(
+                if matches!(key, "blocks" | "blocked_by") {
+                    "blocks"
+                } else {
+                    "unspecified"
+                },
+            );
+            let group = match (kind, key) {
+                ("blocks", "dependencies" | "blocked_by") => {
+                    "Blocked by ← prerequisites".to_owned()
+                }
+                ("blocks", _) => "Blocks → dependents".to_owned(),
+                ("parent-child", "dependencies") => "Parents".to_owned(),
+                ("parent-child", "dependents") => "Children".to_owned(),
+                _ => format!("{kind} ({key})"),
+            };
+            if let Some((_, nodes)) = groups.iter_mut().find(|(label, _)| *label == group) {
+                nodes.push(relation);
+            } else {
+                groups.push((group, vec![relation]));
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if !groups.is_empty() {
+        out.extend(chart_row(value, "── ", "   ", width));
+        // Blocking links come first, even when hierarchy data was returned first.
+        groups.sort_by_key(|(label, _)| match label.as_str() {
+            "Blocked by ← prerequisites" => 0,
+            "Blocks → dependents" => 1,
+            _ => 2,
+        });
+        for (label, nodes) in groups {
+            out.extend(chart_wrap(&label, width).into_iter().map(|line| {
+                Line::styled(line, Style::default().fg(TEAL).add_modifier(Modifier::BOLD))
+            }));
+            for (index, node) in nodes.iter().enumerate() {
+                let last = index + 1 == nodes.len();
+                out.extend(chart_row(
+                    node,
+                    if last { "└─ " } else { "├─ " },
+                    if last { "   " } else { "│  " },
+                    width,
+                ));
+            }
+        }
+    } else if RELATION_FIELDS
+        .iter()
+        .filter_map(|key| value.get(key))
+        .all(|relations| relations.as_array().is_some_and(Vec::is_empty))
+    {
+        out.push(Line::from("No dependency links returned."));
+    }
+    out
+}
+
+/// Present narrative fields, comments, and supported dependency links.
+/// Miscellaneous issue metadata and relationship extras stay in the source JSON only.
 pub fn render(value: &Value, selected_title: Option<&str>, width: u16) -> Text<'static> {
     let mut out = Vec::new();
     let object = value.as_object();
     let narrative = ["description", "notes", "design", "acceptance_criteria"];
-    let excluded = [
-        "comments",
-        "dependencies",
-        "dependents",
-        "blocks",
-        "blocked_by",
-        "revision",
-    ];
     if let Some(title) = selected_title {
         let field = |name: &str| object.and_then(|o| o.get(name));
         let shown_title = field("title").and_then(Value::as_str).unwrap_or(title);
@@ -221,54 +345,22 @@ pub fn render(value: &Value, selected_title: Option<&str>, width: u16) -> Text<'
                 out.extend(narrative_value(v, width));
             }
         }
-        let mut relation_heading = false;
-        for key in [
-            "comments",
-            "dependencies",
-            "dependents",
-            "blocks",
-            "blocked_by",
-        ] {
-            if let Some(v) = obj.get(key) {
-                if !out.is_empty() {
-                    out.push(Line::default());
-                }
-                if key == "comments" {
-                    out.push(heading("COMMENTS"));
-                } else if !relation_heading {
-                    out.push(heading("RELATIONSHIPS"));
-                    relation_heading = true;
-                }
-                out.push(Line::from(Span::styled(
-                    key.replace('_', " "),
-                    Style::default().fg(MUTED),
-                )));
-                if key == "comments" {
-                    out.extend(comments(v, width));
-                } else {
-                    out.extend(relationships(v, width));
-                }
-            }
-        }
-        let mut remaining: Vec<_> = obj
-            .iter()
-            .filter(|(k, _)| {
-                !(narrative.contains(&k.as_str())
-                    || excluded.contains(&k.as_str())
-                    || selected_title.is_some()
-                        && (["id", "status", "priority"].contains(&k.as_str())
-                            || k.as_str() == "title"
-                                && obj.get("title").and_then(Value::as_str).is_some()))
-            })
-            .collect();
-        remaining.sort_by_key(|(k, _)| *k);
-        if !remaining.is_empty() {
+        if let Some(v) = obj.get("comments") {
             if !out.is_empty() {
                 out.push(Line::default());
             }
-            out.push(heading("OTHER DETAILS"));
-            for (key, v) in remaining {
-                out.extend(metadata(key, v));
+            out.push(heading("COMMENTS"));
+            out.push(Line::styled("comments", Style::default().fg(MUTED)));
+            out.extend(comments(v, width));
+        }
+        if RELATION_FIELDS.iter().any(|key| obj.contains_key(*key)) {
+            let chart = relationship_chart(value, width);
+            if !chart.is_empty() {
+                if !out.is_empty() {
+                    out.push(Line::default());
+                }
+                out.push(heading("DEPENDENCY FLOW"));
+                out.extend(chart);
             }
         }
     } else {
@@ -283,7 +375,156 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn markdown_markup_is_rendered_and_complete_record_stays_visible() {
+    fn blocking_flow_points_from_prerequisite_to_dependent() {
+        let value = json!({
+            "id": "task", "title": "Ship", "status": "open",
+            "dependencies": [{"id": "base", "dependency_type": "blocks", "title": "Build", "status": "closed"}],
+            "dependents": [{"id": "next", "dependency_type": "blocks"}]
+        });
+        let chart = Text::from(relationship_chart(&value, 24)).to_string();
+        assert_eq!(
+            chart,
+            concat!(
+                "── task [open]\n",
+                "   Ship\n",
+                "Blocked by ← prerequisit\n",
+                "es\n",
+                "└─ base [closed]\n",
+                "   Build\n",
+                "Blocks → dependents\n",
+                "└─ next"
+            )
+        );
+    }
+
+    #[test]
+    fn eight_children_fit_one_screen_with_priority_and_solid_branches() {
+        let children: Vec<_> = (0..8)
+            .map(|i| {
+                json!({
+                    "id": format!("OCA_Genie-4ao.{i}"), "priority": i % 5,
+                    "status": "open", "dependency_type": "parent-child",
+                    "title": "Decode the complete recording into an ordered replay timeline"
+                })
+            })
+            .collect();
+        let value = json!({"id": "OCA_Genie-4ao", "priority": 1,
+            "title": "Implement frame by frame replayability", "dependents": children});
+        let chart = relationship_chart(&value, 100);
+        assert_eq!(chart.len(), 19);
+        let plain = Text::from(chart.clone()).to_string();
+        assert_eq!(plain.matches("Children").count(), 1);
+        assert_eq!(plain.matches("├─").count(), 7);
+        assert_eq!(plain.matches("└─").count(), 1);
+        assert!(!plain.contains("RELATIONSHIP DETAILS"));
+        for (priority, color) in [
+            (0, Color::Indexed(1)),
+            (1, Color::Indexed(3)),
+            (2, Color::Indexed(3)),
+            (3, Color::Indexed(2)),
+            (4, MUTED),
+        ] {
+            let row = chart
+                .iter()
+                .find(|line| {
+                    line.to_string()
+                        .contains(&format!("4ao.{priority} · P{priority}"))
+                })
+                .unwrap();
+            assert_eq!(row.spans[0].style.fg, Some(color));
+        }
+        assert_eq!(node_style(&json!({"priority": "invalid"})).fg, Some(MUTED));
+        assert_eq!(node_style(&json!({})).fg, Some(MUTED));
+    }
+
+    #[test]
+    fn blockers_precede_hierarchy_and_nonblocking_groups_keep_source_direction() {
+        let chart = Text::from(relationship_chart(
+            &json!({"id": "task",
+                "dependencies": [{"id": "parent", "dependency_type": "parent-child"}],
+                "dependents": [{"id": "child", "dependency_type": "parent-child"}],
+                "blocked_by": ["base"], "blocks": ["next"]
+            }),
+            100,
+        ))
+        .to_string();
+        assert!(chart.find("Blocked by").unwrap() < chart.find("Blocks →").unwrap());
+        assert!(chart.find("Blocks →").unwrap() < chart.find("Parents").unwrap());
+        assert!(chart.contains("Parents\n└─ parent"));
+        assert!(chart.contains("Children\n└─ child"));
+    }
+
+    #[test]
+    fn aliases_and_nonblocking_types_do_not_invent_blockers() {
+        let value = json!({"id": "task",
+            "blocked_by": ["base"], "blocks": ["next"],
+            "dependencies": [{"id": "parent", "dependency_type": "parent-child"},
+                             {"id": "friend", "type": "related"}, {"id": "unknown"}]
+        });
+        let chart = Text::from(relationship_chart(&value, 60)).to_string();
+        for expected in [
+            "Blocked by ← prerequisites",
+            "Blocks → dependents",
+            "Parents",
+            "related (dependencies)",
+            "unspecified (dependencies)",
+        ] {
+            assert!(chart.contains(expected), "{chart}");
+        }
+        assert_eq!(chart.matches("prerequisites").count(), 1);
+    }
+
+    #[test]
+    fn chart_wraps_literal_unicode_labels_and_omits_relationship_extras() {
+        let value = json!({"id": "selected", "dependencies": [{
+            "id": "base", "dependency_type": "blocks", "type": "task",
+            "title": "**literal** 界界 é title with a long ending", "status": "open",
+            "priority": 1, "extra": {"revision": "keep-me"}
+        }, {"unexpected": "fallback"}, null, 7]});
+        for width in [2, 8, 12, 18, 40, 80] {
+            let chart = relationship_chart(&value, width);
+            assert!(
+                chart.iter().all(|line| line.width() <= usize::from(width)),
+                "width {width}: {chart:?}"
+            );
+            let plain = Text::from(chart).to_string();
+            for omitted in [
+                "RELATIONSHIP DETAILS",
+                "keep-me",
+                "unexpected",
+                "fallback",
+                "null",
+            ] {
+                assert!(!plain.contains(omitted), "{plain}");
+            }
+            let label = "**literal** 界界 é title with a long ending";
+            assert_eq!(chart_wrap(label, usize::from(width)).concat(), label);
+        }
+        let wide = Text::from(relationship_chart(&value, 80)).to_string();
+        assert!(wide.contains("**literal**"));
+        for width in [0, 1] {
+            relationship_chart(&value, width);
+        }
+    }
+
+    #[test]
+    fn absent_and_empty_relationships_are_explicit_without_fabricated_nodes() {
+        assert!(
+            !render(&json!({"id": "task"}), None, 40)
+                .to_string()
+                .contains("DEPENDENCY FLOW")
+        );
+        let empty = render(&json!({"dependencies": [], "dependents": []}), None, 40).to_string();
+        assert!(empty.contains("No dependency links returned."));
+        assert!(!empty.contains("Selected Bead"));
+        let malformed =
+            render(&json!({"dependencies": {"unexpected": true}}), None, 40).to_string();
+        assert!(malformed.is_empty());
+        assert!(!malformed.contains("No dependency links"));
+    }
+
+    #[test]
+    fn markdown_markup_comments_and_dependency_nodes_stay_visible() {
         let value = json!({
             "description": "# Plan\n\nA **bold** and *emphasized* note with `code` and [guide](https://example.test).\n\n- first",
             "notes": "## Notes\n\n- retain this",
@@ -297,16 +538,7 @@ mod tests {
         assert!(plain.contains("bold") && !plain.contains("**bold**"));
         assert!(plain.contains("code") && !plain.contains("`code`"));
         assert!(plain.contains("https://example.test"));
-        for expected in [
-            "hello comment",
-            "other-1",
-            "unknown",
-            "nested",
-            "true",
-            "null",
-            "5",
-            "Title",
-        ] {
+        for expected in ["hello comment", "other-1", "Title"] {
             assert!(plain.contains(expected), "missing {expected}: {plain}");
         }
         assert!(
@@ -319,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn preserves_typed_optional_fields_and_multiline_unknown_metadata() {
+    fn preserves_typed_narrative_fields() {
         let value = serde_json::json!({
             "title": null,
             "description": null,
@@ -332,7 +564,6 @@ mod tests {
             let rendered = render(&value, selected, 18);
             let plain = rendered.to_string();
             for expected in [
-                "title",
                 "null",
                 "DESCRIPTION",
                 "NOTES",
@@ -340,10 +571,6 @@ mod tests {
                 "DESIGN",
                 "[]",
                 "ACCEPTANCE CRITERIA",
-                "unknown",
-                "line one",
-                "line two",
-                "FINAL_SENTINEL",
             ] {
                 assert!(plain.contains(expected), "missing {expected}: {plain}");
             }
@@ -352,7 +579,7 @@ mod tests {
     }
 
     #[test]
-    fn hides_top_level_revision_but_keeps_other_details() {
+    fn hides_miscellaneous_metadata_without_changing_source_json() {
         let value = json!({
             "id": "demo-1",
             "title": "Title",
@@ -364,8 +591,15 @@ mod tests {
         for selected in [Some("Title"), None] {
             let plain = render(&value, selected, 50).to_string();
             assert!(!plain.contains("stale-revision"), "{plain}");
-            assert!(plain.contains("created_at: today"), "{plain}");
-            assert!(plain.contains("nested-revision"), "{plain}");
+            for omitted in [
+                "OTHER DETAILS",
+                "created_at",
+                "today",
+                "unknown",
+                "nested-revision",
+            ] {
+                assert!(!plain.contains(omitted), "{plain}");
+            }
         }
         assert_eq!(value["revision"], "stale-revision");
     }
@@ -386,7 +620,6 @@ mod tests {
         for expected in [
             "Live title",
             "Useful description",
-            "owner: Ada",
             "Keep this comment",
             "other-1",
         ] {
@@ -409,10 +642,9 @@ mod tests {
             "today",
             "bold",
             "other-1",
-            "blocks",
+            "Blocked by ← prerequisites",
             "Other",
             "extra",
-            "kept",
             "Alternate body retained",
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");

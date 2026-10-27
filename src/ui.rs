@@ -810,6 +810,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 continue;
             };
             let bead = &app.beads[i];
+            let depth = crate::app::issue_path(&app.beads, &bead_positions, i)
+                .len()
+                .saturating_sub(1);
+            let inner_width = split[0].width.saturating_sub(2);
+            let indent = depth.min(inner_width.saturating_sub(4) as usize / 2) as u16 * 2;
+            let row_width = inner_width.saturating_sub(indent);
             for line in 0..target.height {
                 let natural_y = target.y + line;
                 if natural_y < app.list_offset
@@ -870,6 +876,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                             Style::default().fg(themed_status_color(status, app.theme)),
                         ),
                     ];
+                    if !bead.blocked_by.is_empty() {
+                        spans.push(Span::styled(
+                            format!(" · waiting on {}", bead.blocked_by.join(", ")),
+                            Style::default().fg(gold),
+                        ));
+                    }
                     if handed_off {
                         spans.push(Span::styled(
                             " · sent",
@@ -878,13 +890,11 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     }
                     Line::from(spans)
                 } else {
-                    let path = crate::app::issue_path(&app.beads, &bead_positions, i);
-                    let depth = path.len().saturating_sub(1);
-                    let width = split[0].width.saturating_sub(2) as usize;
+                    let width = row_width as usize;
                     let parent = bead.data.get("parent").and_then(|value| value.as_str());
-                    let prefix = if depth > 0 {
-                        format!("{}↳ ", "  ".repeat(depth.min(width.saturating_sub(4) / 2)))
-                    } else if let Some(parent) = parent.filter(|parent| !parent.trim().is_empty()) {
+                    let prefix = if let Some(parent) =
+                        parent.filter(|parent| depth == 0 && !parent.trim().is_empty())
+                    {
                         format!(
                             "  ↳ {} · ",
                             truncate_display(parent, width.saturating_sub(8) / 2)
@@ -899,12 +909,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 };
                 f.render_widget(
                     Paragraph::new(content),
-                    Rect::new(
-                        split[0].x + 1,
-                        screen_y,
-                        split[0].width.saturating_sub(2),
-                        1,
-                    ),
+                    Rect::new(split[0].x + 1 + indent, screen_y, row_width, 1),
                 );
             }
         }
@@ -1003,6 +1008,24 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 ),
                 width.saturating_sub(4) as usize,
             )),
+            crate::app::Modal::ConfirmClose { id, title } => Some(if app.mutation_busy {
+                vec![
+                    format!("Closing bead {id}…"),
+                    "Command running · dialog locked".into(),
+                ]
+            } else {
+                wrap_words(
+                    &format!(
+                        "Close this bead?\nID: {id}\n{}\n\nOnly this issue will be closed.\n\n[y] Close · [n / Enter / Esc] Cancel{}",
+                        truncate_display(title, width.saturating_sub(4) as usize),
+                        app.notice
+                            .as_ref()
+                            .map(|text| format!("\n\n{text}"))
+                            .unwrap_or_default()
+                    ),
+                    width.saturating_sub(4) as usize,
+                )
+            }),
             crate::app::Modal::ConfirmDelete { id, title } => Some(delete_dialog_lines(
                 id,
                 title,
@@ -1058,6 +1081,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             }
             crate::app::Modal::EditLoading { .. } => 8,
             crate::app::Modal::ConfirmGenerateEpic { .. }
+            | crate::app::Modal::ConfirmClose { .. }
             | crate::app::Modal::ConfirmDelete { .. } => confirmation_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
@@ -1116,6 +1140,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     " EDIT BEAD "
                 }
                 crate::app::Modal::ConfirmGenerateEpic { .. } => " GENERATE EPIC TASKS? ",
+                crate::app::Modal::ConfirmClose { .. } => " CLOSE BEAD? ",
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
                 crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
@@ -1744,7 +1769,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     rows[6],
                 );
             }
-            crate::app::Modal::ConfirmGenerateEpic { .. } => {
+            crate::app::Modal::ConfirmClose { .. }
+            | crate::app::Modal::ConfirmGenerateEpic { .. } => {
                 f.render_widget(
                     Paragraph::new(confirmation_lines.unwrap_or_default().join("\n"))
                         .style(Style::default().fg(ink)),
@@ -2074,6 +2100,7 @@ fn footer_text(width: usize) -> String {
         " · s settings",
         " · w worktrees",
         " · Ctrl+? keys",
+        " · c close",
     ] {
         if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
             footer.push_str(hint);
@@ -2413,6 +2440,8 @@ mod tests {
     fn issue_rows_indent_nested_children_and_identify_split_parents() {
         let mut app = app();
         let bead = |id: &str, title: &str, parent: Option<&str>, status: &str| Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: id.into(),
             title: title.into(),
             status: status.into(),
@@ -2424,39 +2453,102 @@ mod tests {
             bead("grandchild", "Grandchild", Some("child"), "open"),
             bead("parent", "Parent", None, "open"),
             bead("split", "Split child", Some("parent"), "closed"),
+            bead(
+                "great-grandchild",
+                "Great grandchild",
+                Some("grandchild"),
+                "open",
+            ),
+            bead("unrelated", "Unrelated root", None, "open"),
+            bead("orphan", "Missing parent", Some("absent"), "closed"),
         ];
         app.selected = Some(2);
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
         terminal
             .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
             .unwrap();
         let layout = crate::app::list_layout(&app.beads, &app.collapsed);
-        let row = |index: usize| {
+        let row = |index: usize, line: usize| {
             let target = layout
                 .targets
                 .iter()
                 .find(|target| target.row == DisplayRow::Bead(index))
                 .unwrap();
-            let y = app.list_rect.y + (target.y + 1 - app.list_offset) as u16;
+            let y = app.list_rect.y + (target.y + line - app.list_offset) as u16;
             (0..app.list_rect.width)
                 .map(|x| terminal.backend().buffer()[(app.list_rect.x + x, y)].symbol())
                 .collect::<String>()
         };
-        assert!(row(2).contains("  Parent"));
-        assert!(row(0).contains("  ↳ Child"));
-        assert!(row(1).contains("    ↳ Grandchild"));
-        assert!(row(3).contains("↳ parent · Split child"));
+        let column_of =
+            |row: String, text: &str| row.find(text).map(|byte| row[..byte].chars().count());
+        for (index, title, depth) in [
+            (2, "Parent", 0),
+            (0, "Child", 1),
+            (1, "Grandchild", 2),
+            (4, "Great grandchild", 3),
+            (5, "Unrelated root", 0),
+        ] {
+            let column = 3 + 2 * depth; // Border and common two-column row gutter.
+            assert_eq!(column_of(row(index, 0), "task"), Some(column));
+            assert_eq!(column_of(row(index, 1), title), Some(column));
+        }
+        assert_eq!(column_of(row(2, 0), "›"), Some(1));
+        assert_eq!(column_of(row(3, 1), "↳ parent · Split child"), Some(3));
+        assert_eq!(column_of(row(6, 1), "↳ absent · Missing parent"), Some(3));
 
         let mut compact = Terminal::new(TestBackend::new(40, 16)).unwrap();
         compact
             .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
             .unwrap();
     }
+    #[test]
+    fn deeply_nested_issue_indentation_stays_inside_narrow_group_borders() {
+        let mut app = app();
+        app.beads = (0..32)
+            .map(|index| Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
+                id: format!("task-{index}"),
+                title: "Nested title".into(),
+                status: "open".into(),
+                priority: 2,
+                data: json!({
+                    "issue_type": "task",
+                    "parent": (index > 0).then(|| format!("task-{}", index - 1)),
+                }),
+            })
+            .collect();
+        app.selected = Some(31);
+        for width in [40, 24] {
+            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
+            terminal
+                .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let layout = crate::app::list_layout(&app.beads, &app.collapsed);
+            let target = layout
+                .targets
+                .iter()
+                .find(|target| target.row == DisplayRow::Bead(31))
+                .unwrap();
+            let y = app.list_rect.y + (target.y - app.list_offset) as u16;
+            let inner_width = app.list_rect.width - 2;
+            let indent = inner_width.saturating_sub(4) / 2 * 2;
+            let x = app.list_rect.x + 1 + indent;
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(x, y)].symbol(), "›");
+            assert_eq!(buffer[(x + 2, y + 1)].symbol(), "N");
+            for row in [y, y + 1] {
+                assert_eq!(buffer[(app.list_rect.right() - 1, row)].symbol(), "│");
+            }
+        }
+    }
     fn app() -> App {
         let (tx, _) = mpsc::channel();
         let (_, responses) = mpsc::channel();
         App {
             beads: vec![Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
                 id: "demo-1".into(),
                 title: "Title is visible".into(),
                 status: "closed".into(),
@@ -2626,7 +2718,7 @@ mod tests {
         assert!(compact.contains("Esc"));
     }
     #[test]
-    fn renders_exact_two_line_issue_with_status_and_full_nested_data() {
+    fn renders_two_line_issue_with_status_comments_and_narrative() {
         let mut a = app();
         let (s, _) = draw((120, 40), &mut a);
         assert!(s.contains("task     P1  closed"));
@@ -2703,9 +2795,30 @@ mod tests {
         let bottom = a.list_rect.y + (group.y + group.height - 1 - a.list_offset) as u16;
         assert_eq!(buffer[(a.list_rect.x, bottom)].symbol(), "╰");
         assert!(line(bottom).contains("╯"));
-        for x in ["unknown", "comments", "hello comment", "界", "5"] {
+        for x in ["comments", "hello comment"] {
             assert!(s.contains(x), "{x}")
         }
+        assert!(!s.contains("unknown"));
+        assert!(!s.contains("界"));
+    }
+
+    #[test]
+    fn ready_issue_shows_waiting_bead_ids_beside_status_and_clears_on_refresh() {
+        let mut a = app();
+        a.beads[0].status = "open".into();
+        a.beads[0].data["labels"] = json!([crate::beads::READY_LABEL]);
+        a.beads[0].dependency_ready = false;
+        a.beads[0].blocked_by = vec!["base-1".into(), "base-2".into()];
+        assert!(
+            draw((150, 30), &mut a)
+                .0
+                .contains("ready · waiting on base-1, base-2")
+        );
+        // Compact terminals must keep rendering and navigation functional.
+        draw((40, 12), &mut a);
+        a.beads[0].dependency_ready = true;
+        a.beads[0].blocked_by.clear();
+        assert!(!draw((150, 30), &mut a).0.contains("waiting on"));
     }
 
     #[test]
@@ -2864,6 +2977,8 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(i, kind)| crate::beads::Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
                 id: format!("aligned-{i}"),
                 title: format!("title-{i}"),
                 status: "open".into(),
@@ -2911,6 +3026,8 @@ mod tests {
         let mut a = app();
         a.beads = (0..15)
             .map(|i| crate::beads::Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
                 id: format!("b{i}"),
                 title: format!("item {i}"),
                 status: if i == 14 { "closed" } else { "open" }.into(),
@@ -2965,6 +3082,8 @@ mod tests {
         let mut a = app();
         a.beads[0].status = "closed".into();
         a.beads.push(crate::beads::Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "open-2".into(),
             title: "open title".into(),
             status: "open".into(),
@@ -3016,6 +3135,8 @@ mod tests {
         let mut a = app();
         a.beads = (0..8)
             .map(|i| crate::beads::Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
                 id: format!("long-{i}"),
                 title: format!("visible-title-{i}"),
                 status: "open".into(),
@@ -3071,6 +3192,124 @@ mod tests {
         );
     }
     #[test]
+    fn dependency_chart_priority_colors_follow_every_theme() {
+        for theme in crate::settings::Theme::ALL {
+            let mut a = app();
+            a.theme = theme;
+            a.detail = Some(json!({"id": "demo-1", "title": "Release", "priority": 2,
+                "blocked_by": [{"id": "CRITICAL", "priority": 0}],
+                "blocks": [{"id": "FOLLOWUP", "priority": 3}],
+                "dependents": (0..8).map(|i| json!({"id": format!("child-{i}"),
+                    "priority": i % 5, "status": "open", "dependency_type": "parent-child",
+                    "title": "Decode the complete recording into an ordered replay timeline"
+                })).collect::<Vec<_>>()
+            }));
+            let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for (name, priority) in [("CRITICAL", 0), ("FOLLOWUP", 3)] {
+                let row = (0..40)
+                    .find(|y| {
+                        (0..180)
+                            .map(|x| buffer[(x, *y)].symbol())
+                            .collect::<String>()
+                            .contains(name)
+                    })
+                    .unwrap();
+                let cell = (a.list_rect.width..180)
+                    .find(|x| buffer[(*x, row)].symbol() == &name[..1])
+                    .unwrap();
+                assert_eq!(
+                    buffer[(cell, row)].fg,
+                    crate::theme::priority_color(theme, priority)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dependency_chart_renders_and_scrolls_after_resize() {
+        let mut a = app();
+        a.detail = Some(json!({
+            "id": "demo-1", "title": "Ship", "status": "open",
+            "dependencies": [{"id": "base", "dependency_type": "blocks", "title": "Build", "status": "closed"}],
+            "dependents": [{"id": "next", "dependency_type": "blocks", "title": "FINAL_NODE"}]
+        }));
+        let (wide, _) = draw((120, 40), &mut a);
+        for expected in [
+            "DEPENDENCY FLOW",
+            "Blocked by ← prerequisites",
+            "Blocks → dependents",
+            "base [closed]",
+            "FINAL_NODE",
+        ] {
+            assert!(wide.contains(expected), "missing {expected}: {wide}");
+        }
+        for size in [(50, 14), (80, 18), (120, 24)] {
+            a.detail_offset = u16::MAX;
+            let (scrolled, _) = draw(size, &mut a);
+            if size.0 == 50 {
+                assert!(a.detail_offset > 0);
+            }
+            assert!(scrolled.contains("FINAL_NODE"), "{scrolled}");
+        }
+        a.detail_offset = 0;
+        let (top, _) = draw((120, 40), &mut a);
+        assert!(top.contains("DEPENDENCY FLOW"));
+        assert!(top.contains("Blocked by ← prerequisites"));
+    }
+
+    #[test]
+    fn issue_details_hide_fallback_sections_at_all_scroll_positions() {
+        let mut a = app();
+        let detail = json!({
+            "id": "demo-1", "title": "Ship",
+            "description": "Useful description",
+            "notes": "Useful notes", "design": "Useful design",
+            "acceptance_criteria": "Useful acceptance",
+            "comments": [{"body": "Useful comment"}],
+            "owner": "HIDDEN_OWNER", "custom": {"nested": "HIDDEN_CUSTOM"},
+            "dependencies": [
+                {"id": "base", "type": "blocks", "title": "Build", "extra": "HIDDEN_EXTRA"},
+                {"unsupported": "HIDDEN_RECORD"}
+            ]
+        });
+        a.detail = Some(detail.clone());
+        for size in [(50, 14), (120, 40)] {
+            let mut visible = String::new();
+            for offset in 0..40 {
+                a.detail_offset = offset;
+                let (screen, _) = draw(size, &mut a);
+                for omitted in [
+                    "RELATIONSHIP DETAILS",
+                    "OTHER DETAILS",
+                    "HIDDEN_OWNER",
+                    "HIDDEN_CUSTOM",
+                    "HIDDEN_EXTRA",
+                    "HIDDEN_RECORD",
+                ] {
+                    assert!(!screen.contains(omitted), "{screen}");
+                }
+                visible.push_str(&screen);
+            }
+            for expected in [
+                "Useful description",
+                "Useful notes",
+                "Useful design",
+                "Useful acceptance",
+                "Useful comment",
+                "base",
+                "Build",
+            ] {
+                assert!(visible.contains(expected), "missing {expected}: {visible}");
+            }
+        }
+        assert_eq!(a.detail.as_ref(), Some(&detail));
+    }
+
+    #[test]
     fn tiny_terminal_startup_and_wrapped_detail_are_safe() {
         let mut a = app();
         a.list_rect = Rect::new(1, 1, 10, 10);
@@ -3094,15 +3333,16 @@ mod tests {
         a.detail_error = None;
         assert!(draw((80, 24), &mut a).0.contains("No issues"));
         a.beads.push(Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "long".into(),
             title: "long".into(),
             status: "open".into(),
             priority: 2,
-            data: json!({"text":"界".repeat(700)}),
+            data: json!({"description":"界".repeat(700)}),
         });
         a.selected = Some(0);
-        a.beads[0].data =
-            json!({"unknown_multiline": format!("{}FINAL_SENTINEL", "word\n".repeat(800))});
+        a.beads[0].data = json!({"description": format!("{}FINAL_SENTINEL", "word\n".repeat(800))});
         a.detail = Some(a.beads[0].data.clone());
         a.detail_offset = u16::MAX;
         let (rendered, rect) = draw((50, 14), &mut a);
@@ -3112,6 +3352,50 @@ mod tests {
         let (resized, _) = draw((90, 24), &mut a);
         assert!(resized.contains("FINAL_SENTINEL"));
     }
+    #[test]
+    fn close_confirmation_renders_target_errors_and_locks_small_terminals() {
+        let mut a = app();
+        a.modal = Some(crate::app::Modal::ConfirmClose {
+            id: "test-1".into(),
+            title: "Close selected task 界".into(),
+        });
+        for size in [(100, 30), (50, 24)] {
+            let screen = draw(size, &mut a).0;
+            for text in [
+                "CLOSE BEAD?",
+                "ID: test-1",
+                "Close selected task 界",
+                "[y] Close",
+                "Esc] Cancel",
+            ] {
+                assert!(screen.contains(text), "missing {text} at {size:?}");
+            }
+            assert!(a.modal_ready);
+        }
+        a.notice = Some("Close failed: blocked by task".into());
+        assert!(draw((100, 30), &mut a).0.contains("blocked by task"));
+        a.mutation_busy = true;
+        assert!(draw((100, 30), &mut a).0.contains("Closing bead test-1"));
+        a.mutation_busy = false;
+        for size in [(40, 24), (100, 8)] {
+            assert!(draw(size, &mut a).0.contains("Expand terminal"));
+            assert!(!a.modal_ready);
+        }
+        for context in [
+            crate::hotkeys::Context::Issues,
+            crate::hotkeys::Context::Details,
+            crate::hotkeys::Context::EpicIssues,
+            crate::hotkeys::Context::EpicDetails,
+        ] {
+            assert!(
+                context
+                    .entries()
+                    .iter()
+                    .any(|(key, text)| *key == "c" && text.contains("Close selected"))
+            );
+        }
+    }
+
     #[test]
     fn create_and_delete_modals_render_at_normal_and_tiny_sizes() {
         let mut a = app();
@@ -3332,6 +3616,7 @@ mod tests {
             assert!(!footer.contains("←"));
             assert!(!footer.contains("READY"));
         }
+        assert!(footer_text(140).contains("c close"));
         assert!(footer_text(120).contains("N child"));
         assert!(!footer_text(120).contains("u update"));
         assert!(footer_text(120).contains("Ctrl+? keys"));

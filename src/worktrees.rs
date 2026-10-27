@@ -3435,6 +3435,10 @@ mod tests {
     }
 
     impl Executor for Fake {
+        fn dependency_ready(&mut self, _id: &str) -> io::Result<bool> {
+            Ok(true)
+        }
+
         fn run(&mut self, args: &[&str]) -> io::Result<Vec<u8>> {
             self.calls
                 .push(args.iter().map(|s| (*s).to_owned()).collect());
@@ -4723,10 +4727,14 @@ mod tests {
     }
 
     #[test]
-    fn child_auto_merge_uses_its_own_preference_and_parent_target() {
-        for (auto_merge, auto_merge_children, should_request) in
-            [(false, true, true), (true, false, false)]
-        {
+    fn child_auto_merge_and_cleanup_use_parent_target_and_preferences() {
+        for (auto_merge, auto_merge_children, cleanup_action) in [
+            (false, true, None),
+            (false, true, Some(Action::CloseWorkspace)),
+            (false, true, Some(Action::RemoveCheckout)),
+            (true, false, None),
+        ] {
+            let should_request = auto_merge_children;
             let fixture = Fixture::managed();
             let child_path = fixture.directory.join("child");
             let child_branch = "ontrack/child";
@@ -4827,6 +4835,77 @@ mod tests {
                 assert_eq!(rows[1].status, WorktreeStatus::Integrated);
                 assert_eq!(tip(&fixture.source, "HEAD").unwrap(), child_tip);
                 assert_eq!(tip(&fixture.main, "HEAD").unwrap(), main_tip);
+
+                if let Some(action) = cleanup_action {
+                    let remove_checkout = matches!(action, Action::RemoveCheckout);
+                    // A reserved Epic hosts children without an active parent agent.
+                    let mut registry = Registry::open(&fixture.main).unwrap();
+                    registry.entries[0]["phase"] = json!("reserved");
+                    registry.save().unwrap();
+                    drop(registry);
+                    let inventory = |open, checkout| {
+                        let mut inventory = fixture.inventory(true, true);
+                        if checkout {
+                            inventory["result"]["worktrees"].as_array_mut().unwrap().push(
+                                json!({"path":child_path, "branch":child_branch,
+                                    "open_workspace_id":if open {json!("wChild")} else {Value::Null}}),
+                            );
+                        }
+                        inventory
+                    };
+                    let main = fixture.main.clone();
+                    let child_checkout = child_path.clone();
+                    let mut cleanup = Fake {
+                        hook: Some(Box::new(move |args| {
+                            if args.starts_with(&["worktree", "remove"]) {
+                                git(
+                                    &main,
+                                    &["worktree", "remove", child_checkout.to_str().unwrap()],
+                                )
+                                .unwrap();
+                            }
+                        })),
+                        ..Fake::default()
+                    };
+                    cleanup.json(child_agent(14));
+                    cleanup.json(inventory(true, true));
+                    cleanup.json(json!({"result":{"type":if remove_checkout {
+                        "worktree_removed"
+                    } else {
+                        "workspace_closed"
+                    }}}));
+                    cleanup.json(inventory(false, !remove_checkout));
+                    let rows = reconcile_with(
+                        &fixture.main,
+                        CleanupPolicy {
+                            auto_merge: false,
+                            auto_merge_children: false,
+                            auto_close_workspace: true,
+                            auto_remove_checkout: remove_checkout,
+                        },
+                        &mut cleanup,
+                    )
+                    .unwrap();
+                    assert_eq!(rows[0].status, WorktreeStatus::Reserved);
+                    assert_eq!(
+                        rows[1].status,
+                        if remove_checkout {
+                            WorktreeStatus::CheckoutRemoved
+                        } else {
+                            WorktreeStatus::WorkspaceClosed
+                        }
+                    );
+                    let expected = if remove_checkout {
+                        vec!["worktree", "remove", "--workspace", "wChild"]
+                    } else {
+                        vec!["workspace", "close", "wChild"]
+                    };
+                    assert_eq!(cleanup.calls[3], expected);
+                    assert_eq!(child_path.exists(), !remove_checkout);
+                    assert_eq!(tip(&fixture.source, "HEAD").unwrap(), child_tip);
+                    assert_eq!(tip(&fixture.main, "HEAD").unwrap(), main_tip);
+                    assert!(tip(&fixture.main, &format!("refs/heads/{child_branch}")).is_ok());
+                }
             }
         }
     }

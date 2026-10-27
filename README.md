@@ -9,7 +9,7 @@ OnTrack brings [Beads](https://beads.gascity.com) and [Herdr](https://herdr.dev)
 
 ## From idea to implementation
 
-Browse your backlog beside its Markdown descriptions, comments, and dependencies. Create a task or Epic and add child tasks manually. Paste PNG or JPEG screenshots into descriptions with `Ctrl+V`; handoffs include the saved local image paths.
+Browse your backlog beside its Markdown descriptions, comments, and compact, priority-colored dependency charts. Create a task or Epic and add child tasks manually. Paste PNG or JPEG screenshots into descriptions with `Ctrl+V`; handoffs include the saved local image paths.
 
 Mark tasks **Ready** and let OnTrack dispatch eligible work to Herdr agents in separate Git worktrees, with a concurrency limit you control. Need to start something immediately? Hand the selected Bead to an agent with `h`.
 
@@ -48,4 +48,4 @@ See [installation and updates](docs/installation.md) for supported architectures
 | `s`, `Ctrl+?` | Open settings or context-specific hotkey help |
 | `Esc`, `q` / `Ctrl+C` | Go back; quit when no dialog is open |
 
-Issues are grouped into coloured, collapsible panes. Open, Ready, Blocked, Deferred, In Progress, and Closed remain visible with zero counts when empty; Closed starts collapsed after loading. Press `Ctrl+?` for hotkeys, `s` for settings, and `d` to delete (confirmation required). See the [user guide](docs/user-guide.md) for the full workflow and controls, [settings](docs/settings.md) for preferences, the [development guide](docs/development.md) for architecture and checks, [CI checks](docs/ci.md), and the [release guide](docs/releases.md).
+Issues are grouped into coloured, collapsible panes. Open, Ready, Blocked, Deferred, In Progress, and Closed remain visible with zero counts when empty; Closed starts collapsed after loading. Press `Ctrl+?` for hotkeys, `s` for settings, `c` to close, and `d` to delete (both require confirmation). See the [user guide](docs/user-guide.md) for the full workflow and controls, [settings](docs/settings.md) for preferences, the [development guide](docs/development.md) for architecture and checks, [CI checks](docs/ci.md), and the [release guide](docs/releases.md).

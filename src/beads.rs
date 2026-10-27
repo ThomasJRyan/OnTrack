@@ -69,6 +69,8 @@ pub struct Bead {
     pub status: String,
     pub priority: u64,
     pub data: Value,
+    pub dependency_ready: bool,
+    pub blocked_by: Vec<String>,
 }
 
 const LIST_ARGS: &[&str] = &[
@@ -83,6 +85,65 @@ const LIST_ARGS: &[&str] = &[
 
 pub fn list_beads() -> io::Result<Vec<Bead>> {
     parse_list(&run_bd(LIST_ARGS)?)
+}
+
+const READY_ARGS: &[&str] = &[
+    "--readonly",
+    "--no-color",
+    "ready",
+    "--limit",
+    "0",
+    "--json",
+];
+const BLOCKED_ARGS: &[&str] = &["--readonly", "--no-color", "blocked", "--json"];
+
+/// Fetch graph eligibility together with the browser snapshot. Any failed read
+/// rejects the snapshot so scheduling never treats an unknown graph as ready.
+pub fn list_browser_beads() -> io::Result<Vec<Bead>> {
+    let mut beads = list_beads()?;
+    let ready = parse_records(&run_bd(READY_ARGS)?)?;
+    let blocked = parse_records(&run_bd(BLOCKED_ARGS)?)?;
+    apply_readiness(&mut beads, &ready, &blocked)?;
+    Ok(beads)
+}
+
+fn apply_readiness(beads: &mut [Bead], ready: &[Value], blocked: &[Value]) -> io::Result<()> {
+    let ready_ids = ready
+        .iter()
+        .map(|record| required_string(record, "id"))
+        .collect::<io::Result<std::collections::HashSet<_>>>()?;
+    let mut blockers = std::collections::HashMap::new();
+    for record in blocked {
+        let id = required_string(record, "id")?;
+        let ids = record["blocked_by"]
+            .as_array()
+            .ok_or_else(|| invalid_data("Blocked Bead is missing blocked_by IDs"))?
+            .iter()
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid_data("Invalid blocking Bead ID"))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        blockers.insert(id, ids);
+    }
+    for bead in beads {
+        bead.blocked_by = blockers.remove(&bead.id).unwrap_or_default();
+        bead.dependency_ready = ready_ids.contains(&bead.id) && bead.blocked_by.is_empty();
+    }
+    Ok(())
+}
+
+pub fn dependency_ready(id: &str) -> io::Result<bool> {
+    validate_id(id)?;
+    let records = parse_records(&run_bd(READY_ARGS)?)?;
+    let ids = records
+        .iter()
+        .map(|record| required_string(record, "id"))
+        .collect::<io::Result<std::collections::HashSet<_>>>()?;
+    Ok(ids.contains(id))
 }
 
 pub fn show_bead(id: &str) -> io::Result<Value> {
@@ -234,50 +295,52 @@ fn set_ready_many(ids: &[String], ready: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Change an Epic and its open descendant Tasks in one CLI invocation.
+/// Change an open issue and its open descendants in one CLI invocation.
 /// Beads applies updates per ID, so callers must refresh after any error.
-pub fn set_epic_ready(
-    epic_id: &str,
+pub fn set_tree_ready(
+    parent_id: &str,
     ready: bool,
     known_handoffs: &std::collections::HashSet<String>,
     protected_handoffs: &std::collections::HashSet<String>,
 ) -> io::Result<Vec<String>> {
-    validate_id(epic_id)?;
+    validate_id(parent_id)?;
     let beads = list_beads()?;
-    let ids = epic_ready_targets_in(&beads, epic_id, ready, known_handoffs, protected_handoffs)?;
+    let ids = tree_ready_targets_in(&beads, parent_id, ready, known_handoffs, protected_handoffs)?;
     set_ready_many(&ids, ready)?;
     Ok(ids)
 }
 
-fn epic_ready_targets_in(
+fn tree_ready_targets_in(
     beads: &[Bead],
-    epic_id: &str,
+    parent_id: &str,
     ready: bool,
     known_handoffs: &std::collections::HashSet<String>,
     protected_handoffs: &std::collections::HashSet<String>,
 ) -> io::Result<Vec<String>> {
-    let epic = beads
+    let parent = beads
         .iter()
-        .find(|bead| bead.id == epic_id)
+        .find(|bead| bead.id == parent_id)
         .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "Selected Epic is no longer listed")
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "Selected issue is no longer listed",
+            )
         })?;
-    if epic.status != "open" || epic.data["issue_type"] != "epic" {
+    if parent.status != "open" {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "Only open Epics can change descendant Ready markers",
+            "Only open issues can change descendant Ready markers",
         ));
     }
     let descendants: std::collections::HashSet<_> =
-        open_descendants_in(beads, epic_id).into_iter().collect();
-    let mut ids = vec![epic_id.to_owned()];
+        open_descendants_in(beads, parent_id).into_iter().collect();
+    let mut ids = vec![parent_id.to_owned()];
     ids.extend(
         beads
             .iter()
             .filter(|bead| {
                 descendants.contains(&bead.id)
                     && bead.status == "open"
-                    && bead.data["issue_type"] == "task"
                     && (!ready || !known_handoffs.contains(&bead.id))
                     && (ready || !protected_handoffs.contains(&bead.id))
                     && (ready != is_ready(bead))
@@ -311,12 +374,23 @@ pub fn has_harness_label(data: &Value) -> bool {
     labels(data).any(|label| label.starts_with(HARNESS_PREFIX))
 }
 
-fn labels(data: &Value) -> impl Iterator<Item = &str> {
+pub(crate) fn labels(data: &Value) -> impl Iterator<Item = &str> {
     data.get("labels")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
+}
+
+/// Close only the selected issue, retaining Beads' normal dependency guards.
+pub fn close_bead(id: &str) -> io::Result<()> {
+    run_bd(&close_args(id)?)?;
+    Ok(())
+}
+
+fn close_args(id: &str) -> io::Result<[&str; 5]> {
+    validate_id(id)?;
+    Ok(["--no-color", "close", "--json", "--", id])
 }
 
 /// Permanently delete only this issue, never cascading to dependent issues.
@@ -512,6 +586,8 @@ fn parse_list(bytes: &[u8]) -> io::Result<Vec<Bead>> {
                 title,
                 status,
                 priority,
+                dependency_ready: false,
+                blocked_by: Vec::new(),
                 data,
             })
         })
@@ -540,6 +616,73 @@ fn parse_show(bytes: &[u8], id: &str) -> io::Result<Value> {
 mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn graph_readiness_is_authoritative_and_preserves_ready_intent() {
+        let mut beads = parse_list(
+            br#"[
+            {"id":"waiting","title":"Waiting","status":"open","labels":["ontrack:ready"]},
+            {"id":"free","title":"Free","status":"open","labels":["ontrack:ready"]},
+            {"id":"deferred","title":"Later","status":"open","labels":["ontrack:ready"]}
+        ]"#,
+        )
+        .unwrap();
+        assert!(beads.iter().all(|bead| !bead.dependency_ready));
+        apply_readiness(
+            &mut beads,
+            &[json!({"id":"free"})],
+            &[json!({"id":"waiting","blocked_by":["base", "other"]})],
+        )
+        .unwrap();
+        assert!(!beads[0].dependency_ready);
+        assert_eq!(beads[0].blocked_by, ["base", "other"]);
+        assert!(beads[1].dependency_ready);
+        assert!(!beads[2].dependency_ready);
+        assert!(beads.iter().all(is_ready));
+        apply_readiness(
+            &mut beads,
+            &[json!({"id":"waiting"}), json!({"id":"free"})],
+            &[],
+        )
+        .unwrap();
+        assert!(beads[0].dependency_ready);
+        assert!(beads[0].blocked_by.is_empty());
+        // A dependency added between the ready and blocked reads wins.
+        apply_readiness(
+            &mut beads,
+            &[json!({"id":"free"})],
+            &[json!({"id":"free","blocked_by":["new"]})],
+        )
+        .unwrap();
+        assert!(!beads[1].dependency_ready);
+    }
+
+    #[test]
+    fn readiness_queries_are_readonly_uncapped_and_reject_invalid_records() {
+        assert_eq!(
+            READY_ARGS,
+            [
+                "--readonly",
+                "--no-color",
+                "ready",
+                "--limit",
+                "0",
+                "--json"
+            ]
+        );
+        assert_eq!(
+            BLOCKED_ARGS,
+            ["--readonly", "--no-color", "blocked", "--json"]
+        );
+        for bad in [
+            json!({}),
+            json!({"id":"x"}),
+            json!({"id":"x","blocked_by":[null]}),
+        ] {
+            assert!(apply_readiness(&mut [], &[], &[bad]).is_err());
+        }
+        assert!(apply_readiness(&mut [], &[json!({})], &[]).is_err());
+    }
+
     #[test]
     fn child_creation_keeps_parent_and_user_text_in_separate_arguments() {
         let args = create_child_args(
@@ -601,6 +744,8 @@ mod tests {
     fn ready_and_harness_labels_are_app_state_without_changing_beads_status() {
         let data = json!({"issue_type":"task", "labels":["team:core", READY_LABEL, "ontrack:agent:opencode"]});
         let bead = Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "b1".into(),
             title: "Task".into(),
             status: "open".into(),
@@ -624,6 +769,8 @@ mod tests {
             })));
         }
         assert!(is_ready(&Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "epic".into(),
             title: "Epic".into(),
             status: "open".into(),
@@ -636,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn epic_ready_targets_include_nested_open_tasks_and_skip_existing_handoffs() {
+    fn tree_ready_targets_include_nested_open_tasks_and_skip_existing_handoffs() {
         let rows = json!([
             {"id":"epic","title":"Epic","status":"open","issue_type":"epic"},
             {"id":"direct","title":"Direct","status":"open","issue_type":"task","parent":"epic"},
@@ -652,14 +799,50 @@ mod tests {
         let handoffs = std::collections::HashSet::from(["sent".to_owned(), "reserved".to_owned()]);
         let accepted = std::collections::HashSet::from(["sent".to_owned()]);
         assert_eq!(
-            epic_ready_targets_in(&beads, "epic", true, &handoffs, &accepted).unwrap(),
+            tree_ready_targets_in(&beads, "epic", true, &handoffs, &accepted).unwrap(),
             ["epic", "direct", "nested"]
         );
         assert_eq!(
-            epic_ready_targets_in(&beads, "epic", false, &handoffs, &accepted).unwrap(),
+            tree_ready_targets_in(&beads, "epic", false, &handoffs, &accepted).unwrap(),
             ["epic", "ready", "reserved"]
         );
-        assert!(epic_ready_targets_in(&beads, "other", true, &handoffs, &accepted).is_err());
+        assert_eq!(
+            tree_ready_targets_in(&beads, "other", true, &handoffs, &accepted).unwrap(),
+            ["other"]
+        );
+    }
+
+    #[test]
+    fn task_ready_cascades_across_types_and_preserves_handoffs() {
+        let rows = serde_json::json!([
+            {"id":"parent","title":"Parent","status":"open","issue_type":"task"},
+            {"id":"child","title":"Child","status":"open","issue_type":"feature","parent":"parent"},
+            {"id":"leaf","title":"Leaf","status":"open","issue_type":"bug","parent":"child"},
+            {"id":"closed","title":"Closed","status":"closed","parent":"parent"},
+            {"id":"under-closed","title":"Open","status":"open","parent":"closed"},
+            {"id":"active","title":"Active","status":"in_progress","parent":"parent"},
+            {"id":"deferred","title":"Deferred","status":"deferred","parent":"parent"},
+            {"id":"sent","title":"Sent","status":"open","parent":"parent","labels":[READY_LABEL]},
+            {"id":"pending","title":"Pending","status":"open","parent":"child","labels":[READY_LABEL]},
+            {"id":"unrelated","title":"Unrelated","status":"open"}
+        ]);
+        let mut beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        let known = std::collections::HashSet::from(["sent".into()]);
+        let protected = std::collections::HashSet::from(["sent".into(), "pending".into()]);
+        let marked = tree_ready_targets_in(&beads, "parent", true, &known, &protected).unwrap();
+        assert_eq!(marked, ["parent", "child", "leaf", "under-closed"]);
+        for bead in &mut beads {
+            if marked.contains(&bead.id) {
+                bead.data["labels"] = serde_json::json!([READY_LABEL]);
+            }
+        }
+        assert_eq!(
+            tree_ready_targets_in(&beads, "parent", false, &known, &protected).unwrap(),
+            marked
+        );
+        for id in ["closed", "active", "deferred", "missing"] {
+            assert!(tree_ready_targets_in(&beads, id, true, &known, &protected).is_err());
+        }
     }
 
     #[test]
@@ -675,12 +858,12 @@ mod tests {
         }));
         let mut beads = parse_list(&serde_json::to_vec(&rows).unwrap()).unwrap();
         let empty = std::collections::HashSet::new();
-        let marked = epic_ready_targets_in(&beads, "epic", true, &empty, &empty).unwrap();
+        let marked = tree_ready_targets_in(&beads, "epic", true, &empty, &empty).unwrap();
         assert_eq!(marked.len(), 101);
         for bead in &mut beads {
             bead.data["labels"] = serde_json::json!([READY_LABEL]);
         }
-        let cleared = epic_ready_targets_in(&beads, "epic", false, &empty, &empty).unwrap();
+        let cleared = tree_ready_targets_in(&beads, "epic", false, &empty, &empty).unwrap();
         assert_eq!(marked, cleared);
     }
 
@@ -911,6 +1094,14 @@ mod tests {
     }
 
     #[test]
+    fn close_args_target_only_one_issue_without_force() {
+        assert_eq!(
+            close_args("ontrack-70t").unwrap(),
+            ["--no-color", "close", "--json", "--", "ontrack-70t"]
+        );
+    }
+
+    #[test]
     fn delete_args_force_only_selected_issue_without_cascade() {
         assert_eq!(
             delete_args("ontrack-70t").unwrap(),
@@ -934,6 +1125,11 @@ mod tests {
             "", " ", "--force", "-a", "a b", "a\nb", "a\tb", "a\0b", "a\u{7f}b", "a\u{a0}b",
         ] {
             assert_eq!(
+                close_bead(id).unwrap_err().kind(),
+                io::ErrorKind::InvalidInput,
+                "id: {id:?}"
+            );
+            assert_eq!(
                 delete_bead(id).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput,
                 "id: {id:?}"
@@ -954,7 +1150,12 @@ mod tests {
         let owned_args = create_args(&create_input()).unwrap();
         let create_args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         let delete_args = delete_args("ontrack-70t").unwrap();
-        for args in [create_args.as_slice(), delete_args.as_slice()] {
+        let close_args = close_args("ontrack-70t").unwrap();
+        for args in [
+            create_args.as_slice(),
+            delete_args.as_slice(),
+            close_args.as_slice(),
+        ] {
             let error = run_bd_with(args, |actual| {
                 assert_eq!(actual, args);
                 Ok(Output {

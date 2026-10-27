@@ -49,7 +49,8 @@ pub(super) enum Request {
     CreateChild(CreateBead, String),
     Update(UpdateBead),
     SetReady(String, bool),
-    SetEpicReady(String, bool, HashSet<String>, HashSet<String>),
+    SetTreeReady(String, bool, HashSet<String>, HashSet<String>),
+    Close(String),
     Delete(String),
     DiscoverHarnesses(u64),
     Discover(u64),
@@ -77,6 +78,7 @@ pub(super) enum Response {
     EpicFinished(String, std::io::Result<Vec<String>>),
     Updated(String, std::io::Result<()>),
     ReadySet(String, bool, std::io::Result<Vec<String>>),
+    Closed(String, std::io::Result<()>),
     Deleted(std::io::Result<()>),
     HarnessesDiscovered(u64, std::io::Result<Vec<String>>),
     Discovered(u64, std::io::Result<LaunchContext>),
@@ -183,6 +185,10 @@ pub enum Modal {
     },
     #[allow(dead_code)] // Legacy confirmation is retained but has no browser entry point.
     ConfirmGenerateEpic {
+        id: String,
+        title: String,
+    },
+    ConfirmClose {
         id: String,
         title: String,
     },
@@ -420,7 +426,7 @@ fn cycle_theme(theme: Theme, forward: bool) -> Theme {
 }
 fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
     let response = match request {
-        Request::List => Response::List(beads::list_beads()),
+        Request::List => Response::List(beads::list_browser_beads()),
         Request::Show(id, seq) => Response::Show(id.clone(), seq, beads::show_bead(&id)),
         Request::LoadEdit(id, seq) => Response::EditLoaded(id.clone(), seq, beads::show_bead(&id)),
         Request::Create(input) => Response::Created(beads::create_bead(&input)),
@@ -454,11 +460,12 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
             ready,
             beads::set_ready(&id, ready).map(|()| vec![id]),
         ),
-        Request::SetEpicReady(id, ready, known_handoffs, protected_handoffs) => Response::ReadySet(
+        Request::SetTreeReady(id, ready, known_handoffs, protected_handoffs) => Response::ReadySet(
             id.clone(),
             ready,
-            beads::set_epic_ready(&id, ready, &known_handoffs, &protected_handoffs),
+            beads::set_tree_ready(&id, ready, &known_handoffs, &protected_handoffs),
         ),
+        Request::Close(id) => Response::Closed(id.clone(), beads::close_bead(&id)),
         Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
         Request::DiscoverHarnesses(seq) => {
             Response::HarnessesDiscovered(seq, crate::herdr::installed_harnesses())
@@ -539,7 +546,7 @@ fn start_workers(
                 if managed.send(request).is_err() {
                     break;
                 }
-            } else if matches!(request, Request::SetReady(..) | Request::SetEpicReady(..)) {
+            } else if matches!(request, Request::SetReady(..) | Request::SetTreeReady(..)) {
                 if ready.send(request).is_err() {
                     break;
                 }
@@ -677,17 +684,17 @@ impl App {
         }
     }
     fn poll_scheduler(&mut self) {
-        if !self.worktrees_discovered || self.mutation_busy {
+        if !self.worktrees_discovered || self.mutation_busy || self.list_error.is_some() {
             return;
         }
-        // A child must branch from its managed parent checkout. Preparing an
-        // Epic only reserves that checkout; it does not occupy an agent slot.
-        if let Some(epic) = self
+        // A child must branch from its managed parent checkout. Preparing a
+        // parent only reserves that checkout; it does not occupy an agent slot.
+        if let Some(parent) = self
             .beads
             .iter()
             .find(|bead| {
                 if !beads::is_ready(bead)
-                    || bead.data["issue_type"] != "epic"
+                    || !self.scheduler_eligible(bead)
                     || self.scheduler_attempted.contains(&bead.id)
                     || self.known_handoffs.contains(&bead.id)
                     || self.worktrees.iter().any(|item| item.bead_id == bead.id)
@@ -701,6 +708,7 @@ impl App {
                 let descendants = beads::open_descendants_in(&self.beads, &bead.id);
                 self.beads.iter().any(|child| {
                     beads::is_ready(child)
+                        && child.dependency_ready
                         && child.data["issue_type"] != "epic"
                         && !beads::explicitly_unassigned(&child.data)
                         && (!beads::has_harness_label(&child.data)
@@ -711,8 +719,8 @@ impl App {
             })
             .cloned()
         {
-            self.scheduler_attempted.insert(epic.id.clone());
-            self.start_launch(epic, false);
+            self.scheduler_attempted.insert(parent.id.clone());
+            self.start_launch(parent, true);
             return;
         }
         let active_agents =
@@ -757,6 +765,7 @@ impl App {
             .iter()
             .filter(|bead| {
                 beads::is_ready(bead)
+                    && bead.dependency_ready
                     && bead.data["issue_type"] != "epic"
                     && self.scheduler_eligible(bead)
                     && !self.scheduler_attempted.contains(&bead.id)
@@ -837,6 +846,7 @@ impl App {
     }
     fn poll_worktrees(&mut self, now: Instant) {
         let automatic = self.settings.auto_merge
+            || self.settings.auto_merge_children
             || self.settings.auto_close_workspace
             || self.settings.auto_remove_checkout;
         let should_poll = !self.worktrees_discovered
@@ -1386,6 +1396,17 @@ impl App {
                             self.notice = Some(format!("Could not update Ready for {id}: {error}"));
                             self.refresh_at(now);
                         }
+                    }
+                }
+                Response::Closed(id, result) => {
+                    self.mutation_busy = false;
+                    match result {
+                        Ok(()) => {
+                            self.notice = Some(format!("Bead {id} closed"));
+                            self.modal = None;
+                            self.refresh_at(now);
+                        }
+                        Err(error) => self.notice = Some(format!("Close failed for {id}: {error}")),
                     }
                 }
                 Response::Deleted(result) => {
@@ -1973,6 +1994,18 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('c') if k.modifiers.is_empty() => {
+                if let Some(b) = self.selected.and_then(|i| self.beads.get(i))
+                    && b.status != "closed"
+                {
+                    self.modal = Some(Modal::ConfirmClose {
+                        id: b.id.clone(),
+                        title: b.title.clone(),
+                    });
+                    self.modal_ready = false;
+                    self.notice = None;
+                }
+            }
             KeyCode::Char('d') => {
                 if let Some(b) = self.selected.and_then(|i| self.beads.get(i)) {
                     self.modal = Some(Modal::ConfirmDelete {
@@ -2387,6 +2420,19 @@ impl App {
             }
             return false;
         }
+        if let Some(Modal::ConfirmClose { id, .. }) = self.modal.as_ref() {
+            if matches!(key.code, Char('y') | Char('Y')) {
+                let id = id.clone();
+                self.mutation_busy = true;
+                if self.requests.send(Request::Close(id)).is_err() {
+                    self.mutation_busy = false;
+                    self.notice = Some("Close could not be queued; try again".into());
+                }
+            } else if matches!(key.code, Char('n') | Char('N') | Enter) {
+                self.modal = None;
+            }
+            return false;
+        }
         if let Some(Modal::ConfirmDelete { id, .. }) = self.modal.as_ref() {
             if matches!(key.code, Char('y') | Char('Y')) && !self.mutation_busy {
                 let id = id.clone();
@@ -2743,8 +2789,8 @@ impl App {
         self.mutation_busy = true;
         self.ready_pending = true;
         self.notice = Some(format!("Updating Ready for {id}…"));
-        let request = if epic {
-            Request::SetEpicReady(id, ready, self.known_handoffs.clone(), protected_handoffs)
+        let request = if epic || !beads::open_descendants_in(&self.beads, &id).is_empty() {
+            Request::SetTreeReady(id, ready, self.known_handoffs.clone(), protected_handoffs)
         } else {
             Request::SetReady(id, ready)
         };
@@ -3161,6 +3207,8 @@ mod tests {
     #[test]
     fn issue_layout_groups_children_under_visible_parents() {
         let bead = |id: &str, parent: Option<&str>, status: &str| Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: id.into(),
             title: id.into(),
             status: status.into(),
@@ -3224,6 +3272,8 @@ mod tests {
     #[test]
     fn closed_group_uses_completion_recency_instead_of_id_or_parent_order() {
         let bead = |id: &str, status: &str, data: serde_json::Value| Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: id.into(),
             title: id.into(),
             status: status.into(),
@@ -3311,6 +3361,8 @@ mod tests {
         App {
             beads: (0..4)
                 .map(|i| Bead {
+                    dependency_ready: true,
+                    blocked_by: Vec::new(),
                     id: format!("b{i}"),
                     title: format!("issue {i}"),
                     status: "open".into(),
@@ -3415,6 +3467,49 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_waits_for_dependencies_then_resumes_without_ready_toggle() {
+        let (mut a, rx, _) = connected_app();
+        a.beads.truncate(1);
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+        a.beads[0].dependency_ready = false;
+        a.beads[0].blocked_by = vec!["prerequisite".into()];
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        assert!(!a.scheduler_attempted.contains("b0"));
+        assert!(beads::is_ready(&a.beads[0]));
+        a.beads[0].dependency_ready = true;
+        a.beads[0].blocked_by.clear();
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+    }
+
+    #[test]
+    fn scheduler_pauses_on_failed_browser_snapshot_and_skips_blocked_children() {
+        let (mut a, rx, _) = connected_app();
+        a.beads.truncate(2);
+        for bead in &mut a.beads {
+            bead.data["issue_type"] = json!("task");
+            bead.data["labels"] = json!([beads::READY_LABEL]);
+        }
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[1].dependency_ready = false;
+        a.poll_scheduler();
+        assert!(
+            rx.try_recv().is_err(),
+            "blocked child must not trigger parent preparation"
+        );
+        a.beads[1].dependency_ready = true;
+        a.list_error = Some("readiness lookup failed".into());
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err());
+        a.list_error = None;
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+    }
+
+    #[test]
     fn scheduler_uses_selected_harness_once_and_keeps_ready_after_launch() {
         let mut a = app();
         let (tx, rx) = mpsc::channel();
@@ -3495,7 +3590,9 @@ mod tests {
             .send(Response::Discovered(parent_seq, Ok(launch_context())))
             .unwrap();
         a.receive();
-        assert!(matches!(queued.try_recv(), Ok(Request::Launch(_, _, _, bead)) if bead.id == "b0"));
+        assert!(
+            matches!(queued.try_recv(), Ok(Request::LaunchReady(_, _, _, bead)) if bead.id == "b0")
+        );
         replies
             .send(Response::Launched(
                 parent_seq,
@@ -3797,7 +3894,7 @@ mod tests {
                 assert!(a.notice.as_deref().unwrap().contains("Updating Ready"));
                 assert!(matches!(
                     requests.try_recv(),
-                    Ok(Request::SetReady(..) | Request::SetEpicReady(..))
+                    Ok(Request::SetReady(..) | Request::SetTreeReady(..))
                 ));
                 for key in ['r', 'R', 'n', 'N', 'e', 'd', 'g', 'h', 's', 'u'] {
                     press(&mut a, KeyCode::Char(key));
@@ -3852,7 +3949,7 @@ mod tests {
             let (entered, started) = mpsc::channel();
             let (requests, responses, _) = start_workers(move |request, out| {
                 let response = match request {
-                    Request::SetReady(id, ready) | Request::SetEpicReady(id, ready, ..) => {
+                    Request::SetReady(id, ready) | Request::SetTreeReady(id, ready, ..) => {
                         entered.send(()).unwrap();
                         // Timeout also releases the worker if a regression fails the test.
                         blocked
@@ -3871,7 +3968,7 @@ mod tests {
             });
             requests
                 .send(if epic {
-                    Request::SetEpicReady("epic".into(), true, HashSet::new(), HashSet::new())
+                    Request::SetTreeReady("epic".into(), true, HashSet::new(), HashSet::new())
                 } else {
                     Request::SetReady("task".into(), false)
                 })
@@ -3993,7 +4090,7 @@ mod tests {
         press(&mut a, KeyCode::Char('r'));
         assert!(matches!(
             rx.try_recv(),
-            Ok(Request::SetEpicReady(id, true, handoffs, protected))
+            Ok(Request::SetTreeReady(id, true, handoffs, protected))
                 if id == "b0" && handoffs.contains("b2") && protected.is_empty()
         ));
         assert_eq!(a.beads[0].status, "open");
@@ -4036,6 +4133,105 @@ mod tests {
         assert!(matches!(queued.try_recv(), Ok(Request::List)));
         assert!(a.notice.as_deref().unwrap().contains("partial update"));
         assert!(!a.ready_pending && !a.mutation_busy);
+    }
+
+    #[test]
+    fn task_ready_toggle_queues_tree_with_pending_and_accepted_protection() {
+        let (mut a, rx, _) = connected_app();
+        a.beads[0].data["issue_type"] = json!("task");
+        a.beads[1].data["parent"] = json!("b0");
+        a.beads[2].data["parent"] = json!("b1");
+        a.accepted_handoffs.insert("b1".into());
+        a.known_handoffs.insert("b1".into());
+        let pending = a.beads[2].clone();
+        a.start_launch(pending, false);
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+        press(&mut a, KeyCode::Char('r'));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Request::SetTreeReady(id, true, known, protected))
+                if id == "b0" && known.contains("b1")
+                    && protected.contains("b1") && protected.contains("b2")
+        ));
+    }
+
+    #[test]
+    fn nested_ready_tasks_reserve_ancestors_then_run_agents_from_leaves_up() {
+        let (mut a, rx, _) = connected_app();
+        a.beads.truncate(3);
+        for (i, bead) in a.beads.iter_mut().enumerate() {
+            bead.data["issue_type"] = json!("task");
+            bead.data["labels"] = json!([beads::READY_LABEL, "ontrack:agent:codex"]);
+            // Ancestors have higher priority, but still must wait for descendants.
+            bead.priority = i as u64;
+            if i > 0 {
+                bead.data["parent"] = json!(format!("b{}", i - 1));
+            }
+        }
+        a.settings.agent_limit = settings::AgentLimit::Limited(1);
+        a.worktrees
+            .push(observed_row("other", worktrees::WorktreeStatus::InProgress));
+        // Checkouts must be prepared root first, even at the agent limit.
+        for (id, parent) in [("b0", None), ("b1", Some("b0"))] {
+            a.poll_scheduler();
+            let Request::Discover(seq) = rx.try_recv().unwrap() else {
+                panic!("ancestor preparation was not queued");
+            };
+            let pending = a.handoff.remove(&seq).unwrap();
+            assert_eq!(pending.bead.id, id);
+            assert!(pending.scheduled);
+            a.scheduler_attempted.remove(id);
+            a.known_handoffs.insert(id.into());
+            let mut row = observed_row(id, worktrees::WorktreeStatus::Reserved);
+            row.handoff_accepted = false;
+            row.parent_bead_id = parent.map(str::to_owned);
+            a.worktrees.push(row);
+        }
+        a.poll_scheduler();
+        assert!(rx.try_recv().is_err(), "leaf must wait for an agent slot");
+        a.worktrees.remove(0);
+        a.poll_scheduler();
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!("leaf launch was not queued");
+        };
+        let pending = a.handoff.remove(&seq).unwrap();
+        assert_eq!(pending.bead.id, "b2");
+        assert!(pending.scheduled);
+        a.known_handoffs.insert("b2".into());
+        let mut leaf = observed_row("b2", worktrees::WorktreeStatus::InProgress);
+        leaf.parent_bead_id = Some("b1".into());
+        a.worktrees.push(leaf);
+        assert!(!a.scheduler_eligible(&a.beads[0]));
+        assert!(!a.scheduler_eligible(&a.beads[1]));
+        a.beads[2].status = "closed".into();
+        a.worktrees[2].status = worktrees::WorktreeStatus::Unmerged;
+        assert!(
+            !a.scheduler_eligible(&a.beads[1]),
+            "closed leaf must integrate first"
+        );
+        a.worktrees[2].status = worktrees::WorktreeStatus::Integrated;
+        a.poll_scheduler();
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!("intermediate parent did not resume");
+        };
+        let pending = a.handoff.remove(&seq).unwrap();
+        assert_eq!(pending.bead.id, "b1");
+        assert!(pending.scheduled);
+        assert!(!a.scheduler_eligible(&a.beads[0]));
+        a.beads[1].status = "closed".into();
+        a.worktrees[1].status = worktrees::WorktreeStatus::Unmerged;
+        assert!(
+            !a.scheduler_eligible(&a.beads[0]),
+            "closed child must integrate first"
+        );
+        a.worktrees[1].status = worktrees::WorktreeStatus::Integrated;
+        a.poll_scheduler();
+        let Request::Discover(seq) = rx.try_recv().unwrap() else {
+            panic!("root parent did not resume");
+        };
+        let pending = a.handoff.remove(&seq).unwrap();
+        assert_eq!(pending.bead.id, "b0");
+        assert!(pending.scheduled);
     }
 
     #[test]
@@ -4361,7 +4557,7 @@ mod tests {
         a.selected = Some(0);
         a.toggle_ready();
         assert!(
-            matches!(rx.try_recv(), Ok(Request::SetEpicReady(_,false,_,protected)) if protected.contains("b0") && protected.contains("b2"))
+            matches!(rx.try_recv(), Ok(Request::SetTreeReady(_,false,_,protected)) if protected.contains("b0") && protected.contains("b2"))
         );
     }
 
@@ -6181,6 +6377,8 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         a.responses = rx;
         tx.send(Response::List(Ok(vec![Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "c".into(),
             title: "closed issue".into(),
             status: "closed".into(),
@@ -6798,6 +6996,90 @@ mod tests {
         assert!(a.mutation_busy);
     }
     #[test]
+    fn close_captures_target_locks_duplicates_and_refreshes_after_retry() {
+        for focus_detail in [false, true] {
+            let (mut a, rx, tx) = connected_app();
+            a.focus_detail = focus_detail;
+            press(&mut a, KeyCode::Char('c'));
+            assert!(matches!(&a.modal, Some(Modal::ConfirmClose { id, title })
+                if id == "b0" && title == "issue 0"));
+            a.selected = Some(2);
+            press(&mut a, KeyCode::Char('y'));
+            assert!(matches!(rx.try_recv(), Ok(Request::Close(id)) if id == "b0"));
+            press(&mut a, KeyCode::Char('y'));
+            press(&mut a, KeyCode::Esc);
+            assert!(rx.try_recv().is_err());
+            assert!(a.mutation_busy && a.modal.is_some());
+            tx.send(Response::Closed(
+                "b0".into(),
+                Err(std::io::Error::other("blocked")),
+            ))
+            .unwrap();
+            a.receive();
+            assert!(!a.mutation_busy);
+            assert!(a.notice.as_deref().unwrap().contains("blocked"));
+            assert!(a.modal.is_some());
+            press(&mut a, KeyCode::Char('y'));
+            assert!(matches!(rx.try_recv(), Ok(Request::Close(id)) if id == "b0"));
+            tx.send(Response::Closed("b0".into(), Ok(()))).unwrap();
+            a.receive();
+            assert!(!a.mutation_busy && a.modal.is_none());
+            assert!(a.notice.as_deref().unwrap().contains("b0 closed"));
+            assert!(matches!(rx.try_recv(), Ok(Request::List)));
+            tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+            a.receive();
+            take_show(&rx, "b2");
+        }
+    }
+
+    #[test]
+    fn close_cancel_guards_and_queue_failure_preserve_issue() {
+        for cancel in [
+            KeyCode::Char('n'),
+            KeyCode::Char('N'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+        ] {
+            let (mut a, rx, _) = connected_app();
+            press(&mut a, KeyCode::Char('c'));
+            press(&mut a, cancel);
+            assert!(a.modal.is_none());
+            assert!(rx.try_recv().is_err());
+        }
+        let (mut a, rx, _) = connected_app();
+        a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        assert!(rx.try_recv().is_err(), "must render before confirming");
+        a.modal_ready = true;
+        drop(rx);
+        press(&mut a, KeyCode::Char('y'));
+        assert!(!a.mutation_busy && a.modal.is_some());
+        assert!(a.notice.as_deref().unwrap().contains("could not be queued"));
+        a.modal = None;
+        a.beads[0].status = "closed".into();
+        press(&mut a, KeyCode::Char('c'));
+        assert!(a.modal.is_none());
+        a.selected = None;
+        press(&mut a, KeyCode::Char('c'));
+        assert!(a.modal.is_none());
+        assert!(a.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        a.selected = Some(1);
+        a.ready_pending = true;
+        a.mutation_busy = true;
+        press(&mut a, KeyCode::Char('c'));
+        assert!(a.modal.is_none());
+        a.ready_pending = false;
+        a.mutation_busy = false;
+        a.modal = Some(Modal::Create(CreateForm::default()));
+        press(&mut a, KeyCode::Char('c'));
+        assert!(matches!(&a.modal, Some(Modal::Create(form)) if form.title == "c"));
+        a.modal = None;
+        a.worktrees_view = true;
+        press(&mut a, KeyCode::Char('c'));
+        assert!(!matches!(a.modal, Some(Modal::ConfirmClose { .. })));
+    }
+
+    #[test]
     fn unreadable_delete_dialog_cannot_be_confirmed() {
         let mut a = app();
         let (tx, rx) = mpsc::channel();
@@ -6926,6 +7208,8 @@ mod tests {
         a.receive();
         assert!(matches!(rx.try_recv(), Ok(Request::List)));
         out.send(Response::List(Ok(vec![Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
             id: "new-id".into(),
             title: "fresh".into(),
             status: "open".into(),
@@ -7527,6 +7811,51 @@ mod tests {
             }))
         ));
         assert!(!a.worktrees_view);
+    }
+    #[test]
+    fn child_automation_discovers_worktrees_after_an_empty_scan() {
+        let (mut app, requests, responses) = connected_app();
+        assert!(!app.settings.auto_merge);
+        assert!(app.settings.auto_merge_children);
+        assert!(!app.settings.auto_close_workspace);
+        assert!(!app.settings.auto_remove_checkout);
+        assert!(!app.worktrees_view);
+        app.worktrees_discovered = false;
+        let now = Instant::now();
+        app.poll_worktrees(now);
+        assert!(matches!(requests.try_recv(), Ok(Request::ListWorktrees)));
+        responses.send(Response::Worktrees(Ok(vec![]))).unwrap();
+        app.receive_at(now);
+
+        app.poll_worktrees(now + REFRESH_INTERVAL);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Request::ReconcileWorktrees(CleanupPolicy {
+                auto_merge: false,
+                auto_merge_children: true,
+                auto_close_workspace: false,
+                auto_remove_checkout: false,
+            }))
+        ));
+        let mut child = observed_row("child", worktrees::WorktreeStatus::Unmerged);
+        child.parent_bead_id = Some("epic".into());
+        responses
+            .send(Response::Worktrees(Ok(vec![child])))
+            .unwrap();
+        app.receive_at(now + REFRESH_INTERVAL);
+        assert_eq!(app.worktrees[0].parent_bead_id.as_deref(), Some("epic"));
+        app.poll_worktrees(now + REFRESH_INTERVAL * 2);
+        assert!(matches!(
+            requests.try_recv(),
+            Ok(Request::ReconcileWorktrees(_))
+        ));
+    }
+    #[test]
+    fn empty_settled_worktrees_do_not_poll_when_all_automation_is_disabled() {
+        let (mut app, requests, _) = connected_app();
+        app.settings.auto_merge_children = false;
+        app.poll_worktrees(Instant::now());
+        assert!(requests.try_recv().is_err());
     }
     #[test]
     fn tracked_worktree_reconciles_with_cleanup_preferences_disabled() {
