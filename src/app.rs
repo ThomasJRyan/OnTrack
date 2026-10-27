@@ -116,7 +116,6 @@ pub(super) enum WorktreeFocusFeedback {
 pub struct App {
     pub beads: Vec<Bead>,
     pub focused_column: usize,
-    pub board_column_offset: usize,
     pub column_offsets: [usize; 6],
     pub board_columns: Vec<(usize, Rect)>,
     pub board_cards: Vec<(usize, Rect)>,
@@ -604,7 +603,6 @@ impl App {
         let mut a = Self {
             beads: vec![],
             focused_column: 0,
-            board_column_offset: 0,
             column_offsets: [0; 6],
             board_columns: Vec::new(),
             board_cards: Vec::new(),
@@ -3448,7 +3446,6 @@ mod tests {
                 })
                 .collect(),
             focused_column: 0,
-            board_column_offset: 0,
             column_offsets: [0; 6],
             board_columns: vec![(0, Rect::new(0, 0, 30, 12))],
             board_cards: (0..4)
@@ -3682,13 +3679,11 @@ mod tests {
     fn refresh_preserves_empty_column_drawers_and_moves_selection_by_id() {
         let mut a = app();
         a.focus_column(4);
-        a.board_column_offset = 3;
         a.column_offsets[0] = 2;
         let items = a.beads.clone();
         respond(&mut a, Response::List(Ok(items)));
         assert_eq!(a.focused_column, 4);
         assert!(a.selected.is_none());
-        assert_eq!(a.board_column_offset, 3);
         assert_eq!(a.column_offsets[0], 2);
         a.select(2);
         a.focus_detail = true;

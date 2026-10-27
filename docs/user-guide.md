@@ -53,7 +53,7 @@ normal view; standalone help and handoff toasts do not dim the screen.
 
 The selected task card keeps a visible rounded outline against its highlighted fill in every bundled theme.
 
-The full board has six fixed vertical columns, in this order: **Open, Ready, Blocked, In Progress, Ready To Merge, Closed**. Every column shows a count, including zero, and none collapses. There is no Deferred column. Legacy `deferred` and custom statuses remain visible under Open without rewriting existing Beads; the detail drawer retains the raw Beads status. Narrow terminals scroll horizontally to keep columns legible instead of squeezing all six into unreadable widths. Each column scrolls vertically to keep its selection visible. Cards remain fully inside the rounded column border; terminals too short for a complete card show a resize hint instead.
+The full board has six status columns, in this order: **Open, Ready, Blocked, In Progress, Ready To Merge, Closed**. Every column shows a count, including zero, and none collapses. There is no Deferred column. Legacy `deferred` and custom statuses remain visible under Open without rewriting existing Beads; the detail drawer retains the raw Beads status. The board reflows as you resize: widths of at least 108 terminal cells show six columns in one row, widths of 54–107 show three columns in two rows, and narrower widths show two columns in three rows. Status order runs left to right, then top to bottom; Left / Right still follows that order. All six columns remain present. Each column scrolls vertically to keep its selection visible. Cards remain fully inside the rounded column border; terminals too short for a complete card show a resize hint instead.
 
 The rounded bottom edge of each column stays status-colored in both empty and populated columns. Cards and compact-height guidance remain inside that outline as the terminal is resized.
 
@@ -91,7 +91,7 @@ An Open or Ready issue shows `· sent` beside its status after Herdr confirms th
 | --- | --- |
 | `Ctrl+?` | Open context-specific hotkey help for the board, drawer, or dialog. Use arrows / Page keys to scroll, Home / End to jump, and Esc or Ctrl+? to close without changing selection or form text. |
 | `↑` / `↓` or mouse wheel on the board | Move one card within the focused column without wrapping; scroll only enough to keep selection visible. |
-| `←` / `→` on the board | Switch columns, including empty ones; scroll horizontally when needed. |
+| `←` / `→` on the board | Switch columns in status order, including empty ones and across grid rows. |
 | `Shift+←` / `Shift+→` on the board | Move the selected Bead to an adjacent column without moving its children. Closed requires verified integration. |
 | `m` on the board | Choose a destination column for the selected Bead. |
 | `Enter` | Open or close the selected Bead's right-side detail drawer. |

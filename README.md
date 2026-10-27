@@ -15,7 +15,7 @@ Mark tasks **Ready** and let OnTrack dispatch eligible work to Herdr agents in s
 
 Agents commit and check their work, then signal **Ready To Merge**, not Closed. OnTrack closes a tracked Bead only after verifying integration into its recorded target. The worktree drawer preserves workspace focus, confirmed merge and cleanup, continue (`a`), and restart (`Shift+R`) actions. Automatic merging and cleanup are optional; verified integration still closes the Bead when both are disabled.
 
-The board refreshes automatically, scrolls horizontally on narrow terminals, and scrolls each column vertically. Children integrate into their parent branch before closing. Settings include themes, a default agent, and a concurrent-agent limit. Run `ontrack update` to install a verified compatible release.
+The board refreshes automatically, reflows into 3×2 and 2×3 grids on narrower terminals, and scrolls each column vertically. Children integrate into their parent branch before closing. Settings include themes, a default agent, and a concurrent-agent limit. Run `ontrack update` to install a verified compatible release.
 
 ## Get started
 
