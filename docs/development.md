@@ -65,6 +65,14 @@ value column. `settings_row` aligns titles to the left and centers controls
 by terminal cell width; keep dropdown entries on the same value boundary and
 retain the existing compact-terminal fallback when changing this layout.
 
+The shared modal path dims the already-rendered board and drawers by darkening
+their cell foreground and background colors before drawing the dialog. Keep
+the modal's Clear/frame/content after this pass so its theme styles stay intact;
+help and toast overlays alone must not invoke it. Tiny-terminal modal guidance
+remains readable and does not run through the standard shared backdrop path.
+The legacy fullscreen planning editor returns before this shared modal path and
+is intentionally excluded.
+
 ## Beads CLI contract
 
 For an interactive browser launch, `main` first calls `startup::ensure_herdr_workspace`. It accepts only `HERDR_ENV=1`, the marker Herdr supplies to managed pane processes. Missing or other values return an error with launch guidance before any `bd` command, raw mode, or splash. Help and uninstall dispatch before this guard. The guard checks the inherited marker and does not query Herdr's socket or infer a workspace from global focus.

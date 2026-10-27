@@ -345,6 +345,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         v[2],
     );
     if let Some(modal) = &app.modal {
+        // Recolor the complete rendered view, including drawers, before the
+        // dialog's Clear and normal themed rendering restore its own styles.
+        dim_background(f, a);
         let width = match modal {
             crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. } => {
                 FORM_DESCRIPTION_WIDTH as u16 + 6
@@ -1208,6 +1211,29 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     }
     render_toast(f, app);
     render_help(f, app);
+}
+
+fn dim_background(frame: &mut Frame, area: Rect) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                let style = cell.style();
+                cell.set_style(Style {
+                    fg: style.fg.map(dim_color),
+                    bg: style.bg.map(dim_color),
+                    ..style
+                });
+            }
+        }
+    }
+}
+
+fn dim_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(r / 2, g / 2, b / 2),
+        Color::Reset => Color::Rgb(0, 0, 0),
+        other => other,
+    }
 }
 
 fn status_label(status: &str) -> &'static str {
@@ -2403,6 +2429,122 @@ mod tests {
         }
     }
     #[test]
+    fn shared_modal_dims_background_but_not_modal_and_restores_after_close() {
+        for theme in [crate::settings::Theme::Dark, crate::settings::Theme::Light] {
+            for settings in [false, true] {
+                let mut app = app();
+                app.theme = theme;
+                app.focus_detail = true;
+                let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                    .unwrap();
+                let normal = terminal.backend().buffer().content().to_vec();
+                let backdrop_index = 2 + 4 * 100;
+                let background = &normal[backdrop_index];
+                let drawer_index = 85 + 8 * 100;
+                let drawer_before = &normal[drawer_index];
+
+                app.modal = Some(if settings {
+                    crate::app::Modal::Settings {
+                        draft: app.settings,
+                        error: None,
+                        dropdown_open: false,
+                        focus: 0,
+                    }
+                } else {
+                    crate::app::Modal::Create(crate::app::CreateForm::default())
+                });
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let backdrop = &buffer.content()[backdrop_index];
+                assert_eq!(backdrop.symbol(), background.symbol());
+                assert_eq!(
+                    backdrop.fg,
+                    dim_color(background.fg),
+                    "{theme:?} foreground"
+                );
+                assert_eq!(
+                    backdrop.bg,
+                    dim_color(background.bg),
+                    "{theme:?} background"
+                );
+                let drawer_after = &buffer.content()[drawer_index];
+                assert_eq!(
+                    drawer_after.bg,
+                    dim_color(drawer_before.bg),
+                    "{theme:?} drawer background"
+                );
+                assert_eq!(
+                    drawer_after.fg,
+                    dim_color(drawer_before.fg),
+                    "{theme:?} drawer foreground"
+                );
+
+                assert!(
+                    buffer.content().iter().any(|cell| {
+                        cell.symbol() == "╭"
+                            && cell.fg == crate::theme::definition(theme).palette.border
+                    }),
+                    "{theme:?} modal border should retain its themed color"
+                );
+                assert!(
+                    buffer.content().iter().any(|cell| {
+                        cell.symbol() != " "
+                            && cell.bg == crate::theme::definition(theme).palette.panel
+                            && cell.fg == crate::theme::definition(theme).palette.foreground
+                    }),
+                    "{theme:?} dialog text should retain its themed style"
+                );
+
+                app.modal = None;
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                    .unwrap();
+                assert_eq!(terminal.backend().buffer().content(), normal.as_slice());
+            }
+        }
+    }
+    #[test]
+    fn help_toast_and_compact_modal_fallback_keep_their_normal_styles() {
+        for theme in [crate::settings::Theme::Dark, crate::settings::Theme::Light] {
+            let mut app = app();
+            app.theme = theme;
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let background = terminal.backend().buffer()[(2, 4)].clone();
+            app.help = Some(crate::hotkeys::Help {
+                context: crate::hotkeys::Context::Issues,
+                offset: 0,
+            });
+            app.toast = Some(crate::app::Toast {
+                message: "launching".into(),
+                error: false,
+                expires_at: None,
+            });
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            assert_eq!(terminal.backend().buffer()[(2, 4)].bg, background.bg);
+            assert_eq!(terminal.backend().buffer()[(2, 4)].fg, background.fg);
+
+            app.modal = Some(crate::app::Modal::Create(crate::app::CreateForm::default()));
+            let mut tiny = Terminal::new(TestBackend::new(20, 6)).unwrap();
+            tiny.draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let cells = tiny.backend().buffer().content();
+            assert!(
+                cells
+                    .iter()
+                    .any(|cell| cell.fg == crate::theme::definition(theme).palette.muted)
+            );
+        }
+    }
+    #[test]
     fn splash_animates_girl_without_moving_her_or_delaying_browser() {
         let mut app = app();
         let idle = draw_at((100, 30), Duration::ZERO, &mut app);
@@ -3522,7 +3664,7 @@ mod tests {
         assert!(a.modal_ready);
         assert_eq!(
             buffer[(0, 3)].bg,
-            crate::theme::definition(Theme::Light).palette.panel
+            dim_color(crate::theme::definition(Theme::Light).palette.panel)
         );
         assert!(a.modal_ready);
         a.theme = Theme::Dark;
