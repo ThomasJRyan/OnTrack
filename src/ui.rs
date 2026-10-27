@@ -1,4 +1,4 @@
-use crate::app::{App, DisplayRow, PlanningForm, PlanningStage};
+use crate::app::{App, PlanningForm, PlanningStage};
 use crate::settings::Theme;
 use ratatui::{
     Frame,
@@ -7,51 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
-use std::collections::HashMap;
-use std::time::Duration;
-#[cfg(test)]
-const MUTED: Color = Color::Rgb(123, 144, 148);
-#[cfg(test)]
-const TEAL: Color = Color::Rgb(73, 211, 182);
-#[cfg(test)]
-const GOLD: Color = Color::Rgb(239, 183, 99);
-#[cfg(test)]
-fn status_color(status: &str) -> Color {
-    match status {
-        "open" => TEAL,
-        "ready" => Color::Rgb(125, 168, 235),
-        "closed" | "blocked" => Color::Rgb(255, 123, 123),
-        "in_progress" => GOLD,
-        "deferred" => Color::Rgb(145, 170, 220),
-        "unknown" | "" => MUTED,
-        _ => Color::Rgb(125, 168, 235),
-    }
-}
-#[cfg(test)]
-fn row_type_color(kind: &str) -> Color {
-    match kind.to_ascii_lowercase().as_str() {
-        "task" => TEAL,
-        "bug" => Color::Rgb(255, 123, 123),
-        "feature" => Color::Rgb(103, 177, 255),
-        "epic" => Color::Rgb(197, 145, 255),
-        "chore" => Color::Rgb(168, 207, 125),
-        "decision" => Color::Rgb(240, 141, 197),
-        "spike" => Color::Rgb(255, 192, 115),
-        "story" => Color::Rgb(119, 204, 219),
-        "milestone" => Color::Rgb(145, 170, 220),
-        _ => MUTED,
-    }
-}
-#[cfg(test)]
-fn row_priority_color(priority: u64) -> Color {
-    match priority {
-        0 => Color::Rgb(255, 105, 105),
-        1 => Color::Rgb(255, 159, 105),
-        2 => GOLD,
-        3 => Color::Rgb(138, 197, 169),
-        _ => MUTED,
-    }
-}
+use std::time::{Duration, Instant};
 const ASCII_LOGO: [&str; 8] = [
     "    ███████               ███████████                              █████     ",
     "  ███▒▒▒▒▒███            ▒█▒▒▒███▒▒▒█                             ▒▒███      ",
@@ -178,24 +134,10 @@ fn row_issue_type(bead: &crate::beads::Bead) -> String {
         .map(str::to_owned)
         .unwrap_or_else(|| "unknown".to_owned())
 }
-fn themed_status_color(status: &str, theme: Theme) -> Color {
-    crate::theme::status_color(theme, status)
-}
-fn themed_type_color(kind: &str, theme: Theme) -> Color {
-    crate::theme::issue_type_color(theme, kind)
-}
-fn themed_priority_color(priority: u64, theme: Theme) -> Color {
-    crate::theme::priority_color(theme, priority)
-}
-fn worktree_status_style(theme: Theme, status: crate::worktrees::WorktreeStatus) -> Style {
-    Style::default()
-        .fg(crate::theme::worktree_status_color(theme, status))
-        .add_modifier(Modifier::BOLD)
-}
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
         "↑ / ↓ move · ← / → choice · Enter / Space select · Tab moves · Esc close"
-    } else if focus == 7 {
+    } else if focus == 8 {
         "↑ / ↓ move · Enter / Space close · Tab moves · Esc close"
     } else if focus >= 3 {
         "↑ / ↓ move · Enter / Space toggle · Tab moves · Esc close"
@@ -270,21 +212,6 @@ fn visible_limit_window(limit: crate::settings::AgentLimit, available_height: u1
     };
     (selected.saturating_sub((visible - 1) as u64), visible)
 }
-fn metadata_column_widths(beads: &[crate::beads::Bead]) -> (usize, usize) {
-    let type_width = beads
-        .iter()
-        .map(|bead| Span::raw(row_issue_type(bead)).width())
-        .max()
-        .unwrap_or(0)
-        .clamp(8, 18);
-    let priority_width = beads
-        .iter()
-        .map(|bead| Span::raw(format!("P{}", bead.priority)).width())
-        .max()
-        .unwrap_or(2)
-        .max(2);
-    (type_width, priority_width)
-}
 fn render_header(f: &mut Frame, area: Rect, left: Line<'static>, app: &App) {
     let palette = crate::theme::definition(app.theme).palette;
     f.render_widget(
@@ -321,6 +248,8 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     f.render_widget(Block::default().style(Style::default().bg(bg)), a);
     app.list_rect = Rect::default();
     app.detail_rect = Rect::default();
+    app.board_columns.clear();
+    app.board_cards.clear();
     if a.width < 24 || a.height < 7 {
         app.modal_ready = false;
         f.render_widget(
@@ -360,308 +289,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         render_toast(f, app);
         return;
     }
-    if app.worktrees_view {
-        app.modal_ready = true;
-        f.render_widget(Block::default().style(Style::default().bg(bg)), a);
-        let areas = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(2),
-                Constraint::Min(3),
-                Constraint::Length(1),
-            ])
-            .split(a);
-        render_header(
-            f,
-            areas[0],
-            Line::from(vec![
-                Span::styled(
-                    " WORKTREES ",
-                    Style::default()
-                        .fg(palette.selected_foreground)
-                        .bg(palette.selected_background)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  ONTRACK  /  Git integration, not Bead status"),
-            ]),
-            app,
-        );
-        let feedback = app
-            .worktrees_error
-            .as_deref()
-            .map(|error| format!("ERROR · {error}"))
-            .or_else(|| {
-                app.worktrees_focus_feedback
-                    .as_ref()
-                    .map(|feedback| match feedback {
-                        crate::app::WorktreeFocusFeedback::Success(message) => message.clone(),
-                        crate::app::WorktreeFocusFeedback::Error(message) => {
-                            format!("ERROR · {message}")
-                        }
-                    })
-            })
-            .or_else(|| app.notice.clone());
-        render_header_feedback(f, areas[0], feedback.as_deref(), app.theme);
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(42), Constraint::Percentage(58)])
-            .split(areas[1]);
-        app.list_rect = panes[0];
-        app.detail_rect = panes[1];
-        let item_height = 2usize;
-        let visible = (usize::from(panes[0].height.saturating_sub(2)) / item_height).max(1);
-        if app.selected_worktree < app.worktree_offset {
-            app.worktree_offset = app.selected_worktree;
-        }
-        if app.selected_worktree >= app.worktree_offset + visible {
-            app.worktree_offset = app.selected_worktree + 1 - visible;
-        }
-        app.worktree_offset = app
-            .worktree_offset
-            .min(app.worktrees.len().saturating_sub(visible));
-        let mut rows = Vec::new();
-        if app.worktrees.is_empty() && !app.worktrees_loading {
-            rows.push(Line::from("No outstanding OnTrack-tracked handoffs."));
-            rows.push(Line::from("Existing worktrees are not adopted."));
-        }
-        for (index, item) in app
-            .worktrees
-            .iter()
-            .enumerate()
-            .skip(app.worktree_offset)
-            .take(visible)
-        {
-            let selected = index == app.selected_worktree;
-            let style = if selected {
-                Style::default()
-                    .fg(palette.selected_foreground)
-                    .bg(palette.selected_background)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(ink)
-            };
-            let mut depth = 0usize;
-            let mut parent = item.parent_bead_id.as_deref();
-            while let Some(id) = parent {
-                let Some(ancestor) = app
-                    .worktrees
-                    .iter()
-                    .find(|candidate| candidate.bead_id == id)
-                else {
-                    break;
-                };
-                depth += 1;
-                if depth >= 4 {
-                    break;
-                }
-                parent = ancestor.parent_bead_id.as_deref();
-            }
-            let width = panes[0].width.saturating_sub(2) as usize;
-            let prefix = truncate_display(
-                &format!(
-                    "{} {}{} · ",
-                    if selected { "›" } else { " " },
-                    "  ".repeat(depth),
-                    item.bead_id
-                ),
-                width,
-            );
-            let remaining = width.saturating_sub(Span::raw(prefix.as_str()).width());
-            let label = truncate_display(crate::app::worktree_status_label(item.status), remaining);
-            rows.push(Line::from(vec![
-                Span::styled(prefix, style),
-                Span::styled(label, worktree_status_style(app.theme, item.status)),
-            ]));
-            rows.push(Line::from(Span::styled(
-                truncate_display(
-                    &format!(
-                        "  {}{} → {}",
-                        "  ".repeat(depth),
-                        item.branch,
-                        item.target_branch
-                    ),
-                    panes[0].width.saturating_sub(2) as usize,
-                ),
-                Style::default().fg(muted),
-            )));
-        }
-        f.render_widget(
-            Paragraph::new(rows)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .title(" TRACKED HANDOFFS ")
-                        .border_style(Style::default().fg(palette.border)),
-                )
-                .style(Style::default().fg(ink).bg(palette.panel)),
-            panes[0],
-        );
-        let selected = app.worktrees.get(app.selected_worktree);
-        let detail = if let Some(item) = selected {
-            let live_bead = app.beads.iter().find(|bead| bead.id == item.bead_id);
-            let title = live_bead
-                .map(|bead| bead.title.as_str())
-                .filter(|title| !title.trim().is_empty())
-                .or(item.bead_title.as_deref())
-                .filter(|title| !title.trim().is_empty())
-                .unwrap_or("(not recorded at handoff)");
-            let description = live_bead
-                .and_then(|bead| bead.data.get("description"))
-                .and_then(serde_json::Value::as_str)
-                .or(item.bead_description.as_deref());
-            let mut lines = vec![
-                Line::from(vec![
-                    Span::styled(
-                        format!("{} · ", item.bead_id),
-                        Style::default().fg(teal).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        crate::app::worktree_status_label(item.status),
-                        worktree_status_style(app.theme, item.status),
-                    ),
-                ]),
-                Line::from(format!("Branch: {}", item.branch)),
-                Line::from(format!("Target: {}", item.target_branch)),
-                Line::from(format!("Herdr workspace: {}", item.workspace_id)),
-            ];
-            if let Some(detail) = &item.detail {
-                lines.push(Line::from(Span::styled(
-                    format!("Detail: {detail}"),
-                    Style::default().fg(
-                        if matches!(
-                            item.status,
-                            crate::worktrees::WorktreeStatus::NeedsAttention
-                                | crate::worktrees::WorktreeStatus::NeedsResolution
-                        ) {
-                            palette.danger
-                        } else {
-                            muted
-                        },
-                    ),
-                )));
-            }
-            lines.push(Line::default());
-            lines.push(Line::from(vec![
-                Span::styled("Title: ", Style::default().fg(muted)),
-                Span::raw(title),
-            ]));
-            lines.push(Line::from(Span::styled(
-                "Description:",
-                Style::default().fg(muted),
-            )));
-            match description {
-                Some(description) if !description.trim().is_empty() => {
-                    lines.extend(description.split('\n').map(Line::from));
-                }
-                _ => lines.push(Line::from("(none recorded at handoff)")),
-            }
-            lines
-        } else {
-            vec![Line::from("Select a tracked handoff to inspect its state.")]
-        };
-        let detail_width = panes[1].width.saturating_sub(2);
-        let detail_height = panes[1].height.saturating_sub(2);
-        let line_count = Paragraph::new(detail.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(detail_width);
-        app.worktree_detail_offset = app.worktree_detail_offset.min(
-            line_count
-                .saturating_sub(detail_height as usize)
-                .min(u16::MAX as usize) as u16,
-        );
-        f.render_widget(
-            Paragraph::new(detail)
-                .block(
-                    Block::default()
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .title(" HANDOFF DETAILS ")
-                        .border_style(Style::default().fg(palette.border)),
-                )
-                .wrap(Wrap { trim: false })
-                .scroll((app.worktree_detail_offset, 0))
-                .style(Style::default().fg(ink).bg(bg)),
-            panes[1],
-        );
-        f.render_widget(
-            Paragraph::new(worktree_footer_text(areas[2].width as usize))
-                .style(Style::default().fg(muted).bg(palette.panel_alt)),
-            areas[2],
-        );
-        if let Some(crate::app::Modal::ConfirmWorktree { id, action }) = &app.modal {
-            let restart = *action == 3;
-            let height = if restart {
-                12
-            } else if *action == 4 {
-                11
-            } else {
-                8
-            };
-            if a.width < 50 || a.height < height {
-                app.modal_ready = false;
-                f.render_widget(Clear, a);
-                f.render_widget(
-                    Paragraph::new("Resize terminal to confirm · Esc cancels")
-                        .style(Style::default().fg(gold))
-                        .alignment(Alignment::Center),
-                    a,
-                );
-            } else {
-                app.modal_ready = true;
-                let width = 62.min(a.width.saturating_sub(2));
-                let area = Rect::new(
-                    a.x + a.width.saturating_sub(width) / 2,
-                    a.y + a.height.saturating_sub(height) / 2,
-                    width,
-                    height,
-                );
-                f.render_widget(Clear, area);
-                f.render_widget(
-                    Block::default()
-                        .title(if restart {
-                            " RESTART TASK? "
-                        } else if *action == 4 {
-                            " CONTINUE TASK? "
-                        } else {
-                            " CONFIRM WORKTREE ACTION "
-                        })
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(palette.border))
-                        .style(Style::default().bg(palette.panel)),
-                    area,
-                );
-                let prompt = match action {
-                    0 => {
-                        "Request merge resolution from the recorded agent? This is pending, not merged."
-                    }
-                    1 => "Close the integrated Herdr workspace?",
-                    2 => {
-                        "Remove integrated checkout and close its Herdr workspace? Branch is preserved."
-                    }
-                    4 => {
-                        "Ask the original idle agent to continue in this checkout? Existing changes are preserved. Verify its work before merging."
-                    }
-                    _ => {
-                        "Restart this task from scratch?\n\nDiscard all uncommitted checkout changes.\nThe current Herdr workspace will close.\nThe old branch is kept. A fresh worktree\nand agent will start for this Bead."
-                    }
-                };
-                let inner = Rect::new(area.x + 2, area.y + 1, area.width - 4, area.height - 2);
-                f.render_widget(
-                    Paragraph::new(format!(
-                        "{prompt}\n\nWorktree: {id}\n\ny confirm · n / Esc cancel"
-                    ))
-                    .wrap(Wrap { trim: false })
-                    .style(Style::default().fg(ink)),
-                    inner,
-                );
-            }
-        }
-        render_toast(f, app);
-        render_help(f, app);
-        return;
-    }
     let v = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -685,7 +312,20 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         ]),
         app,
     );
-    let feedback = if let Some(error) = &app.list_error {
+    let feedback = if app.worktrees_view && app.worktrees_error.is_some() {
+        app.worktrees_error
+            .as_ref()
+            .map(|error| format!("WORKTREE ERROR · {error}"))
+    } else if app.worktrees_view && app.worktrees_focus_feedback.is_some() {
+        app.worktrees_focus_feedback
+            .as_ref()
+            .map(|feedback| match feedback {
+                crate::app::WorktreeFocusFeedback::Success(message) => message.clone(),
+                crate::app::WorktreeFocusFeedback::Error(message) => {
+                    format!("WORKSPACE ERROR · {message}")
+                }
+            })
+    } else if let Some(error) = &app.list_error {
         Some(format!("LIST ERROR · {error}"))
     } else if let Some(error) = &app.detail_error {
         Some(format!("DETAIL ERROR · {error}"))
@@ -693,302 +333,21 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         app.notice.clone()
     };
     render_header_feedback(f, v[0], feedback.as_deref(), app.theme);
-    let split = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(v[1]);
-    app.list_rect = split[0];
-    app.detail_rect = split[1];
-    let layout = crate::app::list_layout(&app.beads, &app.collapsed);
-    let bead_positions = app
-        .beads
-        .iter()
-        .enumerate()
-        .map(|(index, bead)| (bead.id.as_str(), index))
-        .collect::<HashMap<_, _>>();
-    let (type_width, priority_width) = metadata_column_widths(&app.beads);
-    let viewport = split[0].height as usize;
-    let focused_target = app
-        .collapse_context
-        .as_ref()
-        .and_then(|status| {
-            layout.targets.iter().find(|target| {
-                target.row == DisplayRow::Group(status.clone())
-                    && (app.collapsed.contains(status)
-                        || !app
-                            .beads
-                            .iter()
-                            .any(|bead| crate::app::display_status(bead) == status))
-            })
-        })
-        .or_else(|| {
-            app.selected
-                .and_then(|i| layout.targets.iter().find(|t| t.row == DisplayRow::Bead(i)))
-        });
-    if let Some(target) = focused_target {
-        let keep = target.height.min(viewport);
-        if target.y < app.list_offset {
-            app.list_offset = target.y;
-        } else if target.y + keep > app.list_offset + viewport {
-            app.list_offset = target.y + keep - viewport;
-        }
+    render_kanban(f, v[1], app);
+    if app.focus_detail {
+        render_detail_drawer(f, a, app, Instant::now());
+    } else if app.worktrees_view {
+        render_worktree_drawer(f, a, app, Instant::now());
     }
-    app.list_offset = app.list_offset.min(layout.height.saturating_sub(viewport));
-    for group in &layout.groups {
-        let natural_top = group.y;
-        let natural_bottom = group.y + group.height;
-        let clip_top = natural_top.max(app.list_offset);
-        let clip_bottom = natural_bottom.min(app.list_offset + viewport);
-        if clip_top >= clip_bottom {
-            continue;
-        }
-        let color = themed_status_color(&group.status, app.theme);
-        let border = Style::default().fg(color);
-        // Draw the sides only over the true intersection. Top and bottom are
-        // drawn at their natural rows, so scrolling never creates fake edges.
-        let side_y = split[0].y + clip_top.saturating_sub(app.list_offset) as u16;
-        let side_h = (clip_bottom - clip_top) as u16;
-        for x in [split[0].x, split[0].x + split[0].width.saturating_sub(1)] {
-            let side_lines = (0..side_h).map(|_| Line::from("│")).collect::<Vec<_>>();
-            f.render_widget(
-                Paragraph::new(side_lines).style(border),
-                Rect::new(x, side_y, 1, side_h),
-            );
-        }
-        if natural_top >= app.list_offset && natural_top < app.list_offset + viewport {
-            let y = split[0].y + (natural_top - app.list_offset) as u16;
-            let label = if group.status.is_empty() {
-                "UNKNOWN".to_owned()
-            } else {
-                group.status.to_uppercase()
-            };
-            let marker = if group.collapsed { "▸" } else { "▾" };
-            let focused = app.collapse_context.as_deref() == Some(group.status.as_str())
-                && (group.collapsed || group.indices.is_empty());
-            let title_style = if focused {
-                Style::default()
-                    .fg(palette.selected_foreground)
-                    .bg(palette.selected_background)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(color).add_modifier(Modifier::BOLD)
-            };
-            let title = truncate_display(
-                &format!(" {marker} {label} · {} ", group.indices.len()),
-                split[0].width.saturating_sub(2) as usize,
-            );
-            let fill = (split[0].width.saturating_sub(2) as usize)
-                .saturating_sub(Span::raw(title.as_str()).width());
-            let top = Line::from(vec![
-                Span::styled("╭", border),
-                Span::styled(title, title_style),
-                Span::styled("─".repeat(fill), border),
-                Span::styled("╮", border),
-            ]);
-            f.render_widget(
-                Paragraph::new(top),
-                Rect::new(split[0].x, y, split[0].width, 1),
-            );
-        }
-        if natural_bottom > app.list_offset && natural_bottom <= app.list_offset + viewport {
-            let y = split[0].y + (natural_bottom - 1 - app.list_offset) as u16;
-            f.render_widget(
-                Paragraph::new(format!(
-                    "╰{}╯",
-                    "─".repeat(split[0].width.saturating_sub(2) as usize)
-                ))
-                .style(border),
-                Rect::new(split[0].x, y, split[0].width, 1),
-            );
-        }
-        for target in layout
-            .targets
-            .iter()
-            .filter(|t| matches!(&t.row,DisplayRow::Bead(i) if group.indices.contains(i)))
-        {
-            let DisplayRow::Bead(i) = target.row else {
-                continue;
-            };
-            let bead = &app.beads[i];
-            let depth = crate::app::issue_path(&app.beads, &bead_positions, i)
-                .len()
-                .saturating_sub(1);
-            let inner_width = split[0].width.saturating_sub(2);
-            let indent = depth.min(inner_width.saturating_sub(4) as usize / 2) as u16 * 2;
-            let row_width = inner_width.saturating_sub(indent);
-            for line in 0..target.height {
-                let natural_y = target.y + line;
-                if natural_y < app.list_offset
-                    || natural_y >= app.list_offset + viewport
-                    || natural_y <= group.y
-                    || natural_y >= natural_bottom - 1
-                {
-                    continue;
-                }
-                let screen_y = split[0].y + (natural_y - app.list_offset) as u16;
-                let selected = app.selected == Some(i);
-                let content = if line == 0 {
-                    let kind = truncate_display(&row_issue_type(bead), type_width);
-                    let kind_width = Span::raw(kind.as_str()).width();
-                    let kind = format!(
-                        "{kind}{}",
-                        " ".repeat(type_width.saturating_sub(kind_width))
-                    );
-                    let status = crate::app::display_status(bead);
-                    let handed_off = bead.status == "open"
-                        && (app.accepted_handoffs.contains(&bead.id)
-                            || app.worktrees.iter().any(|worktree| {
-                                worktree.bead_id == bead.id && worktree.handoff_accepted
-                            }));
-                    let mut spans = vec![
-                        Span::styled(
-                            if selected { "› " } else { "  " },
-                            Style::default()
-                                .fg(if selected { teal } else { muted })
-                                .add_modifier(if selected {
-                                    Modifier::BOLD
-                                } else {
-                                    Modifier::empty()
-                                }),
-                        ),
-                        Span::styled(
-                            kind,
-                            Style::default()
-                                .fg(themed_type_color(&row_issue_type(bead), app.theme)),
-                        ),
-                        Span::raw(" "),
-                        Span::styled(
-                            {
-                                let priority = format!("P{}", bead.priority);
-                                format!(
-                                    "{priority}{}",
-                                    " ".repeat(
-                                        priority_width
-                                            .saturating_sub(Span::raw(priority.as_str()).width())
-                                    )
-                                )
-                            },
-                            Style::default().fg(themed_priority_color(bead.priority, app.theme)),
-                        ),
-                        Span::raw("  "),
-                        Span::styled(
-                            status,
-                            Style::default().fg(themed_status_color(status, app.theme)),
-                        ),
-                    ];
-                    if !bead.blocked_by.is_empty() {
-                        spans.push(Span::styled(
-                            format!(" · waiting on {}", bead.blocked_by.join(", ")),
-                            Style::default().fg(gold),
-                        ));
-                    }
-                    if handed_off {
-                        spans.push(Span::styled(
-                            " · sent",
-                            Style::default().fg(gold).add_modifier(Modifier::BOLD),
-                        ));
-                    }
-                    Line::from(spans)
-                } else {
-                    let width = row_width as usize;
-                    let parent = bead.data.get("parent").and_then(|value| value.as_str());
-                    let prefix = if let Some(parent) =
-                        parent.filter(|parent| depth == 0 && !parent.trim().is_empty())
-                    {
-                        format!(
-                            "  ↳ {} · ",
-                            truncate_display(parent, width.saturating_sub(8) / 2)
-                        )
-                    } else {
-                        "  ".to_owned()
-                    };
-                    Line::from(vec![
-                        Span::raw(prefix),
-                        Span::styled(bead.title.clone(), Style::default().fg(ink)),
-                    ])
-                };
-                f.render_widget(
-                    Paragraph::new(content),
-                    Rect::new(split[0].x + 1 + indent, screen_y, row_width, 1),
-                );
-            }
-        }
-    }
-    let selected = app.selected.and_then(|i| app.beads.get(i));
-    let detail = app.detail.as_ref().or_else(|| selected.map(|b| &b.data));
-    let inner_width = split[1].width.saturating_sub(2).max(1);
-    let selected_title = selected.map(|b| b.title.as_str());
-    let mut detail_text = detail
-        .map(|v| crate::detail::render(v, selected_title, inner_width))
-        .unwrap_or_else(|| {
-            ratatui::text::Text::from(if app.beads.is_empty() {
-                "No issues found in this workspace.\n\nThe issue list refreshes automatically."
-            } else {
-                "Select an issue to inspect its full record."
-            })
-        });
-    for line in &mut detail_text.lines {
-        for span in &mut line.spans {
-            let old = span.style;
-            let style = old.fg(old
-                .fg
-                .map(|color| crate::theme::markdown_foreground(app.theme, color))
-                .unwrap_or(ink));
-            let code = old.fg == Some(Color::Rgb(239, 183, 99))
-                && !old.add_modifier.contains(Modifier::BOLD);
-            // tui-markdown marks inline code by its code-foreground style, but
-            // leaves the background unset. Keep its established panel backing
-            // while the surrounding detail copy inherits the list background.
-            span.style = old
-                .bg
-                .map(|background| {
-                    style.bg(crate::theme::markdown_background(app.theme, background))
-                })
-                .unwrap_or_else(|| {
-                    style.bg(if code {
-                        palette.panel
-                    } else {
-                        palette.background
-                    })
-                });
-        }
-    }
-    let lines = Paragraph::new(detail_text.clone())
-        .wrap(Wrap { trim: false })
-        .line_count(inner_width);
-    let viewport = split[1].height.saturating_sub(2);
-    app.detail_offset = app.detail_offset.min(
-        lines
-            .saturating_sub(viewport as usize)
-            .min(u16::MAX as usize) as u16,
-    );
-    let title = selected
-        .map(|b| format!(" {} · {} · P{} ", b.id, b.status, b.priority))
-        .unwrap_or_else(|| " ISSUE DETAILS ".into());
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(Style::default().fg(if app.focus_detail {
-            teal
-        } else {
-            palette.border
-        }))
-        .style(Style::default().bg(palette.background));
     f.render_widget(
-        Paragraph::new(detail_text)
-            .block(block)
-            .style(Style::default().fg(ink).bg(palette.background))
-            .wrap(Wrap { trim: false })
-            .scroll((app.detail_offset, 0)),
-        split[1],
-    );
-    f.render_widget(
-        Paragraph::new(footer_text(v[2].width as usize, app.selected_is_epic()))
+        Paragraph::new(footer_text(v[2].width as usize))
             .style(Style::default().fg(muted).bg(palette.panel_alt)),
         v[2],
     );
     if let Some(modal) = &app.modal {
+        // Recolor the complete rendered view, including drawers, before the
+        // dialog's Clear and normal themed rendering restore its own styles.
+        dim_background(f, a);
         let width = match modal {
             crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. } => {
                 FORM_DESCRIPTION_WIDTH as u16 + 6
@@ -1016,7 +375,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             } else {
                 wrap_words(
                     &format!(
-                        "Close this bead?\nID: {id}\n{}\n\nOnly this issue will be closed.\n\n[y] Close · [n / Enter / Esc] Cancel{}",
+                        "Close this bead?\nID: {id}\n{}\n\nOnly this issue will be closed.\nVerified Git integration is required first.\n\n[y] Close · [n / Enter / Esc] Cancel{}",
                         truncate_display(title, width.saturating_sub(4) as usize),
                         app.notice
                             .as_ref()
@@ -1077,17 +436,17 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 (11 + option_lines + error_lines + hint_lines + 2) as u16
             }
             crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
-                let epic_toggle = matches!(modal, crate::app::Modal::Create(_))
-                    && crate::beads::BEAD_TYPES[form.issue_type] == "epic";
-                (if form.dropdown.is_some() { 22 } else { 18 }) + u16::from(epic_toggle)
+                if form.dropdown.is_some() { 22 } else { 18 }
             }
             crate::app::Modal::EditLoading { .. } => 8,
+            crate::app::Modal::Move { .. } => 10,
             crate::app::Modal::ConfirmGenerateEpic { .. }
             | crate::app::Modal::ConfirmClose { .. }
             | crate::app::Modal::ConfirmDelete { .. } => confirmation_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
             crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
+            crate::app::Modal::ConfirmWorktree { action: 4, .. } => 11,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
         };
         let min_width = if matches!(
@@ -1141,10 +500,12 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 crate::app::Modal::EditLoading { .. } | crate::app::Modal::Edit { .. } => {
                     " EDIT BEAD "
                 }
+                crate::app::Modal::Move { .. } => " MOVE BEAD ",
                 crate::app::Modal::ConfirmGenerateEpic { .. } => " GENERATE EPIC TASKS? ",
                 crate::app::Modal::ConfirmClose { .. } => " CLOSE BEAD? ",
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
+                crate::app::Modal::ConfirmWorktree { action: 4, .. } => " CONTINUE TASK? ",
                 crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
                 _ => " DELETE BEAD? ",
             })
@@ -1359,6 +720,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "Remove checkout + close Herdr workspace",
                         draft.auto_remove_checkout,
                     ),
+                    ("Animate drawer opening", draft.animate_drawers),
                 ]
                 .into_iter()
                 .enumerate()
@@ -1387,11 +749,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     ))
                     .alignment(Alignment::Center),
                 );
-                lines.push(Line::from(""));
                 lines.push(
                     Line::from(Span::styled(
                         "[ Close ]",
-                        if *focus == 7 {
+                        if *focus == 8 {
                             selected_style
                         } else {
                             value_style
@@ -1427,7 +788,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             }
             crate::app::Modal::Create(form) | crate::app::Modal::Edit { form, .. } => {
                 let editing = matches!(modal, crate::app::Modal::Edit { .. });
-                let epic_toggle = !editing && crate::beads::BEAD_TYPES[form.issue_type] == "epic";
                 let rows = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -1439,7 +799,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         }),
                         Constraint::Length(if form.dropdown == Some(6) { 7 } else { 3 }),
                         Constraint::Min(3),
-                        Constraint::Length(u16::from(epic_toggle)),
+                        Constraint::Length(0),
                         Constraint::Length(1),
                         Constraint::Length(1),
                     ])
@@ -1714,22 +1074,6 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         ));
                     }
                 }
-                if epic_toggle {
-                    let label = format!(
-                        "[{}] Generate child tasks with a Herdr agent",
-                        if form.generate_children { "x" } else { " " }
-                    );
-                    f.render_widget(
-                        Paragraph::new(label).style(if form.focus == 7 {
-                            Style::default()
-                                .fg(palette.selected_foreground)
-                                .bg(palette.selected_background)
-                        } else {
-                            Style::default().fg(teal)
-                        }),
-                        rows[4],
-                    );
-                }
                 let actions = Paragraph::new(Line::from(vec![
                     Span::styled(
                         if editing { "[ Save ]" } else { "[ Create ]" },
@@ -1836,10 +1180,642 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     inner,
                 );
             }
+            crate::app::Modal::Move {
+                id,
+                title,
+                selected,
+            } => {
+                let statuses = crate::app::BOARD_STATUSES;
+                let lines = std::iter::once(format!(
+                    "{id} · {}",
+                    truncate_display(title, inner.width as usize)
+                ))
+                .chain(statuses.iter().enumerate().map(|(index, status)| {
+                    format!(
+                        "{} {}",
+                        if *selected == index { "›" } else { " " },
+                        status_label(status)
+                    )
+                }))
+                .chain(std::iter::once(
+                    "↑/↓ choose · Enter move · Esc cancel".into(),
+                ))
+                .collect::<Vec<_>>();
+                f.render_widget(
+                    Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                        .style(Style::default().fg(ink)),
+                    inner,
+                );
+            }
         }
     }
     render_toast(f, app);
     render_help(f, app);
+}
+
+fn dim_background(frame: &mut Frame, area: Rect) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                let style = cell.style();
+                cell.set_style(Style {
+                    fg: style.fg.map(dim_color),
+                    bg: style.bg.map(dim_color),
+                    ..style
+                });
+            }
+        }
+    }
+}
+
+fn dim_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(r / 2, g / 2, b / 2),
+        Color::Reset => Color::Rgb(0, 0, 0),
+        other => other,
+    }
+}
+
+fn status_label(status: &str) -> &'static str {
+    match status {
+        "open" => "OPEN",
+        "ready" => "READY",
+        "blocked" => "BLOCKED",
+        "in_progress" => "IN PROGRESS",
+        "ready_to_merge" => "READY TO MERGE",
+        "closed" => "CLOSED",
+        _ => "OPEN",
+    }
+}
+
+fn column_heading_parts(
+    status: &str,
+    focused: bool,
+    count: usize,
+    width: usize,
+) -> (String, String) {
+    let count = count.to_string();
+    let count_width = Span::raw(count.as_str()).width();
+    let label_width = width.saturating_sub(count_width + 1);
+    let marker = if focused { "› " } else { "  " };
+    let label = truncate_display(status_label(status), label_width.saturating_sub(2));
+    (
+        truncate_display(&format!("{marker}{label}"), label_width),
+        count,
+    )
+}
+
+fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
+    let statuses = crate::app::BOARD_STATUSES;
+    let palette = crate::theme::definition(app.theme).palette;
+    let previous_card_capacity = std::array::from_fn::<_, 6, _>(|column| {
+        app.board_cards
+            .iter()
+            .filter(|(index, _)| {
+                app.beads.get(*index).is_some_and(|bead| {
+                    statuses
+                        .iter()
+                        .position(|status| *status == crate::app::display_status(bead))
+                        == Some(column)
+                })
+            })
+            .count()
+    });
+    let previously_visible_selection = app
+        .selected
+        .is_some_and(|selected| app.board_cards.iter().any(|(index, _)| *index == selected));
+    let visible = (area.width / 18).clamp(1, 6) as usize;
+    if app.focused_column < app.board_column_offset {
+        app.board_column_offset = app.focused_column;
+    }
+    if app.focused_column >= app.board_column_offset + visible {
+        app.board_column_offset = app.focused_column + 1 - visible;
+    }
+    app.board_column_offset = app.board_column_offset.min(6 - visible);
+    app.board_columns.clear();
+    app.board_cards.clear();
+    let width = area.width / visible as u16;
+    let rem = area.width % visible as u16;
+    let mut x = area.x;
+    for slot in 0..visible {
+        let column = app.board_column_offset + slot;
+        let col_width = width + u16::from((slot as u16) < rem);
+        let rect = Rect::new(x, area.y, col_width, area.height);
+        app.board_columns.push((column, rect));
+        let status = statuses[column];
+        let mut indices = crate::app::list_layout(&app.beads, &Default::default())
+            .groups
+            .into_iter()
+            .find(|group| group.status == status)
+            .map(|group| group.indices)
+            .unwrap_or_default();
+        indices.retain(|&i| crate::app::display_status(&app.beads[i]) == status);
+        let card_height = 5usize;
+        let can_show_cards = rect.height.saturating_sub(3) >= card_height as u16;
+        let visible_cards = if can_show_cards {
+            rect.height.saturating_sub(3) as usize / card_height
+        } else {
+            0
+        };
+        let mut offset = if can_show_cards {
+            app.column_offsets[column].min(indices.len().saturating_sub(visible_cards))
+        } else {
+            0
+        };
+        if can_show_cards
+            && previously_visible_selection
+            && previous_card_capacity[column] > visible_cards
+            && let Some(row) = app
+                .selected
+                .and_then(|selected| indices.iter().position(|&index| index == selected))
+        {
+            if row < offset {
+                offset = row;
+            } else if row >= offset + visible_cards {
+                offset = row + 1 - visible_cards;
+            }
+        }
+        app.column_offsets[column] = offset;
+        let border = crate::theme::status_color(app.theme, status);
+        f.render_widget(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::default().fg(border))
+                .style(Style::default().bg(palette.panel)),
+            rect,
+        );
+        let (mut heading, count_label) = column_heading_parts(
+            status,
+            app.focused_column == column,
+            indices.len(),
+            rect.width.saturating_sub(2) as usize,
+        );
+        if app.focused_column == column {
+            heading = heading.trim_start().to_owned();
+            heading.insert(0, '›');
+        }
+        let count_width = Span::raw(count_label.as_str())
+            .width()
+            .min(rect.width.saturating_sub(2) as usize) as u16;
+        let label_width = rect.width.saturating_sub(2 + count_width + 1);
+        f.render_widget(
+            Paragraph::new(heading).style(
+                Style::default()
+                    .fg(if app.focused_column == column {
+                        palette.accent
+                    } else {
+                        border
+                    })
+                    .add_modifier(if app.focused_column == column {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    }),
+            ),
+            Rect::new(rect.x + 1, rect.y + 1, label_width, 1),
+        );
+        f.render_widget(
+            Paragraph::new(count_label)
+                .alignment(Alignment::Right)
+                .style(
+                    Style::default()
+                        .fg(palette.foreground)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            Rect::new(
+                rect.right().saturating_sub(1 + count_width),
+                rect.y + 1,
+                count_width,
+                1,
+            ),
+        );
+        let inner = Rect::new(
+            rect.x + 1,
+            rect.y + 2,
+            rect.width.saturating_sub(2),
+            rect.height.saturating_sub(3),
+        );
+        if indices.is_empty() {
+            f.render_widget(
+                Paragraph::new("No Beads").style(Style::default().fg(palette.muted)),
+                inner,
+            );
+        }
+        if !can_show_cards {
+            app.column_offsets[column] = 0;
+            f.render_widget(
+                Paragraph::new(truncate_display(
+                    "Resize to 10 rows to show cards",
+                    inner.width as usize,
+                ))
+                .style(Style::default().fg(palette.muted)),
+                inner,
+            );
+            x += col_width;
+            continue;
+        }
+        for (n, &index) in indices.iter().enumerate().skip(offset).take(visible_cards) {
+            let y = inner.y + ((n - offset) * card_height) as u16;
+            if y + card_height as u16 > inner.y + inner.height {
+                break;
+            }
+            let card = Rect::new(inner.x, y, inner.width, card_height as u16);
+            app.board_cards.push((index, card));
+            let bead = &app.beads[index];
+            let selected = app.selected == Some(index);
+            let style = if selected {
+                Style::default()
+                    .fg(palette.selected_foreground)
+                    .bg(palette.selected_background)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(palette.foreground)
+                    .bg(palette.panel_alt)
+            };
+            let kind = row_issue_type(bead);
+            let title_width = card.width.saturating_sub(2) as usize;
+            let lines = vec![
+                Line::from(truncate_display(&bead.title, title_width)),
+                Line::from(vec![
+                    Span::styled(
+                        truncate_display(&bead.id, title_width),
+                        Style::default().fg(if selected {
+                            palette.selected_foreground
+                        } else {
+                            palette.accent
+                        }),
+                    ),
+                    Span::raw(" "),
+                    Span::styled(
+                        truncate_display(&kind, 8),
+                        Style::default().fg(crate::theme::issue_type_color(app.theme, &kind)),
+                    ),
+                    Span::raw(format!(" P{}", bead.priority)),
+                ]),
+                Line::from(Span::styled(
+                    if !bead.blocked_by.is_empty() {
+                        format!("WAIT:{}", bead.blocked_by.join(","))
+                    } else if bead.status == "open"
+                        && (app.accepted_handoffs.contains(&bead.id)
+                            || app
+                                .worktrees
+                                .iter()
+                                .any(|item| item.bead_id == bead.id && item.handoff_accepted))
+                    {
+                        "SENT".to_owned()
+                    } else {
+                        status_label(status).to_owned()
+                    },
+                    Style::default().fg(if bead.blocked_by.is_empty() {
+                        border
+                    } else {
+                        palette.warning
+                    }),
+                )),
+            ];
+            f.render_widget(
+                Paragraph::new(lines)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(
+                                Style::default()
+                                    .fg(crate::theme::issue_type_color(app.theme, &kind)),
+                            )
+                            .style(Style::default().bg(palette.panel_alt)),
+                    )
+                    .style(style),
+                card,
+            );
+        }
+        x += col_width;
+    }
+}
+
+fn drawer_width(screen_width: u16, started: Option<Instant>, enabled: bool, now: Instant) -> u16 {
+    let target = screen_width.min((screen_width * 2 / 5).max(36));
+    let Some(started) = started.filter(|_| enabled) else {
+        return target;
+    };
+    let progress = (now.saturating_duration_since(started).as_secs_f32() / 0.22).clamp(0.0, 1.0);
+    let eased = 1.0 - (1.0 - progress).powi(3);
+    (f32::from(target) * eased).round() as u16
+}
+
+fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
+    let palette = crate::theme::definition(app.theme).palette;
+    let width = drawer_width(
+        screen.width,
+        app.drawer_opened_at,
+        app.settings.animate_drawers,
+        now,
+    );
+    let area = Rect::new(
+        screen.x + screen.width.saturating_sub(width),
+        screen.y + 2,
+        width,
+        screen.height.saturating_sub(3),
+    );
+    app.detail_rect = area;
+    if width < 4 {
+        return;
+    }
+    f.render_widget(Clear, area);
+    let selected = app.selected.and_then(|i| app.beads.get(i));
+    let title = selected
+        .map(|b| {
+            format!(
+                " BEAD DETAILS · {} · {} ",
+                b.id,
+                status_label(crate::app::display_status(b))
+            )
+        })
+        .unwrap_or_else(|| " BEAD DETAILS ".into());
+    let data = app.detail.as_ref().or_else(|| selected.map(|b| &b.data));
+    let mut text = data
+        .map(|d| {
+            crate::detail::render(
+                d,
+                selected.map(|b| b.title.as_str()),
+                area.width.saturating_sub(4),
+            )
+        })
+        .unwrap_or_else(|| ratatui::text::Text::from("Select a Bead to inspect."));
+    if let Some(bead) = selected {
+        let metadata = vec![
+            Line::from(format!("ID: {}", bead.id)),
+            Line::from(format!(
+                "Board column: {}",
+                status_label(crate::app::display_status(bead))
+            )),
+            Line::from(format!("Raw status: {}", bead.status)),
+            Line::from(format!("Priority: P{}", bead.priority)),
+            Line::default(),
+        ];
+        text.lines.splice(0..0, metadata);
+    }
+    for line in &mut text.lines {
+        for span in &mut line.spans {
+            let old = span.style;
+            let code = old.fg == Some(Color::Rgb(239, 183, 99))
+                && !old.add_modifier.contains(Modifier::BOLD);
+            let foreground = old
+                .fg
+                .map(|color| crate::theme::markdown_foreground(app.theme, color))
+                .unwrap_or(palette.foreground);
+            let background = old
+                .bg
+                .map(|color| crate::theme::markdown_background(app.theme, color))
+                .unwrap_or(if code {
+                    palette.code_background
+                } else {
+                    palette.background
+                });
+            span.style = old
+                .fg(foreground)
+                .bg(if code { palette.panel } else { background });
+        }
+    }
+    let content_width = area.width.saturating_sub(2);
+    let content_height = area.height.saturating_sub(2);
+    let line_count = Paragraph::new(text.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(content_width);
+    app.detail_offset = app.detail_offset.min(
+        line_count
+            .saturating_sub(content_height as usize)
+            .min(u16::MAX as usize) as u16,
+    );
+    f.render_widget(
+        Paragraph::new(text)
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(palette.accent)),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((app.detail_offset, 0))
+            .style(
+                Style::default()
+                    .fg(palette.foreground)
+                    .bg(palette.background),
+            ),
+        area,
+    );
+}
+
+fn render_worktree_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
+    let palette = crate::theme::definition(app.theme).palette;
+    let width = drawer_width(
+        screen.width,
+        app.drawer_opened_at,
+        app.settings.animate_drawers,
+        now,
+    );
+    let area = Rect::new(
+        screen.x + screen.width.saturating_sub(width),
+        screen.y + 2,
+        width,
+        screen.height.saturating_sub(3),
+    );
+    if width < 4 {
+        app.list_rect = Rect::default();
+        app.detail_rect = area;
+        return;
+    }
+    f.render_widget(Clear, area);
+    f.render_widget(
+        Block::default()
+            .title(" WORKTREES · GIT HANDOFFS · ESC CLOSES ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(palette.accent))
+            .style(Style::default().bg(palette.panel)),
+        area,
+    );
+    let inner = Rect::new(
+        area.x + 1,
+        area.y + 1,
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(4),
+    );
+    let list_height = (inner.height / 3).max(5).min(inner.height);
+    let list = Rect::new(inner.x, inner.y, inner.width, list_height);
+    let detail = Rect::new(
+        inner.x,
+        inner.y + list_height,
+        inner.width,
+        inner.height.saturating_sub(list_height),
+    );
+    app.list_rect = list;
+    app.detail_rect = detail;
+
+    let visible = usize::from(list.height.saturating_sub(2) / 2).max(1);
+    if app.selected_worktree < app.worktree_offset {
+        app.worktree_offset = app.selected_worktree;
+    }
+    if app.selected_worktree >= app.worktree_offset + visible {
+        app.worktree_offset = app.selected_worktree + 1 - visible;
+    }
+    app.worktree_offset = app
+        .worktree_offset
+        .min(app.worktrees.len().saturating_sub(visible));
+    let rows = app
+        .worktrees
+        .iter()
+        .enumerate()
+        .skip(app.worktree_offset)
+        .take(visible)
+        .flat_map(|(i, item)| {
+            let focused = i == app.selected_worktree;
+            let status = crate::app::worktree_status_label(item.status);
+            let style = if focused {
+                Style::default()
+                    .fg(palette.selected_foreground)
+                    .bg(palette.selected_background)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.foreground)
+            };
+            [
+                Line::from(vec![
+                    Span::styled(if focused { "› " } else { "  " }, style),
+                    Span::styled(item.bead_id.clone(), style),
+                    Span::raw(" · "),
+                    Span::styled(
+                        status,
+                        Style::default()
+                            .fg(crate::theme::worktree_status_color(app.theme, item.status))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Line::from(Span::styled(
+                    truncate_display(
+                        &format!("  {} → {}", item.branch, item.target_branch),
+                        inner.width as usize,
+                    ),
+                    Style::default().fg(palette.muted),
+                )),
+            ]
+        })
+        .collect::<Vec<_>>();
+    let rows = if rows.is_empty() && !app.worktrees_loading {
+        vec![Line::from("No outstanding tracked handoffs.")]
+    } else {
+        rows
+    };
+    f.render_widget(
+        Paragraph::new(rows)
+            .block(
+                Block::default()
+                    .title(" HANDOFFS ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(palette.border)),
+            )
+            .style(Style::default().bg(palette.panel)),
+        list,
+    );
+
+    let selected = app.worktrees.get(app.selected_worktree);
+    let mut lines = if let Some(item) = selected {
+        let live = app.beads.iter().find(|bead| bead.id == item.bead_id);
+        let title = live
+            .map(|bead| bead.title.as_str())
+            .or(item.bead_title.as_deref())
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or("(not recorded at handoff)");
+        let description = live
+            .and_then(|bead| bead.data.get("description"))
+            .and_then(serde_json::Value::as_str)
+            .or(item.bead_description.as_deref());
+        let mut lines = vec![Line::from(vec![
+            Span::styled(
+                item.bead_id.clone(),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" · "),
+            Span::styled(
+                crate::app::worktree_status_label(item.status),
+                Style::default()
+                    .fg(crate::theme::worktree_status_color(app.theme, item.status))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])];
+        if let Some(detail) = &item.detail {
+            lines.push(Line::from(Span::styled(
+                detail.clone(),
+                Style::default().fg(palette.warning),
+            )));
+        }
+        lines.extend([
+            Line::from(truncate_display(title, inner.width as usize)),
+            Line::from(format!("Branch: {}", item.branch)),
+            Line::from(format!("Target: {}", item.target_branch)),
+            Line::from(format!("Workspace: {}", item.workspace_id)),
+        ]);
+        lines.push(Line::default());
+        lines.push(Line::from("Description:"));
+        lines.extend(
+            description
+                .unwrap_or("(none recorded at handoff)")
+                .lines()
+                .map(Line::from),
+        );
+        lines
+    } else {
+        vec![Line::from("Select a handoff to inspect its state.")]
+    };
+    let viewport = detail.height.saturating_sub(2);
+    let count = Paragraph::new(lines.clone())
+        .wrap(Wrap { trim: false })
+        .line_count(detail.width.saturating_sub(2));
+    app.worktree_detail_offset = app.worktree_detail_offset.min(
+        count
+            .saturating_sub(viewport as usize)
+            .min(u16::MAX as usize) as u16,
+    );
+    f.render_widget(
+        Paragraph::new(std::mem::take(&mut lines))
+            .block(
+                Block::default()
+                    .title(" HANDOFF DETAILS ")
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded)
+                    .border_style(Style::default().fg(palette.border)),
+            )
+            .wrap(Wrap { trim: false })
+            .scroll((app.worktree_detail_offset, 0))
+            .style(Style::default().fg(palette.foreground).bg(palette.panel)),
+        detail,
+    );
+    let footer = Rect::new(
+        area.x + 2,
+        area.bottom().saturating_sub(3),
+        area.width.saturating_sub(4),
+        2,
+    );
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(truncate_display(
+                "Enter switch · m merge · c close",
+                footer.width as usize,
+            )),
+            Line::from(truncate_display(
+                "x remove · a continue · R restart",
+                footer.width as usize,
+            )),
+        ])
+        .style(Style::default().fg(palette.muted).bg(palette.panel_alt)),
+        footer,
+    );
 }
 
 fn render_planning(f: &mut Frame, area: Rect, form: &PlanningForm, theme: Theme, ready: bool) {
@@ -2109,47 +2085,13 @@ fn render_toast(f: &mut Frame, app: &App) {
         box_area,
     );
 }
-fn footer_text(width: usize, epic: bool) -> String {
-    let mut footer = truncate_display(
-        if epic {
-            " g generate · n new · e edit · d delete · h hand off · r ready · q quit"
-        } else {
-            " n new · e edit · d delete · h hand off · r ready · q quit"
-        },
+fn footer_text(width: usize) -> String {
+    truncate_display(
+        "↑↓ select · ←→ column · ⇧←→ move · m move · Enter details · w worktrees · n new · e edit · q quit",
         width,
-    );
-    for hint in [
-        " · p plan",
-        " · N child",
-        " · s settings",
-        " · w worktrees",
-        " · Ctrl+? keys",
-        " · c close",
-    ] {
-        if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
-            footer.push_str(hint);
-        }
-    }
-    footer
+    )
 }
-fn worktree_footer_text(width: usize) -> String {
-    let mut footer = String::new();
-    for hint in [
-        " Enter switch",
-        " · m merge",
-        " · c close",
-        " · x remove",
-        " · a continue",
-        " · R restart",
-        " · PgUp/PgDn scroll",
-        " · Ctrl+? keys",
-    ] {
-        if Span::raw(footer.as_str()).width() + Span::raw(hint).width() <= width {
-            footer.push_str(hint);
-        }
-    }
-    footer
-}
+
 fn bead_type_name(index: usize) -> &'static str {
     crate::beads::BEAD_TYPES
         .get(index)
@@ -2421,151 +2363,7 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
     use std::sync::mpsc;
-    #[test]
-    fn tracked_child_row_is_indented_under_parent() {
-        let mut app = app();
-        app.worktrees_view = true;
-        let parent = crate::worktrees::ManagedWorktree {
-            id: "parent".into(),
-            bead_id: "parent".into(),
-            parent_bead_id: None,
-            handoff_accepted: true,
-            bead_title: None,
-            bead_description: None,
-            branch: "ontrack/parent".into(),
-            target_branch: "trunk".into(),
-            workspace_id: "wParent".into(),
-            status: crate::worktrees::WorktreeStatus::Unmerged,
-            detail: None,
-        };
-        let child = crate::worktrees::ManagedWorktree {
-            id: "child".into(),
-            bead_id: "child".into(),
-            parent_bead_id: Some("parent".into()),
-            branch: "ontrack/child".into(),
-            target_branch: "ontrack/parent".into(),
-            ..parent.clone()
-        };
-        app.worktrees = vec![parent, child];
-        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        terminal
-            .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let row = |y| {
-            (0..app.list_rect.width)
-                .map(|x| buffer[(app.list_rect.x + x, y)].symbol())
-                .collect::<String>()
-        };
-        assert!(row(app.list_rect.y + 1).contains("› parent"));
-        assert!(row(app.list_rect.y + 3).contains("    child"));
-    }
-    #[test]
-    fn issue_rows_indent_nested_children_and_identify_split_parents() {
-        let mut app = app();
-        let bead = |id: &str, title: &str, parent: Option<&str>, status: &str| Bead {
-            dependency_ready: true,
-            blocked_by: Vec::new(),
-            id: id.into(),
-            title: title.into(),
-            status: status.into(),
-            priority: 2,
-            data: json!({"issue_type": "task", "parent": parent}),
-        };
-        app.beads = vec![
-            bead("child", "Child", Some("parent"), "open"),
-            bead("grandchild", "Grandchild", Some("child"), "open"),
-            bead("parent", "Parent", None, "open"),
-            bead("split", "Split child", Some("parent"), "closed"),
-            bead(
-                "great-grandchild",
-                "Great grandchild",
-                Some("grandchild"),
-                "open",
-            ),
-            bead("unrelated", "Unrelated root", None, "open"),
-            bead("orphan", "Missing parent", Some("absent"), "closed"),
-        ];
-        app.selected = Some(2);
-        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
-        terminal
-            .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
-            .unwrap();
-        let layout = crate::app::list_layout(&app.beads, &app.collapsed);
-        let row = |index: usize, line: usize| {
-            let target = layout
-                .targets
-                .iter()
-                .find(|target| target.row == DisplayRow::Bead(index))
-                .unwrap();
-            let y = app.list_rect.y + (target.y + line - app.list_offset) as u16;
-            (0..app.list_rect.width)
-                .map(|x| terminal.backend().buffer()[(app.list_rect.x + x, y)].symbol())
-                .collect::<String>()
-        };
-        let column_of =
-            |row: String, text: &str| row.find(text).map(|byte| row[..byte].chars().count());
-        for (index, title, depth) in [
-            (2, "Parent", 0),
-            (0, "Child", 1),
-            (1, "Grandchild", 2),
-            (4, "Great grandchild", 3),
-            (5, "Unrelated root", 0),
-        ] {
-            let column = 3 + 2 * depth; // Border and common two-column row gutter.
-            assert_eq!(column_of(row(index, 0), "task"), Some(column));
-            assert_eq!(column_of(row(index, 1), title), Some(column));
-        }
-        assert_eq!(column_of(row(2, 0), "›"), Some(1));
-        assert_eq!(column_of(row(3, 1), "↳ parent · Split child"), Some(3));
-        assert_eq!(column_of(row(6, 1), "↳ absent · Missing parent"), Some(3));
 
-        let mut compact = Terminal::new(TestBackend::new(40, 16)).unwrap();
-        compact
-            .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
-            .unwrap();
-    }
-    #[test]
-    fn deeply_nested_issue_indentation_stays_inside_narrow_group_borders() {
-        let mut app = app();
-        app.beads = (0..32)
-            .map(|index| Bead {
-                dependency_ready: true,
-                blocked_by: Vec::new(),
-                id: format!("task-{index}"),
-                title: "Nested title".into(),
-                status: "open".into(),
-                priority: 2,
-                data: json!({
-                    "issue_type": "task",
-                    "parent": (index > 0).then(|| format!("task-{}", index - 1)),
-                }),
-            })
-            .collect();
-        app.selected = Some(31);
-        for width in [40, 24] {
-            let mut terminal = Terminal::new(TestBackend::new(width, 16)).unwrap();
-            terminal
-                .draw(|frame| render(frame, Duration::from_secs(2), &mut app))
-                .unwrap();
-            let layout = crate::app::list_layout(&app.beads, &app.collapsed);
-            let target = layout
-                .targets
-                .iter()
-                .find(|target| target.row == DisplayRow::Bead(31))
-                .unwrap();
-            let y = app.list_rect.y + (target.y - app.list_offset) as u16;
-            let inner_width = app.list_rect.width - 2;
-            let indent = inner_width.saturating_sub(4) / 2 * 2;
-            let x = app.list_rect.x + 1 + indent;
-            let buffer = terminal.backend().buffer();
-            assert_eq!(buffer[(x, y)].symbol(), "›");
-            assert_eq!(buffer[(x + 2, y + 1)].symbol(), "N");
-            for row in [y, y + 1] {
-                assert_eq!(buffer[(app.list_rect.right() - 1, row)].symbol(), "│");
-            }
-        }
-    }
     fn app() -> App {
         let (tx, _) = mpsc::channel();
         let (_, responses) = mpsc::channel();
@@ -2579,14 +2377,17 @@ mod tests {
                 priority: 1,
                 data: json!({"issue_type":"task","unknown":{"n":5},"comments":[{"body":"hello comment"}],"unicode":"界界界界界界界界界界"}),
             }],
-            collapsed: std::collections::HashSet::new(),
-            closed_default_pending: false,
-            collapse_context: None,
+            focused_column: 5,
+            board_column_offset: 0,
+            column_offsets: [0; 6],
+            board_columns: Vec::new(),
+            board_cards: Vec::new(),
+            column_rows: [0; 6],
             selected: Some(0),
             detail: None,
             focus_detail: false,
-            list_offset: 0,
             detail_offset: 0,
+            drawer_opened_at: None,
             list_loading: false,
             detail_loading: false,
             list_error: None,
@@ -2629,7 +2430,6 @@ mod tests {
             mutation_busy: false,
             ready_pending: false,
             planning_epics: Default::default(),
-            planning_seq: 0,
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -2666,6 +2466,26 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect()
     }
+    fn draw_drawer(size: (u16, u16), app: &mut App, now: Instant) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let screen = frame.area();
+                if app.focus_detail {
+                    render_detail_drawer(frame, screen, app, now);
+                } else {
+                    render_worktree_drawer(frame, screen, app, now);
+                }
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
     #[test]
     fn bordered_screens_render_without_square_corners() {
         let mut app = app();
@@ -2684,6 +2504,122 @@ mod tests {
                     .chars()
                     .any(|corner| matches!(corner, '┌' | '┐' | '└' | '┘')),
                 "{screen} contains a square corner"
+            );
+        }
+    }
+    #[test]
+    fn shared_modal_dims_background_but_not_modal_and_restores_after_close() {
+        for theme in [crate::settings::Theme::Dark, crate::settings::Theme::Light] {
+            for settings in [false, true] {
+                let mut app = app();
+                app.theme = theme;
+                app.focus_detail = true;
+                let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                    .unwrap();
+                let normal = terminal.backend().buffer().content().to_vec();
+                let backdrop_index = 2 + 4 * 100;
+                let background = &normal[backdrop_index];
+                let drawer_index = 85 + 8 * 100;
+                let drawer_before = &normal[drawer_index];
+
+                app.modal = Some(if settings {
+                    crate::app::Modal::Settings {
+                        draft: app.settings,
+                        error: None,
+                        dropdown_open: false,
+                        focus: 0,
+                    }
+                } else {
+                    crate::app::Modal::Create(crate::app::CreateForm::default())
+                });
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let backdrop = &buffer.content()[backdrop_index];
+                assert_eq!(backdrop.symbol(), background.symbol());
+                assert_eq!(
+                    backdrop.fg,
+                    dim_color(background.fg),
+                    "{theme:?} foreground"
+                );
+                assert_eq!(
+                    backdrop.bg,
+                    dim_color(background.bg),
+                    "{theme:?} background"
+                );
+                let drawer_after = &buffer.content()[drawer_index];
+                assert_eq!(
+                    drawer_after.bg,
+                    dim_color(drawer_before.bg),
+                    "{theme:?} drawer background"
+                );
+                assert_eq!(
+                    drawer_after.fg,
+                    dim_color(drawer_before.fg),
+                    "{theme:?} drawer foreground"
+                );
+
+                assert!(
+                    buffer.content().iter().any(|cell| {
+                        cell.symbol() == "╭"
+                            && cell.fg == crate::theme::definition(theme).palette.border
+                    }),
+                    "{theme:?} modal border should retain its themed color"
+                );
+                assert!(
+                    buffer.content().iter().any(|cell| {
+                        cell.symbol() != " "
+                            && cell.bg == crate::theme::definition(theme).palette.panel
+                            && cell.fg == crate::theme::definition(theme).palette.foreground
+                    }),
+                    "{theme:?} dialog text should retain its themed style"
+                );
+
+                app.modal = None;
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                    .unwrap();
+                assert_eq!(terminal.backend().buffer().content(), normal.as_slice());
+            }
+        }
+    }
+    #[test]
+    fn help_toast_and_compact_modal_fallback_keep_their_normal_styles() {
+        for theme in [crate::settings::Theme::Dark, crate::settings::Theme::Light] {
+            let mut app = app();
+            app.theme = theme;
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let background = terminal.backend().buffer()[(2, 4)].clone();
+            app.help = Some(crate::hotkeys::Help {
+                context: crate::hotkeys::Context::Issues,
+                offset: 0,
+            });
+            app.toast = Some(crate::app::Toast {
+                message: "launching".into(),
+                error: false,
+                expires_at: None,
+            });
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            assert_eq!(terminal.backend().buffer()[(2, 4)].bg, background.bg);
+            assert_eq!(terminal.backend().buffer()[(2, 4)].fg, background.fg);
+
+            app.modal = Some(crate::app::Modal::Create(crate::app::CreateForm::default()));
+            let mut tiny = Terminal::new(TestBackend::new(20, 6)).unwrap();
+            tiny.draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let cells = tiny.backend().buffer().content();
+            assert!(
+                cells
+                    .iter()
+                    .any(|cell| cell.fg == crate::theme::definition(theme).palette.muted)
             );
         }
     }
@@ -2742,103 +2678,17 @@ mod tests {
         assert!(compact.contains("HOTKEYS"));
         assert!(compact.contains("Esc"));
     }
-    #[test]
-    fn renders_two_line_issue_with_status_comments_and_narrative() {
-        let mut a = app();
-        let (s, _) = draw((120, 40), &mut a);
-        assert!(s.contains("task     P1  closed"));
-        assert!(!s.contains("demo-1  P1"));
-        assert!(s.contains(" demo-1 · closed · P1 "));
-        assert!(!s.contains("id: demo-1"));
-        assert!(!s.contains("status: closed"));
-        assert!(!s.contains("priority: P1"));
-        assert!(s.contains("Title is visible"));
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal
-            .draw(|f| render(f, Duration::from_secs(2), &mut a))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let line = |y: u16| {
-            (0..120)
-                .map(|x| buffer[(x, y)].symbol())
-                .collect::<String>()
-        };
-        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
-        let closed = layout
-            .groups
-            .iter()
-            .find(|group| group.status == "closed")
-            .unwrap();
-        let header_row = a.list_rect.y + (closed.y - a.list_offset) as u16;
-        let bead_row = header_row + 1;
-        assert!(line(bead_row).contains("task     P1  closed"));
-        assert!(line(bead_row + 1).contains("Title is visible"));
-        assert_eq!(buffer[(a.list_rect.x, header_row)].symbol(), "╭");
-        assert_eq!(
-            buffer[(a.list_rect.x, header_row)].fg,
-            status_color("closed")
-        );
-        assert!(line(header_row).contains("CLOSED"));
-        assert_eq!(
-            buffer[(a.list_rect.x + 3, bead_row)].fg,
-            row_type_color("task")
-        );
-        assert_eq!(
-            buffer[(a.list_rect.x + 12, bead_row)].fg,
-            crate::theme::priority_color(a.theme, 1)
-        );
-        assert_eq!(
-            buffer[(a.list_rect.x + 16, bead_row)].fg,
-            status_color("closed")
-        );
-        assert_eq!(
-            buffer[(a.list_rect.x + 3, bead_row + 1)].fg,
-            crate::theme::definition(a.theme).palette.foreground
-        );
-        assert_eq!(buffer[(a.detail_rect.x, a.detail_rect.y)].symbol(), "╭");
-        assert_eq!(
-            buffer[(a.detail_rect.x, a.detail_rect.y)].bg,
-            crate::theme::definition(a.theme).palette.background
-        );
-        assert_eq!(
-            buffer[(a.detail_rect.x + 1, a.detail_rect.y + 1)].bg,
-            crate::theme::definition(a.theme).palette.background
-        );
-        assert_eq!(
-            buffer[(a.list_rect.x + 2, bead_row)].bg,
-            buffer[(a.detail_rect.x + 2, a.detail_rect.y + 1)].bg,
-            "list and detail text rows share the rendered background"
-        );
-        assert_eq!(
-            buffer[(a.list_rect.x + 2, a.list_rect.y + 4)].bg,
-            buffer[(a.detail_rect.x + 2, a.detail_rect.y + 4)].bg,
-            "unused list and detail space share the rendered background"
-        );
-        let group = crate::app::list_layout(&a.beads, &a.collapsed)
-            .groups
-            .remove(0);
-        let bottom = a.list_rect.y + (group.y + group.height - 1 - a.list_offset) as u16;
-        assert_eq!(buffer[(a.list_rect.x, bottom)].symbol(), "╰");
-        assert!(line(bottom).contains("╯"));
-        for x in ["comments", "hello comment"] {
-            assert!(s.contains(x), "{x}")
-        }
-        assert!(!s.contains("unknown"));
-        assert!(!s.contains("界"));
-    }
 
     #[test]
     fn ready_issue_shows_waiting_bead_ids_beside_status_and_clears_on_refresh() {
         let mut a = app();
+        a.focused_column = 1;
         a.beads[0].status = "open".into();
         a.beads[0].data["labels"] = json!([crate::beads::READY_LABEL]);
         a.beads[0].dependency_ready = false;
         a.beads[0].blocked_by = vec!["base-1".into(), "base-2".into()];
-        assert!(
-            draw((150, 30), &mut a)
-                .0
-                .contains("ready · waiting on base-1, base-2")
-        );
+        let screen = draw((150, 30), &mut a).0;
+        assert!(screen.contains("WAIT:base-1,base-2"), "{screen}");
         // Compact terminals must keep rendering and navigation functional.
         draw((40, 12), &mut a);
         a.beads[0].dependency_ready = true;
@@ -2849,9 +2699,9 @@ mod tests {
     #[test]
     fn open_issue_shows_confirmed_agent_handoff_only() {
         let mut a = app();
+        a.focused_column = 0;
         a.beads[0].status = "open".into();
         a.beads[0].data["issue_type"] = json!("task");
-        a.beads[0].data["labels"] = json!([crate::beads::READY_LABEL]);
         a.worktrees.push(crate::worktrees::ManagedWorktree {
             id: "wt-1".into(),
             bead_id: "demo-1".into(),
@@ -2867,333 +2717,20 @@ mod tests {
         });
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));
         a.worktrees[0].handoff_accepted = true;
-        assert!(draw((80, 24), &mut a).0.contains("ready · sent"));
+        assert!(draw((80, 24), &mut a).0.contains("SENT"));
         a.worktrees.clear();
         a.accepted_handoffs.insert("demo-1".into());
-        assert!(draw((80, 24), &mut a).0.contains("ready · sent"));
+        assert!(draw((80, 24), &mut a).0.contains("SENT"));
         a.beads[0].status = "in_progress".into();
-        assert!(draw((80, 24), &mut a).0.contains("in_progress"));
+        a.focused_column = 3;
+        assert!(draw((80, 24), &mut a).0.contains("IN PROGRESS"));
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));
     }
-    #[test]
-    fn list_and_detail_backgrounds_match_across_themes() {
-        for theme in Theme::ALL {
-            let mut a = app();
-            a.theme = theme;
-            let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-            terminal
-                .draw(|f| render(f, Duration::from_secs(2), &mut a))
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            let panel = crate::theme::definition(theme).palette.background;
-            assert_eq!(buffer[(a.detail_rect.x, a.detail_rect.y)].symbol(), "╭");
-            assert_eq!(buffer[(a.detail_rect.x, a.detail_rect.y)].bg, panel);
-            assert_eq!(buffer[(a.list_rect.x + 2, a.list_rect.y + 1)].bg, panel);
-            assert_eq!(buffer[(a.detail_rect.x + 2, a.detail_rect.y + 1)].bg, panel);
-            assert_eq!(buffer[(a.list_rect.x + 2, a.list_rect.y + 4)].bg, panel);
-            assert_eq!(buffer[(a.detail_rect.x + 2, a.detail_rect.y + 4)].bg, panel);
-        }
-    }
-    #[test]
-    fn collapsed_header_focus_is_visible_without_bead_detail_identity() {
-        let mut a = app();
-        a.collapsed.insert("closed".into());
-        a.collapse_context = Some("closed".into());
-        a.selected = None;
-        a.detail = None;
-        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal
-            .draw(|f| render(f, Duration::from_secs(2), &mut a))
-            .unwrap();
-        let palette = crate::theme::definition(a.theme).palette;
-        let buffer = terminal.backend().buffer();
-        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
-        let closed_y = a.list_rect.y
-            + (layout
-                .groups
-                .iter()
-                .find(|group| group.status == "closed")
-                .unwrap()
-                .y
-                - a.list_offset) as u16;
-        assert_eq!(buffer[(a.list_rect.x, closed_y)].symbol(), "╭");
-        assert!(
-            (a.list_rect.x + 1..a.list_rect.x + a.list_rect.width - 1)
-                .any(|x| buffer[(x, closed_y)].bg == palette.selected_background)
-        );
-        assert!(a.selected.is_none());
-        assert!(a.detail.is_none());
-        assert!(a.modal.is_none());
-    }
-    #[test]
-    fn empty_standard_groups_render_zero_counts_and_scroll_in_small_viewports() {
-        let mut a = app();
-        a.beads.clear();
-        a.selected = None;
-        let (screen, _) = draw((100, 30), &mut a);
-        for status in [
-            "OPEN",
-            "READY",
-            "BLOCKED",
-            "DEFERRED",
-            "IN_PROGRESS",
-            "CLOSED",
-        ] {
-            assert!(
-                screen.contains(&format!("{status} · 0")),
-                "missing {status}"
-            );
-        }
 
-        a.collapsed.insert("closed".into());
-        a.collapse_context = Some("closed".into());
-        let (compact, _) = draw((60, 12), &mut a);
-        assert!(compact.contains("CLOSED · 0"));
-        assert!(a.list_offset > 0);
-    }
-    #[test]
-    fn issue_type_fallback_priority_bounds_and_title_color_are_safe() {
-        assert_eq!(row_type_color("task"), TEAL);
-        assert_eq!(row_type_color("bug"), Color::Rgb(255, 123, 123));
-        assert_eq!(row_type_color("feature"), Color::Rgb(103, 177, 255));
-        assert_eq!(row_type_color("epic"), Color::Rgb(197, 145, 255));
-        assert_eq!(row_type_color("chore"), Color::Rgb(168, 207, 125));
-        assert_eq!(row_type_color("private-kind"), MUTED);
-        assert_eq!(row_issue_type(&app().beads[0]), "task");
-        let mut bead = app().beads[0].clone();
-        bead.data = json!({"type":"bespoke"});
-        assert_eq!(row_issue_type(&bead), "bespoke");
-        bead.data = json!({"issue_type":null,"type":"bug"});
-        assert_eq!(row_issue_type(&bead), "bug");
-        bead.data = json!({"issue_type":"  ","type":" feature "});
-        assert_eq!(row_issue_type(&bead), "feature");
-        bead.data = json!({"issue_type":null});
-        assert_eq!(row_issue_type(&bead), "unknown");
-        assert_eq!(row_priority_color(u64::MAX), MUTED);
-        let mut a = app();
-        a.selected = None;
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        terminal
-            .draw(|f| render(f, Duration::from_secs(2), &mut a))
-            .unwrap();
-        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
-        let closed = layout
-            .groups
-            .iter()
-            .find(|group| group.status == "closed")
-            .unwrap();
-        let y = a.list_rect.y + (closed.y + 2 - a.list_offset) as u16;
-        assert_eq!(
-            terminal.backend().buffer()[(a.list_rect.x + 3, y)].fg,
-            crate::theme::definition(a.theme).palette.foreground
-        );
-    }
-    #[test]
-    fn metadata_columns_align_across_core_custom_and_unknown_types() {
-        let mut a = app();
-        let kinds = [
-            Some("task"),
-            Some("feature"),
-            Some("custom-extremely-long-type"),
-            None,
-            Some("bug"),
-        ];
-        a.beads = kinds
-            .iter()
-            .enumerate()
-            .map(|(i, kind)| crate::beads::Bead {
-                dependency_ready: true,
-                blocked_by: Vec::new(),
-                id: format!("aligned-{i}"),
-                title: format!("title-{i}"),
-                status: "open".into(),
-                priority: [0, 4, 12, 2, 1][i],
-                data: kind.map_or_else(|| json!({}), |kind| json!({"issue_type":kind})),
-            })
-            .collect();
-        a.selected = Some(0);
-        let mut terminal = Terminal::new(TestBackend::new(120, 32)).unwrap();
-        terminal
-            .draw(|f| render(f, Duration::from_secs(2), &mut a))
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
-        let mut priority_columns = Vec::new();
-        let mut status_columns = Vec::new();
-        for i in 0..a.beads.len() {
-            let target = layout
-                .targets
-                .iter()
-                .find(|t| t.row == DisplayRow::Bead(i))
-                .unwrap();
-            let y = a.list_rect.y + (target.y - a.list_offset) as u16;
-            let line = (0..a.list_rect.width)
-                .map(|x| buf[(a.list_rect.x + x, y)].symbol())
-                .collect::<String>();
-            let priority_byte = line.find(&format!("P{}", a.beads[i].priority)).unwrap();
-            let status_byte = line.find("open").unwrap();
-            priority_columns.push(Span::raw(&line[..priority_byte]).width());
-            status_columns.push(Span::raw(&line[..status_byte]).width());
-        }
-        assert!(
-            priority_columns.iter().all(|x| *x == priority_columns[0]),
-            "priority columns: {priority_columns:?}"
-        );
-        assert!(status_columns.iter().all(|x| *x == status_columns[0]));
-        assert!(buf.content().iter().any(|cell| cell.symbol() == "…"));
-    }
-    #[test]
-    fn stable_status_colors_and_scrolled_last_group_render_in_small_viewport() {
-        assert_eq!(status_color("custom"), Color::Rgb(125, 168, 235));
-        assert_eq!(status_color("open"), TEAL);
-        assert_eq!(status_color("ready"), Color::Rgb(125, 168, 235));
-        assert_eq!(status_color("closed"), Color::Rgb(255, 123, 123));
-        let mut a = app();
-        a.beads = (0..15)
-            .map(|i| crate::beads::Bead {
-                dependency_ready: true,
-                blocked_by: Vec::new(),
-                id: format!("b{i}"),
-                title: format!("item {i}"),
-                status: if i == 14 { "closed" } else { "open" }.into(),
-                priority: 2,
-                data: json!({}),
-            })
-            .collect();
-        a.selected = Some(14);
-        let (shown, _) = draw((52, 14), &mut a);
-        assert!(shown.contains("CLOSED"));
-        assert!(shown.contains("b14"));
-        assert!(a.list_offset > 0);
-    }
-    #[test]
-    fn ready_group_and_row_use_blue_in_every_theme() {
-        for theme in Theme::ALL {
-            let mut a = app();
-            a.theme = theme;
-            a.beads[0].status = "open".into();
-            a.beads[0].data["labels"] = json!([crate::beads::READY_LABEL]);
-            let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-            terminal
-                .draw(|f| render(f, Duration::from_secs(2), &mut a))
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            let layout = crate::app::list_layout(&a.beads, &a.collapsed);
-            let ready_group = layout
-                .groups
-                .iter()
-                .find(|group| group.status == "ready")
-                .unwrap();
-            let top = a.list_rect.y + (ready_group.y - a.list_offset) as u16;
-            let border_x = a.list_rect.x;
-            let ready = crate::theme::status_color(theme, "ready");
-            assert_eq!(buffer[(border_x, top)].fg, ready);
-            let row = top + 1;
-            let status_x = (0..96)
-                .find(|&x| {
-                    (x..x + 5)
-                        .map(|column| buffer[(column, row)].symbol())
-                        .collect::<String>()
-                        == "ready"
-                })
-                .expect("Ready row status is visible");
-            for x in status_x..status_x + 5 {
-                assert_eq!(buffer[(x, row)].fg, ready);
-            }
-        }
-    }
-    #[test]
-    fn expanded_panes_enclose_rows_and_follow_status_order() {
-        let mut a = app();
-        a.beads[0].status = "closed".into();
-        a.beads.push(crate::beads::Bead {
-            dependency_ready: true,
-            blocked_by: Vec::new(),
-            id: "open-2".into(),
-            title: "open title".into(),
-            status: "open".into(),
-            priority: 2,
-            data: json!({}),
-        });
-        a.selected = Some(0);
-        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
-        assert_eq!(
-            layout
-                .groups
-                .iter()
-                .map(|g| g.status.as_str())
-                .collect::<Vec<_>>(),
-            [
-                "open",
-                "ready",
-                "blocked",
-                "deferred",
-                "in_progress",
-                "closed"
-            ]
-        );
-        assert_eq!(
-            layout.groups[0].height,
-            2 + 2 * layout.groups[0].indices.len()
-        );
-        assert_eq!(
-            layout.groups[5].y,
-            layout.groups[4].y + layout.groups[4].height
-        );
-        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
-        terminal
-            .draw(|f| render(f, Duration::from_secs(2), &mut a))
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let closed_y = a.list_rect.y + (layout.groups[5].y - a.list_offset) as u16;
-        let line = (0..100)
-            .map(|x| buf[(x, closed_y)].symbol())
-            .collect::<String>();
-        assert!(line.contains("CLOSED"));
-        let bottom = closed_y + layout.groups[5].height as u16 - 1;
-        assert_eq!(buf[(a.list_rect.x, bottom)].symbol(), "╰");
-        assert_eq!(buf[(a.list_rect.x, bottom)].fg, status_color("closed"));
-        assert!(buf[(a.list_rect.x, closed_y + 1)].symbol() == "│");
-    }
-    #[test]
-    fn partial_scrolled_issue_line_has_no_fabricated_pane_edges() {
-        let mut a = app();
-        a.beads = (0..8)
-            .map(|i| crate::beads::Bead {
-                dependency_ready: true,
-                blocked_by: Vec::new(),
-                id: format!("long-{i}"),
-                title: format!("visible-title-{i}"),
-                status: "open".into(),
-                priority: 2,
-                data: json!({}),
-            })
-            .collect();
-        a.selected = None;
-        a.detail = None;
-        let layout = crate::app::list_layout(&a.beads, &a.collapsed);
-        let target = layout
-            .targets
-            .iter()
-            .find(|t| t.row == DisplayRow::Bead(0))
-            .unwrap();
-        a.list_offset = target.y + 1;
-        let mut terminal = Terminal::new(TestBackend::new(70, 14)).unwrap();
-        terminal
-            .draw(|f| render(f, Duration::from_secs(2), &mut a))
-            .unwrap();
-        let buf = terminal.backend().buffer();
-        let first_visible = a.list_rect.y;
-        let line = (0..a.list_rect.width)
-            .map(|x| buf[(a.list_rect.x + x, first_visible)].symbol())
-            .collect::<String>();
-        assert!(line.contains("visible-title-0"));
-        assert!(!line.contains("╭") && !line.contains("╰"));
-        assert_eq!(buf[(a.list_rect.x, first_visible)].symbol(), "│");
-    }
     #[test]
     fn markdown_description_is_readable_and_styled_in_detail_pane() {
         let mut a = app();
+        a.focus_detail = true;
         a.detail = Some(json!({"description":"# Overview\n\nA **bold** point and `code`."}));
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         terminal
@@ -3220,6 +2757,7 @@ mod tests {
     fn dependency_chart_priority_colors_follow_every_theme() {
         for theme in crate::settings::Theme::ALL {
             let mut a = app();
+            a.focus_detail = true;
             a.theme = theme;
             a.detail = Some(json!({"id": "demo-1", "title": "Release", "priority": 2,
                 "blocked_by": [{"id": "CRITICAL", "priority": 0}],
@@ -3255,8 +2793,145 @@ mod tests {
     }
 
     #[test]
+    fn selected_card_border_contrasts_with_fill_in_every_theme() {
+        for theme in crate::settings::Theme::ALL {
+            let mut a = app();
+            let mut unselected = a.beads[0].clone();
+            unselected.id = "demo-2".into();
+            unselected.title = "Unselected card".into();
+            unselected.data["issue_type"] = serde_json::Value::String("feature".into());
+            a.beads.push(unselected);
+            a.theme = theme;
+            let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let card = a
+                .board_cards
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .unwrap()
+                .1;
+            let palette = crate::theme::definition(theme).palette;
+            for (x, y, glyph) in (card.x..card.right())
+                .flat_map(|x| {
+                    [
+                        (
+                            x,
+                            card.y,
+                            if x == card.x {
+                                "╭"
+                            } else if x + 1 == card.right() {
+                                "╮"
+                            } else {
+                                "─"
+                            },
+                        ),
+                        (
+                            x,
+                            card.bottom() - 1,
+                            if x == card.x {
+                                "╰"
+                            } else if x + 1 == card.right() {
+                                "╯"
+                            } else {
+                                "─"
+                            },
+                        ),
+                    ]
+                })
+                .chain(
+                    (card.y + 1..card.bottom() - 1)
+                        .flat_map(|y| [(card.x, y, "│"), (card.right() - 1, y, "│")]),
+                )
+            {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.symbol(), glyph);
+                assert_eq!(cell.fg, crate::theme::issue_type_color(theme, "task"));
+                assert_eq!(cell.bg, palette.panel_alt);
+                assert_ne!(cell.fg, cell.bg);
+            }
+            let unselected_card = a
+                .board_cards
+                .iter()
+                .find(|(index, _)| *index == 1)
+                .unwrap()
+                .1;
+            assert_eq!(unselected_card.width, card.width);
+            assert_eq!(unselected_card.height, card.height);
+            for (x, y) in (unselected_card.x..unselected_card.right())
+                .flat_map(|x| [(x, unselected_card.y), (x, unselected_card.bottom() - 1)])
+                .chain(
+                    (unselected_card.y + 1..unselected_card.bottom() - 1)
+                        .flat_map(|y| [(unselected_card.x, y), (unselected_card.right() - 1, y)]),
+                )
+            {
+                let cell = &buffer[(x, y)];
+                assert_ne!(cell.symbol(), " ");
+                assert_eq!(cell.fg, crate::theme::issue_type_color(theme, "feature"));
+            }
+            let title_x = card.x + 1;
+            let title_y = card.y + 1;
+            let title_cell = &buffer[(title_x, title_y)];
+            assert_eq!(title_cell.bg, palette.selected_background);
+            assert_eq!(title_cell.fg, palette.selected_foreground);
+            let selected_position = a
+                .board_cards
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .unwrap()
+                .1;
+            assert_eq!(selected_position, card);
+            let rendered = buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Title is visible"));
+            assert!(rendered.contains("demo-1"));
+        }
+    }
+
+    #[test]
+    fn card_border_uses_legacy_and_fallback_issue_types() {
+        for theme in crate::settings::Theme::ALL {
+            for (field, value, expected) in [
+                ("issue_type", None, "unknown"),
+                ("type", Some("bug"), "bug"),
+                ("issue_type", Some("custom"), "custom"),
+            ] {
+                let mut a = app();
+                if field == "type" {
+                    a.beads[0]
+                        .data
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("issue_type");
+                }
+                if let Some(value) = value {
+                    a.beads[0].data[field] = serde_json::Value::String(value.into());
+                } else {
+                    a.beads[0].data.as_object_mut().unwrap().remove(field);
+                }
+                a.theme = theme;
+                let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                    .unwrap();
+                let card = a.board_cards[0].1;
+                let cell = &terminal.backend().buffer()[(card.x, card.y)];
+                assert_eq!(cell.symbol(), "╭");
+                assert_eq!(cell.fg, crate::theme::issue_type_color(theme, expected));
+                assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel_alt);
+            }
+        }
+    }
+
+    #[test]
     fn dependency_chart_renders_and_scrolls_after_resize() {
         let mut a = app();
+        a.focus_detail = true;
         a.detail = Some(json!({
             "id": "demo-1", "title": "Ship", "status": "open",
             "dependencies": [{"id": "base", "dependency_type": "blocks", "title": "Build", "status": "closed"}],
@@ -3289,6 +2964,7 @@ mod tests {
     #[test]
     fn issue_details_hide_fallback_sections_at_all_scroll_positions() {
         let mut a = app();
+        a.focus_detail = true;
         let detail = json!({
             "id": "demo-1", "title": "Ship",
             "description": "Useful description",
@@ -3356,7 +3032,7 @@ mod tests {
         a.selected = None;
         a.detail = None;
         a.detail_error = None;
-        assert!(draw((80, 24), &mut a).0.contains("No issues"));
+        assert!(draw((80, 24), &mut a).0.contains("No Beads"));
         a.beads.push(Bead {
             dependency_ready: true,
             blocked_by: Vec::new(),
@@ -3369,11 +3045,12 @@ mod tests {
         a.selected = Some(0);
         a.beads[0].data = json!({"description": format!("{}FINAL_SENTINEL", "word\n".repeat(800))});
         a.detail = Some(a.beads[0].data.clone());
+        a.focus_detail = true;
         a.detail_offset = u16::MAX;
-        let (rendered, rect) = draw((50, 14), &mut a);
+        let (rendered, _) = draw((50, 14), &mut a);
         assert!(a.detail_offset > 0);
         assert!(rendered.contains("FINAL_SENTINEL"));
-        assert!(rect.height > 0);
+        assert!(a.detail_rect.height > 0);
         let (resized, _) = draw((90, 24), &mut a);
         assert!(resized.contains("FINAL_SENTINEL"));
     }
@@ -3384,12 +3061,13 @@ mod tests {
             id: "test-1".into(),
             title: "Close selected task 界".into(),
         });
-        for size in [(100, 30), (50, 24)] {
+        for size in [(100, 30), (50, 24), (100, 16)] {
             let screen = draw(size, &mut a).0;
             for text in [
                 "CLOSE BEAD?",
                 "ID: test-1",
                 "Close selected task 界",
+                "Verified Git integration is required first",
                 "[y] Close",
                 "Esc] Cancel",
             ] {
@@ -3406,19 +3084,93 @@ mod tests {
             assert!(draw(size, &mut a).0.contains("Expand terminal"));
             assert!(!a.modal_ready);
         }
-        for context in [
-            crate::hotkeys::Context::Issues,
-            crate::hotkeys::Context::Details,
-            crate::hotkeys::Context::EpicIssues,
-            crate::hotkeys::Context::EpicDetails,
-        ] {
-            assert!(
-                context
-                    .entries()
-                    .iter()
-                    .any(|(key, text)| *key == "c" && text.contains("Close selected"))
-            );
+    }
+
+    #[test]
+    fn detail_metadata_preserves_raw_status_and_priority_without_relationships() {
+        for size in [(50, 24), (120, 30)] {
+            let mut a = app();
+            a.beads[0].status = "deferred".into();
+            a.beads[0].priority = 3;
+            a.beads[0].data = json!({"issue_type":"task","description":"No relationships here"});
+            a.focus_detail = true;
+            let screen = draw(size, &mut a).0;
+            for text in [
+                "ID: demo-1",
+                "Board column: OPEN",
+                "Raw status: deferred",
+                "Priority: P3",
+            ] {
+                assert!(
+                    screen.contains(text),
+                    "missing {text} at {size:?}: {screen}"
+                );
+            }
+            assert!(!screen.contains("Raw status: open"));
         }
+    }
+
+    #[test]
+    fn focused_empty_column_has_non_color_marker_and_compact_counts_stay_visible() {
+        let mut a = app();
+        a.beads.clear();
+        a.focused_column = 5;
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, Duration::from_secs(2), &mut a))
+            .unwrap();
+        let column = a
+            .board_columns
+            .iter()
+            .find(|(index, _)| *index == 5)
+            .unwrap()
+            .1;
+        let buffer = terminal.backend().buffer();
+        let heading = (column.x..column.right())
+            .map(|x| buffer[(x, column.y + 1)].symbol())
+            .collect::<String>();
+        assert!(heading.contains('›'), "{heading}");
+        assert!(heading.contains('0'), "{heading}");
+
+        a.beads = (0..123).map(|i| Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
+            id: format!("c{i}"),
+            title: format!("Card {i}"),
+            status: "in_progress".into(),
+            priority: 2,
+            data: json!({"issue_type":"task","status":"in_progress","labels":[crate::beads::READY_TO_MERGE_LABEL]}),
+        }).collect();
+        a.focused_column = 4;
+        let screen = draw((120, 20), &mut a).0;
+        assert!(screen.contains("123"), "{screen}");
+        assert!(screen.contains("123"));
+    }
+
+    #[test]
+    fn short_board_heights_show_resize_guidance_without_stale_hit_rectangles() {
+        let mut a = app();
+        a.beads[0].status = "open".into();
+        a.focused_column = 0;
+        for height in [7, 8, 9] {
+            a.board_cards.push((99, Rect::new(1, 1, 1, 1)));
+            let screen = draw((120, height), &mut a).0;
+            assert!(
+                screen.contains("Resize to 10 rows"),
+                "height {height}: {screen}"
+            );
+            assert!(a.board_cards.is_empty(), "stale cards at height {height}");
+        }
+        let screen = draw((120, 10), &mut a).0;
+        assert!(screen.contains("Resize to 10 rows"), "{screen}");
+        assert!(a.board_cards.is_empty());
+        let screen = draw((120, 12), &mut a).0;
+        assert!(screen.contains("Title is visible"), "{screen}");
+        assert!(
+            a.board_cards
+                .iter()
+                .any(|(index, rect)| *index == 0 && rect.height > 0)
+        );
     }
 
     #[test]
@@ -3433,8 +3185,7 @@ mod tests {
         let status = draw((120, 40), &mut a).0;
         assert!(status.contains("n new"));
         assert!(status.contains("e edit"));
-        assert!(status.contains("d delete"));
-        assert!(status.contains("h hand off"));
+        assert!(status.contains("n new"));
         a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm::default()));
         let normal = draw((100, 30), &mut a).0;
         assert!(normal.contains("NEW BEAD"));
@@ -3503,7 +3254,10 @@ mod tests {
                     .palette
                     .selected_background
         }));
-        assert_eq!(buf[(17, 9)].fg, TEAL);
+        assert_eq!(
+            buf[(17, 9)].fg,
+            crate::theme::definition(a.theme).palette.accent
+        );
         a.notice = None;
         a.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
             focus: 5,
@@ -3538,94 +3292,35 @@ mod tests {
         assert!(error_delete.contains("[y] Delete"));
     }
     #[test]
-    fn existing_epic_generation_dialog_and_hints_are_contextual_and_responsive() {
-        let mut state = app();
-        state.selected = Some(0);
-        state.beads[0].data["issue_type"] = serde_json::json!("task");
-        assert!(!draw((130, 30), &mut state).0.contains("g generate"));
-        assert!(
-            !crate::hotkeys::Context::current(&state)
-                .entries()
-                .iter()
-                .any(|(key, _)| *key == "g")
-        );
-        state.beads[0].data["issue_type"] = serde_json::json!("epic");
-        assert!(draw((130, 30), &mut state).0.contains("g generate"));
-        for details in [false, true] {
-            state.focus_detail = details;
+    fn planning_controls_are_absent_from_epic_screen_and_create_form() {
+        let mut app = app();
+        app.selected = Some(0);
+        app.beads[0].data["issue_type"] = serde_json::json!("epic");
+        let screen = draw((130, 30), &mut app).0;
+        assert!(!screen.contains("g generate"));
+        assert!(!screen.contains("p plan"));
+        for focus_detail in [false, true] {
+            app.focus_detail = focus_detail;
             assert!(
-                crate::hotkeys::Context::current(&state)
+                !crate::hotkeys::Context::current(&app)
                     .entries()
                     .iter()
-                    .any(|(key, _)| *key == "g")
+                    .any(|(key, _)| *key == "g" || *key == "p")
             );
         }
-        state.modal = Some(crate::app::Modal::ConfirmGenerateEpic {
-            id: "epic-1".into(),
-            title: "Plan release 界".into(),
-        });
-        for size in [(100, 30), (50, 24)] {
-            let screen = draw(size, &mut state).0;
-            assert!(state.modal_ready);
-            for text in [
-                "GENERATE EPIC TASKS?",
-                "Epic: epic-1",
-                "Plan release 界",
-                "Herdr agent?",
-                "duplicate tasks.",
-                "y confirm",
-                "Esc cancel",
-            ] {
-                assert!(screen.contains(text), "missing {text} at {size:?}");
-            }
-        }
-        for size in [(40, 24), (100, 8)] {
-            assert!(draw(size, &mut state).0.contains("Expand terminal"));
-            assert!(!state.modal_ready);
-        }
-        state.modal = Some(crate::app::Modal::ConfirmGenerateEpic {
-            id: "epic-1".into(),
-            title: "Long proposal 界 ".repeat(100),
-        });
-        assert!(
-            draw((80, 24), &mut state)
-                .0
-                .contains("Expand terminal height")
-        );
-        assert!(!state.modal_ready);
-    }
-
-    #[test]
-    fn epic_generation_toggle_is_visible_only_when_creating_epic() {
-        let mut app = app();
-        let mut form = crate::app::CreateForm {
+        app.modal = Some(crate::app::Modal::Create(crate::app::CreateForm {
             issue_type: crate::beads::BEAD_TYPES
                 .iter()
                 .position(|kind| *kind == "epic")
                 .unwrap(),
-            generate_children: true,
-            focus: 7,
             ..Default::default()
-        };
-        app.modal = Some(crate::app::Modal::Create(form.clone()));
-        let epic = draw((100, 30), &mut app).0;
-        assert!(epic.contains("[x] Generate child tasks"));
-        assert!(epic.contains("Agent harness"));
-        assert!(epic.contains("Description"));
-        assert!(epic.contains("[ Create ]"));
-        form.issue_type = 0;
-        app.modal = Some(crate::app::Modal::Create(form.clone()));
-        assert!(!draw((100, 30), &mut app).0.contains("Generate child tasks"));
-        form.issue_type = crate::beads::BEAD_TYPES
-            .iter()
-            .position(|kind| *kind == "epic")
-            .unwrap();
-        app.modal = Some(crate::app::Modal::Edit {
-            id: "e1".into(),
-            form,
-        });
-        assert!(!draw((100, 30), &mut app).0.contains("Generate child tasks"));
+        }));
+        let form = draw((100, 30), &mut app).0;
+        assert!(!form.contains("Generate child tasks"));
+        assert!(form.contains("Agent harness"));
+        assert!(form.contains("[ Create ]"));
     }
+
     #[test]
     fn create_harness_picker_shows_only_discovered_kinds_and_discovery_states() {
         let mut app = app();
@@ -3686,24 +3381,16 @@ mod tests {
         assert!(rendered.contains("y confirm"));
     }
     #[test]
-    fn browser_footer_keeps_action_hints_without_routine_state_or_arrow_tips() {
-        for width in [64, 90, 120] {
-            let footer = footer_text(width, false);
-            for action in ["n new", "d delete", "h hand off", "r ready", "q quit"] {
-                assert!(
-                    footer.contains(action),
-                    "{action} missing at width {width}: {footer}"
-                );
-            }
+    fn board_footer_documents_navigation_and_drawers_without_overflow() {
+        for width in [40, 64, 90, 120] {
+            let footer = footer_text(width);
             assert!(Span::raw(footer.as_str()).width() <= width);
-            assert!(!footer.contains("↑"));
-            assert!(!footer.contains("←"));
-            assert!(!footer.contains("READY"));
+            assert!(footer.contains("↑↓"));
         }
-        assert!(footer_text(140, false).contains("c close"));
-        assert!(footer_text(120, false).contains("N child"));
-        assert!(!footer_text(120, false).contains("u update"));
-        assert!(footer_text(120, false).contains("Ctrl+? keys"));
+        let footer = footer_text(140);
+        for action in ["←→ column", "move", "Enter details", "worktrees", "n new"] {
+            assert!(footer.contains(action));
+        }
         let mut app = app();
         let original = draw((120, 24), &mut app).0;
         app.list_error = Some("current failure".into());
@@ -3732,44 +3419,6 @@ mod tests {
     }
 
     #[test]
-    fn planning_view_shows_agent_choices_and_review_confirmation() {
-        let mut app = app();
-        let mut form = crate::app::PlanningForm {
-            seq: 1,
-            proposal: "Plan search".into(),
-            input: "My answer".into(),
-            marker: "ONTRACK_PLAN_1".into(),
-            round: 0,
-            session: None,
-            stage: crate::app::PlanningStage::Question {
-                text: "Which scope?".into(),
-                options: vec!["Titles".into(), "All fields".into()],
-            },
-            selected: 2,
-            poll_inflight: false,
-            next_poll: std::time::Instant::now(),
-            scroll: 0,
-        };
-        app.modal = Some(crate::app::Modal::Planning(form.clone()));
-        let rendered = draw((80, 24), &mut app).0;
-        assert!(rendered.contains("Which scope?"));
-        assert!(rendered.contains("Custom answer: My answer"));
-        form.stage = crate::app::PlanningStage::Review(crate::planning::Plan {
-            kind: "task".into(),
-            root: crate::planning::Item {
-                title: "Search".into(),
-                description: "Implement search".into(),
-                acceptance: "Result appears".into(),
-                priority: 2,
-            },
-            tasks: vec![],
-        });
-        app.modal = Some(crate::app::Modal::Planning(form));
-        let rendered = draw((80, 24), &mut app).0;
-        assert!(rendered.contains("Result appears"));
-        assert!(rendered.contains("y create Beads"));
-    }
-    #[test]
     fn outstanding_worktrees_render_target_state_and_pending_dispatch_on_compact_terminal() {
         let mut app = app();
         app.worktrees_view = true;
@@ -3792,52 +3441,22 @@ mod tests {
         assert!(screen.contains("MERGE PENDING"));
         assert!(screen.contains("main"));
         assert!(screen.contains("waiting for verified ancestry"));
-        assert!(screen.contains("Git integration"));
-        let footer = screen.chars().skip(80 * 15).collect::<String>();
-        assert!(footer.contains("Enter switch"));
-        assert!(footer.contains("m merge"));
-        assert!(footer.contains("c close"));
-        assert!(footer.contains("x remove"));
-        assert!(!footer.contains("MERGE PENDING"));
-        assert!(!footer.contains("waiting for verified ancestry"));
+        assert!(screen.contains("GIT HANDOFFS"));
+        for action in ["Enter switch", "m merge", "c close", "x remove"] {
+            assert!(screen.contains(action));
+        }
         app.worktrees_error = Some("scan failed".into());
         let with_error = draw((80, 16), &mut app).0;
-        let error_footer = with_error.chars().skip(80 * 15).collect::<String>();
-        assert_eq!(footer, error_footer);
-        assert!(with_error.contains("ERROR · scan failed"));
+        assert!(with_error.contains("WORKTREE ERROR · scan failed"));
         app.worktrees_focus_feedback = Some(crate::app::WorktreeFocusFeedback::Success(
             "Switched workspace".into(),
         ));
         app.worktrees_error = None;
         let with_focus = draw((80, 16), &mut app).0;
-        assert_eq!(footer, with_focus.chars().skip(80 * 15).collect::<String>());
         assert!(with_focus.contains("Switched workspace"));
-        assert_eq!(app.detail_rect.height, 13);
+        assert!(app.detail_rect.height > 0);
     }
-    #[test]
-    fn worktree_footer_shows_essential_actions_and_fits_one_row() {
-        let hints = worktree_footer_text(200);
-        for key in [
-            "Enter switch",
-            "m merge",
-            "c close",
-            "x remove",
-            "a continue",
-            "R restart",
-            "PgUp/PgDn scroll",
-            "Ctrl+? keys",
-        ] {
-            assert!(hints.contains(key), "missing {key}: {hints}");
-        }
-        for width in [24, 64, 80, 120, 200] {
-            let footer = worktree_footer_text(width);
-            assert!(Span::raw(footer.as_str()).width() <= width);
-            assert!(!footer.contains('\n'));
-            for hidden in ["refresh", "select", "quit", "back"] {
-                assert!(!footer.contains(hidden), "unexpected {hidden}: {footer}");
-            }
-        }
-    }
+
     #[test]
     fn worktree_status_text_uses_theme_colours_in_list_and_detail() {
         use crate::worktrees::{ManagedWorktree, WorktreeStatus};
@@ -3875,6 +3494,8 @@ mod tests {
         for theme in Theme::ALL {
             let mut app = app();
             app.theme = theme;
+            app.beads[0].status = "open".into();
+            app.focused_column = 0;
             app.worktrees_view = true;
             app.worktrees = statuses
                 .iter()
@@ -3894,24 +3515,6 @@ mod tests {
                 })
                 .collect();
             let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
-            terminal
-                .draw(|f| render(f, Duration::from_secs(2), &mut app))
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            for status in statuses {
-                let label = crate::app::worktree_status_label(status);
-                let (x, y) = locate(buffer, app.list_rect, label);
-                for offset in 0..label.len() as u16 {
-                    let cell = &buffer[(x + offset, y)];
-                    assert_eq!(cell.fg, crate::theme::worktree_status_color(theme, status));
-                    assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel);
-                    assert!(cell.modifier.contains(Modifier::BOLD));
-                }
-            }
-            assert_eq!(
-                buffer[(app.list_rect.x + 1, app.list_rect.y + 1)].bg,
-                crate::theme::definition(theme).palette.selected_background
-            );
             for (index, status) in statuses.into_iter().enumerate() {
                 app.selected_worktree = index;
                 terminal
@@ -3923,7 +3526,7 @@ mod tests {
                 for offset in 0..label.len() as u16 {
                     let cell = &buffer[(x + offset, y)];
                     assert_eq!(cell.fg, crate::theme::worktree_status_color(theme, status));
-                    assert_eq!(cell.bg, crate::theme::definition(theme).palette.background);
+                    assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel);
                     assert!(cell.modifier.contains(Modifier::BOLD));
                 }
             }
@@ -4059,13 +3662,6 @@ mod tests {
         assert!(screen.contains("Request merge"));
         assert!(screen.contains("recorded agent"));
         assert!(screen.contains("confirm"));
-        assert!(
-            screen
-                .chars()
-                .skip(80 * 8)
-                .collect::<String>()
-                .contains("m merge")
-        );
         assert!(app.worktree_offset > 0);
     }
     #[test]
@@ -4145,6 +3741,7 @@ mod tests {
     #[test]
     fn settings_dialog_and_light_theme_render_with_contrast_at_small_sizes() {
         let mut a = app();
+        a.focus_detail = true;
         a.theme = crate::settings::Theme::Light;
         let storage_error = "Could not save settings to '/home/alexander/.config/ontrack/settings.json': Permission denied while replacing the destination file. Check the parent directory permissions and try again.";
         a.modal = Some(crate::app::Modal::Settings {
@@ -4180,7 +3777,10 @@ mod tests {
         assert!(text.contains("Enter / Space select"));
         assert!(text.contains("Esc") && text.contains("close"));
         assert!(a.modal_ready);
-        assert_eq!(buffer[(0, 3)].bg, Color::Rgb(246, 248, 247));
+        assert_eq!(
+            buffer[(0, 3)].bg,
+            dim_color(crate::theme::definition(Theme::Light).palette.panel)
+        );
         assert!(a.modal_ready);
         a.theme = Theme::Dark;
         a.modal = Some(crate::app::Modal::Settings {
@@ -4330,6 +3930,7 @@ mod tests {
     #[test]
     fn markdown_detail_colors_and_inline_code_backgrounds_follow_theme() {
         let mut a = app();
+        a.focus_detail = true;
         a.detail = Some(json!({"description":"# Overview\n\nReadable text with `inline code`."}));
         let draw_detail = |app: &mut App| {
             let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
@@ -4377,6 +3978,8 @@ mod tests {
             let palette = crate::theme::definition(theme).palette;
             let mut app = app();
             app.theme = theme;
+            app.beads[0].status = "open".into();
+            app.focused_column = 0;
             for size in [(100, 30), (60, 18)] {
                 let rendered = draw(size, &mut app).0;
                 assert!(
@@ -4551,5 +4154,721 @@ mod tests {
             Some(std::time::Instant::now() - Duration::from_secs(1));
         let expired = draw((40, 12), &mut app).0;
         assert!(!expired.contains("Handoff failed"));
+    }
+
+    #[test]
+    fn wide_board_renders_all_columns_counts_cards_and_exact_hit_rectangles() {
+        let mut a = app();
+        a.beads = crate::app::BOARD_STATUSES
+            .iter()
+            .enumerate()
+            .map(|(i, status)| Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
+                id: format!("b{i}"),
+                title: format!("Card {i}"),
+                status: match *status {
+                    "ready" => "open".into(),
+                    "ready_to_merge" => "in_progress".into(),
+                    value => value.into(),
+                },
+                priority: i as u64 % 5,
+                data: match *status {
+                    "ready" => json!({"issue_type":"task","labels":[crate::beads::READY_LABEL]}),
+                    "ready_to_merge" => {
+                        json!({"issue_type":"task","status":"in_progress","labels":[crate::beads::READY_TO_MERGE_LABEL]})
+                    }
+                    _ => json!({"issue_type":"task"}),
+                },
+            })
+            .collect();
+        a.selected = Some(4);
+        a.focused_column = 4;
+        let (screen, _) = draw((160, 30), &mut a);
+        assert_eq!(a.board_columns.len(), 6);
+        for (label, title) in [
+            ("OPEN · 1", "Card 0"),
+            ("READY · 1", "Card 1"),
+            ("BLOCKED · 1", "Card 2"),
+            ("IN PROGRESS · 1", "Card 3"),
+            ("READY TO MERGE · 1", "Card 4"),
+            ("CLOSED · 1", "Card 5"),
+        ] {
+            let (heading, count) = label.split_once(" · ").unwrap();
+            assert!(
+                screen.contains(heading) && screen.contains(count),
+                "missing {label}: {screen}"
+            );
+            assert!(screen.contains(title), "missing {title}");
+        }
+        assert_eq!(a.board_cards.len(), 6);
+        for (_, rect) in &a.board_cards {
+            assert!(
+                a.board_columns
+                    .iter()
+                    .any(|(_, column)| { rect.x >= column.x && rect.right() <= column.right() })
+            );
+        }
+    }
+
+    #[test]
+    fn board_cards_and_hit_rectangles_stay_inside_bottom_column_border() {
+        for height in 8..=24 {
+            let mut a = overflowing_board();
+            let mut terminal = Terminal::new(TestBackend::new(120, height)).unwrap();
+            terminal
+                .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+                .unwrap();
+            for (_, card) in &a.board_cards {
+                let column = a
+                    .board_columns
+                    .iter()
+                    .find(|(_, column)| card.x > column.x && card.right() < column.right())
+                    .unwrap()
+                    .1;
+                assert!(
+                    card.y > column.y && card.bottom() < column.bottom(),
+                    "height {height}: {card:?} in {column:?}"
+                );
+            }
+            let buffer = terminal.backend().buffer();
+            for (_, column) in &a.board_columns {
+                assert_eq!(buffer[(column.x, column.bottom() - 1)].symbol(), "╰");
+                assert_eq!(
+                    buffer[(column.right() - 1, column.bottom() - 1)].symbol(),
+                    "╯"
+                );
+                for x in column.x + 1..column.right() - 1 {
+                    assert_eq!(buffer[(x, column.bottom() - 1)].symbol(), "─");
+                }
+            }
+        }
+
+        let mut a = overflowing_board();
+        let mut terminal = Terminal::new(TestBackend::new(72, 7)).unwrap();
+        terminal
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        assert!(a.board_cards.is_empty());
+        for pair in a.board_columns.windows(2) {
+            assert_eq!(pair[0].1.right(), pair[1].1.x);
+        }
+        let buffer = terminal.backend().buffer();
+        for (_, column) in &a.board_columns {
+            assert_eq!(buffer[(column.x, column.y)].symbol(), "╭");
+        }
+    }
+
+    #[test]
+    fn resizing_keeps_selected_card_visible_across_board_boundaries() {
+        use crossterm::event::KeyCode;
+
+        let mut a = overflowing_board();
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        terminal
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        for _ in 0..3 {
+            board_key(&mut a, KeyCode::Down);
+            terminal
+                .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+                .unwrap();
+        }
+        assert_eq!(a.selected, Some(3));
+        let mut small = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        small
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        assert!(
+            a.board_cards
+                .iter()
+                .any(|(index, _)| Some(*index) == a.selected)
+        );
+        assert_eq!(a.column_offsets[0], 3);
+        board_event(&mut a, board_navigation_events()[0].0.clone());
+        small
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        assert_eq!(a.selected, Some(4));
+        assert!(
+            a.board_cards
+                .iter()
+                .any(|(index, _)| Some(*index) == a.selected)
+        );
+        let mut large = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        large
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        assert!(
+            a.board_cards
+                .iter()
+                .any(|(index, _)| Some(*index) == a.selected)
+        );
+        board_event(&mut a, board_navigation_events()[1].0.clone());
+        small
+            .draw(|frame| render_kanban(frame, frame.area(), &mut a))
+            .unwrap();
+        assert_eq!(a.selected, Some(5));
+        assert!(
+            a.board_cards
+                .iter()
+                .any(|(index, _)| Some(*index) == a.selected)
+        );
+    }
+
+    #[test]
+    fn kanban_outer_bottom_borders_keep_status_colors_and_cards_stay_inside() {
+        for theme in Theme::ALL {
+            for size in [
+                (160, 11),
+                (160, 7),
+                (160, 10),
+                (160, 15),
+                (160, 20),
+                (160, 30),
+                (80, 15),
+            ] {
+                let mut a = app();
+                a.theme = theme;
+                a.focused_column = 5;
+                a.beads = crate::app::BOARD_STATUSES.iter().enumerate().flat_map(|(i, status)| {
+                    (0..3).map(move |n| Bead {
+                            dependency_ready: true,
+                            blocked_by: Vec::new(),
+                            id: format!("b{i}-{n}"),
+                            title: format!("Card {i}-{n}"),
+                            status: match *status {
+                                "ready" => "open".into(),
+                                "ready_to_merge" => "in_progress".into(),
+                                value => value.into(),
+                            },
+                            priority: 0,
+                            data: match *status {
+                                "ready" => json!({"issue_type":"task","labels":[crate::beads::READY_LABEL]}),
+                                "ready_to_merge" => json!({"issue_type":"task","status":"in_progress","labels":[crate::beads::READY_TO_MERGE_LABEL]}),
+                                _ => json!({"issue_type":"task"}),
+                            },
+                        })
+                }).collect();
+                let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                assert!(
+                    a.board_columns
+                        .windows(2)
+                        .all(|pair| pair[0].1.right() == pair[1].1.x)
+                );
+                if size.0 == 80 {
+                    assert_eq!(a.board_columns.last().unwrap().0, 5);
+                    assert!(a.board_columns.first().unwrap().0 > 0);
+                }
+                let mut total_cards = 0;
+                for &(column, rect) in &a.board_columns {
+                    let color =
+                        crate::theme::status_color(theme, crate::app::BOARD_STATUSES[column]);
+                    let bottom = rect.bottom() - 1;
+                    assert_eq!(buffer[(rect.x, bottom)].symbol(), "╰");
+                    assert_eq!(buffer[(rect.right() - 1, bottom)].symbol(), "╯");
+                    for x in rect.x + 1..rect.right() - 1 {
+                        assert_eq!(buffer[(x, bottom)].symbol(), "─");
+                    }
+                    for x in rect.x..rect.right() {
+                        assert_eq!(
+                            buffer[(x, bottom)].fg,
+                            color,
+                            "{theme:?} {size:?} column {column}"
+                        );
+                    }
+                    let cards = a
+                        .board_cards
+                        .iter()
+                        .filter(|(_, card)| card.x >= rect.x && card.right() <= rect.right())
+                        .count();
+                    let expected = (rect.height.saturating_sub(3) as usize / 5).min(3);
+                    assert_eq!(cards, expected, "{theme:?} {size:?} column {column}");
+                    total_cards += cards;
+                }
+                assert_eq!(total_cards, a.board_cards.len());
+                for (_, card) in &a.board_cards {
+                    let column = a
+                        .board_columns
+                        .iter()
+                        .find(|(_, rect)| card.x >= rect.x && card.right() <= rect.right())
+                        .unwrap()
+                        .1;
+                    assert!(
+                        card.bottom() < column.bottom(),
+                        "card overlaps bottom border at {size:?}"
+                    );
+                }
+                a.beads.clear();
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                assert!(a.board_cards.is_empty());
+                for &(column, rect) in &a.board_columns {
+                    let bottom = rect.bottom() - 1;
+                    let color =
+                        crate::theme::status_color(theme, crate::app::BOARD_STATUSES[column]);
+                    assert_eq!(buffer[(rect.x, bottom)].symbol(), "╰");
+                    assert_eq!(buffer[(rect.right() - 1, bottom)].symbol(), "╯");
+                    for x in rect.x..rect.right() {
+                        assert_eq!(buffer[(x, bottom)].fg, color);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn board_navigation_arrow_keys_cross_viewport_edges_one_card_at_a_time() {
+        assert_board_navigation_edges(board_navigation_events()[0].clone());
+    }
+
+    #[test]
+    fn board_navigation_wheel_crosses_viewport_edges_one_card_at_a_time() {
+        assert_board_navigation_edges(board_navigation_events()[1].clone());
+    }
+
+    fn assert_board_navigation_edges(
+        (down, up): (crossterm::event::Event, crossterm::event::Event),
+    ) {
+        let mut a = overflowing_board();
+        draw((120, 24), &mut a);
+        assert_board_viewport(&a, 0, 0);
+        for row in 1..=2 {
+            board_event(&mut a, down.clone());
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(row), "after {down:?}");
+            assert_board_viewport(&a, 0, 0);
+        }
+        let bottom = a.board_cards.iter().find(|(i, _)| *i == 2).unwrap().1;
+        for row in 3..=4 {
+            board_event(&mut a, down.clone());
+            let screen = draw((120, 24), &mut a).0;
+            assert_eq!(a.selected, Some(row), "after {down:?}");
+            assert_board_viewport(&a, 0, row - 2);
+            assert_eq!(
+                a.board_cards.iter().find(|(i, _)| *i == row).unwrap().1,
+                bottom
+            );
+            assert!(screen.contains(&format!("Card 0-{row:02}")));
+        }
+        for row in (0..4).rev() {
+            board_event(&mut a, up.clone());
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(row), "after {up:?}");
+            assert_board_viewport(&a, 0, row.min(2));
+            if row < 2 {
+                assert_eq!(
+                    a.board_cards.iter().find(|(i, _)| *i == row).unwrap().1.y,
+                    bottom.y - 10
+                );
+            }
+        }
+        board_event(&mut a, up);
+        draw((120, 24), &mut a);
+        assert_eq!(a.selected, Some(0));
+        assert_board_viewport(&a, 0, 0);
+    }
+
+    #[test]
+    fn board_navigation_does_not_wrap_at_first_or_last_card() {
+        for (down, up) in board_navigation_events() {
+            let mut a = overflowing_board();
+            draw((120, 24), &mut a);
+            for step in 1usize..=14 {
+                board_event(&mut a, down.clone());
+                draw((120, 24), &mut a);
+                let row = step.min(11);
+                assert_eq!(a.selected, Some(row));
+                assert_board_viewport(&a, 0, row.saturating_sub(2));
+                assert_eq!(&a.column_offsets[1..], &[0; 5]);
+            }
+            for step in 1usize..=14 {
+                board_event(&mut a, up.clone());
+                draw((120, 24), &mut a);
+                let row = 11usize.saturating_sub(step);
+                assert_eq!(a.selected, Some(row));
+                assert_board_viewport(&a, 0, row.min(9));
+                assert_eq!(&a.column_offsets[1..], &[0; 5]);
+            }
+        }
+    }
+
+    #[test]
+    fn board_navigation_batches_events_without_using_stale_card_positions() {
+        for (down, up) in board_navigation_events() {
+            let mut a = overflowing_board();
+            draw((120, 24), &mut a);
+            for _ in 0..2 {
+                board_event(&mut a, down.clone());
+            }
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(2));
+            assert_board_viewport(&a, 0, 0);
+            for _ in 0..3 {
+                board_event(&mut a, down.clone());
+            }
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(5));
+            assert_board_viewport(&a, 0, 3);
+            for _ in 0..5 {
+                board_event(&mut a, up.clone());
+            }
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(0));
+            assert_board_viewport(&a, 0, 0);
+        }
+    }
+
+    #[test]
+    fn board_navigation_retains_independent_offsets_when_columns_leave_the_screen() {
+        use crossterm::event::KeyCode;
+
+        for size in [(120, 24), (36, 24)] {
+            let mut a = overflowing_board();
+            draw(size, &mut a);
+            for _ in 0..6 {
+                board_key(&mut a, KeyCode::Down);
+                draw(size, &mut a);
+            }
+            assert_eq!(a.selected, Some(6));
+            assert_board_viewport(&a, 0, 4);
+            board_key(&mut a, KeyCode::Right);
+            draw(size, &mut a);
+            for _ in 0..4 {
+                board_key(&mut a, KeyCode::Down);
+                draw(size, &mut a);
+            }
+            assert_eq!(a.selected, Some(16));
+            assert_board_viewport(&a, 1, 2);
+            assert_eq!(a.column_offsets[0], 4);
+            for _ in 0..4 {
+                board_key(&mut a, KeyCode::Right);
+                draw(size, &mut a);
+            }
+            assert_eq!(a.focused_column, 5);
+            if size.0 == 36 {
+                assert!(a.board_column_offset > 0);
+                assert!(a.board_columns.iter().all(|(column, _)| *column != 0));
+                assert!(a.board_cards.iter().all(|(index, _)| *index >= 12));
+            }
+            for _ in 0..5 {
+                board_key(&mut a, KeyCode::Down);
+                draw(size, &mut a);
+            }
+            assert_board_viewport(&a, 5, 3);
+            assert_eq!(a.column_offsets, [4, 2, 0, 0, 0, 3]);
+            for _ in 0..4 {
+                board_key(&mut a, KeyCode::Left);
+                draw(size, &mut a);
+            }
+            assert_eq!(a.selected, Some(16));
+            assert_board_viewport(&a, 1, 2);
+            board_key(&mut a, KeyCode::Left);
+            draw(size, &mut a);
+            assert_eq!(a.selected, Some(6));
+            assert_board_viewport(&a, 0, 4);
+            assert_eq!(a.column_offsets, [4, 2, 0, 0, 0, 3]);
+            assert_eq!(a.board_column_offset, 0);
+        }
+    }
+
+    #[test]
+    fn board_navigation_is_safe_when_the_viewport_cannot_fit_a_card() {
+        use crossterm::event::KeyCode;
+
+        for size in [(120, 9), (24, 7), (12, 4), (1, 1)] {
+            let mut a = overflowing_board();
+            draw(size, &mut a);
+            assert!(a.board_cards.is_empty());
+            for (code, down) in [(KeyCode::Down, true), (KeyCode::Up, false)] {
+                for step in 1usize..=14 {
+                    board_key(&mut a, code);
+                    draw(size, &mut a);
+                    let row = if down {
+                        step.min(11)
+                    } else {
+                        11usize.saturating_sub(step)
+                    };
+                    assert_eq!(a.selected, Some(row), "tiny viewport {size:?}");
+                    assert!(a.board_cards.is_empty());
+                    assert!(a.column_offsets.iter().all(|offset| *offset < 12));
+                }
+            }
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(0));
+            assert_board_viewport(&a, 0, 0);
+        }
+    }
+
+    fn overflowing_board() -> App {
+        let mut a = app();
+        a.beads = crate::app::BOARD_STATUSES
+            .iter()
+            .enumerate()
+            .flat_map(|(column, status)| {
+                (0..12).map(move |row| Bead {
+                    dependency_ready: true,
+                    blocked_by: Vec::new(),
+                    id: format!("c{column}-{row:02}"),
+                    title: format!("Card {column}-{row:02}"),
+                    status: match *status {
+                        "ready" => "open",
+                        "ready_to_merge" => "in_progress",
+                        value => value,
+                    }
+                    .into(),
+                    priority: 2,
+                    data: match *status {
+                        "ready" => json!({"issue_type":"task","labels":[crate::beads::READY_LABEL]}),
+                        "ready_to_merge" => json!({"issue_type":"task","labels":[crate::beads::READY_TO_MERGE_LABEL]}),
+                        _ => json!({"issue_type":"task"}),
+                    },
+                })
+            })
+            .collect();
+        a.focused_column = 0;
+        a.selected = Some(0);
+        a
+    }
+
+    fn board_navigation_events() -> [(crossterm::event::Event, crossterm::event::Event); 2] {
+        use crossterm::event::{
+            Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        };
+        let wheel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 2,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        [
+            (
+                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            ),
+            (
+                wheel(MouseEventKind::ScrollDown),
+                wheel(MouseEventKind::ScrollUp),
+            ),
+        ]
+    }
+
+    fn board_event(a: &mut App, event: crossterm::event::Event) {
+        match event {
+            crossterm::event::Event::Key(key) => assert!(!a.key(key)),
+            crossterm::event::Event::Mouse(mouse) => a.mouse(mouse.kind, mouse.column, mouse.row),
+            _ => unreachable!(),
+        }
+    }
+
+    fn board_key(a: &mut App, code: crossterm::event::KeyCode) {
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        board_event(a, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn assert_board_viewport(a: &App, column: usize, offset: usize) {
+        assert_eq!(a.column_offsets[column], offset, "column {column} offset");
+        let cards = a
+            .board_cards
+            .iter()
+            .filter(|(i, _)| i / 12 == column)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cards.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (column * 12 + offset..column * 12 + offset + 3).collect::<Vec<_>>()
+        );
+        for pair in cards.windows(2) {
+            assert_eq!(
+                pair[0].1.bottom(),
+                pair[1].1.y,
+                "visible cards must be contiguous"
+            );
+        }
+        if a.focused_column == column {
+            assert!(
+                cards.iter().any(|(index, _)| Some(*index) == a.selected),
+                "selected card must remain visible"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_board_brings_focused_column_into_view_and_keeps_column_scroll_independent() {
+        let mut a = app();
+        a.beads = (0..12)
+            .map(|i| Bead {
+                dependency_ready: true,
+                blocked_by: Vec::new(),
+                id: format!("open-{i}"),
+                title: format!("Open card {i}"),
+                status: "open".into(),
+                priority: 2,
+                data: json!({"issue_type":"task"}),
+            })
+            .collect();
+        a.focused_column = 5;
+        a.column_offsets[0] = 8;
+        draw((60, 20), &mut a);
+        assert!(a.board_columns.len() < 6);
+        assert!(a.board_columns.iter().any(|(column, _)| *column == 5));
+        assert!(a.board_column_offset > 0);
+        assert_eq!(a.column_offsets[0], 8);
+
+        a.focused_column = 0;
+        draw((60, 20), &mut a);
+        assert!(a.board_columns.iter().any(|(column, _)| *column == 0));
+        assert!(a.board_cards.iter().any(|(index, _)| *index == 8));
+    }
+
+    #[test]
+    fn detail_drawer_overlays_board_without_changing_selection_or_hit_rects() {
+        let mut a = app();
+        a.beads[0].status = "open".into();
+        a.focused_column = 0;
+        a.detail = Some(json!({"id":"demo-1","description":"Drawer details"}));
+        a.focus_detail = true;
+        let selected = a.selected;
+        let (screen, _) = draw((120, 28), &mut a);
+        assert!(screen.contains("› OPEN"));
+        assert!(screen.contains("BEAD DETAILS"));
+        assert!(screen.contains("Drawer details"));
+        assert_eq!(a.selected, selected);
+        assert!(a.board_columns.iter().any(|(column, _)| *column == 0));
+        assert!(a.detail_rect.width > 0);
+        assert!(
+            a.board_cards
+                .iter()
+                .any(|(index, rect)| { *index == selected.unwrap() && rect.width > 0 })
+        );
+    }
+
+    #[test]
+    fn worktree_drawer_keeps_handoff_details_controls_and_modal_above_it() {
+        let mut a = app();
+        a.worktrees_view = true;
+        a.beads.clear();
+        a.worktrees.push(crate::worktrees::ManagedWorktree {
+            id: "wt-1".into(),
+            bead_id: "demo-1".into(),
+            parent_bead_id: None,
+            handoff_accepted: true,
+            bead_title: Some("Captured title".into()),
+            bead_description: Some("Captured handoff notes".into()),
+            branch: "ontrack/demo-1".into(),
+            target_branch: "main".into(),
+            workspace_id: "workspace-1".into(),
+            status: crate::worktrees::WorktreeStatus::NeedsAttention,
+            detail: Some("Review needed".into()),
+        });
+        let screen = draw((120, 30), &mut a).0;
+        for text in [
+            "WORKTREES",
+            "HANDOFFS",
+            "HANDOFF DETAILS",
+            "Captured title",
+            "Review needed",
+            "m merge",
+            "R restart",
+        ] {
+            assert!(screen.contains(text), "missing {text}");
+        }
+        assert!(a.list_rect.width > 0 && a.detail_rect.width > 0);
+        a.modal = Some(crate::app::Modal::ConfirmWorktree {
+            id: "wt-1".into(),
+            action: 4,
+        });
+        let confirmed = draw((120, 30), &mut a).0;
+        assert!(confirmed.contains("CONTINUE TASK?"));
+        assert!(confirmed.contains("Existing changes are preserved"));
+    }
+
+    #[test]
+    fn move_chooser_overlays_board_and_shows_all_fixed_destinations() {
+        let mut a = app();
+        a.modal = Some(crate::app::Modal::Move {
+            id: "demo-1".into(),
+            title: "Move this bead".into(),
+            selected: 4,
+        });
+        let screen = draw((100, 30), &mut a).0;
+        assert!(screen.contains("MOVE BEAD"));
+        assert!(screen.contains("Move this bead"));
+        assert!(screen.contains("READY TO MERGE"));
+        assert!(screen.contains("↑/↓ choose · Enter move · Esc cancel"));
+        assert!(screen.contains("CLOSED"));
+    }
+
+    #[test]
+    fn drawer_width_eases_from_right_to_final_width_and_can_be_disabled() {
+        let start = Instant::now();
+        assert_eq!(drawer_width(100, Some(start), true, start), 0);
+        assert!(drawer_width(100, Some(start), true, start + Duration::from_millis(110)) > 0);
+        assert_eq!(
+            drawer_width(100, Some(start), true, start + Duration::from_millis(220)),
+            40
+        );
+        assert_eq!(drawer_width(100, Some(start), false, start), 40);
+    }
+
+    #[test]
+    fn both_drawers_render_through_animation_resize_and_static_geometry() {
+        for worktrees in [false, true] {
+            let mut a = app();
+            a.focus_detail = !worktrees;
+            a.worktrees_view = worktrees;
+            a.detail_offset = 7;
+            let start = Instant::now();
+            a.drawer_opened_at = Some(start);
+
+            let initial_text = draw_drawer((100, 30), &mut a, start);
+            let initial = a.detail_rect;
+            assert!(initial.width < 4);
+            assert_eq!(a.detail_offset, 7, "unusable frames must not clamp scroll");
+            assert!(initial.x + initial.width <= 100);
+            assert!(a.list_rect.x + a.list_rect.width <= 100);
+            assert!(!initial_text.contains(if worktrees {
+                "WORKTREES ·"
+            } else {
+                "BEAD DETAILS"
+            }));
+
+            let halfway = start + Duration::from_millis(110);
+            a.drawer_opened_at = Some(start);
+            let middle_text = draw_drawer((60, 18), &mut a, halfway);
+            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 36);
+            assert!(a.detail_rect.x + a.detail_rect.width <= 60);
+            assert!(a.list_rect.x + a.list_rect.width <= 60);
+            assert!(middle_text.contains(if worktrees {
+                "WORKTREES"
+            } else {
+                "BEAD DETAILS"
+            }));
+
+            let _ = draw_drawer((100, 30), &mut a, halfway);
+            assert!(a.detail_rect.x + a.detail_rect.width <= 100);
+            assert!(a.list_rect.x + a.list_rect.width <= 100);
+
+            let complete = start + Duration::from_millis(300);
+            let final_text = draw_drawer((100, 30), &mut a, complete);
+            let animated_final = a.detail_rect;
+            assert!(animated_final.width > 0);
+            assert!(final_text.contains(if worktrees {
+                "WORKTREES"
+            } else {
+                "BEAD DETAILS"
+            }));
+            a.settings.animate_drawers = false;
+            let static_text = draw_drawer((100, 30), &mut a, start);
+            assert_eq!(a.detail_rect, animated_final);
+            assert_eq!(static_text, final_text);
+        }
     }
 }

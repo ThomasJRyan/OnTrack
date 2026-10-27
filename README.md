@@ -5,17 +5,17 @@
 OnTrack brings [Beads](https://beads.gascity.com) and [Herdr](https://herdr.dev) together in one keyboard-driven workspace. See what needs doing, give it to a coding agent, and follow the work through to integration.
 
 > **Application screenshot coming soon.**
-<!-- Replace the placeholder above with a screenshot of the issue browser and details pane. -->
+<!-- Replace the placeholder above with a screenshot of the Kanban board and detail drawer. -->
 
 ## From idea to implementation
 
-Browse your backlog beside its Markdown descriptions, comments, and compact, priority-colored dependency charts. Create a task, break it into children, or have an agent turn an Epic's description into prioritized tasks. Discuss a new Task or Epic with an agent, review its proposal, and confirm creation in Beads. Paste PNG or JPEG screenshots into descriptions with `Ctrl+V`; handoffs include the saved local image paths.
+Browse six Kanban columns: **Open, Ready, Blocked, In Progress, Ready To Merge, Closed**. Open a Bead's right-side detail drawer for Markdown descriptions, comments, and dependency charts. Create Tasks, Epics, and children; paste local PNG or JPEG screenshots with `Ctrl+V`.
 
 Mark tasks **Ready** and let OnTrack dispatch eligible work to Herdr agents in separate Git worktrees, with a concurrency limit you control. Need to start something immediately? Hand the selected Bead to an agent with `h`.
 
-Keep the bigger picture in view as agents work. Status groups refresh automatically, and the worktree view lets you jump into an agent's workspace, request a merge, and clean up after verified integration. Configure automatic merging and cleanup when they fit your workflow. Continue work in the same checkout with `a`, or confirm a fresh start with `Shift+R`.
+Agents commit and check their work, then signal **Ready To Merge**, not Closed. OnTrack closes a tracked Bead only after verifying integration into its recorded target. The worktree drawer preserves workspace focus, confirmed merge and cleanup, continue (`a`), and restart (`Shift+R`) actions. Automatic merging and cleanup are optional; verified integration still closes the Bead when both are disabled.
 
-Other features include a two-pane browser with cached Beads details and visible refresh errors, child tasks that wait for their parent handoff and can request integration when complete, an optional Epic task planner, and a short animated startup splash with compact-terminal layouts. Settings include a theme, default agent, and concurrent-agent limit. Run `ontrack update` to check for and install a verified compatible release.
+The board refreshes automatically, scrolls horizontally on narrow terminals, and scrolls each column vertically. Children integrate into their parent branch before closing. Settings include themes, a default agent, and a concurrent-agent limit. Run `ontrack update` to install a verified compatible release.
 
 ## Get started
 
@@ -39,13 +39,13 @@ See [installation and updates](docs/installation.md) for supported architectures
 
 | Key | Action |
 | --- | --- |
-| `↑` / `↓`, `Tab` | Select issues; switch panes to scroll details |
-| `←` / `→` | Collapse / expand a status group in the issue list |
+| `↑` / `↓`; `←` / `→` | Select a card; switch columns, including empty ones |
+| `Shift+←` / `Shift+→`, `m` | Move a card to an adjacent column or choose a destination |
+| `Enter` | Open Bead details; arrows / Page keys scroll the drawer |
 | `n` / `Shift+N`, `e` | Create a Bead / child task, or edit the selection |
-| `r` | Toggle Ready for an open Task or an Epic and its tasks |
 | `h` | Hand the selected Bead to a Herdr agent |
-| `w` | Inspect worktrees; `Enter` opens the selected Herdr workspace |
+| `w` | Open worktree drawer; `Enter` focuses the selected Herdr workspace |
 | `s`, `Ctrl+?` | Open settings or context-specific hotkey help |
 | `Esc`, `q` / `Ctrl+C` | Go back; quit when no dialog is open |
 
-Issues are grouped into coloured, collapsible panes. Open, Ready, Blocked, Deferred, In Progress, and Closed remain visible with zero counts when empty; Closed starts collapsed after loading. Press `Ctrl+?` for hotkeys, `p` to plan new work, `s` for settings, `c` to close, and `d` to delete (both require confirmation). See the [user guide](docs/user-guide.md) for the full workflow and controls, [settings](docs/settings.md) for preferences, the [development guide](docs/development.md) for architecture and checks, [CI checks](docs/ci.md), and the [release guide](docs/releases.md).
+All six columns retain empty counts. Moving to Ready schedules eligible agents; other moves do not start or stop them, and individual moves never cascade to children. Closed moves and `c` require fresh tracked integration proof; `d` permanently deletes after confirmation. See the [user guide](docs/user-guide.md), [settings](docs/settings.md), [development guide](docs/development.md), [CI checks](docs/ci.md), and [release guide](docs/releases.md).
