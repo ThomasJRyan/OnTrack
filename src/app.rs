@@ -39,6 +39,14 @@ fn spawn_epic_planning(id: String, replies: mpsc::Sender<Response>) {
 }
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+pub const BOARD_STATUSES: [&str; 6] = [
+    "open",
+    "ready",
+    "blocked",
+    "in_progress",
+    "ready_to_merge",
+    "closed",
+];
 
 pub(super) enum Request {
     List,
@@ -50,6 +58,7 @@ pub(super) enum Request {
     Update(UpdateBead),
     SetReady(String, bool),
     SetTreeReady(String, bool, HashSet<String>, HashSet<String>),
+    Move(String, String),
     Close(String),
     Delete(String),
     DiscoverHarnesses(u64),
@@ -78,6 +87,7 @@ pub(super) enum Response {
     EpicFinished(String, std::io::Result<Vec<String>>),
     Updated(String, std::io::Result<()>),
     ReadySet(String, bool, std::io::Result<Vec<String>>),
+    Moved(String, String, std::io::Result<()>),
     Closed(String, std::io::Result<()>),
     Deleted(std::io::Result<()>),
     HarnessesDiscovered(u64, std::io::Result<Vec<String>>),
@@ -105,13 +115,15 @@ pub(super) enum WorktreeFocusFeedback {
 }
 pub struct App {
     pub beads: Vec<Bead>,
-    pub collapsed: HashSet<String>,
-    pub(crate) closed_default_pending: bool,
-    pub collapse_context: Option<String>,
+    pub focused_column: usize,
+    pub board_column_offset: usize,
+    pub column_offsets: [usize; 6],
+    pub board_columns: Vec<(usize, Rect)>,
+    pub board_cards: Vec<(usize, Rect)>,
+    pub(crate) column_rows: [usize; 6],
     pub selected: Option<usize>,
     pub detail: Option<serde_json::Value>,
     pub focus_detail: bool,
-    pub list_offset: usize,
     pub detail_offset: u16,
     pub list_loading: bool,
     pub detail_loading: bool,
@@ -155,7 +167,7 @@ pub struct App {
     pub(crate) next_agent_observation: Instant,
     pub notice: Option<String>,
     pub mutation_busy: bool,
-    /// Ready keeps mutation exclusion without locking browser input.
+    /// Ready and board moves exclude other mutations without locking navigation.
     pub ready_pending: bool,
     pub planning_epics: HashSet<String>,
     pub modal_ready: bool,
@@ -191,6 +203,11 @@ pub enum Modal {
     ConfirmClose {
         id: String,
         title: String,
+    },
+    Move {
+        id: String,
+        title: String,
+        selected: usize,
     },
     ConfirmDelete {
         id: String,
@@ -465,7 +482,10 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
             ready,
             beads::set_tree_ready(&id, ready, &known_handoffs, &protected_handoffs),
         ),
-        Request::Close(id) => Response::Closed(id.clone(), beads::close_bead(&id)),
+        Request::Move(id, target) => {
+            Response::Moved(id.clone(), target.clone(), beads::move_bead(&id, &target))
+        }
+        Request::Close(id) => Response::Closed(id.clone(), worktrees::close_integrated_bead(&id)),
         Request::Delete(id) => Response::Deleted(beads::delete_bead(&id)),
         Request::DiscoverHarnesses(seq) => {
             Response::HarnessesDiscovered(seq, crate::herdr::installed_harnesses())
@@ -492,7 +512,8 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
     let _ = out.send(response);
 }
 
-/// Browser bd, managed work, and independent Herdr jobs never share a FIFO.
+/// Board moves/closes share the managed FIFO with reconciliation and cleanup.
+/// Browser reads, Ready cascades, and independent Herdr jobs stay separate.
 /// Detached jobs are not joined or cancelled when the terminal app exits.
 fn start_workers(
     execute: impl Fn(Request, &mpsc::Sender<Response>) + Send + Sync + 'static,
@@ -538,6 +559,8 @@ fn start_workers(
             } else if matches!(
                 request,
                 Request::ListWorktrees
+                    | Request::Move(..)
+                    | Request::Close(_)
                     | Request::WorktreeAction(..)
                     | Request::RestartWorktree(_)
                     | Request::ContinueWorktree(_)
@@ -579,13 +602,15 @@ impl App {
         let theme = settings.theme;
         let mut a = Self {
             beads: vec![],
-            collapsed: HashSet::new(),
-            closed_default_pending: true,
-            collapse_context: None,
+            focused_column: 0,
+            board_column_offset: 0,
+            column_offsets: [0; 6],
+            board_columns: Vec::new(),
+            board_cards: Vec::new(),
+            column_rows: [0; 6],
             selected: None,
             detail: None,
             focus_detail: false,
-            list_offset: 0,
             detail_offset: 0,
             list_loading: true,
             detail_loading: false,
@@ -851,6 +876,7 @@ impl App {
             || self.settings.auto_remove_checkout;
         let should_poll = !self.worktrees_discovered
             || automatic
+            || !self.known_handoffs.is_empty()
             || !self.worktrees.is_empty()
             || self.worktrees_view;
         if should_poll
@@ -923,16 +949,22 @@ impl App {
         }
     }
     fn select(&mut self, index: usize) {
-        self.collapse_context = None;
         if self.beads.is_empty() {
             self.clear_selection();
             return;
         }
         let index = index.min(self.beads.len() - 1);
-        let status = display_status(&self.beads[index]).to_owned();
-        if self.collapsed.contains(&status) {
-            self.clear_selection();
-            return;
+        let previous_column = self.focused_column;
+        self.focused_column = status_order(display_status(&self.beads[index]));
+        self.column_rows[self.focused_column] = self
+            .column_indices(self.focused_column)
+            .iter()
+            .position(|&i| i == index)
+            .unwrap_or(0);
+        if previous_column != self.focused_column
+            || !self.board_cards.iter().any(|&(i, _)| i == index)
+        {
+            self.column_offsets[self.focused_column] = self.column_rows[self.focused_column];
         }
         if self.selected == Some(index) {
             return;
@@ -955,96 +987,67 @@ impl App {
         self.detail_offset = 0;
     }
     fn step(&mut self, d: isize) {
-        let targets = list_layout(&self.beads, &self.collapsed)
-            .targets
-            .into_iter()
-            .filter_map(|target| match target.row {
-                DisplayRow::Bead(index) => Some(DisplayRow::Bead(index)),
-                DisplayRow::Group(status)
-                    if self.collapsed.contains(&status)
-                        || !self.beads.iter().any(|bead| display_status(bead) == status) =>
-                {
-                    Some(DisplayRow::Group(status))
-                }
-                DisplayRow::Group(_) => None,
-            })
-            .collect::<Vec<_>>();
-        if targets.is_empty() {
+        let indices = self.column_indices(self.focused_column);
+        if indices.is_empty() {
             self.clear_selection();
-            self.collapse_context = None;
             return;
         }
-        let current = self
+        let next = self
             .selected
-            .and_then(|index| {
-                targets
-                    .iter()
-                    .position(|target| *target == DisplayRow::Bead(index))
-            })
-            .or_else(|| {
-                self.collapse_context.as_ref().and_then(|status| {
-                    targets
-                        .iter()
-                        .position(|target| target == &DisplayRow::Group(status.clone()))
-                })
-            });
-        let next = current
-            .map(|i| i.saturating_add_signed(d).min(targets.len() - 1))
-            .unwrap_or(if d < 0 { targets.len() - 1 } else { 0 });
-        match &targets[next] {
-            DisplayRow::Bead(index) => self.select(*index),
-            DisplayRow::Group(status) => self.focus_collapsed_group(status.clone()),
+            .and_then(|index| indices.iter().position(|&i| i == index))
+            .map_or(
+                self.column_rows[self.focused_column].min(indices.len() - 1),
+                |row| row.saturating_add_signed(d).min(indices.len() - 1),
+            );
+        self.select(indices[next]);
+    }
+    fn column_indices(&self, column: usize) -> Vec<usize> {
+        list_layout(&self.beads, &HashSet::new()).groups[column]
+            .indices
+            .clone()
+    }
+    fn focus_column(&mut self, column: usize) {
+        self.focused_column = column.min(BOARD_STATUSES.len() - 1);
+        let indices = self.column_indices(self.focused_column);
+        if indices.is_empty() {
+            self.clear_selection();
+        } else {
+            self.select(indices[self.column_rows[self.focused_column].min(indices.len() - 1)]);
         }
     }
-    fn toggle_selected_group(&mut self) {
-        if let Some(status) = self.focused_status() {
-            self.toggle_group(status);
+    fn move_selected(&mut self, direction: isize) {
+        if let Some(bead) = self.selected.and_then(|i| self.beads.get(i)) {
+            let column = status_order(display_status(bead));
+            let target = column
+                .saturating_add_signed(direction)
+                .min(BOARD_STATUSES.len() - 1);
+            if column != target {
+                self.move_bead(bead.id.clone(), bead.title.clone(), target);
+            }
         }
     }
-    fn focused_status(&self) -> Option<String> {
-        self.selected
-            .and_then(|i| self.beads.get(i))
-            .map(|b| display_status(b).to_owned())
-            .or_else(|| self.collapse_context.clone())
-    }
-    fn focus_collapsed_group(&mut self, status: String) {
-        self.clear_selection();
-        self.collapse_context = Some(status);
-    }
-    fn set_group_collapsed(&mut self, status: String, collapsed: bool) {
-        if !group_statuses(&self.beads).contains(&status) {
+    fn move_bead(&mut self, id: String, title: String, target: usize) {
+        if self.mutation_busy {
             return;
         }
-        let is_collapsed = self.collapsed.contains(&status);
-        if is_collapsed == collapsed {
+        if BOARD_STATUSES[target] == "closed" {
+            self.modal = Some(Modal::ConfirmClose { id, title });
+            self.modal_ready = false;
             return;
         }
-        let selected_in_group = self
-            .selected
-            .is_some_and(|i| display_status(&self.beads[i]) == status);
-        if collapsed {
-            self.collapsed.insert(status.clone());
-            if selected_in_group {
-                self.focus_collapsed_group(status.clone());
-            }
+        self.mutation_busy = true;
+        self.ready_pending = true;
+        self.notice = Some(format!("Moving {id} to {}…", BOARD_STATUSES[target]));
+        if self
+            .requests
+            .send(Request::Move(id, BOARD_STATUSES[target].into()))
+            .is_err()
+        {
+            self.mutation_busy = false;
+            self.ready_pending = false;
+            self.notice = Some("Move could not be queued".into());
         } else {
-            self.collapsed.remove(&status);
-            if let Some(i) = self.beads.iter().position(|b| display_status(b) == status) {
-                self.select(i);
-            } else {
-                self.focus_collapsed_group(status);
-            }
-        }
-    }
-    fn toggle_group(&mut self, status: String) {
-        if self.collapsed.remove(&status) {
-            if let Some(i) = self.beads.iter().position(|b| display_status(b) == status) {
-                self.select(i);
-            } else {
-                self.focus_collapsed_group(status);
-            }
-        } else {
-            self.set_group_collapsed(status, true);
+            self.modal = None;
         }
     }
     fn receive(&mut self) {
@@ -1063,26 +1066,13 @@ impl App {
                                 .selected
                                 .and_then(|i| self.beads.get(i))
                                 .map(|b| b.id.clone());
-                            let collapse_context = self.collapse_context.clone();
-                            self.beads = items
-                                .into_iter()
-                                .map(|mut b| {
-                                    b.status = normalized_status(&b.status).to_owned();
-                                    b
-                                })
-                                .collect();
+                            self.beads = items;
                             self.beads.sort_by(|a, b| {
                                 status_order(display_status(a))
                                     .cmp(&status_order(display_status(b)))
                                     .then_with(|| a.status.cmp(&b.status))
                                     .then_with(|| a.id.cmp(&b.id))
                             });
-                            if self.closed_default_pending {
-                                self.collapsed.insert("closed".into());
-                                self.closed_default_pending = false;
-                            }
-                            let groups = group_statuses(&self.beads);
-                            self.collapsed.retain(|s| groups.contains(s));
                             // An in-flight pre-mutation snapshot must not consume
                             // the new ID before the trailing refresh can see it.
                             let preferred = if self.refresh_pending {
@@ -1098,52 +1088,20 @@ impl App {
                             // Indices may now refer to different beads. Only the
                             // surviving ID can reuse the existing detail and scroll.
                             self.selected = None;
-                            if let Some(i) = preferred {
-                                self.collapse_context = None;
-                                self.collapsed.remove(display_status(&self.beads[i]));
+                            if let Some(i) = preferred.or(same_id) {
                                 if Some(i) == same_id {
                                     self.selected = Some(i);
+                                    self.select(i);
                                     self.refresh_detail();
                                 } else {
                                     self.select(i);
                                 }
-                            } else if let Some(status) = collapse_context.filter(|status| {
-                                groups.contains(status)
-                                    && (self.collapsed.contains(status)
-                                        || !self
-                                            .beads
-                                            .iter()
-                                            .any(|bead| display_status(bead) == status))
-                            }) {
-                                self.focus_collapsed_group(status);
-                            } else if let Some(i) = same_id {
-                                self.collapse_context = None;
-                                if self.collapsed.contains(display_status(&self.beads[i])) {
-                                    self.clear_selection();
-                                    if let Some(visible) = list_layout(&self.beads, &self.collapsed)
-                                        .targets
-                                        .into_iter()
-                                        .find_map(|target| match target.row {
-                                            DisplayRow::Bead(index) => Some(index),
-                                            DisplayRow::Group(_) => None,
-                                        })
-                                    {
-                                        self.select(visible);
-                                    }
-                                } else {
-                                    self.selected = Some(i);
-                                    self.refresh_detail();
+                                if preferred.is_some() {
+                                    self.column_offsets[self.focused_column] =
+                                        self.column_rows[self.focused_column];
                                 }
                             } else {
-                                self.clear_selection();
-                                self.collapse_context = None;
-                                let targets = list_layout(&self.beads, &self.collapsed).targets;
-                                if let Some(i) = targets.iter().find_map(|t| match t.row {
-                                    DisplayRow::Bead(i) => Some(i),
-                                    DisplayRow::Group(_) => None,
-                                }) {
-                                    self.select(i);
-                                }
+                                self.focus_column(self.focused_column);
                             }
                             self.list_error = None;
                         }
@@ -1388,7 +1346,6 @@ impl App {
                                 .is_some_and(|bead| bead.id == id)
                             {
                                 self.preferred_id = Some(id.clone());
-                                self.collapsed.remove(if ready { "ready" } else { "open" });
                             }
                             self.refresh_at(now);
                         }
@@ -1398,15 +1355,38 @@ impl App {
                         }
                     }
                 }
+                Response::Moved(id, target, result) => {
+                    self.mutation_busy = false;
+                    self.ready_pending = false;
+                    let (message, error) = match result {
+                        Ok(()) => {
+                            if target == "ready" {
+                                self.scheduler_attempted.remove(&id);
+                            } else {
+                                self.scheduler_attempted.insert(id.clone());
+                            }
+                            self.preferred_id = Some(id.clone());
+                            (format!("Moved {id} to {target}"), false)
+                        }
+                        Err(error) => (format!("Could not move {id} to {target}: {error}"), true),
+                    };
+                    self.notice = Some(message.clone());
+                    self.toast = Some(Toast::result(message, error));
+                    self.refresh_at(now);
+                }
                 Response::Closed(id, result) => {
                     self.mutation_busy = false;
                     match result {
                         Ok(()) => {
                             self.notice = Some(format!("Bead {id} closed"));
                             self.modal = None;
+                            self.preferred_id = Some(id.clone());
                             self.refresh_at(now);
                         }
-                        Err(error) => self.notice = Some(format!("Close failed for {id}: {error}")),
+                        Err(error) => {
+                            self.notice = Some(format!("Close failed for {id}: {error}"));
+                            self.refresh_at(now);
+                        }
                     }
                 }
                 Response::Deleted(result) => {
@@ -1854,8 +1834,8 @@ impl App {
         if event::is_quit(k) {
             return true;
         }
-        // Keep browsing available during Ready, but do not open mutation dialogs
-        // or start handoffs against a partially updated cascade.
+        // Keep browsing available during Ready and moves, but exclude mutations
+        // and handoffs against a partially updated snapshot.
         if self.ready_pending
             && matches!(
                 k.code,
@@ -1881,7 +1861,8 @@ impl App {
         if self.worktrees_view {
             match k.code {
                 KeyCode::Char('w') | KeyCode::Esc | KeyCode::Backspace => {
-                    self.worktrees_view = false
+                    self.worktrees_view = false;
+                    self.focus_detail = false;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.selected_worktree = self.selected_worktree.saturating_sub(1);
@@ -1919,6 +1900,19 @@ impl App {
         match k.code {
             KeyCode::Char('w') => {
                 self.worktrees_view = true;
+                self.focus_detail = false;
+                if let Some(index) =
+                    self.selected
+                        .and_then(|i| self.beads.get(i))
+                        .and_then(|bead| {
+                            self.worktrees
+                                .iter()
+                                .position(|item| item.bead_id == bead.id)
+                        })
+                {
+                    self.selected_worktree = index;
+                    self.worktree_detail_offset = 0;
+                }
                 self.worktrees_focus_feedback = None;
                 self.worktrees_next_refresh = Instant::now();
                 self.poll_worktrees(Instant::now());
@@ -1937,7 +1931,16 @@ impl App {
                 });
                 self.modal_ready = false;
             }
-            KeyCode::Char(' ') => self.toggle_selected_group(),
+            KeyCode::Char('m') if !self.focus_detail => {
+                if let Some(bead) = self.selected.and_then(|i| self.beads.get(i)) {
+                    self.modal = Some(Modal::Move {
+                        id: bead.id.clone(),
+                        title: bead.title.clone(),
+                        selected: status_order(display_status(bead)),
+                    });
+                    self.modal_ready = false;
+                }
+            }
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 let child = k.code == KeyCode::Char('N')
                     || (k.code == KeyCode::Char('n')
@@ -2017,16 +2020,21 @@ impl App {
                 }
             }
             KeyCode::Char('h') => self.open_launch(),
-            KeyCode::Tab => self.focus_detail = !self.focus_detail,
+            KeyCode::Esc => self.focus_detail = false,
+            KeyCode::Tab => self.focus_detail = !self.focus_detail && self.selected.is_some(),
+            KeyCode::Enter if !self.focus_detail && self.selected.is_some() => {
+                self.focus_detail = true
+            }
+            KeyCode::Left | KeyCode::Right
+                if !self.focus_detail && k.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                self.move_selected(if k.code == KeyCode::Right { 1 } else { -1 });
+            }
             KeyCode::Left if !self.focus_detail => {
-                if let Some(status) = self.focused_status() {
-                    self.set_group_collapsed(status, true);
-                }
+                self.focus_column(self.focused_column.saturating_sub(1));
             }
             KeyCode::Right if !self.focus_detail => {
-                if let Some(status) = self.focused_status() {
-                    self.set_group_collapsed(status, false);
-                }
+                self.focus_column(self.focused_column.saturating_add(1));
             }
             KeyCode::Up if self.focus_detail => {
                 self.detail_offset = self.detail_offset.saturating_sub(1)
@@ -2312,6 +2320,23 @@ impl App {
         }
         if self.paste_pending {
             self.notice = Some("Wait for screenshot paste or press Esc to cancel".into());
+            return false;
+        }
+        if let Some(Modal::Move {
+            id,
+            title,
+            selected,
+        }) = self.modal.as_mut()
+        {
+            match key.code {
+                Up => *selected = selected.saturating_sub(1),
+                Down => *selected = (*selected + 1).min(BOARD_STATUSES.len() - 1),
+                Enter => {
+                    let (id, title, target) = (id.clone(), title.clone(), *selected);
+                    self.move_bead(id, title, target);
+                }
+                _ => {}
+            }
             return false;
         }
         if let Some(Modal::ConfirmWorktree { id, action }) = self.modal.as_ref() {
@@ -2843,8 +2868,16 @@ impl App {
         }
         if self.worktrees_view {
             match k {
+                MouseEventKind::ScrollUp if self.detail_rect.contains((x, y).into()) => {
+                    self.worktree_detail_offset = self.worktree_detail_offset.saturating_sub(3);
+                }
+                MouseEventKind::ScrollDown if self.detail_rect.contains((x, y).into()) => {
+                    self.worktree_detail_offset = self.worktree_detail_offset.saturating_add(3);
+                }
                 MouseEventKind::Down(MouseButton::Left)
-                    if self.list_rect.contains((x, y).into()) && y > self.list_rect.y =>
+                    if self.list_rect.contains((x, y).into())
+                        && y > self.list_rect.y
+                        && y < self.list_rect.bottom().saturating_sub(1) =>
                 {
                     let row = usize::from(y - self.list_rect.y - 1) / 2 + self.worktree_offset;
                     if row < self.worktrees.len() {
@@ -2852,60 +2885,70 @@ impl App {
                         self.worktree_detail_offset = 0;
                     }
                 }
-                MouseEventKind::ScrollUp if self.detail_rect.contains((x, y).into()) => {
-                    self.worktree_detail_offset = self.worktree_detail_offset.saturating_sub(3);
-                }
-                MouseEventKind::ScrollDown if self.detail_rect.contains((x, y).into()) => {
-                    self.worktree_detail_offset = self.worktree_detail_offset.saturating_add(3);
-                }
                 _ => {}
             }
             return;
         }
-        match k {
-            MouseEventKind::Down(MouseButton::Left)
-                if self.list_rect.contains((x, y).into())
-                    && x > self.list_rect.x
-                    && x < self.list_rect.x + self.list_rect.width.saturating_sub(1) =>
-            {
-                let row = usize::from(y - self.list_rect.y) + self.list_offset;
-                if let Some(target) = list_layout(&self.beads, &self.collapsed)
-                    .targets
-                    .into_iter()
-                    .find(|t| row >= t.y && row < t.y + t.height)
-                {
-                    match target.row {
-                        DisplayRow::Group(status) => self.toggle_group(status),
-                        DisplayRow::Bead(i) => self.select(i),
+        if self.focus_detail {
+            if self.detail_rect.contains((x, y).into()) {
+                match k {
+                    MouseEventKind::ScrollUp => {
+                        self.detail_offset = self.detail_offset.saturating_sub(3)
                     }
-                    self.focus_detail = false;
+                    MouseEventKind::ScrollDown => {
+                        self.detail_offset = self.detail_offset.saturating_add(3)
+                    }
+                    _ => {}
                 }
             }
-            MouseEventKind::ScrollUp if self.list_rect.contains((x, y).into()) => self.step(-1),
-            MouseEventKind::ScrollDown if self.list_rect.contains((x, y).into()) => self.step(1),
-            MouseEventKind::ScrollUp if self.detail_rect.contains((x, y).into()) => {
-                self.detail_offset = self.detail_offset.saturating_sub(3)
+            return;
+        }
+        if let Some(&(column, _)) = self
+            .board_columns
+            .iter()
+            .find(|(_, rect)| rect.contains((x, y).into()))
+        {
+            match k {
+                MouseEventKind::Down(MouseButton::Left) => {
+                    if let Some(&(index, _)) = self
+                        .board_cards
+                        .iter()
+                        .find(|(_, rect)| rect.contains((x, y).into()))
+                    {
+                        self.select(index);
+                    } else {
+                        self.focus_column(column);
+                    }
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    if self.focused_column != column {
+                        self.focus_column(column);
+                    }
+                    self.step(if k == MouseEventKind::ScrollUp { -1 } else { 1 });
+                }
+                _ => {}
             }
-            MouseEventKind::ScrollDown if self.detail_rect.contains((x, y).into()) => {
-                self.detail_offset = self.detail_offset.saturating_add(3)
-            }
-            _ => {}
         }
     }
 }
-fn status_order(status: &str) -> (u8, &str) {
-    match status {
-        "open" => (0, status),
-        "ready" => (1, status),
-        "closed" => (3, status),
-        _ => (2, status),
-    }
+fn status_order(status: &str) -> usize {
+    BOARD_STATUSES
+        .iter()
+        .position(|&known| known == status)
+        .unwrap_or(0)
 }
 pub fn display_status(bead: &Bead) -> &str {
-    if beads::is_ready(bead) {
+    if beads::ready_to_merge_record(&bead.data) {
+        "ready_to_merge"
+    } else if beads::is_ready(bead) {
         "ready"
     } else {
-        normalized_status(&bead.status)
+        match bead.status.as_str() {
+            "blocked" => "blocked",
+            "in_progress" => "in_progress",
+            "closed" => "closed",
+            _ => "open",
+        }
     }
 }
 pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'static str {
@@ -2924,12 +2967,6 @@ pub(super) fn worktree_status_label(status: worktrees::WorktreeStatus) -> &'stat
         CheckoutRemoved => "CHECKOUT REMOVED",
         DirtyCheckout => "UNCOMMITTED CHANGES",
         NeedsAttention => "NEEDS ATTENTION",
-    }
-}
-fn normalized_status(status: &str) -> &str {
-    match status.trim() {
-        "" => "unknown",
-        status => status,
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2957,22 +2994,8 @@ pub struct ListTarget {
     pub y: usize,
     pub height: usize,
 }
-pub fn group_statuses(beads: &[Bead]) -> Vec<String> {
-    let mut groups = [
-        "open",
-        "ready",
-        "in_progress",
-        "blocked",
-        "deferred",
-        "closed",
-    ]
-    .into_iter()
-    .map(str::to_owned)
-    .chain(beads.iter().map(|b| display_status(b).to_owned()))
-    .collect::<Vec<_>>();
-    groups.sort_by(|a, b| status_order(a).cmp(&status_order(b)).then_with(|| a.cmp(b)));
-    groups.dedup();
-    groups
+pub fn group_statuses(_beads: &[Bead]) -> Vec<String> {
+    BOARD_STATUSES.into_iter().map(str::to_owned).collect()
 }
 
 /// The visible ancestry of an issue within its status pane, from root to issue.
@@ -3248,24 +3271,14 @@ mod tests {
 
         let mut app = app();
         app.beads = beads;
-        app.collapsed.clear();
         app.selected = Some(5);
         app.step(1);
         assert_eq!(app.selected, Some(0));
         app.step(1);
         assert_eq!(app.selected, Some(1));
-        app.list_rect = Rect::new(5, 7, 40, 24);
-        let parent_row = list_layout(&app.beads, &app.collapsed)
-            .targets
-            .iter()
-            .find(|target| target.row == DisplayRow::Bead(5))
-            .unwrap()
-            .y;
-        app.mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            6,
-            7 + parent_row as u16,
-        );
+        app.board_columns = vec![(0, Rect::new(5, 7, 40, 24))];
+        app.board_cards = vec![(5, Rect::new(6, 8, 38, 3))];
+        app.mouse(MouseEventKind::Down(MouseButton::Left), 6, 8);
         assert_eq!(app.selected, Some(5));
     }
 
@@ -3341,7 +3354,7 @@ mod tests {
         respond(&mut a, Response::List(Ok(items.clone())));
         assert_eq!(a.beads[a.selected.unwrap()].id, "b0");
         assert_eq!(
-            list_layout(&a.beads, &a.collapsed).groups[5].indices,
+            list_layout(&a.beads, &HashSet::new()).groups[5].indices,
             [0, 1]
         );
 
@@ -3349,7 +3362,7 @@ mod tests {
         respond(&mut a, Response::List(Ok(items)));
         assert_eq!(a.beads[a.selected.unwrap()].id, "b0");
         assert_eq!(
-            list_layout(&a.beads, &a.collapsed).groups[5].indices,
+            list_layout(&a.beads, &HashSet::new()).groups[5].indices,
             [1, 0]
         );
         a.step(-1);
@@ -3370,13 +3383,17 @@ mod tests {
                     data: json!({"id": format!("b{i}"), "description": format!("detail {i}")}),
                 })
                 .collect(),
-            collapsed: HashSet::new(),
-            closed_default_pending: false,
-            collapse_context: None,
+            focused_column: 0,
+            board_column_offset: 0,
+            column_offsets: [0; 6],
+            board_columns: vec![(0, Rect::new(0, 0, 30, 12))],
+            board_cards: (0..4)
+                .map(|i| (i, Rect::new(1, 1 + i as u16 * 2, 28, 2)))
+                .collect(),
+            column_rows: [0; 6],
             selected: Some(0),
             detail: Some(json!({"id": "b0", "description": "detail 0"})),
             focus_detail: false,
-            list_offset: 0,
             detail_offset: 0,
             list_loading: false,
             detail_loading: false,
@@ -3432,17 +3449,339 @@ mod tests {
             responses,
         }
     }
-    fn assert_collapsed_header_selected(a: &App, status: &str) {
-        assert_eq!(a.collapse_context.as_deref(), Some(status));
-        assert!(a.collapsed.contains(status));
-        assert!(a.selected.is_none());
-        assert!(a.detail.is_none());
-    }
     fn assert_bead(a: &App, id: &str) {
         let bead = &a.beads[a.selected.expect("selected bead")];
         assert_eq!(bead.id, id);
         assert_eq!(a.detail.as_ref(), Some(&bead.data));
     }
+    #[test]
+    fn board_navigation_stays_in_column_and_visits_empty_columns_without_wrapping() {
+        let mut a = app();
+        a.beads[2].status = "blocked".into();
+        a.beads[3].status = "closed".into();
+        a.step(-1);
+        assert_bead(&a, "b0");
+        a.step(20);
+        assert_bead(&a, "b1");
+        press(&mut a, KeyCode::Right);
+        assert_eq!(a.focused_column, 1);
+        assert!(a.selected.is_none());
+        a.step(20);
+        assert_eq!(a.focused_column, 1);
+        assert!(a.selected.is_none());
+        press(&mut a, KeyCode::Right);
+        assert_bead(&a, "b2");
+        a.step(20);
+        assert_bead(&a, "b2");
+        press(&mut a, KeyCode::Left);
+        press(&mut a, KeyCode::Left);
+        assert_bead(&a, "b1");
+        a.focus_column(5);
+        press(&mut a, KeyCode::Right);
+        assert_bead(&a, "b3");
+        assert_eq!(a.focused_column, 5);
+        a.focus_column(0);
+        press(&mut a, KeyCode::Left);
+        assert_bead(&a, "b1");
+        a.beads.clear();
+        a.step(1);
+        assert!(a.selected.is_none());
+    }
+
+    #[test]
+    fn board_statuses_are_fixed_and_unknown_data_is_not_rewritten() {
+        let mut a = app();
+        assert_eq!(group_statuses(&[]), BOARD_STATUSES);
+        for status in ["deferred", "custom", "", "unknown"] {
+            a.beads[0].status = status.into();
+            assert_eq!(display_status(&a.beads[0]), "open");
+            let items = a.beads.clone();
+            respond(&mut a, Response::List(Ok(items)));
+            assert_eq!(
+                a.beads.iter().find(|b| b.id == "b0").unwrap().status,
+                status
+            );
+            assert_eq!(group_statuses(&a.beads), BOARD_STATUSES);
+        }
+        a.beads[0].status = "in_progress".into();
+        a.beads[0].data["status"] = json!("in_progress");
+        a.beads[0].data["labels"] = json!([beads::READY_LABEL, beads::READY_TO_MERGE_LABEL]);
+        assert_eq!(display_status(&a.beads[0]), "ready_to_merge");
+    }
+
+    #[test]
+    fn shift_move_is_per_bead_even_for_parent_with_accepted_handoff() {
+        let (mut a, rx, _) = connected_app();
+        a.beads[0].data["issue_type"] = json!("epic");
+        a.beads[1].data["parent"] = json!("b0");
+        a.accepted_handoffs.insert("b0".into());
+        a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Move(id, target)) if id == "b0" && target == "ready")
+        );
+        assert!(a.mutation_busy && a.ready_pending);
+        press(&mut a, KeyCode::Down);
+        assert_bead(&a, "b1");
+        a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Char('r'));
+        assert!(a.modal.is_none());
+        assert!(matches!(rx.try_recv(), Ok(Request::Show(id, _)) if id == "b1"));
+        assert!(rx.try_recv().is_err());
+
+        let (mut a, rx, _) = connected_app();
+        a.beads[0].status = "in_progress".into();
+        a.accepted_handoffs.insert("b0".into());
+        a.select(0);
+        a.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Move(id, target)) if id == "b0" && target == "blocked")
+        );
+    }
+
+    #[test]
+    fn move_chooser_captures_identity_and_closed_uses_existing_confirmation() {
+        let (mut a, rx, _) = connected_app();
+        a.select(2);
+        take_show(&rx, "b2");
+        press(&mut a, KeyCode::Char('m'));
+        assert!(matches!(a.modal, Some(Modal::Move { ref id, selected: 0, .. }) if id == "b2"));
+        a.select(1);
+        take_show(&rx, "b1");
+        for _ in 0..20 {
+            press(&mut a, KeyCode::Down);
+        }
+        assert!(matches!(a.modal, Some(Modal::Move { selected: 5, .. })));
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(a.modal, Some(Modal::ConfirmClose { ref id, .. }) if id == "b2"));
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Char('y'));
+        assert!(matches!(rx.try_recv(), Ok(Request::Close(id)) if id == "b2"));
+
+        let (mut a, rx, _) = connected_app();
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::Move(id, target)) if id == "b0" && target == "blocked")
+        );
+        assert!(a.modal.is_none());
+    }
+
+    #[test]
+    fn move_results_refresh_authoritative_state_and_follow_id_without_optimism() {
+        let (mut a, rx, tx) = connected_app();
+        a.scheduler_attempted.insert("b0".into());
+        a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert!(matches!(rx.try_recv(), Ok(Request::Move(..))));
+        assert_eq!(display_status(&a.beads[0]), "open");
+        tx.send(Response::Moved("b0".into(), "ready".into(), Ok(())))
+            .unwrap();
+        a.receive();
+        assert_eq!(display_status(&a.beads[0]), "open");
+        assert!(!a.scheduler_attempted.contains("b0"));
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        let mut items = a.beads.clone();
+        items[0].data["labels"] = json!([beads::READY_LABEL]);
+        items.reverse();
+        tx.send(Response::List(Ok(items))).unwrap();
+        a.receive();
+        assert_eq!(a.beads[a.selected.unwrap()].id, "b0");
+        assert_eq!(a.focused_column, 1);
+        take_show(&rx, "b0");
+        a.poll_scheduler();
+        assert!(matches!(rx.try_recv(), Ok(Request::Discover(_))));
+
+        let (mut a, rx, tx) = connected_app();
+        a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert!(matches!(rx.try_recv(), Ok(Request::Move(..))));
+        tx.send(Response::Moved(
+            "b0".into(),
+            "ready".into(),
+            Err(std::io::Error::other("live state changed")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(!a.mutation_busy && !a.ready_pending);
+        assert!(
+            a.toast
+                .as_ref()
+                .is_some_and(|toast| toast.error && toast.message.contains("live state changed"))
+        );
+        assert_eq!(display_status(&a.beads[0]), "open");
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+    }
+
+    #[test]
+    fn refresh_preserves_empty_column_drawers_and_moves_selection_by_id() {
+        let mut a = app();
+        a.focus_column(4);
+        a.board_column_offset = 3;
+        a.column_offsets[0] = 2;
+        let items = a.beads.clone();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_eq!(a.focused_column, 4);
+        assert!(a.selected.is_none());
+        assert_eq!(a.board_column_offset, 3);
+        assert_eq!(a.column_offsets[0], 2);
+        a.select(2);
+        a.focus_detail = true;
+        a.detail_offset = 8;
+        let mut items = a.beads.clone();
+        items[2].status = "closed".into();
+        items.reverse();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_eq!(a.beads[a.selected.unwrap()].id, "b2");
+        assert_eq!(a.focused_column, 5);
+        assert!(a.focus_detail && !a.worktrees_view);
+        assert_eq!(a.detail_offset, 8);
+        let items = a.beads.iter().filter(|b| b.id != "b2").cloned().collect();
+        respond(&mut a, Response::List(Ok(items)));
+        assert_eq!(a.focused_column, 5);
+        assert!(a.selected.is_none());
+        assert!(a.focus_detail);
+    }
+
+    #[test]
+    fn drawers_restore_board_selection_and_isolate_move_inputs() {
+        let (mut a, rx, _) = connected_app();
+        a.worktrees = vec![
+            observed_row("b1", worktrees::WorktreeStatus::InProgress),
+            observed_row("b0", worktrees::WorktreeStatus::InProgress),
+        ];
+        press(&mut a, KeyCode::Enter);
+        assert!(a.focus_detail && !a.worktrees_view);
+        a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Down);
+        assert_eq!(a.selected, Some(0));
+        assert_eq!(a.detail_offset, 1);
+        assert!(a.modal.is_none());
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Char('w'));
+        assert!(a.worktrees_view && !a.focus_detail);
+        assert_eq!(a.selected_worktree, 1);
+        a.key(KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT));
+        press(&mut a, KeyCode::Up);
+        assert_eq!(a.selected_worktree, 0);
+        assert_eq!(a.selected, Some(0));
+        press(&mut a, KeyCode::Esc);
+        assert!(!a.worktrees_view && !a.focus_detail);
+        assert_eq!(a.selected, Some(0));
+        press(&mut a, KeyCode::Tab);
+        press(&mut a, KeyCode::Esc);
+        assert!(!a.focus_detail);
+    }
+
+    #[test]
+    fn board_mouse_uses_renderer_rectangles_and_drawers_prevent_click_through() {
+        let mut a = app();
+        a.beads[2].status = "blocked".into();
+        a.beads[3].status = "blocked".into();
+        a.board_columns = vec![(0, Rect::new(10, 5, 20, 20)), (2, Rect::new(30, 5, 20, 20))];
+        a.board_cards = vec![
+            (1, Rect::new(11, 10, 18, 3)),
+            (2, Rect::new(31, 6, 18, 3)),
+            (3, Rect::new(31, 10, 18, 3)),
+        ];
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 12, 11);
+        assert_bead(&a, "b1");
+        a.mouse(MouseEventKind::ScrollDown, 32, 6);
+        assert_bead(&a, "b3");
+        assert_eq!(a.focused_column, 2);
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 4);
+        assert_bead(&a, "b3");
+        a.focus_detail = true;
+        a.detail_rect = Rect::new(30, 5, 20, 20);
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 32, 6);
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 12, 11);
+        assert_bead(&a, "b3");
+        a.mouse(MouseEventKind::ScrollDown, 32, 6);
+        assert_eq!(a.detail_offset, 3);
+        a.focus_detail = false;
+        a.worktrees_view = true;
+        a.list_rect = Rect::new(30, 5, 20, 20);
+        a.mouse(MouseEventKind::Down(MouseButton::Left), 12, 11);
+        assert_bead(&a, "b3");
+    }
+
+    #[test]
+    fn move_queue_failure_and_chooser_cancel_leave_board_available() {
+        let mut a = app();
+        a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert!(!a.mutation_busy && !a.ready_pending);
+        assert!(a.notice.as_deref().unwrap().contains("could not be queued"));
+        press(&mut a, KeyCode::Char('m'));
+        press(&mut a, KeyCode::Esc);
+        assert!(a.modal.is_none());
+        assert_bead(&a, "b0");
+    }
+
+    #[test]
+    fn board_move_keys_do_not_leak_through_help_or_move_modal() {
+        let (mut a, rx, _) = connected_app();
+        a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+        a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        press(&mut a, KeyCode::Char('m'));
+        assert!(a.help.is_some() && a.modal.is_none());
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('m'));
+        assert_eq!(hotkeys::Context::current(&a), hotkeys::Context::Move);
+        a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        assert!(matches!(a.modal, Some(Modal::Move { selected: 0, .. })));
+        assert_eq!(a.focused_column, 0);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn move_preserves_preferred_id_until_post_mutation_snapshot_and_scrolls_destination() {
+        let (mut a, rx, tx) = connected_app();
+        a.beads[1].status = "blocked".into();
+        let stale = a.beads.clone();
+        a.refresh();
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        a.move_bead("b0".into(), "issue 0".into(), 2);
+        assert!(matches!(rx.try_recv(), Ok(Request::Move(..))));
+        tx.send(Response::Moved("b0".into(), "blocked".into(), Ok(())))
+            .unwrap();
+        a.receive();
+        assert!(a.refresh_pending);
+        tx.send(Response::List(Ok(stale.clone()))).unwrap();
+        a.receive();
+        take_show(&rx, "b0");
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        assert_eq!(a.preferred_id.as_deref(), Some("b0"));
+        let mut updated = stale;
+        updated[0].status = "blocked".into();
+        updated[0].data["parent"] = json!("b1");
+        tx.send(Response::List(Ok(updated))).unwrap();
+        a.receive();
+        take_show(&rx, "b0");
+        assert_eq!(a.beads[a.selected.unwrap()].id, "b0");
+        assert_eq!(a.focused_column, 2);
+        assert_eq!(a.column_offsets[2], 1);
+        assert!(a.preferred_id.is_none());
+        assert!(a.scheduler_attempted.contains("b0"));
+    }
+
+    #[test]
+    fn outstanding_handoffs_are_reconciled_with_all_cleanup_preferences_disabled() {
+        let (mut a, rx, _) = connected_app();
+        a.settings.auto_merge = false;
+        a.settings.auto_merge_children = false;
+        a.settings.auto_close_workspace = false;
+        a.settings.auto_remove_checkout = false;
+        a.known_handoffs.insert("b0".into());
+        a.poll_worktrees(Instant::now());
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::ReconcileWorktrees(policy))
+            if !policy.auto_merge && !policy.auto_merge_children
+                && !policy.auto_close_workspace && !policy.auto_remove_checkout)
+        );
+    }
+
     #[test]
     fn ready_group_is_distinct_while_beads_status_stays_open() {
         let mut a = app();
@@ -3455,15 +3794,15 @@ mod tests {
                 "open",
                 "ready",
                 "blocked",
-                "deferred",
                 "in_progress",
+                "ready_to_merge",
                 "closed"
             ]
         );
         let layout = list_layout(&a.beads, &HashSet::new());
         assert_eq!(layout.groups[1].indices, [0]);
         a.select(0);
-        assert_eq!(a.focused_status().as_deref(), Some("ready"));
+        assert_eq!(a.focused_column, 1);
     }
 
     #[test]
@@ -4282,13 +4621,6 @@ mod tests {
             Some("b0")
         );
     }
-    fn unloaded_app() -> App {
-        let mut a = app();
-        a.beads.clear();
-        a.clear_selection();
-        a.closed_default_pending = true;
-        a
-    }
     fn launch_context() -> LaunchContext {
         LaunchContext {
             workspace: crate::herdr::Workspace {
@@ -4447,6 +4779,109 @@ mod tests {
             received_steps.recv_timeout(Duration::from_secs(5)).unwrap(),
             2
         );
+    }
+
+    #[test]
+    fn moves_and_closes_serialize_with_reconciliation_without_blocking_reads_or_ready() {
+        for reconcile_first in [true, false] {
+            let (release, blocked) = mpsc::channel();
+            let blocked = std::sync::Mutex::new(blocked);
+            let (entered, started) = mpsc::channel();
+            let (steps, completed) = mpsc::channel();
+            let (requests, responses, _) = start_workers(move |request, out| {
+                let wait = || {
+                    entered.send(()).unwrap();
+                    blocked
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                };
+                let response = match request {
+                    Request::ReconcileWorktrees(_) => {
+                        if reconcile_first {
+                            wait();
+                        }
+                        steps.send("reconcile").unwrap();
+                        Response::Worktrees(Ok(vec![]))
+                    }
+                    Request::Move(id, target) => {
+                        if !reconcile_first {
+                            wait();
+                        }
+                        steps.send("move").unwrap();
+                        Response::Moved(id, target, Ok(()))
+                    }
+                    Request::Close(id) => {
+                        steps.send("close").unwrap();
+                        Response::Closed(id, Ok(()))
+                    }
+                    Request::List => Response::List(Ok(vec![])),
+                    Request::Show(id, seq) => Response::Show(id, seq, Ok(json!({}))),
+                    Request::SetReady(id, ready) => {
+                        Response::ReadySet(id.clone(), ready, Ok(vec![id]))
+                    }
+                    _ => panic!("unexpected request"),
+                };
+                out.send(response).unwrap();
+            });
+            let reconcile = Request::ReconcileWorktrees(CleanupPolicy {
+                auto_merge: false,
+                auto_merge_children: false,
+                auto_close_workspace: false,
+                auto_remove_checkout: false,
+            });
+            let backward_move = Request::Move("task".into(), "in_progress".into());
+            let (first, second) = if reconcile_first {
+                (reconcile, backward_move)
+            } else {
+                (backward_move, reconcile)
+            };
+            requests.send(first).unwrap();
+            started.recv_timeout(Duration::from_secs(5)).unwrap();
+            requests.send(second).unwrap();
+            requests.send(Request::Close("task".into())).unwrap();
+            requests
+                .send(Request::SetReady("other".into(), true))
+                .unwrap();
+            requests.send(Request::List).unwrap();
+            requests.send(Request::Show("other".into(), 1)).unwrap();
+            let mut observed = HashSet::new();
+            for _ in 0..3 {
+                observed.insert(
+                    match responses.recv_timeout(Duration::from_secs(5)).unwrap() {
+                        Response::List(Ok(_)) => "list",
+                        Response::Show(_, _, Ok(_)) => "show",
+                        Response::ReadySet(_, _, Ok(_)) => "ready",
+                        _ => {
+                            panic!("managed mutations must remain queued behind the paused request")
+                        }
+                    },
+                );
+            }
+            assert_eq!(observed, HashSet::from(["list", "show", "ready"]));
+            // Ready and browser replies fence the old Move/Close lanes, without sleeps.
+            assert!(completed.try_recv().is_err());
+            release.send(()).unwrap();
+            let expected = if reconcile_first {
+                ["reconcile", "move", "close"]
+            } else {
+                ["move", "reconcile", "close"]
+            };
+            for step in expected {
+                assert_eq!(
+                    completed.recv_timeout(Duration::from_secs(5)).unwrap(),
+                    step
+                );
+                let response = responses.recv_timeout(Duration::from_secs(5)).unwrap();
+                match step {
+                    "reconcile" => assert!(matches!(response, Response::Worktrees(Ok(_)))),
+                    "move" => assert!(matches!(response, Response::Moved(id, target, Ok(()))
+                        if id == "task" && target == "in_progress")),
+                    _ => assert!(matches!(response, Response::Closed(id, Ok(())) if id == "task")),
+                }
+            }
+        }
     }
 
     #[test]
@@ -5326,7 +5761,7 @@ mod tests {
         }
     }
     #[test]
-    fn unchanged_polls_preserve_detail_scroll_focus_collapsed_groups_and_modals() {
+    fn unchanged_polls_preserve_detail_scroll_drawers_columns_and_modals() {
         for modal in [
             None,
             Some(Modal::Create(CreateForm {
@@ -5343,9 +5778,9 @@ mod tests {
         ] {
             let (mut a, rx, tx) = connected_app();
             a.beads[3].status = "closed".into();
-            a.collapsed.insert("closed".into());
+            a.column_offsets[5] = 3;
             a.focus_detail = true;
-            a.list_offset = 7;
+            a.column_offsets[0] = 7;
             a.detail_offset = 23;
             a.detail = Some(json!({"id":"b0", "comments":[{"body":"keep me"}]}));
             a.modal = modal.clone();
@@ -5363,9 +5798,9 @@ mod tests {
             assert!(!a.detail_loading);
             assert_eq!(a.detail, detail);
             assert_eq!(a.selected, Some(0));
-            assert_eq!(a.collapsed, HashSet::from(["closed".into()]));
+            assert_eq!(a.column_offsets[5], 3);
             assert!(a.focus_detail);
-            assert_eq!((a.list_offset, a.detail_offset), (7, 23));
+            assert_eq!((a.column_offsets[0], a.detail_offset), (7, 23));
             assert_eq!(a.modal, modal);
             assert!(!a.modal_ready);
             assert_eq!(a.notice.as_deref(), Some("keep notice"));
@@ -5375,29 +5810,9 @@ mod tests {
                 .unwrap();
             a.receive_at(now);
             assert_eq!(a.detail, Some(updated));
-            assert_eq!((a.list_offset, a.detail_offset), (7, 23));
+            assert_eq!((a.column_offsets[0], a.detail_offset), (7, 23));
             assert_eq!(a.modal, modal);
         }
-    }
-    #[test]
-    fn refresh_preserves_surviving_collapsed_header_selection() {
-        let (mut a, rx, tx) = connected_app();
-        a.collapsed.insert("open".into());
-        a.focus_collapsed_group("open".into());
-        a.focus_detail = true;
-        a.list_offset = 4;
-        let now = Instant::now();
-        a.poll_refresh(now);
-        assert!(matches!(rx.try_recv(), Ok(Request::List)));
-        tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
-        a.receive_at(now);
-        assert!(a.selected.is_none());
-        assert_eq!(a.collapse_context.as_deref(), Some("open"));
-        assert!(a.detail.is_none());
-        assert!(a.collapsed.contains("open"));
-        assert!(a.focus_detail);
-        assert_eq!(a.list_offset, 4);
-        assert!(rx.try_recv().is_err());
     }
     #[test]
     fn polling_applies_external_metadata_additions_and_removals_by_id() {
@@ -5405,7 +5820,7 @@ mod tests {
         a.select(2);
         take_show(&rx, "b2");
         a.detail_offset = 12;
-        a.list_offset = 3;
+        a.column_offsets[0] = 3;
         let now = Instant::now();
         a.poll_refresh(now);
         assert!(matches!(rx.try_recv(), Ok(Request::List)));
@@ -5429,7 +5844,7 @@ mod tests {
         assert_eq!(selected.data["assignee"], "someone");
         assert!(a.beads.iter().any(|b| b.id == "added"));
         assert!(!a.beads.iter().any(|b| b.id == "b1"));
-        assert_eq!((a.list_offset, a.detail_offset), (3, 12));
+        assert_eq!((a.column_offsets[0], a.detail_offset), (3, 12));
         let seq = take_show(&rx, "b2");
         let updated = a.beads[a.selected.unwrap()].data.clone();
         tx.send(Response::Show("b2".into(), seq, Ok(updated.clone())))
@@ -5441,8 +5856,9 @@ mod tests {
         let items = a.beads.iter().filter(|b| b.id != "b2").cloned().collect();
         tx.send(Response::List(Ok(items))).unwrap();
         a.receive_at(now + REFRESH_INTERVAL);
-        assert_eq!(a.beads[a.selected.unwrap()].id, "added");
-        take_show(&rx, "added");
+        assert!(a.selected.is_none());
+        assert_eq!(a.focused_column, 2);
+        assert!(rx.try_recv().is_err());
     }
     #[test]
     fn transient_list_and_show_errors_keep_data_and_retry_until_success() {
@@ -5544,149 +5960,6 @@ mod tests {
         a.poll_refresh(now + REFRESH_INTERVAL);
         assert!(matches!(rx.try_recv(), Ok(Request::List)));
         assert!(a.refresh_inflight);
-    }
-    #[test]
-    fn layout_has_physical_geometry_and_only_interactive_targets() {
-        let mut a = app();
-        a.beads[0].status = " closed ".into();
-        a.beads[1].status = "blocked".into();
-        a.beads[2].status = "open".into();
-        a.beads[3].status = " \t ".into();
-        let layout = list_layout(&a.beads, &HashSet::from(["blocked".into()]));
-        assert_eq!(layout.height, 20);
-        assert_eq!(
-            layout
-                .groups
-                .iter()
-                .map(|g| (&*g.status, g.y, g.height, g.collapsed))
-                .collect::<Vec<_>>(),
-            [
-                ("open", 0, 4, false),
-                ("ready", 4, 2, false),
-                ("blocked", 6, 2, true),
-                ("deferred", 8, 2, false),
-                ("in_progress", 10, 2, false),
-                ("unknown", 12, 4, false),
-                ("closed", 16, 4, false)
-            ]
-        );
-        assert_eq!(
-            layout
-                .groups
-                .iter()
-                .map(|g| g.indices.clone())
-                .collect::<Vec<_>>(),
-            [vec![2], vec![], vec![1], vec![], vec![], vec![3], vec![0]]
-        );
-        assert_eq!(
-            layout.targets,
-            vec![
-                ListTarget {
-                    row: DisplayRow::Group("open".into()),
-                    y: 0,
-                    height: 1
-                },
-                ListTarget {
-                    row: DisplayRow::Bead(2),
-                    y: 1,
-                    height: 2
-                },
-                ListTarget {
-                    row: DisplayRow::Group("ready".into()),
-                    y: 4,
-                    height: 1
-                },
-                ListTarget {
-                    row: DisplayRow::Group("blocked".into()),
-                    y: 6,
-                    height: 1
-                },
-                ListTarget {
-                    row: DisplayRow::Group("deferred".into()),
-                    y: 8,
-                    height: 1
-                },
-                ListTarget {
-                    row: DisplayRow::Group("in_progress".into()),
-                    y: 10,
-                    height: 1
-                },
-                ListTarget {
-                    row: DisplayRow::Group("unknown".into()),
-                    y: 12,
-                    height: 1
-                },
-                ListTarget {
-                    row: DisplayRow::Bead(3),
-                    y: 13,
-                    height: 2
-                },
-                ListTarget {
-                    row: DisplayRow::Group("closed".into()),
-                    y: 16,
-                    height: 1
-                },
-                ListTarget {
-                    row: DisplayRow::Bead(0),
-                    y: 17,
-                    height: 2
-                },
-            ]
-        );
-        let empty = list_layout(&[], &HashSet::new());
-        assert_eq!(empty.groups.len(), 6);
-        assert_eq!(empty.height, 12);
-        assert!(empty.groups.iter().all(|group| group.indices.is_empty()));
-        assert!(
-            empty
-                .targets
-                .iter()
-                .all(|target| matches!(target.row, DisplayRow::Group(_)))
-        );
-        a.beads[1].status = "unknown".into();
-        assert_eq!(
-            list_layout(&a.beads, &HashSet::new()).groups[5].indices,
-            [1, 3]
-        );
-    }
-    #[test]
-    fn mouse_cross_group_toggle_clears_detail_and_delete_identity() {
-        let mut a = app();
-        a.list_rect = Rect::new(5, 7, 30, 30);
-        a.beads[1].status = "closed".into();
-        a.select(2);
-        a.detail_error = Some("stale".into());
-        a.detail_offset = 8;
-        let layout = list_layout(&a.beads, &a.collapsed);
-        let closed_y = layout
-            .groups
-            .iter()
-            .find(|g| g.status == "closed")
-            .unwrap()
-            .y;
-        a.mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            6,
-            7 + closed_y as u16,
-        );
-        assert!(a.collapse_context.is_none());
-        assert_eq!(a.beads[a.selected.unwrap()].id, "b2");
-        press(&mut a, KeyCode::Char('d'));
-        assert!(matches!(&a.modal, Some(Modal::ConfirmDelete { id, .. }) if id == "b2"));
-        press(&mut a, KeyCode::Esc);
-        // Reopening uses the same toggle path as Space, not the old open selection.
-        a.mouse(
-            MouseEventKind::Down(MouseButton::Left),
-            6,
-            7 + closed_y as u16,
-        );
-        assert_bead(&a, "b1");
-        press(&mut a, KeyCode::Char('d'));
-        assert!(matches!(&a.modal, Some(Modal::ConfirmDelete { id, .. }) if id == "b1"));
-        press(&mut a, KeyCode::Esc);
-        // Selecting the same index must still remove conflicting header focus.
-        a.select(1);
-        assert_bead(&a, "b1");
     }
     #[test]
     fn settings_change_autosaves_and_close_keeps_committed_theme() {
@@ -5990,141 +6263,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
     #[test]
-    fn mouse_targets_follow_scrolled_natural_lines_without_relocated_headers() {
-        let mut a = app();
-        a.list_rect = Rect::new(5, 7, 30, 20);
-        a.beads[1].status = "closed".into();
-        a.select(2);
-        let layout = list_layout(&a.beads, &a.collapsed);
-        for target in layout
-            .targets
-            .iter()
-            .filter(|t| matches!(t.row, DisplayRow::Bead(_)))
-        {
-            let DisplayRow::Bead(i) = target.row else {
-                unreachable!()
-            };
-            for line in 0..target.height {
-                a.list_offset = target.y + line;
-                a.mouse(MouseEventKind::Down(MouseButton::Left), 6, 7);
-                assert_bead(&a, &a.beads[i].id);
-            }
-        }
-        a.list_offset = 1;
-        let closed_bead = layout
-            .targets
-            .iter()
-            .find(|t| t.row == DisplayRow::Bead(1))
-            .unwrap();
-        let screen_y = a.list_rect.y + (closed_bead.y - a.list_offset) as u16;
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 6, screen_y);
-        assert_bead(&a, "b1");
-        assert!(a.collapsed.is_empty());
-        let closed = layout.groups.iter().find(|g| g.status == "closed").unwrap();
-        a.list_offset = closed.y;
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 6, 7);
-        assert_collapsed_header_selected(&a, "closed");
-    }
-    #[test]
-    fn collapse_and_reselect_reject_stale_detail_success_and_failure() {
-        let mut a = app();
-        a.select(1);
-        let old_seq = a.detail_seq;
-        press(&mut a, KeyCode::Char(' '));
-        respond(
-            &mut a,
-            Response::Show("b1".into(), old_seq, Ok(json!({"stale": true}))),
-        );
-        assert_collapsed_header_selected(&a, "open");
-        press(&mut a, KeyCode::Char(' '));
-        a.select(1);
-        assert_ne!(a.detail_seq, old_seq);
-        respond(
-            &mut a,
-            Response::Show("b1".into(), old_seq, Err(std::io::Error::other("stale"))),
-        );
-        assert_bead(&a, "b1");
-        assert!(a.detail_loading);
-        assert!(a.detail_error.is_none());
-        respond(
-            &mut a,
-            Response::Show("b1".into(), old_seq, Ok(json!({"stale": true}))),
-        );
-        assert_bead(&a, "b1");
-        let seq = a.detail_seq;
-        respond(
-            &mut a,
-            Response::Show("b1".into(), seq, Ok(json!({"fresh": "b1"}))),
-        );
-        assert_eq!(a.detail, Some(json!({"fresh": "b1"})));
-        assert!(!a.detail_loading);
-    }
-    #[test]
-    fn navigation_clamps_and_empty_is_safe() {
-        let mut a = app();
-        a.step(-1);
-        assert_eq!(a.selected, Some(0));
-        a.step(20);
-        assert_eq!(a.collapse_context.as_deref(), Some("closed"));
-        assert!(a.selected.is_none());
-        a.beads.clear();
-        a.step(1);
-        assert_eq!(a.selected, None);
-        assert_eq!(a.collapse_context.as_deref(), Some("closed"));
-    }
-    #[test]
-    fn status_groups_sort_open_middle_closed_and_unknown() {
-        let mut a = app();
-        a.beads[0].status = "closed".into();
-        a.beads[1].status = "blocked".into();
-        a.beads[2].status = "open".into();
-        a.beads[3].status = "".into();
-        assert_eq!(
-            group_statuses(&a.beads),
-            [
-                "open",
-                "ready",
-                "blocked",
-                "deferred",
-                "in_progress",
-                "unknown",
-                "closed"
-            ]
-        );
-    }
-    #[test]
-    fn keyboard_steps_between_expanded_rows_and_collapsed_headers() {
-        let mut a = app();
-        a.beads[0].status = "open".into();
-        a.beads[1].status = "closed".into();
-        a.beads[2].status = "closed".into();
-        a.beads[3].status = "open".into();
-        press(&mut a, KeyCode::Char(' '));
-        assert_collapsed_header_selected(&a, "open");
-        for _ in 0..5 {
-            press(&mut a, KeyCode::Down);
-        }
-        assert_bead(&a, "b1");
-        press(&mut a, KeyCode::Char(' '));
-        assert_eq!(a.collapsed.len(), 2);
-        assert_collapsed_header_selected(&a, "closed");
-        for _ in 0..5 {
-            press(&mut a, KeyCode::Up);
-        }
-        assert_collapsed_header_selected(&a, "open");
-        press(&mut a, KeyCode::Char(' '));
-        assert_bead(&a, "b0");
-        press(&mut a, KeyCode::Down);
-        assert_bead(&a, "b3");
-        for _ in 0..5 {
-            press(&mut a, KeyCode::Down);
-        }
-        assert_collapsed_header_selected(&a, "closed");
-        press(&mut a, KeyCode::Right);
-        assert_bead(&a, "b1");
-        assert!(a.collapsed.is_empty());
-    }
-    #[test]
     fn detail_focus_and_scroll_work() {
         let mut a = app();
         assert!(!a.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
@@ -6135,27 +6273,7 @@ mod tests {
         assert_eq!(a.detail_offset, 7);
     }
     #[test]
-    fn left_right_collapse_expand_idempotently_without_losing_live_selection() {
-        let mut a = app();
-        a.select(2);
-        press(&mut a, KeyCode::Left);
-        assert!(a.collapsed.contains("open"));
-        assert_collapsed_header_selected(&a, "open");
-        assert!(a.selected.is_none());
-        press(&mut a, KeyCode::Left);
-        assert_collapsed_header_selected(&a, "open");
-        press(&mut a, KeyCode::Right);
-        assert!(!a.collapsed.contains("open"));
-        assert_bead(&a, "b0");
-        a.select(2);
-        let detail = a.detail.clone();
-        press(&mut a, KeyCode::Right);
-        assert_bead(&a, "b2");
-        assert_eq!(a.detail, detail);
-        assert!(detail.is_some());
-    }
-    #[test]
-    fn details_focus_keeps_arrows_out_of_group_state_and_tab_alone_switches_panes() {
+    fn detail_drawer_arrows_leave_columns_unchanged_and_tab_toggles_drawer() {
         let mut a = app();
         let selected = a.selected;
         let detail = a.detail.clone();
@@ -6164,7 +6282,7 @@ mod tests {
         press(&mut a, KeyCode::Left);
         press(&mut a, KeyCode::Right);
         assert!(a.focus_detail);
-        assert!(a.collapsed.is_empty());
+        assert_eq!(a.focused_column, 0);
         assert_eq!(a.selected, selected);
         assert_eq!(a.detail, detail);
         press(&mut a, KeyCode::Tab);
@@ -6173,14 +6291,14 @@ mod tests {
         assert!(a.focus_detail);
     }
     #[test]
-    fn list_arrows_are_safe_when_empty_and_modal_arrows_remain_form_controls() {
+    fn board_arrows_are_safe_when_empty_and_modal_arrows_remain_form_controls() {
         let mut a = app();
         a.beads.clear();
         a.clear_selection();
         press(&mut a, KeyCode::Left);
         press(&mut a, KeyCode::Right);
         assert!(a.selected.is_none());
-        assert!(a.collapsed.is_empty());
+        assert_eq!(a.focused_column, 1);
         a.beads = app().beads;
         a.modal = Some(Modal::Create(CreateForm {
             title: "xy".into(),
@@ -6198,89 +6316,7 @@ mod tests {
         };
         assert_eq!(form.cursor, 1);
         assert!(!a.focus_detail);
-        assert!(a.collapsed.is_empty());
-    }
-    #[test]
-    fn mouse_row_includes_list_offset_and_two_line_items() {
-        let mut a = app();
-        a.list_offset = 1;
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 3);
-        assert_eq!(a.selected, Some(1));
-    }
-    #[test]
-    fn vertical_navigation_crosses_visible_groups_without_selecting_headers() {
-        let mut a = app();
-        a.beads[2].status = "blocked".into();
-        a.beads[3].status = "closed".into();
-        a.select(1);
-        press(&mut a, KeyCode::Down);
-        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
-        press(&mut a, KeyCode::Down);
-        assert_bead(&a, "b2");
-        press(&mut a, KeyCode::Up);
-        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
-        press(&mut a, KeyCode::Up);
-        assert_bead(&a, "b1");
-        for _ in 0..5 {
-            press(&mut a, KeyCode::Down);
-        }
-        assert_bead(&a, "b3");
-        press(&mut a, KeyCode::Down);
-        assert_bead(&a, "b3");
-        press(&mut a, KeyCode::Up);
-        assert_eq!(a.collapse_context.as_deref(), Some("in_progress"));
-        press(&mut a, KeyCode::Up);
-        assert_eq!(a.collapse_context.as_deref(), Some("deferred"));
-        press(&mut a, KeyCode::Up);
-        assert_bead(&a, "b2");
-        for _ in 0..3 {
-            press(&mut a, KeyCode::Up);
-        }
-        assert_bead(&a, "b0");
-        press(&mut a, KeyCode::Up);
-        assert_bead(&a, "b0");
-        assert!(a.collapse_context.is_none());
-    }
-    #[test]
-    fn collapsed_headers_are_keyboard_targets_and_mouse_can_also_reopen() {
-        let mut a = app();
-        a.beads[2].status = "blocked".into();
-        a.beads[3].status = "closed".into();
-        a.collapsed.insert("blocked".into());
-        a.select(1);
-        press(&mut a, KeyCode::Down);
-        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
-        press(&mut a, KeyCode::Down);
-        assert_collapsed_header_selected(&a, "blocked");
-        press(&mut a, KeyCode::Right);
-        assert_bead(&a, "b2");
-
-        a.collapsed
-            .extend(["open".into(), "blocked".into(), "closed".into()]);
-        a.focus_collapsed_group("open".into());
-        press(&mut a, KeyCode::Up);
-        assert_collapsed_header_selected(&a, "open");
-        press(&mut a, KeyCode::Down);
-        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
-        press(&mut a, KeyCode::Down);
-        assert_collapsed_header_selected(&a, "blocked");
-        for _ in 0..3 {
-            press(&mut a, KeyCode::Down);
-        }
-        assert_collapsed_header_selected(&a, "closed");
-        press(&mut a, KeyCode::Down);
-        assert_collapsed_header_selected(&a, "closed");
-        for _ in 0..3 {
-            press(&mut a, KeyCode::Up);
-        }
-        assert_collapsed_header_selected(&a, "blocked");
-        press(&mut a, KeyCode::Right);
-        assert_bead(&a, "b2");
-        assert!(!a.collapsed.contains("blocked"));
-        // Mouse title clicks and keyboard controls share the same expansion transition.
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 0);
-        assert_bead(&a, "b0");
-        assert!(!a.collapsed.contains("open"));
+        assert_eq!(a.focused_column, 1);
     }
     #[test]
     fn details_focused_arrows_scroll_without_changing_issue_selection() {
@@ -6322,27 +6358,6 @@ mod tests {
         assert_eq!(a.detail, Some(a.beads[1].data.clone()));
         assert!(a.detail_loading);
     }
-    #[test]
-    fn click_ignores_border_and_blank_rows() {
-        let mut a = app();
-        a.list_rect = Rect::new(0, 0, 30, 16);
-        a.select(3);
-        for (x, y) in [(0, 0), (0, 3), (29, 3), (4, 9), (4, 11), (4, 13), (4, 16)] {
-            a.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
-            assert_bead(&a, "b3");
-            assert!(a.collapsed.is_empty());
-        }
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 3);
-        assert_bead(&a, "b1");
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 4);
-        assert_bead(&a, "b1");
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 0);
-        assert!(a.collapsed.contains("open"));
-        assert_eq!(a.collapse_context.as_deref(), Some("open"));
-        assert!(a.selected.is_none());
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 0);
-        assert_bead(&a, "b0");
-    }
 
     #[test]
     fn successful_refresh_preserves_selection_and_clears_empty_details() {
@@ -6369,223 +6384,6 @@ mod tests {
         assert!(a.detail.is_none());
         assert!(!a.detail_loading);
         assert!(a.detail_error.is_none());
-    }
-    #[test]
-    fn refresh_keeps_existing_group_collapse_and_drops_stale_group_state() {
-        let mut a = app();
-        a.collapsed.extend(["closed".into(), "removed".into()]);
-        let (tx, rx) = mpsc::channel();
-        a.responses = rx;
-        tx.send(Response::List(Ok(vec![Bead {
-            dependency_ready: true,
-            blocked_by: Vec::new(),
-            id: "c".into(),
-            title: "closed issue".into(),
-            status: "closed".into(),
-            priority: 2,
-            data: json!({}),
-        }])))
-        .unwrap();
-        a.receive();
-        assert_eq!(a.collapsed, HashSet::from(["closed".to_owned()]));
-        assert_eq!(a.selected, None);
-        assert!(a.detail.is_none());
-        assert!(a.collapse_context.is_none());
-    }
-    #[test]
-    fn closed_group_starts_collapsed_and_user_expansion_survives_refresh() {
-        let mut a = unloaded_app();
-        let mut items = app().beads;
-        items.truncate(2);
-        items[1].status = " closed ".into();
-        respond(&mut a, Response::List(Ok(items)));
-        assert_bead(&a, "b0");
-        let layout = list_layout(&a.beads, &a.collapsed);
-        assert_eq!(layout.groups.len(), 6);
-        assert!(!layout.groups[0].collapsed);
-        assert!(layout.groups[5].collapsed);
-        assert_eq!(layout.groups[5].indices, vec![1]);
-        assert!(
-            !layout
-                .targets
-                .iter()
-                .any(|target| target.row == DisplayRow::Bead(1))
-        );
-
-        for _ in 0..5 {
-            press(&mut a, KeyCode::Down);
-        }
-        assert_collapsed_header_selected(&a, "closed");
-        press(&mut a, KeyCode::Right);
-        assert_bead(&a, "b1");
-        let refreshed = a.beads.clone();
-        respond(&mut a, Response::List(Ok(refreshed)));
-        assert_bead(&a, "b1");
-        assert!(!a.collapsed.contains("closed"));
-        press(&mut a, KeyCode::Left);
-        assert_collapsed_header_selected(&a, "closed");
-    }
-    #[test]
-    fn closed_group_defaults_on_first_empty_list_and_remains_collapsed() {
-        let mut a = unloaded_app();
-        respond(&mut a, Response::List(Ok(vec![])));
-        assert!(!a.closed_default_pending);
-        assert!(a.collapsed.contains("closed"));
-
-        let mut items = app().beads;
-        items.truncate(2);
-        respond(&mut a, Response::List(Ok(items.clone())));
-        assert!(!a.closed_default_pending);
-        assert!(a.collapsed.contains("closed"));
-        assert_bead(&a, "b0");
-
-        items[1].status = "closed".into();
-        respond(&mut a, Response::List(Ok(items)));
-        assert!(!a.closed_default_pending);
-        assert!(a.collapsed.contains("closed"));
-        assert_bead(&a, "b0");
-    }
-    #[test]
-    fn empty_group_headers_remain_keyboard_and_mouse_targets_without_issue_actions() {
-        let mut a = unloaded_app();
-        respond(&mut a, Response::List(Ok(vec![])));
-        let layout = list_layout(&a.beads, &a.collapsed);
-        assert_eq!(layout.groups.len(), 6);
-        assert!(layout.groups.iter().all(|group| group.indices.is_empty()));
-
-        press(&mut a, KeyCode::Down);
-        assert_eq!(a.collapse_context.as_deref(), Some("open"));
-        press(&mut a, KeyCode::Char(' '));
-        assert!(a.collapsed.contains("open"));
-        press(&mut a, KeyCode::Char(' '));
-        assert!(!a.collapsed.contains("open"));
-        assert_eq!(a.collapse_context.as_deref(), Some("open"));
-        press(&mut a, KeyCode::Char('d'));
-        assert!(a.modal.is_none());
-        assert!(a.selected.is_none());
-        assert!(a.detail.is_none());
-
-        press(&mut a, KeyCode::Down);
-        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
-        respond(&mut a, Response::List(Ok(vec![])));
-        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
-        a.list_rect = Rect::new(0, 0, 30, 16);
-        a.mouse(MouseEventKind::Down(MouseButton::Left), 4, 2);
-        assert!(a.collapsed.contains("ready"));
-        assert_eq!(a.collapse_context.as_deref(), Some("ready"));
-        assert!(a.selected.is_none());
-    }
-    #[test]
-    fn closed_only_workspace_keeps_header_keyboard_accessible() {
-        let mut a = unloaded_app();
-        let mut items = app().beads;
-        items.truncate(1);
-        items[0].status = "closed".into();
-        respond(&mut a, Response::List(Ok(items)));
-        assert!(a.collapsed.contains("closed"));
-        assert!(a.selected.is_none());
-        for _ in 0..6 {
-            press(&mut a, KeyCode::Down);
-        }
-        assert_collapsed_header_selected(&a, "closed");
-        press(&mut a, KeyCode::Right);
-        assert_bead(&a, "b0");
-    }
-    #[test]
-    fn refresh_never_selects_group_headers_or_makes_them_delete_targets() {
-        let mut a = app();
-        a.beads[1].status = "closed".into();
-        let mut items = a.beads.clone();
-        items.reverse();
-        respond(&mut a, Response::List(Ok(items)));
-        assert!(a.collapse_context.is_none());
-        assert!(a.selected.is_some());
-        press(&mut a, KeyCode::Char('d'));
-        assert!(matches!(a.modal, Some(Modal::ConfirmDelete { .. })));
-    }
-    #[test]
-    fn refresh_tracks_bead_id_across_reorder_status_moves_and_collapsed_destination() {
-        let mut a = app();
-        a.select(2);
-        let old_seq = a.detail_seq;
-        let old_detail = a.detail.clone();
-        let mut items = a.beads.clone();
-        items[2].status = "closed".into();
-        items[2].data = json!({"id": "b2", "description": "updated detail"});
-        items.reverse();
-        respond(&mut a, Response::List(Ok(items)));
-        assert_eq!(a.beads[a.selected.unwrap()].id, "b2");
-        assert_eq!(a.detail, old_detail);
-        assert_eq!(a.selected, Some(3));
-        assert_eq!(a.detail_offset, 0);
-        respond(
-            &mut a,
-            Response::Show("b2".into(), old_seq, Ok(json!({"stale": true}))),
-        );
-        assert_eq!(a.detail, old_detail);
-        press(&mut a, KeyCode::Char('d'));
-        assert!(matches!(&a.modal, Some(Modal::ConfirmDelete { id, .. }) if id == "b2"));
-        press(&mut a, KeyCode::Esc);
-        a.collapsed.insert("blocked".into());
-        let mut items = a.beads.clone();
-        items.iter_mut().find(|b| b.id == "b2").unwrap().status = "blocked".into();
-        respond(&mut a, Response::List(Ok(items)));
-        assert!(a.collapse_context.is_none());
-        let selected = a.selected.expect("refresh keeps a visible issue selected");
-        assert_ne!(a.beads[selected].id, "b2");
-        assert_eq!(a.detail.as_ref(), Some(&a.beads[selected].data));
-        assert!(!a.collapsed.contains("closed"));
-        press(&mut a, KeyCode::Char('d'));
-        assert!(
-            matches!(&a.modal, Some(Modal::ConfirmDelete { id, .. }) if id == &a.beads[selected].id)
-        );
-    }
-    #[test]
-    fn refresh_missing_bead_selects_visible_issue_or_leaves_no_selection() {
-        let mut a = app();
-        a.beads[0].status = "closed".into();
-        a.beads[1].status = "blocked".into();
-        a.collapsed.insert("open".into());
-        a.select(0);
-        let items = a.beads.iter().filter(|b| b.id != "b0").cloned().collect();
-        respond(&mut a, Response::List(Ok(items)));
-        assert_bead(&a, "b1");
-        let mut items = a.beads.clone();
-        items.iter_mut().find(|b| b.id == "b1").unwrap().status = "closed".into();
-        respond(&mut a, Response::List(Ok(items)));
-        assert_bead(&a, "b1");
-        a.collapsed.insert("closed".into());
-        let items = a
-            .beads
-            .iter()
-            .filter(|b| b.status != "closed")
-            .cloned()
-            .collect();
-        respond(&mut a, Response::List(Ok(items)));
-        assert!(a.collapse_context.is_none());
-        assert!(a.selected.is_none());
-        respond(&mut a, Response::List(Ok(vec![])));
-        assert!(a.collapse_context.is_none());
-        assert!(a.selected.is_none());
-        assert!(a.detail.is_none());
-        assert_eq!(
-            a.collapsed,
-            HashSet::from(["open".to_owned(), "closed".to_owned()])
-        );
-    }
-    #[test]
-    fn preferred_id_expands_destination_and_selects_created_bead() {
-        {
-            let mut a = app();
-            a.beads[1].status = "closed".into();
-            a.collapsed.insert("closed".into());
-            a.preferred_id = Some("b1".into());
-            let items = a.beads.clone();
-            respond(&mut a, Response::List(Ok(items)));
-            assert_bead(&a, "b1");
-            assert!(!a.collapsed.contains("closed"));
-            assert!(a.preferred_id.is_none());
-        }
     }
     #[test]
     fn missing_preferred_id_falls_back_to_visible_issue_not_header() {
@@ -7019,6 +6817,10 @@ mod tests {
             assert!(!a.mutation_busy);
             assert!(a.notice.as_deref().unwrap().contains("blocked"));
             assert!(a.modal.is_some());
+            assert!(matches!(rx.try_recv(), Ok(Request::List)));
+            tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+            a.receive();
+            take_show(&rx, "b2");
             press(&mut a, KeyCode::Char('y'));
             assert!(matches!(rx.try_recv(), Ok(Request::Close(id)) if id == "b0"));
             tx.send(Response::Closed("b0".into(), Ok(()))).unwrap();
@@ -7026,9 +6828,16 @@ mod tests {
             assert!(!a.mutation_busy && a.modal.is_none());
             assert!(a.notice.as_deref().unwrap().contains("b0 closed"));
             assert!(matches!(rx.try_recv(), Ok(Request::List)));
-            tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+            let mut items = a.beads.clone();
+            items
+                .iter_mut()
+                .find(|bead| bead.id == "b0")
+                .unwrap()
+                .status = "closed".into();
+            tx.send(Response::List(Ok(items))).unwrap();
             a.receive();
-            take_show(&rx, "b2");
+            take_show(&rx, "b0");
+            assert_eq!(a.focused_column, 5);
         }
     }
 

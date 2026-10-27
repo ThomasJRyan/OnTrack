@@ -65,8 +65,8 @@ A missing `agent_limit` defaults to 5.
 It accepts a positive integer or `"unlimited"`; zero, negative, fractional, and
 other values are invalid. Child merge requests are on by default; top-level
 merge requests, workspace closing, and checkout removal are off by default.
-Child auto-merge keeps background worktree discovery running even when the
-tracked list is empty and the worktrees view is hidden. Epic subtasks merge
+Background reconciliation remains active to detect integration and finish Bead
+closure even with all automatic merge and cleanup preferences off. Epic subtasks merge
 into their recorded parent checkout. Workspace closing and checkout removal
 preferences also apply to integrated child worktrees, with the same safety
 checks as top-level tasks; parent cleanup waits for child checkouts to be removed.
@@ -108,13 +108,22 @@ Use `Tab` / `Shift+Tab` to move focus; Close exits the dialog.
 
 “Auto-merge child tasks into parent” controls managed child handoffs, including
 Epic subtasks and nested child tasks. It is enabled by default. Once a child
-Bead is closed and its agent has finished, OnTrack requests integration into
-the recorded parent worktree without a confirmation dialog. The existing Git,
+Bead signals Ready To Merge (`in_progress` plus `ontrack:ready-to-merge`) and its
+agent has settled, OnTrack requests integration into the recorded parent
+worktree without a confirmation dialog. The existing Git,
 agent, and Beads checks still apply; conflicts and uncertain outcomes stay
 visible for manual recovery. Turning this off leaves children available for
 the confirmed manual `m` action. “Auto-merge top-level tasks” controls
 handoffs without a managed parent independently and remains off by default.
 Neither merge setting closes workspaces or removes checkouts by itself.
+
+Bead closure is not a cleanup preference: after freshly verifying tracked Git
+integration, OnTrack closes a child integrated into its parent branch or a
+top-level Bead integrated into its recorded target. This also applies to detected
+external or confirmed manual merges when automatic merging and cleanup are off.
+A failed Beads close is retried without replaying the Git merge; cleanup must
+wait rather than conceal the incomplete lifecycle. A board move alone never
+authorizes a merge, workspace closure, checkout removal, or restart.
 
 Agent limit starts at 5. `Left` / `Right` moves through Unlimited, 1, 2, 3,
 and increasing positive counts, saving each change immediately. `Enter` or

@@ -341,6 +341,13 @@ pub fn status_color(theme: Theme, status: &str) -> Color {
         }
         "closed" | "blocked" => p.danger,
         "in_progress" => p.warning,
+        "ready_to_merge" => {
+            if theme == Theme::SolarizedDark {
+                rgb(180, 125, 175)
+            } else {
+                p.accent_alt
+            }
+        }
         "deferred" => p.info,
         "unknown" | "" => p.muted,
         _ => p.accent_alt,
@@ -542,6 +549,26 @@ mod tests {
                 entry.id
             );
             assert_ne!(ready, status_color(entry.theme, "open"));
+        }
+    }
+
+    #[test]
+    fn ready_to_merge_has_readable_distinct_semantic_color() {
+        for entry in CATALOG {
+            let color = status_color(entry.theme, "ready_to_merge");
+            assert_ne!(
+                color,
+                status_color(entry.theme, "in_progress"),
+                "{}",
+                entry.id
+            );
+            assert_ne!(color, status_color(entry.theme, "ready"), "{}", entry.id);
+            assert!(
+                contrast(color, entry.palette.background) >= 3.0,
+                "{}",
+                entry.id
+            );
+            assert!(contrast(color, entry.palette.panel) >= 3.0, "{}", entry.id);
         }
     }
 

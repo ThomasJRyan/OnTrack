@@ -14,6 +14,7 @@ pub enum Context {
     SettingsChoices,
     EditLoading,
     Close,
+    Move,
     Delete,
     GenerateEpic,
     WorktreeConfirm,
@@ -42,6 +43,7 @@ impl Context {
             Some(Modal::EditLoading { .. }) => Self::EditLoading,
             Some(Modal::ConfirmGenerateEpic { .. }) => Self::GenerateEpic,
             Some(Modal::ConfirmClose { .. }) => Self::Close,
+            Some(Modal::Move { .. }) => Self::Move,
             Some(Modal::ConfirmDelete { .. }) => Self::Delete,
             Some(Modal::ConfirmWorktree { .. }) => Self::WorktreeConfirm,
             None if app.worktrees_view => Self::Worktrees,
@@ -54,7 +56,7 @@ impl Context {
 
     pub fn title(self) -> &'static str {
         match self {
-            Self::Issues | Self::EpicIssues => "Issue list",
+            Self::Issues | Self::EpicIssues => "Kanban board",
             Self::Details | Self::EpicDetails => "Issue details",
             Self::Worktrees => "Outstanding worktrees",
             Self::Form => "Create / edit form",
@@ -64,6 +66,7 @@ impl Context {
             Self::EditLoading => "Loading edit",
             Self::GenerateEpic => "Generate Epic tasks",
             Self::Close => "Close confirmation",
+            Self::Move => "Move Bead",
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
             Self::Planning => "Plan new work",
@@ -73,16 +76,26 @@ impl Context {
     pub fn entries(self) -> Vec<(&'static str, &'static str)> {
         let mut rows = match self {
             Self::Issues | Self::EpicIssues => vec![
-                ("↑ / ↓", "Select an issue or collapsed group"),
-                ("← / →", "Collapse / expand selected status group"),
-                ("Space", "Toggle selected status group"),
-                ("Tab", "Focus issue details"),
+                ("↑ / ↓", "Select a Bead within the focused column"),
+                (
+                    "← / →",
+                    "Focus the adjacent column, including empty columns",
+                ),
+                (
+                    "Shift+← / Shift+→",
+                    "Move the selected Bead to the adjacent column",
+                ),
+                ("m", "Choose any destination column for this Bead"),
+                ("Enter / Tab", "Open the detail drawer"),
                 ("r", "Toggle Ready for an open issue; Epic includes tasks"),
                 ("s", "Open settings"),
                 ("n", "Create a bead"),
                 ("Shift+N", "Create child of selected open task"),
                 ("e", "Edit selected bead"),
-                ("c", "Close selected non-closed bead after confirmation"),
+                (
+                    "c",
+                    "Close after confirmation; verified integration required",
+                ),
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
                 (
@@ -95,7 +108,10 @@ impl Context {
             Self::Details | Self::EpicDetails => vec![
                 ("↑ / ↓", "Scroll issue details one line"),
                 ("PgUp / PgDn", "Scroll issue details one page"),
-                ("Tab", "Focus issue list"),
+                (
+                    "Tab / Esc",
+                    "Close the detail drawer and return to the board",
+                ),
                 ("r", "Toggle Ready for an open issue; Epic includes tasks"),
                 (
                     "Shift+R",
@@ -105,11 +121,13 @@ impl Context {
                 ("n", "Create a bead"),
                 ("Shift+N", "Create child of selected open task"),
                 ("e", "Edit selected bead"),
-                ("c", "Close selected non-closed bead after confirmation"),
+                (
+                    "c",
+                    "Close after confirmation; verified integration required",
+                ),
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
                 ("w", "Open outstanding worktrees"),
-                ("Esc", "Stay in the issue browser"),
             ],
             Self::Worktrees => vec![
                 ("↑ / k", "Select previous worktree"),
@@ -166,6 +184,14 @@ impl Context {
                 ("e", "Retry a failed edit load"),
                 ("Esc", "Cancel edit loading"),
             ],
+            Self::Move => vec![
+                ("↑ / ↓", "Choose a destination column"),
+                (
+                    "Enter",
+                    "Move Bead; Closed requires confirmation and integration",
+                ),
+                ("Esc", "Cancel and return to the board"),
+            ],
             Self::Close | Self::Delete | Self::WorktreeConfirm | Self::GenerateEpic => vec![
                 ("y / Y", "Confirm action"),
                 ("n / N / Enter", "Cancel action"),
@@ -208,6 +234,42 @@ pub fn is_help_key(key: KeyEvent) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn board_and_drawer_help_describes_actual_navigation() {
+        let board = Context::Issues.entries();
+        assert!(board.iter().any(|&(key, _)| key == "m"));
+        assert!(board.iter().any(|&(key, _)| key == "Shift+← / Shift+→"));
+        assert!(board.iter().any(|&(key, _)| key == "Enter / Tab"));
+        assert!(
+            !board
+                .iter()
+                .any(|&(_, action)| action.contains("collapsed") || action.contains("Collapse"))
+        );
+        assert!(
+            Context::Details
+                .entries()
+                .iter()
+                .any(|&(key, _)| key == "Tab / Esc")
+        );
+        assert!(
+            Context::Move
+                .entries()
+                .iter()
+                .any(|&(key, _)| key == "Enter")
+        );
+        assert_eq!(Context::Issues.title(), "Kanban board");
+        for context in [
+            Context::Issues,
+            Context::EpicIssues,
+            Context::Details,
+            Context::EpicDetails,
+        ] {
+            assert!(context.entries().iter().any(
+                |&(key, action)| key == "c" && action.contains("verified integration required")
+            ));
+        }
+    }
 
     #[test]
     fn recognizes_reported_help_keys_without_stealing_text_editing() {

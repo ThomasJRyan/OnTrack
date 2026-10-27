@@ -17,6 +17,7 @@ pub const BEAD_TYPES: &[&str] = &[
     "milestone",
 ];
 pub const READY_LABEL: &str = "ontrack:ready";
+pub const READY_TO_MERGE_LABEL: &str = "ontrack:ready-to-merge";
 pub const HARNESS_PREFIX: &str = "ontrack:agent:";
 pub const UNASSIGNED_LABEL: &str = "ontrack:unassigned";
 pub const HARNESSES: &[&str] = &[
@@ -206,6 +207,7 @@ pub fn create_child(input: &CreateBead, parent_id: &str) -> io::Result<String> {
     let inherited = labels(&parent)
         .filter(|label| {
             *label != READY_LABEL
+                && *label != READY_TO_MERGE_LABEL
                 && *label != UNASSIGNED_LABEL
                 && !label.starts_with(HARNESS_PREFIX)
         })
@@ -226,7 +228,11 @@ fn create_child_args(
     args.push(format!("--parent={parent_id}"));
     args.push("--no-inherit-labels".into());
     for label in inherited {
-        if label == READY_LABEL || label == UNASSIGNED_LABEL || label.starts_with(HARNESS_PREFIX) {
+        if label == READY_LABEL
+            || label == READY_TO_MERGE_LABEL
+            || label == UNASSIGNED_LABEL
+            || label.starts_with(HARNESS_PREFIX)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "OnTrack parent state cannot be inherited by child",
@@ -276,6 +282,124 @@ pub fn set_ready(id: &str, ready: bool) -> io::Result<()> {
     set_ready_many(&[id.to_owned()], ready)
 }
 
+/// Move only the workflow state; agent sessions and unrelated issue fields are untouched.
+pub fn move_bead(id: &str, target: &str) -> io::Result<()> {
+    validate_id(id)?;
+    validate_move_target(target)?;
+    if target == "closed" {
+        return crate::worktrees::close_integrated_bead(id);
+    }
+    move_bead_with(&std::env::current_dir()?, id, target, show_bead, |args| {
+        run_bd(args).map(|_| ())
+    })
+}
+
+pub(crate) fn move_bead_with(
+    cwd: &std::path::Path,
+    id: &str,
+    target: &str,
+    show: impl FnOnce(&str) -> io::Result<Value>,
+    update: impl FnOnce(&[&str]) -> io::Result<()>,
+) -> io::Result<()> {
+    validate_id(id)?;
+    validate_move_target(target)?;
+    if target == "closed" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Closure requires the integration gate",
+        ));
+    }
+    crate::worktrees::with_existing_registry_lock(cwd, || {
+        let live = show(id)?;
+        let args = move_args(id, target, &live)?;
+        update(&args.iter().map(String::as_str).collect::<Vec<_>>())
+    })
+}
+
+fn validate_move_target(target: &str) -> io::Result<()> {
+    if matches!(
+        target,
+        "open" | "ready" | "blocked" | "in_progress" | "ready_to_merge" | "closed"
+    ) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Invalid Kanban target",
+        ))
+    }
+}
+
+fn move_args(id: &str, target: &str, live: &Value) -> io::Result<Vec<String>> {
+    validate_id(id)?;
+    validate_move_target(target)?;
+    if live["id"] != id || target == "closed" {
+        return Err(invalid_data(
+            "Move requires a matching live Bead; closure requires integration proof",
+        ));
+    }
+    let previous = required_string(live, "status")?;
+    let status = match target {
+        "ready" => "open",
+        "ready_to_merge" => "in_progress",
+        other => other,
+    };
+    let mut args = vec![
+        "--no-color".into(),
+        "update".into(),
+        format!("--if-status={previous}"),
+        format!("--status={status}"),
+        "--json".into(),
+    ];
+    for (label, enabled) in [
+        (READY_LABEL, target == "ready"),
+        (READY_TO_MERGE_LABEL, target == "ready_to_merge"),
+    ] {
+        args.push(format!(
+            "--{}-label={label}",
+            if enabled { "add" } else { "remove" }
+        ));
+    }
+    if previous == "deferred"
+        || live["defer_until"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    {
+        args.push("--defer=".into());
+    }
+    args.extend(["--".into(), id.into()]);
+    Ok(args)
+}
+
+/// Executor-only: the caller must freshly verify tracked Git integration first.
+pub(crate) fn close_verified_bead(id: &str, expected: &Value) -> io::Result<()> {
+    let live = show_bead(id)?;
+    let args = close_verified_args(id, expected, &live)?;
+    run_bd(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    Ok(())
+}
+
+fn close_verified_args(id: &str, expected: &Value, live: &Value) -> io::Result<Vec<String>> {
+    // shortcut: bd has no label CAS; use an atomic label guard when its CLI supports one.
+    if expected["id"] != id
+        || live["status"] != expected["status"]
+        || ready_to_merge_record(live) != ready_to_merge_record(expected)
+    {
+        return Err(io::Error::other(
+            "Live Bead workflow state changed; closure cancelled",
+        ));
+    }
+    let mut args = move_args(id, "in_progress", live)?;
+    // bd update retains normal close dependency guards and supports a status CAS;
+    // bd close does not support --if-status.
+    let status = args
+        .iter_mut()
+        .find(|arg| arg.starts_with("--status="))
+        .unwrap();
+    *status = "--status=closed".into();
+    Ok(args)
+}
+
 fn set_ready_many(ids: &[String], ready: bool) -> io::Result<()> {
     for id in ids {
         validate_id(id)?;
@@ -287,7 +411,14 @@ fn set_ready_many(ids: &[String], ready: bool) -> io::Result<()> {
     };
     let mut args = vec!["--no-color", "update", flag, READY_LABEL];
     if ready {
-        args.extend(["--if-status", "open", "--status", "open"]);
+        args.extend([
+            "--if-status",
+            "open",
+            "--status",
+            "open",
+            "--remove-label",
+            READY_TO_MERGE_LABEL,
+        ]);
     }
     args.push("--");
     args.extend(ids.iter().map(String::as_str));
@@ -360,6 +491,10 @@ pub fn ready_record(data: &Value) -> bool {
         && labels(data).any(|label| label == READY_LABEL)
 }
 
+pub fn ready_to_merge_record(data: &Value) -> bool {
+    data["status"] == "in_progress" && labels(data).any(|label| label == READY_TO_MERGE_LABEL)
+}
+
 pub fn harness(data: &Value) -> Option<&str> {
     labels(data)
         .filter_map(|label| label.strip_prefix(HARNESS_PREFIX))
@@ -380,17 +515,6 @@ pub(crate) fn labels(data: &Value) -> impl Iterator<Item = &str> {
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-}
-
-/// Close only the selected issue, retaining Beads' normal dependency guards.
-pub fn close_bead(id: &str) -> io::Result<()> {
-    run_bd(&close_args(id)?)?;
-    Ok(())
-}
-
-fn close_args(id: &str) -> io::Result<[&str; 5]> {
-    validate_id(id)?;
-    Ok(["--no-color", "close", "--json", "--", id])
 }
 
 /// Permanently delete only this issue, never cascading to dependent issues.
@@ -501,7 +625,7 @@ fn show_args(id_arg: &str) -> [&str; 8] {
     ]
 }
 
-fn validate_id(id: &str) -> io::Result<()> {
+pub(crate) fn validate_id(id: &str) -> io::Result<()> {
     if id.is_empty()
         || id.starts_with('-')
         || id.chars().any(|ch| ch.is_whitespace() || ch.is_control())
@@ -614,6 +738,66 @@ fn parse_show(bytes: &[u8], id: &str) -> io::Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kanban_moves_are_guarded_and_only_change_workflow_fields() {
+        let live = serde_json::json!({"id":"test-1", "status":"closed", "labels":["team:core"], "metadata":{"keep":true}});
+        for (target, status) in [
+            ("open", "open"),
+            ("ready", "open"),
+            ("blocked", "blocked"),
+            ("in_progress", "in_progress"),
+            ("ready_to_merge", "in_progress"),
+        ] {
+            let args = super::move_args("test-1", target, &live).unwrap();
+            assert!(args.contains(&"--if-status=closed".into()));
+            assert!(args.contains(&format!("--status={status}")));
+            for (label, enabled) in [
+                (super::READY_LABEL, target == "ready"),
+                (super::READY_TO_MERGE_LABEL, target == "ready_to_merge"),
+            ] {
+                assert!(args.contains(&format!(
+                    "--{}-label={label}",
+                    if enabled { "add" } else { "remove" }
+                )));
+            }
+            assert!(!args.iter().any(|arg| arg.contains("metadata")
+                || arg.contains("set-labels")
+                || arg == "--force"));
+            assert_eq!(&args[args.len() - 2..], ["--", "test-1"]);
+        }
+        let deferred = serde_json::json!({"id":"test-1", "status":"deferred"});
+        assert!(
+            super::move_args("test-1", "open", &deferred)
+                .unwrap()
+                .contains(&"--defer=".into())
+        );
+        assert!(super::move_args("test-1", "closed", &live).is_err());
+        assert!(super::move_args("wrong", "open", &live).is_err());
+        assert!(super::move_bead("--force", "closed").is_err());
+        assert!(super::move_bead("test-1", "invalid").is_err());
+    }
+
+    #[test]
+    fn ready_to_merge_is_exact_and_verified_closure_guards_the_live_state() {
+        for status in ["open", "blocked", "deferred", "in_progress", "closed"] {
+            for marked in [false, true] {
+                let live = serde_json::json!({"id":"test-1", "status":status, "labels":if marked {vec![super::READY_TO_MERGE_LABEL]} else {vec![]}});
+                let ready = status == "in_progress" && marked;
+                assert_eq!(super::ready_to_merge_record(&live), ready);
+                let args = super::close_verified_args("test-1", &live, &live).unwrap();
+                assert!(args.contains(&format!("--if-status={status}")));
+                assert!(args.contains(&"--status=closed".into()));
+                assert!(!args.iter().any(|arg| arg == "--force"));
+            }
+        }
+        let ready = serde_json::json!({"id":"test-1", "status":"in_progress", "labels":[super::READY_TO_MERGE_LABEL]});
+        for changed in [
+            serde_json::json!({"id":"test-1", "status":"open"}),
+            serde_json::json!({"id":"test-1", "status":"in_progress"}),
+        ] {
+            assert!(super::close_verified_args("test-1", &ready, &changed).is_err());
+        }
+    }
     use super::*;
     use serde_json::json;
     #[test]
@@ -1094,10 +1278,22 @@ mod tests {
     }
 
     #[test]
-    fn close_args_target_only_one_issue_without_force() {
+    fn verified_close_args_guard_and_target_only_one_issue_without_force() {
+        let live =
+            json!({"id":"ontrack-70t", "status":"in_progress", "labels":[READY_TO_MERGE_LABEL]});
         assert_eq!(
-            close_args("ontrack-70t").unwrap(),
-            ["--no-color", "close", "--json", "--", "ontrack-70t"]
+            close_verified_args("ontrack-70t", &live, &live).unwrap(),
+            [
+                "--no-color",
+                "update",
+                "--if-status=in_progress",
+                "--status=closed",
+                "--json",
+                "--remove-label=ontrack:ready",
+                "--remove-label=ontrack:ready-to-merge",
+                "--",
+                "ontrack-70t"
+            ]
         );
     }
 
@@ -1120,12 +1316,12 @@ mod tests {
     }
 
     #[test]
-    fn delete_and_show_reject_unsafe_ids_before_running_a_process() {
+    fn verified_close_delete_and_show_reject_unsafe_ids_before_running_a_process() {
         for id in [
             "", " ", "--force", "-a", "a b", "a\nb", "a\tb", "a\0b", "a\u{7f}b", "a\u{a0}b",
         ] {
             assert_eq!(
-                close_bead(id).unwrap_err().kind(),
+                close_verified_bead(id, &Value::Null).unwrap_err().kind(),
                 io::ErrorKind::InvalidInput,
                 "id: {id:?}"
             );
@@ -1150,7 +1346,10 @@ mod tests {
         let owned_args = create_args(&create_input()).unwrap();
         let create_args: Vec<&str> = owned_args.iter().map(String::as_str).collect();
         let delete_args = delete_args("ontrack-70t").unwrap();
-        let close_args = close_args("ontrack-70t").unwrap();
+        let live =
+            json!({"id":"ontrack-70t", "status":"in_progress", "labels":[READY_TO_MERGE_LABEL]});
+        let owned_close_args = close_verified_args("ontrack-70t", &live, &live).unwrap();
+        let close_args: Vec<&str> = owned_close_args.iter().map(String::as_str).collect();
         for args in [
             create_args.as_slice(),
             delete_args.as_slice(),
