@@ -1271,7 +1271,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
         let card_height = 5usize;
         let can_show_cards = rect.height.saturating_sub(3) >= card_height as u16;
         let visible_cards = if can_show_cards {
-            (rect.height.saturating_sub(2) as usize / card_height).max(1)
+            rect.height.saturating_sub(3) as usize / card_height
         } else {
             0
         };
@@ -1339,7 +1339,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
             rect.x + 1,
             rect.y + 2,
             rect.width.saturating_sub(2),
-            rect.height.saturating_sub(2),
+            rect.height.saturating_sub(3),
         );
         if indices.is_empty() {
             f.render_widget(
@@ -1357,6 +1357,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                 .style(Style::default().fg(palette.muted)),
                 inner,
             );
+            x += col_width;
             continue;
         }
         for (n, &index) in indices.iter().enumerate().skip(offset).take(visible_cards) {
@@ -3951,6 +3952,113 @@ mod tests {
                     .iter()
                     .any(|(_, column)| { rect.x >= column.x && rect.right() <= column.right() })
             );
+        }
+    }
+
+    #[test]
+    fn kanban_outer_bottom_borders_keep_status_colors_and_cards_stay_inside() {
+        for theme in Theme::ALL {
+            for size in [
+                (160, 11),
+                (160, 7),
+                (160, 10),
+                (160, 15),
+                (160, 20),
+                (160, 30),
+                (80, 15),
+            ] {
+                let mut a = app();
+                a.theme = theme;
+                a.focused_column = 5;
+                a.beads = crate::app::BOARD_STATUSES.iter().enumerate().flat_map(|(i, status)| {
+                    (0..3).map(move |n| Bead {
+                            dependency_ready: true,
+                            blocked_by: Vec::new(),
+                            id: format!("b{i}-{n}"),
+                            title: format!("Card {i}-{n}"),
+                            status: match *status {
+                                "ready" => "open".into(),
+                                "ready_to_merge" => "in_progress".into(),
+                                value => value.into(),
+                            },
+                            priority: 0,
+                            data: match *status {
+                                "ready" => json!({"issue_type":"task","labels":[crate::beads::READY_LABEL]}),
+                                "ready_to_merge" => json!({"issue_type":"task","status":"in_progress","labels":[crate::beads::READY_TO_MERGE_LABEL]}),
+                                _ => json!({"issue_type":"task"}),
+                            },
+                        })
+                }).collect();
+                let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                assert!(
+                    a.board_columns
+                        .windows(2)
+                        .all(|pair| pair[0].1.right() == pair[1].1.x)
+                );
+                if size.0 == 80 {
+                    assert_eq!(a.board_columns.last().unwrap().0, 5);
+                    assert!(a.board_columns.first().unwrap().0 > 0);
+                }
+                let mut total_cards = 0;
+                for &(column, rect) in &a.board_columns {
+                    let color =
+                        crate::theme::status_color(theme, crate::app::BOARD_STATUSES[column]);
+                    let bottom = rect.bottom() - 1;
+                    assert_eq!(buffer[(rect.x, bottom)].symbol(), "╰");
+                    assert_eq!(buffer[(rect.right() - 1, bottom)].symbol(), "╯");
+                    for x in rect.x + 1..rect.right() - 1 {
+                        assert_eq!(buffer[(x, bottom)].symbol(), "─");
+                    }
+                    for x in rect.x..rect.right() {
+                        assert_eq!(
+                            buffer[(x, bottom)].fg,
+                            color,
+                            "{theme:?} {size:?} column {column}"
+                        );
+                    }
+                    let cards = a
+                        .board_cards
+                        .iter()
+                        .filter(|(_, card)| card.x >= rect.x && card.right() <= rect.right())
+                        .count();
+                    let expected = (rect.height.saturating_sub(3) as usize / 5).min(3);
+                    assert_eq!(cards, expected, "{theme:?} {size:?} column {column}");
+                    total_cards += cards;
+                }
+                assert_eq!(total_cards, a.board_cards.len());
+                for (_, card) in &a.board_cards {
+                    let column = a
+                        .board_columns
+                        .iter()
+                        .find(|(_, rect)| card.x >= rect.x && card.right() <= rect.right())
+                        .unwrap()
+                        .1;
+                    assert!(
+                        card.bottom() < column.bottom(),
+                        "card overlaps bottom border at {size:?}"
+                    );
+                }
+                a.beads.clear();
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                assert!(a.board_cards.is_empty());
+                for &(column, rect) in &a.board_columns {
+                    let bottom = rect.bottom() - 1;
+                    let color =
+                        crate::theme::status_color(theme, crate::app::BOARD_STATUSES[column]);
+                    assert_eq!(buffer[(rect.x, bottom)].symbol(), "╰");
+                    assert_eq!(buffer[(rect.right() - 1, bottom)].symbol(), "╯");
+                    for x in rect.x..rect.right() {
+                        assert_eq!(buffer[(x, bottom)].fg, color);
+                    }
+                }
+            }
         }
     }
 
