@@ -1426,7 +1426,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
                             .border_style(Style::default().fg(if selected {
-                                palette.accent
+                                palette.selected_foreground
                             } else {
                                 palette.border
                             })),
@@ -2617,6 +2617,106 @@ mod tests {
                     crate::theme::priority_color(theme, priority)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn selected_card_border_contrasts_with_fill_in_every_theme() {
+        for theme in crate::settings::Theme::ALL {
+            let mut a = app();
+            let mut unselected = a.beads[0].clone();
+            unselected.id = "demo-2".into();
+            unselected.title = "Unselected card".into();
+            a.beads.push(unselected);
+            a.theme = theme;
+            let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let card = a
+                .board_cards
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .unwrap()
+                .1;
+            let palette = crate::theme::definition(theme).palette;
+            for (x, y, glyph) in (card.x..card.right())
+                .flat_map(|x| {
+                    [
+                        (
+                            x,
+                            card.y,
+                            if x == card.x {
+                                "╭"
+                            } else if x + 1 == card.right() {
+                                "╮"
+                            } else {
+                                "─"
+                            },
+                        ),
+                        (
+                            x,
+                            card.bottom() - 1,
+                            if x == card.x {
+                                "╰"
+                            } else if x + 1 == card.right() {
+                                "╯"
+                            } else {
+                                "─"
+                            },
+                        ),
+                    ]
+                })
+                .chain(
+                    (card.y + 1..card.bottom() - 1)
+                        .flat_map(|y| [(card.x, y, "│"), (card.right() - 1, y, "│")]),
+                )
+            {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.symbol(), glyph);
+                assert_eq!(cell.fg, palette.selected_foreground);
+                assert_eq!(cell.bg, palette.selected_background);
+                assert_ne!(cell.fg, cell.bg);
+            }
+            let unselected_card = a
+                .board_cards
+                .iter()
+                .find(|(index, _)| *index == 1)
+                .unwrap()
+                .1;
+            assert_eq!(unselected_card.width, card.width);
+            assert_eq!(unselected_card.height, card.height);
+            for (x, y) in (unselected_card.x..unselected_card.right())
+                .flat_map(|x| [(x, unselected_card.y), (x, unselected_card.bottom() - 1)])
+                .chain(
+                    (unselected_card.y + 1..unselected_card.bottom() - 1)
+                        .flat_map(|y| [(unselected_card.x, y), (unselected_card.right() - 1, y)]),
+                )
+            {
+                let cell = &buffer[(x, y)];
+                assert_ne!(cell.symbol(), " ");
+                assert_eq!(cell.fg, palette.border);
+            }
+            let title_x = card.x + 1;
+            let title_y = card.y + 1;
+            let title_cell = &buffer[(title_x, title_y)];
+            assert_eq!(title_cell.bg, palette.selected_background);
+            assert_eq!(title_cell.fg, palette.selected_foreground);
+            let selected_position = a
+                .board_cards
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .unwrap()
+                .1;
+            assert_eq!(selected_position, card);
+            let rendered = buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Title is visible"));
+            assert!(rendered.contains("demo-1"));
         }
     }
 
@@ -3899,6 +3999,283 @@ mod tests {
                 a.board_columns
                     .iter()
                     .any(|(_, column)| { rect.x >= column.x && rect.right() <= column.right() })
+            );
+        }
+    }
+
+    #[test]
+    fn board_navigation_arrow_keys_cross_viewport_edges_one_card_at_a_time() {
+        assert_board_navigation_edges(board_navigation_events()[0].clone());
+    }
+
+    #[test]
+    fn board_navigation_wheel_crosses_viewport_edges_one_card_at_a_time() {
+        assert_board_navigation_edges(board_navigation_events()[1].clone());
+    }
+
+    fn assert_board_navigation_edges(
+        (down, up): (crossterm::event::Event, crossterm::event::Event),
+    ) {
+        let mut a = overflowing_board();
+        draw((120, 24), &mut a);
+        assert_board_viewport(&a, 0, 0);
+        for row in 1..=2 {
+            board_event(&mut a, down.clone());
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(row), "after {down:?}");
+            assert_board_viewport(&a, 0, 0);
+        }
+        let bottom = a.board_cards.iter().find(|(i, _)| *i == 2).unwrap().1;
+        for row in 3..=4 {
+            board_event(&mut a, down.clone());
+            let screen = draw((120, 24), &mut a).0;
+            assert_eq!(a.selected, Some(row), "after {down:?}");
+            assert_board_viewport(&a, 0, row - 2);
+            assert_eq!(
+                a.board_cards.iter().find(|(i, _)| *i == row).unwrap().1,
+                bottom
+            );
+            assert!(screen.contains(&format!("Card 0-{row:02}")));
+        }
+        for row in (0..4).rev() {
+            board_event(&mut a, up.clone());
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(row), "after {up:?}");
+            assert_board_viewport(&a, 0, row.min(2));
+            if row < 2 {
+                assert_eq!(
+                    a.board_cards.iter().find(|(i, _)| *i == row).unwrap().1.y,
+                    bottom.y - 10
+                );
+            }
+        }
+        board_event(&mut a, up);
+        draw((120, 24), &mut a);
+        assert_eq!(a.selected, Some(0));
+        assert_board_viewport(&a, 0, 0);
+    }
+
+    #[test]
+    fn board_navigation_does_not_wrap_at_first_or_last_card() {
+        for (down, up) in board_navigation_events() {
+            let mut a = overflowing_board();
+            draw((120, 24), &mut a);
+            for step in 1usize..=14 {
+                board_event(&mut a, down.clone());
+                draw((120, 24), &mut a);
+                let row = step.min(11);
+                assert_eq!(a.selected, Some(row));
+                assert_board_viewport(&a, 0, row.saturating_sub(2));
+                assert_eq!(&a.column_offsets[1..], &[0; 5]);
+            }
+            for step in 1usize..=14 {
+                board_event(&mut a, up.clone());
+                draw((120, 24), &mut a);
+                let row = 11usize.saturating_sub(step);
+                assert_eq!(a.selected, Some(row));
+                assert_board_viewport(&a, 0, row.min(9));
+                assert_eq!(&a.column_offsets[1..], &[0; 5]);
+            }
+        }
+    }
+
+    #[test]
+    fn board_navigation_batches_events_without_using_stale_card_positions() {
+        for (down, up) in board_navigation_events() {
+            let mut a = overflowing_board();
+            draw((120, 24), &mut a);
+            for _ in 0..2 {
+                board_event(&mut a, down.clone());
+            }
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(2));
+            assert_board_viewport(&a, 0, 0);
+            for _ in 0..3 {
+                board_event(&mut a, down.clone());
+            }
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(5));
+            assert_board_viewport(&a, 0, 3);
+            for _ in 0..5 {
+                board_event(&mut a, up.clone());
+            }
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(0));
+            assert_board_viewport(&a, 0, 0);
+        }
+    }
+
+    #[test]
+    fn board_navigation_retains_independent_offsets_when_columns_leave_the_screen() {
+        use crossterm::event::KeyCode;
+
+        for size in [(120, 24), (36, 24)] {
+            let mut a = overflowing_board();
+            draw(size, &mut a);
+            for _ in 0..6 {
+                board_key(&mut a, KeyCode::Down);
+                draw(size, &mut a);
+            }
+            assert_eq!(a.selected, Some(6));
+            assert_board_viewport(&a, 0, 4);
+            board_key(&mut a, KeyCode::Right);
+            draw(size, &mut a);
+            for _ in 0..4 {
+                board_key(&mut a, KeyCode::Down);
+                draw(size, &mut a);
+            }
+            assert_eq!(a.selected, Some(16));
+            assert_board_viewport(&a, 1, 2);
+            assert_eq!(a.column_offsets[0], 4);
+            for _ in 0..4 {
+                board_key(&mut a, KeyCode::Right);
+                draw(size, &mut a);
+            }
+            assert_eq!(a.focused_column, 5);
+            if size.0 == 36 {
+                assert!(a.board_column_offset > 0);
+                assert!(a.board_columns.iter().all(|(column, _)| *column != 0));
+                assert!(a.board_cards.iter().all(|(index, _)| *index >= 12));
+            }
+            for _ in 0..5 {
+                board_key(&mut a, KeyCode::Down);
+                draw(size, &mut a);
+            }
+            assert_board_viewport(&a, 5, 3);
+            assert_eq!(a.column_offsets, [4, 2, 0, 0, 0, 3]);
+            for _ in 0..4 {
+                board_key(&mut a, KeyCode::Left);
+                draw(size, &mut a);
+            }
+            assert_eq!(a.selected, Some(16));
+            assert_board_viewport(&a, 1, 2);
+            board_key(&mut a, KeyCode::Left);
+            draw(size, &mut a);
+            assert_eq!(a.selected, Some(6));
+            assert_board_viewport(&a, 0, 4);
+            assert_eq!(a.column_offsets, [4, 2, 0, 0, 0, 3]);
+            assert_eq!(a.board_column_offset, 0);
+        }
+    }
+
+    #[test]
+    fn board_navigation_is_safe_when_the_viewport_cannot_fit_a_card() {
+        use crossterm::event::KeyCode;
+
+        for size in [(120, 9), (24, 7), (12, 4), (1, 1)] {
+            let mut a = overflowing_board();
+            draw(size, &mut a);
+            assert!(a.board_cards.is_empty());
+            for (code, down) in [(KeyCode::Down, true), (KeyCode::Up, false)] {
+                for step in 1usize..=14 {
+                    board_key(&mut a, code);
+                    draw(size, &mut a);
+                    let row = if down {
+                        step.min(11)
+                    } else {
+                        11usize.saturating_sub(step)
+                    };
+                    assert_eq!(a.selected, Some(row), "tiny viewport {size:?}");
+                    assert!(a.board_cards.is_empty());
+                    assert!(a.column_offsets.iter().all(|offset| *offset < 12));
+                }
+            }
+            draw((120, 24), &mut a);
+            assert_eq!(a.selected, Some(0));
+            assert_board_viewport(&a, 0, 0);
+        }
+    }
+
+    fn overflowing_board() -> App {
+        let mut a = app();
+        a.beads = crate::app::BOARD_STATUSES
+            .iter()
+            .enumerate()
+            .flat_map(|(column, status)| {
+                (0..12).map(move |row| Bead {
+                    dependency_ready: true,
+                    blocked_by: Vec::new(),
+                    id: format!("c{column}-{row:02}"),
+                    title: format!("Card {column}-{row:02}"),
+                    status: match *status {
+                        "ready" => "open",
+                        "ready_to_merge" => "in_progress",
+                        value => value,
+                    }
+                    .into(),
+                    priority: 2,
+                    data: match *status {
+                        "ready" => json!({"issue_type":"task","labels":[crate::beads::READY_LABEL]}),
+                        "ready_to_merge" => json!({"issue_type":"task","labels":[crate::beads::READY_TO_MERGE_LABEL]}),
+                        _ => json!({"issue_type":"task"}),
+                    },
+                })
+            })
+            .collect();
+        a.focused_column = 0;
+        a.selected = Some(0);
+        a
+    }
+
+    fn board_navigation_events() -> [(crossterm::event::Event, crossterm::event::Event); 2] {
+        use crossterm::event::{
+            Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind,
+        };
+        let wheel = |kind| {
+            Event::Mouse(MouseEvent {
+                kind,
+                column: 2,
+                row: 5,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        [
+            (
+                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            ),
+            (
+                wheel(MouseEventKind::ScrollDown),
+                wheel(MouseEventKind::ScrollUp),
+            ),
+        ]
+    }
+
+    fn board_event(a: &mut App, event: crossterm::event::Event) {
+        match event {
+            crossterm::event::Event::Key(key) => assert!(!a.key(key)),
+            crossterm::event::Event::Mouse(mouse) => a.mouse(mouse.kind, mouse.column, mouse.row),
+            _ => unreachable!(),
+        }
+    }
+
+    fn board_key(a: &mut App, code: crossterm::event::KeyCode) {
+        use crossterm::event::{Event, KeyEvent, KeyModifiers};
+        board_event(a, Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    fn assert_board_viewport(a: &App, column: usize, offset: usize) {
+        assert_eq!(a.column_offsets[column], offset, "column {column} offset");
+        let cards = a
+            .board_cards
+            .iter()
+            .filter(|(i, _)| i / 12 == column)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cards.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            (column * 12 + offset..column * 12 + offset + 3).collect::<Vec<_>>()
+        );
+        for pair in cards.windows(2) {
+            assert_eq!(
+                pair[0].1.bottom(),
+                pair[1].1.y,
+                "visible cards must be contiguous"
+            );
+        }
+        if a.focused_column == column {
+            assert!(
+                cards.iter().any(|(index, _)| Some(*index) == a.selected),
+                "selected card must remain visible"
             );
         }
     }
