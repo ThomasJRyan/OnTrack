@@ -1425,11 +1425,11 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                         Block::default()
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(if selected {
-                                palette.selected_foreground
-                            } else {
-                                palette.border
-                            })),
+                            .border_style(
+                                Style::default()
+                                    .fg(crate::theme::issue_type_color(app.theme, &kind)),
+                            )
+                            .style(Style::default().bg(palette.panel_alt)),
                     )
                     .style(style),
                 card,
@@ -2578,6 +2578,7 @@ mod tests {
             let mut unselected = a.beads[0].clone();
             unselected.id = "demo-2".into();
             unselected.title = "Unselected card".into();
+            unselected.data["issue_type"] = serde_json::Value::String("feature".into());
             a.beads.push(unselected);
             a.theme = theme;
             let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
@@ -2626,8 +2627,8 @@ mod tests {
             {
                 let cell = &buffer[(x, y)];
                 assert_eq!(cell.symbol(), glyph);
-                assert_eq!(cell.fg, palette.selected_foreground);
-                assert_eq!(cell.bg, palette.selected_background);
+                assert_eq!(cell.fg, crate::theme::issue_type_color(theme, "task"));
+                assert_eq!(cell.bg, palette.panel_alt);
                 assert_ne!(cell.fg, cell.bg);
             }
             let unselected_card = a
@@ -2647,7 +2648,7 @@ mod tests {
             {
                 let cell = &buffer[(x, y)];
                 assert_ne!(cell.symbol(), " ");
-                assert_eq!(cell.fg, palette.border);
+                assert_eq!(cell.fg, crate::theme::issue_type_color(theme, "feature"));
             }
             let title_x = card.x + 1;
             let title_y = card.y + 1;
@@ -2668,6 +2669,41 @@ mod tests {
                 .collect::<String>();
             assert!(rendered.contains("Title is visible"));
             assert!(rendered.contains("demo-1"));
+        }
+    }
+
+    #[test]
+    fn card_border_uses_legacy_and_fallback_issue_types() {
+        for theme in crate::settings::Theme::ALL {
+            for (field, value, expected) in [
+                ("issue_type", None, "unknown"),
+                ("type", Some("bug"), "bug"),
+                ("issue_type", Some("custom"), "custom"),
+            ] {
+                let mut a = app();
+                if field == "type" {
+                    a.beads[0]
+                        .data
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("issue_type");
+                }
+                if let Some(value) = value {
+                    a.beads[0].data[field] = serde_json::Value::String(value.into());
+                } else {
+                    a.beads[0].data.as_object_mut().unwrap().remove(field);
+                }
+                a.theme = theme;
+                let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                    .unwrap();
+                let card = a.board_cards[0].1;
+                let cell = &terminal.backend().buffer()[(card.x, card.y)];
+                assert_eq!(cell.symbol(), "╭");
+                assert_eq!(cell.fg, crate::theme::issue_type_color(theme, expected));
+                assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel_alt);
+            }
         }
     }
 

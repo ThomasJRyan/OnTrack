@@ -45,7 +45,7 @@ Press `Ctrl+?` whenever you need the controls for the current view. See the sche
 
 All bordered panes and dialogs, including tracked handoffs, forms, and hotkey help, use rounded corners.
 
-The selected task card keeps a visible rounded outline against its highlighted fill in every bundled theme.
+Rounded card outlines use issue type colours: bugs are red and features are blue. The selected card keeps its highlighted fill and type-coloured outline, so selection remains clear without hiding the type.
 
 The full board has six fixed vertical columns, in this order: **Open, Ready, Blocked, In Progress, Ready To Merge, Closed**. Every column shows a count, including zero, and none collapses. There is no Deferred column. Legacy `deferred` and custom statuses remain visible under Open without rewriting existing Beads; the detail drawer retains the raw Beads status. Narrow terminals scroll horizontally to keep columns legible instead of squeezing all six into unreadable widths. Each column scrolls vertically to keep its selection visible.
 
