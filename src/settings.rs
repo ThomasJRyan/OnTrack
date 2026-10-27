@@ -122,6 +122,7 @@ pub struct Settings {
     pub auto_merge_children: bool,
     pub auto_close_workspace: bool,
     pub auto_remove_checkout: bool,
+    pub animate_drawers: bool,
 }
 
 impl Default for Settings {
@@ -134,6 +135,7 @@ impl Default for Settings {
             auto_merge_children: true,
             auto_close_workspace: false,
             auto_remove_checkout: false,
+            animate_drawers: true,
         }
     }
 }
@@ -259,6 +261,7 @@ pub fn load_from(path: &Path) -> io::Result<Settings> {
         auto_merge_children: boolean("auto_merge_children", true)?,
         auto_close_workspace: boolean("auto_close_workspace", false)?,
         auto_remove_checkout: boolean("auto_remove_checkout", false)?,
+        animate_drawers: boolean("animate_drawers", true)?,
     })
 }
 
@@ -284,7 +287,7 @@ pub fn save_to(path: &Path, settings: &Settings) -> io::Result<()> {
         AgentLimit::Limited(count) => count.to_string(),
     };
     let result = (|| {
-        writeln!(file, "{{\"theme\":\"{theme}\",\"default_agent\":\"{default_agent}\",\"agent_limit\":{agent_limit},\"auto_merge\":{},\"auto_merge_children\":{},\"auto_close_workspace\":{},\"auto_remove_checkout\":{}}}", settings.auto_merge, settings.auto_merge_children, settings.auto_close_workspace, settings.auto_remove_checkout)
+        writeln!(file, "{{\"theme\":\"{theme}\",\"default_agent\":\"{default_agent}\",\"agent_limit\":{agent_limit},\"auto_merge\":{},\"auto_merge_children\":{},\"auto_close_workspace\":{},\"auto_remove_checkout\":{},\"animate_drawers\":{}}}", settings.auto_merge, settings.auto_merge_children, settings.auto_close_workspace, settings.auto_remove_checkout, settings.animate_drawers)
             .and_then(|()| file.sync_all())
             .map_err(|error| io_error("write", &temporary_path, error))?;
         drop(file);
@@ -443,6 +446,7 @@ mod tests {
             auto_merge_children: false,
             auto_close_workspace: true,
             auto_remove_checkout: true,
+            animate_drawers: false,
         };
         save_to(&directory.path(), &settings).unwrap();
         assert_eq!(load_from(&directory.path()).unwrap(), settings);

@@ -11,7 +11,7 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 | `src/main.rs` | Dispatches `update` and `uninstall` before checking the Herdr launch context and Beads workspace; initializes, runs, and restores the browser terminal. |
 | `src/startup.rs` | Requires the Herdr pane marker, then discovers the active workspace through Beads; prints manual initialization guidance and exits when none exists. |
 | `src/uninstall.rs` | Validates and removes the running executable and user settings after explicit CLI confirmation, before Beads discovery or terminal setup. |
-| `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, and worktree-cleanup preferences under the user's XDG config directory. |
+| `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, animation, and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
 | `src/beads.rs` | Builds issue CLI commands, validates JSON, preserves returned records, and exposes guarded per-Bead board moves. |
 | `src/screenshots.rs` | Reads clipboard images, writes local screenshots into the shared Beads workspace, and parses description references for agent prompts. |
@@ -29,7 +29,7 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 
 The browser does not dispatch agent planning. Its `p` and `g` keys have no planning action, and the create form always uses ordinary Beads creation, including for Epics. Legacy planning handlers remain in source but have no UI entry point. Keep those controls absent from the keyboard reference, footer, and forms.
 
-The board has exactly six full-view vertical columns: Open, Ready, Blocked, In Progress, Ready To Merge, Closed. Keep headings and counts even when empty. Do not add Deferred/custom columns or collapse state: legacy `deferred` and unknown statuses map to Open for display only, with raw status retained in details and no bulk data rewrite. Left / Right changes columns including empty ones; Up / Down selects within a column. Shift+Left / Shift+Right moves the selected Bead adjacent; board `m` chooses a destination. Navigation, hit testing, and rendering must share card geometry. Narrow terminals horizontally scroll legible columns, and each column has its own vertical viewport. Empty-column focus must not retain an actionable Bead ID.
+The board has exactly six full-view vertical columns: Open, Ready, Blocked, In Progress, Ready To Merge, Closed. Keep headings and counts even when empty. Do not add Deferred/custom columns or collapse state: legacy `deferred` and unknown statuses map to Open for display only, with raw status retained in details and no bulk data rewrite. Left / Right changes columns including empty ones; Up / Down and the mouse wheel move one card within the focused column without wrapping. Shift+Left / Shift+Right moves the selected Bead adjacent; board `m` chooses a destination. Navigation, hit testing, and rendering must share card geometry. Narrow terminals horizontally scroll legible columns, and each column retains its own vertical viewport offset. Crossing a viewport edge adjusts only enough to keep selection visible, not back to the top. Empty-column focus must not retain an actionable Bead ID.
 
 Enter opens or closes the selected Bead's right-side detail drawer, restoring the same board selection; `w` opens the right-side worktree drawer with all-handoffs recovery access, where Enter focuses the selected workspace. Esc closes the drawer and restores board selection. Detail arrows and Page keys scroll rather than moving board selection. Keep create/edit, handoff, settings, and help actions and the worktree focus/merge/close-workspace/remove/continue/restart guards. Drawers use existing Ratatui `Clear`; no overlay dependency or new module split is required.
 
@@ -59,11 +59,19 @@ The create/edit Description field uses `description_layout` to insert visual lin
 
 The hotkey reference is a separate `App::help` overlay, not a modal replacement. `App::key` handles its toggle and scroll keys before dispatching to the board, drawer, or dialog; the mutation lock still takes precedence. `hotkeys::Context` captures that context when opened and owns its key/action list. Update it alongside input handling. `ui::render_help` wraps actions, clamps scrolling, and renders over the board/drawers or forms. Enhanced reports distinguish `Ctrl+?` or `Ctrl+Shift+/`; legacy plain Backspace must remain text deletion/navigation, not open help.
 
-The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, default agent, or agent limit, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. The default-agent setting uses stable supported kind IDs; `automatic` preserves the old Codex/first-available form behavior, `unassigned` selects no harness, and an unavailable preferred kind falls back only for the current form. Agent limit controls automatic Ready-task scheduling. See the [settings guide](settings.md) for details.
+The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, default agent, or agent limit, and Enter / Space toggles preferences. Drawer-opening animation defaults on and older settings files default it on. Failed saves must not update committed settings. The default-agent setting uses stable supported kind IDs; `automatic` preserves the old Codex/first-available form behavior, `unassigned` selects no harness, and an unavailable preferred kind falls back only for the current form. Agent limit controls automatic Ready-task scheduling. See the [settings guide](settings.md) for details.
 Settings rows in `src/ui.rs` share a two-thirds title column and one-third
 value column. `settings_row` aligns titles to the left and centers controls
 by terminal cell width; keep dropdown entries on the same value boundary and
 retain the existing compact-terminal fallback when changing this layout.
+
+The shared modal path dims the already-rendered board and drawers by darkening
+their cell foreground and background colors before drawing the dialog. Keep
+the modal's Clear/frame/content after this pass so its theme styles stay intact;
+help and toast overlays alone must not invoke it. Tiny-terminal modal guidance
+remains readable and does not run through the standard shared backdrop path.
+The legacy fullscreen planning editor returns before this shared modal path and
+is intentionally excluded.
 
 ## Beads CLI contract
 
@@ -112,7 +120,7 @@ Create returns a JSON object containing the created ID; update, close, and delet
 The board `c` shortcut captures the selected non-closed ID/title for confirmation and queues guarded `worktrees::close_integrated_bead(id)` off the terminal loop. Fresh tracked integration proof is mandatory, not merely a displayed Integrated state, label, or agent observation. No tracked handoff means no proof and no close. Success refreshes the board/details; failure retains target/error for retry. Beads close validates the ID, uses no force/cascade flags, and remains subject to Beads guards. Empty columns and closed cards have no close action. Worktree drawer `c` still closes the Herdr workspace, not the Bead.
 
 
-Card rendering must preserve issue identity, type, priority, title, and useful parent cues within legible column widths. The selected rounded outline uses the selected foreground so it remains distinct from the highlighted fill in every bundled theme. Hierarchy does not change column membership or make per-Bead moves cascade. Keep selection and mouse hit testing keyed to the same card geometry as rendering; empty columns must not inherit a stale detail/delete identity.
+Card rendering must preserve issue identity, type, priority, title, and useful parent cues within legible column widths. Rounded card outlines use `theme::issue_type_color` for selected and unselected cards; selected cards keep their highlighted fill. Bug is danger red, feature/story use the theme's blue Ready color, and unknown/missing types are muted. Preserve the status-coloured column outlines/status labels independently. Hierarchy does not change column membership or make per-Bead moves cascade. Keep selection and mouse hit testing keyed to the same card geometry as rendering; empty columns must not inherit a stale detail/delete identity.
 
 `Shift+N` opens the create form with an immutable selected parent ID. Child creation passes `--parent=PARENT_ID` as its own argument, so Beads records the hierarchy and list/show JSON exposes the child's `parent` field. It fetches parent labels, uses `--no-inherit-labels`, and carries over ordinary labels, excluding Ready, Ready To Merge, harness, and explicit Unassigned markers so the child starts Open with its own harness. OnTrack reads the uncapped live list to find open descendants before a parent starts or merges. Beads rejects a `blocks` dependency from parent to descendant because it would also block that child; OnTrack therefore enforces its own child-first gate.
 
@@ -238,6 +246,8 @@ Run interactive checks in a real terminal or a PTY, not an ordinary non-interact
 ## Tests and required checks
 
 Tests are inline in the source modules. They cover CLI arguments and parsing, form input and mutation state, navigation and focus, mouse selection, cached/stale detail behavior, quit-key recognition, and rendering using ratatui's `TestBackend`.
+
+For deterministic board scrolling regressions, use fixed card fixtures and a fixed-size `TestBackend`, render, send keyboard or wheel input, then render again. Assert both the selected card and per-column viewport offsets at the upper and lower visible edges: in-view moves leave offsets unchanged, edge crossings scroll only enough to reveal selection, first/last cards do not wrap, and switching columns preserves each column's offset. Check the rendered selected card remains visible; no live Beads workspace or timing delays are needed.
 
 Escape is navigation, not a quit key. An open choice list consumes Escape before its dialog; closing a drawer restores the board selection. Escape on the board does not leave the app. Preserve explicit quit keys (`q` and `Ctrl+C`) and existing mutation locks, including navigation allowed during Ready updates.
 

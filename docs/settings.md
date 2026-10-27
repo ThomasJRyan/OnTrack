@@ -1,6 +1,6 @@
 # Settings
 
-OnTrack stores theme, default-agent, agent-limit, and cleanup preferences
+OnTrack stores theme, default-agent, agent-limit, animation, and cleanup preferences
 globally for your Linux user, not in the workspace or Beads database. OnTrack
 Dark is the default theme. Twelve built-in themes are available:
 
@@ -55,13 +55,14 @@ The OnTrack-specific role mapping and contrast choices are maintained in
 The file is a JSON object:
 
 ```json
-{"theme":"dark","default_agent":"automatic","agent_limit":5,"auto_merge":false,"auto_merge_children":true,"auto_close_workspace":false,"auto_remove_checkout":false}
+{"theme":"dark","default_agent":"automatic","agent_limit":5,"auto_merge":false,"auto_merge_children":true,"auto_close_workspace":false,"auto_remove_checkout":false,"animate_drawers":true}
 ```
 
 `theme` accepts one of the stable IDs above; existing `"dark"` and `"light"`
 files remain valid. Missing `auto_merge_children` defaults to true, including in
 older theme-only files. Other missing worktree preferences default to false.
 A missing `agent_limit` defaults to 5.
+`animate_drawers` accepts a boolean and defaults to true when omitted.
 It accepts a positive integer or `"unlimited"`; zero, negative, fractional, and
 other values are invalid. Child merge requests are on by default; top-level
 merge requests, workspace closing, and checkout removal are off by default.
@@ -88,7 +89,7 @@ Bead keeps its stored agent choice.
 
 Press `s` to open Settings. `Up` / `Down` moves among Theme, Default agent for
 new issues, Agent limit, top-level merge, child merge, workspace close, checkout
-removal, and Close.
+removal, drawer opening animation, and Close.
 The dialog places setting titles in a wider, left-aligned column and centers
 theme, agent, limit, and cleanup controls in the right column. The choice lists open beneath
 its value; on narrow supported terminals, long titles and values may be
@@ -100,7 +101,9 @@ or closed. The bounded lists scroll to keep the current choice visible. `Enter`
 or `Space` opens the focused list; while it is open, either key saves the selected
 choice again and closes the list, which also lets you retry a failed save. `Esc` closes
 an open list without reverting a successful change; `Esc` again closes Settings.
-`Enter` / `Space` toggles a cleanup preference. Every change saves all settings
+`Enter` / `Space` toggles a preference. Drawer opening animation is on by default;
+turn it off to open both right-side drawers immediately. Changes take effect at
+once and save with the rest of Settings. Every change saves all settings
 together. The removal preference is labeled “Remove checkout + close Herdr workspace”;
 removing the checkout also closes its Herdr workspace. Cleanup remains
 subject to backend integration checks and cannot force-remove a checkout.
