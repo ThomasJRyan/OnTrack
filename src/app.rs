@@ -954,20 +954,30 @@ impl App {
             return;
         }
         let index = index.min(self.beads.len() - 1);
-        let previous_column = self.focused_column;
         self.focused_column = status_order(display_status(&self.beads[index]));
-        self.column_rows[self.focused_column] = self
-            .column_indices(self.focused_column)
-            .iter()
-            .position(|&i| i == index)
-            .unwrap_or(0);
-        if previous_column != self.focused_column
-            || !self.board_cards.iter().any(|&(i, _)| i == index)
-        {
-            self.column_offsets[self.focused_column] = self.column_rows[self.focused_column];
-        }
+        let indices = self.column_indices(self.focused_column);
+        self.column_rows[self.focused_column] =
+            indices.iter().position(|&i| i == index).unwrap_or(0);
         if self.selected == Some(index) {
             return;
+        }
+        let capacity = self
+            .board_cards
+            .iter()
+            .filter(|&&(i, _)| {
+                self.beads
+                    .get(i)
+                    .is_some_and(|bead| status_order(display_status(bead)) == self.focused_column)
+            })
+            .count();
+        if capacity > 0 {
+            let row = self.column_rows[self.focused_column];
+            let offset = &mut self.column_offsets[self.focused_column];
+            if row < *offset {
+                *offset = row;
+            } else if row >= offset.saturating_add(capacity) {
+                *offset = row + 1 - capacity;
+            }
         }
         self.selected = Some(index);
         self.detail_seq = self.detail_seq.wrapping_add(1);
@@ -1799,7 +1809,7 @@ impl App {
             }
         }
     }
-    fn key(&mut self, k: KeyEvent) -> bool {
+    pub(crate) fn key(&mut self, k: KeyEvent) -> bool {
         if self.mutation_busy && !self.ready_pending {
             return false;
         }
@@ -2862,7 +2872,7 @@ impl App {
             self.toast = Some(Toast::result(message, error));
         }
     }
-    fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
+    pub(crate) fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
         if self.modal.is_some() || self.help.is_some() {
             return;
         }
@@ -3280,6 +3290,41 @@ mod tests {
         app.board_cards = vec![(5, Rect::new(6, 8, 38, 3))];
         app.mouse(MouseEventKind::Down(MouseButton::Left), 6, 8);
         assert_eq!(app.selected, Some(5));
+    }
+
+    #[test]
+    fn selection_scrolls_minimally_in_both_directions_and_keeps_column_offsets() {
+        let mut a = app();
+        a.beads.extend((4..8).map(|i| Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
+            id: format!("b{i}"),
+            title: format!("issue {i}"),
+            status: "open".into(),
+            priority: 2,
+            data: json!({"id": format!("b{i}")}),
+        }));
+        a.board_cards.truncate(3);
+        a.selected = Some(0);
+        a.step(1);
+        assert_eq!((a.selected, a.column_offsets[0]), (Some(1), 0));
+        a.step(1);
+        assert_eq!((a.selected, a.column_offsets[0]), (Some(2), 0));
+        a.step(1);
+        assert_eq!((a.selected, a.column_offsets[0]), (Some(3), 1));
+        a.step(1);
+        assert_eq!((a.selected, a.column_offsets[0]), (Some(4), 2));
+        a.step(-1);
+        assert_eq!((a.selected, a.column_offsets[0]), (Some(3), 2));
+        a.column_offsets[1] = 7;
+        a.focused_column = 1;
+        a.board_columns.clear();
+        a.select(0);
+        assert_eq!(a.column_offsets[1], 7);
+        a.step(-1);
+        assert_eq!(a.selected, Some(0));
+        a.step(1);
+        assert_eq!(a.column_offsets[1], 7);
     }
 
     #[test]
