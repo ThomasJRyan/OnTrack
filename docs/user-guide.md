@@ -63,6 +63,8 @@ Ready means Beads status `open` plus label `ontrack:ready`. Ready To Merge means
 
 ## Browsing and controls
 
+Both right-side drawers slide open and closed. Closing restores board controls immediately while the drawer slides away. Turn off **Animate drawers** in Settings for immediate opening and closing.
+
 Create Tasks and Epics with `n`, or use `Shift+N` on an open Task to create a child. The create form saves the issue without starting an agent.
 
 ### Ready issues and scheduler
@@ -98,7 +100,7 @@ An Open or Ready issue shows `· sent` beside its status after Herdr confirms th
 | `Tab` | Open or close the selected Bead's detail drawer. |
 | Arrow keys / `PageUp` / `PageDown` in Bead details | Scroll drawer content. |
 | `r` / `Shift+R` on the board or in Bead details | Toggle Ready for an open issue and its open descendants, subject to handoff guards. |
-| `s` | Open Settings. Up / Down navigates Theme, Default agent for new issues, Agent limit, top-level auto-merge, child auto-merge, Close Herdr workspace, Remove checkout, drawer opening animation, and Close. Left / Right changes the focused choice; Enter / Space opens its list or toggles a focused preference. Changes save immediately as one complete settings file. Drawer animation defaults on; child auto-merge defaults on; the other cleanup options default off. Removal also closes the Herdr workspace. |
+| `s` | Open Settings. Up / Down navigates Theme, Default agent for new issues, Agent limit, top-level auto-merge, child auto-merge, Close Herdr workspace, Remove checkout, drawer animation, and Close. Left / Right changes the focused choice; Enter / Space opens its list or toggles a focused preference. Changes save immediately as one complete settings file. Drawer animation defaults on; child auto-merge defaults on; the other cleanup options default off. Removal also closes the Herdr workspace. |
 | `n` | Open the new-bead form. Tab / Shift+Tab moves through Title, Type, Priority, Agent harness, Description, Create, and Cancel. Left / Right cycles any focused dropdown choice with wraparound, immediately when closed or as a preview while open. Enter (or Space) opens the choice list; Up / Down previews options, Enter commits, and Esc restores the opening choice. In Description, Shift+Enter inserts a newline and Enter focuses Create; press Enter again to submit. An empty title shows a required message. |
 | `Shift+N` | On a selected open task, open the same form for a child task. The form names its parent; creation records a Beads parent-child relationship. |
 | `e` | Load the selected bead's current details and open the edit form. Edit Title, Type, Priority, Agent harness, and Description with the same controls as the new-bead form; Save updates that bead, while Esc or Cancel discards the draft. The loading dialog offers `e` to retry a failed detail load. |
