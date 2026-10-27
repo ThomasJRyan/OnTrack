@@ -63,7 +63,7 @@ Ready means Beads status `open` plus label `ontrack:ready`. Ready To Merge means
 
 ## Browsing and controls
 
-Both right-side drawers slide open and closed. Closing restores board controls immediately while the drawer slides away. Turn off **Animate drawers** in Settings for immediate opening and closing.
+Both right-side drawers use 40% of the terminal width at 144 cells and wider, 70% at 54–143 cells, and the full width below 54 cells. They resize at the same breakpoints as the board, prioritizing readable content in smaller panes. Both right-side drawers slide open and closed. Closing restores board controls immediately while the drawer slides away. Turn off **Animate drawers** in Settings for immediate opening and closing.
 
 Create Tasks and Epics with `n`, or use `Shift+N` on an open Task to create a child. The create form saves the issue without starting an agent.
 

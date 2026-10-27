@@ -1265,16 +1265,20 @@ fn column_heading_parts(
     )
 }
 
-fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
-    let statuses = crate::app::BOARD_STATUSES;
-    let palette = crate::theme::definition(app.theme).palette;
-    let columns: u16 = if area.width >= 144 {
+fn board_columns(width: u16) -> u16 {
+    if width >= 144 {
         6
-    } else if area.width >= 54 {
+    } else if width >= 54 {
         3
     } else {
         2
-    };
+    }
+}
+
+fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
+    let statuses = crate::app::BOARD_STATUSES;
+    let palette = crate::theme::definition(app.theme).palette;
+    let columns = board_columns(area.width);
     let rows = 6 / columns;
     app.board_columns.clear();
     app.board_cards.clear();
@@ -1494,7 +1498,12 @@ fn render_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
 }
 
 fn drawer_width(screen_width: u16, app: &App, now: Instant) -> u16 {
-    let target = screen_width.min((screen_width * 2 / 5).max(36));
+    let percent = match board_columns(screen_width) {
+        6 => 40,
+        3 => 70,
+        _ => 100,
+    };
+    let target = screen_width.min((u32::from(screen_width) * percent / 100).max(36) as u16);
     let fraction = app
         .drawer_animation
         .as_ref()
@@ -4942,6 +4951,46 @@ mod tests {
     }
 
     #[test]
+    fn both_drawers_follow_board_breakpoints_when_resizing() {
+        for worktrees in [false, true] {
+            let mut a = app();
+            a.focus_detail = !worktrees;
+            a.worktrees_view = worktrees;
+            a.settings.animate_drawers = false;
+            let selected = a.selected;
+            for (width, columns, expected) in [
+                (180, 6, 72),
+                (144, 6, 57),
+                (143, 3, 100),
+                (100, 3, 70),
+                (54, 3, 37),
+                (53, 2, 53),
+                (144, 6, 57),
+            ] {
+                assert_eq!(board_columns(width), columns);
+                assert_eq!(drawer_width(width, &a, Instant::now()), expected);
+                let text = draw((width, 30), &mut a).0;
+                let rect = a.detail_rect;
+                let inset = u16::from(worktrees);
+                assert_eq!(rect.width, expected - 2 * inset);
+                assert_eq!(rect.x, width - expected + inset);
+                assert_eq!(rect.right(), width - inset);
+                assert!(text.contains(if worktrees {
+                    "WORKTREES"
+                } else {
+                    "BEAD DETAILS"
+                }));
+                assert_eq!(a.selected, selected);
+                assert_eq!(a.board_columns.len(), 6);
+            }
+        }
+        let a = app();
+        for width in [0, 1, 3, 20, u16::MAX] {
+            assert!(drawer_width(width, &a, Instant::now()) <= width);
+        }
+    }
+
+    #[test]
     fn drawer_width_eases_in_both_directions_and_can_be_disabled() {
         let start = Instant::now();
         let mut a = app();
@@ -4952,16 +5001,16 @@ mod tests {
                 from,
                 to,
             });
-            assert_eq!(drawer_width(100, &a, start), (40.0 * from) as u16);
+            assert_eq!(drawer_width(100, &a, start), (70.0 * from) as u16);
             let middle = drawer_width(100, &a, start + Duration::from_millis(110));
-            assert!(middle > 0 && middle < 40);
+            assert!(middle > 0 && middle < 70);
             assert_eq!(
                 drawer_width(100, &a, start + Duration::from_millis(220)),
-                (40.0 * to) as u16
+                (70.0 * to) as u16
             );
         }
         a.settings.animate_drawers = false;
-        assert_eq!(drawer_width(100, &a, start), 40);
+        assert_eq!(drawer_width(100, &a, start), 70);
     }
 
     #[test]
@@ -4981,10 +5030,10 @@ mod tests {
                 "BEAD DETAILS"
             };
             assert!(draw_drawer((100, 30), &mut a, start).contains(title));
-            assert_eq!(a.detail_rect.width, if worktrees { 38 } else { 40 });
+            assert_eq!(a.detail_rect.width, if worktrees { 68 } else { 70 });
             let middle = start + Duration::from_millis(40);
             assert!(draw_drawer((100, 30), &mut a, middle).contains(title));
-            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 40);
+            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 70);
             for size in [(60, 18), (20, 8), (100, 30)] {
                 draw_drawer(size, &mut a, middle);
                 assert!(a.detail_rect.width > 0 && a.detail_rect.width <= size.0);
@@ -5033,7 +5082,7 @@ mod tests {
                 to: 1.0,
             });
             let middle_text = draw_drawer((60, 18), &mut a, halfway);
-            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 36);
+            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 42);
             assert!(a.detail_rect.x + a.detail_rect.width <= 60);
             assert!(a.list_rect.x + a.list_rect.width <= 60);
             assert!(middle_text.contains(if worktrees {
