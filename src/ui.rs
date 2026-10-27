@@ -1430,9 +1430,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                     .bg(palette.selected_background)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
-                    .fg(palette.foreground)
-                    .bg(palette.panel_alt)
+                Style::default().fg(palette.foreground).bg(palette.panel)
             };
             let kind = row_issue_type(bead);
             let title_width = card.width.saturating_sub(2) as usize;
@@ -1485,7 +1483,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                                 Style::default()
                                     .fg(crate::theme::issue_type_color(app.theme, &kind)),
                             )
-                            .style(Style::default().bg(palette.panel_alt)),
+                            .style(Style::default().bg(palette.panel)),
                     )
                     .style(style),
                 card,
@@ -2849,7 +2847,7 @@ mod tests {
                 let cell = &buffer[(x, y)];
                 assert_eq!(cell.symbol(), glyph);
                 assert_eq!(cell.fg, crate::theme::issue_type_color(theme, "task"));
-                assert_eq!(cell.bg, palette.panel_alt);
+                assert_eq!(cell.bg, palette.panel);
                 assert_ne!(cell.fg, cell.bg);
             }
             let unselected_card = a
@@ -2923,7 +2921,7 @@ mod tests {
                 let cell = &terminal.backend().buffer()[(card.x, card.y)];
                 assert_eq!(cell.symbol(), "╭");
                 assert_eq!(cell.fg, crate::theme::issue_type_color(theme, expected));
-                assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel_alt);
+                assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel);
             }
         }
     }
@@ -4391,7 +4389,7 @@ mod tests {
                     total_cards += cards;
                 }
                 assert_eq!(total_cards, a.board_cards.len());
-                for (_, card) in &a.board_cards {
+                for (index, card) in &a.board_cards {
                     let column = a
                         .board_columns
                         .iter()
@@ -4402,6 +4400,26 @@ mod tests {
                         card.bottom() < column.bottom(),
                         "card overlaps bottom border at {size:?}"
                     );
+                    let palette = crate::theme::definition(theme).palette;
+                    for y in card.y..card.bottom() {
+                        for x in card.x..card.right() {
+                            let selected_interior = a.selected == Some(*index)
+                                && x > card.x
+                                && x + 1 < card.right()
+                                && y > card.y
+                                && y + 1 < card.bottom();
+                            let expected = if selected_interior {
+                                palette.selected_background
+                            } else {
+                                buffer[(column.x, column.y + 1)].bg
+                            };
+                            assert_eq!(
+                                buffer[(x, y)].bg,
+                                expected,
+                                "{theme:?} {size:?} card {index} at ({x}, {y})"
+                            );
+                        }
+                    }
                 }
                 a.beads.clear();
                 terminal

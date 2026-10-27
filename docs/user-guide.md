@@ -45,7 +45,7 @@ Press `Ctrl+?` whenever you need the controls for the current view. See the sche
 
 All bordered panes and dialogs, including tracked handoffs, forms, and hotkey help, use rounded corners.
 
-Rounded card outlines use issue type colours: bugs are red and features are blue. The selected card keeps its highlighted fill and type-coloured outline, so selection remains clear without hiding the type.
+Task cards share their column's background colour, including their rounded outlines. Outlines use issue type colours: bugs are red and features are blue. The selected card keeps its highlighted fill and type-coloured outline, so selection remains clear without hiding the type.
 
 When a dialog is open, the board and any open drawer darken behind it so the
 dialog stands out in both Dark and Light themes. Closing the dialog restores the
