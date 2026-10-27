@@ -3798,7 +3798,7 @@ mod tests {
     #[test]
     fn board_move_keys_do_not_leak_through_help_or_move_modal() {
         let (mut a, rx, _) = connected_app();
-        a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+        a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
         a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
         press(&mut a, KeyCode::Char('m'));
         assert!(a.help.is_some() && a.modal.is_none());
@@ -4325,8 +4325,8 @@ mod tests {
                 press(&mut a, KeyCode::Down);
                 assert!(a.focus_detail);
                 assert_eq!(a.detail_offset, 1);
-                // Ctrl+? opens help while a Ready update is still blocked.
-                a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+                // Shift+? opens help while a Ready update is still blocked.
+                a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
                 assert!(a.help.is_some());
                 press(&mut a, KeyCode::Esc);
                 assert!(a.help.is_none());
@@ -6773,7 +6773,7 @@ mod tests {
     #[test]
     fn help_tracks_active_view_and_preserves_underlying_form() {
         let mut a = app();
-        let help_key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL);
+        let help_key = KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT);
         a.key(help_key);
         assert_eq!(a.help.unwrap().context, hotkeys::Context::Issues);
         press(&mut a, KeyCode::Down);
@@ -6787,11 +6787,11 @@ mod tests {
         a.key(help_key);
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Char('n'));
+        press(&mut a, KeyCode::Char('/'));
         press(&mut a, KeyCode::Char('?'));
-        a.key(help_key);
         assert_eq!(a.help.unwrap().context, hotkeys::Context::Form);
         press(&mut a, KeyCode::Esc);
-        assert!(matches!(a.modal, Some(Modal::Create(ref form)) if form.title == "?"));
+        assert!(matches!(a.modal, Some(Modal::Create(ref form)) if form.title == "/"));
         a.mutation_busy = true;
         a.key(help_key);
         assert!(a.help.is_none());
@@ -6801,7 +6801,7 @@ mod tests {
     fn help_lists_view_specific_commands() {
         let mut a = app();
         a.worktrees_view = true;
-        a.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL));
+        a.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::SHIFT));
         let context = a.help.unwrap().context;
         assert_eq!(context, hotkeys::Context::Worktrees);
         assert!(context.entries().iter().any(|(key, _)| *key == "Shift+R"));

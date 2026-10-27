@@ -2027,7 +2027,7 @@ fn render_help(f: &mut Frame, app: &mut App) {
     let footer = if area.width < 45 {
         "Esc close · ↑↓ scroll"
     } else {
-        "Esc / Ctrl+? close · ↑↓ / PgUp PgDn scroll"
+        "Esc / Shift+? close · ↑↓ / PgUp PgDn scroll"
     };
     f.render_widget(
         Paragraph::new(truncate_display(
@@ -2670,6 +2670,7 @@ mod tests {
         });
         let (wide, _) = draw((80, 15), &mut a);
         assert!(wide.contains("HOTKEYS · Create / edit form"));
+        assert!(wide.contains("Esc / Shift+? close"));
         assert!(wide.contains("Text / Space"));
         assert!(wide.contains("Type in title or description"));
         a.help.as_mut().unwrap().offset = usize::MAX;

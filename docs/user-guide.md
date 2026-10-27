@@ -39,7 +39,7 @@ Once the browser opens in your Herdr project workspace:
 3. Move the task to Ready with `Shift+←` / `Shift+→` or choose Ready with `m`. Run the scheduler from the main checkout; it waits for eligible work, an available agent slot, and a usable harness. For an immediate manual handoff, press `h`.
 4. Press `w` to open the worktree drawer. `Enter` focuses its Herdr workspace; within this drawer, `m` requests a merge. The agent commits and checks work before signalling Ready To Merge. OnTrack closes the Bead after verified integration, independently of automatic merge/cleanup preferences. Use drawer actions `c` or `x` only to close the integrated workspace or remove its checkout. `Esc` returns to your board selection.
 
-Press `Ctrl+?` whenever you need the controls for the current view. See the scheduling and worktree sections below for eligibility, confirmation, and recovery details.
+Press `Shift+?` whenever you need the controls for the current view. See the scheduling and worktree sections below for eligibility, confirmation, and recovery details.
 
 ## Kanban board and moves
 
@@ -89,7 +89,7 @@ An Open or Ready issue shows `· sent` beside its status after Herdr confirms th
 
 | Input | Action |
 | --- | --- |
-| `Ctrl+?` | Open context-specific hotkey help for the board, drawer, or dialog. Use arrows / Page keys to scroll, Home / End to jump, and Esc or Ctrl+? to close without changing selection or form text. |
+| `Shift+?` | Open context-specific hotkey help for the board, drawer, or dialog. Use arrows / Page keys to scroll, Home / End to jump, and Esc or Shift+? to close without changing selection or form text. |
 | `↑` / `↓` or mouse wheel on the board | Move one card within the focused column without wrapping; scroll only enough to keep selection visible. |
 | `←` / `→` on the board | Switch columns, including empty ones; scroll horizontally when needed. |
 | `Shift+←` / `Shift+→` on the board | Move the selected Bead to an adjacent column without moving its children. Closed requires verified integration. |
@@ -113,7 +113,7 @@ Inside the create and edit forms, keys are text unless they are form controls; a
 
 With Description focused, copy a PNG or JPEG screenshot and press `Ctrl+V`. OnTrack reads the image from the local Wayland clipboard with `wl-paste` or the X11 clipboard with `xclip`, saves it under the shared Beads workspace in `.beads/screenshots/`, and inserts a Markdown image reference at the caret. Wait for the saved-image message before submitting the form. Esc discards screenshots pasted in an unsaved form. An unavailable image or clipboard tool shows an error and leaves the text unchanged. Screenshots remain local to this machine; they are not carried by Beads JSON export or Git commits. Keep the shared Beads workspace and its screenshot files available while agents need them.
 
-The hotkey reference accepts terminal reports of `Ctrl+?`, `Ctrl+Shift+/`, and `Ctrl+/`. Some terminals send the same unmodified Backspace code for `Ctrl+?`; on those terminals the app cannot distinguish the keys, so use a terminal with modified-key reporting. The reference is unavailable while a mutation locks its dialog.
+The hotkey reference accepts `?` with or without a reported Shift modifier, plus `Shift+/`. This shortcut also opens Help in text forms, so `?` is reserved for Help. Plain `/` and Backspace keep their usual behavior. The reference is unavailable while a mutation locks its dialog.
 
 The settings dialog captures input until it closes, so `q` cannot quit while it is open. Theme, default-agent, agent-limit, and cleanup changes save immediately. Child auto-merge defaults on; top-level auto-merge, workspace closing, and checkout removal default off. Ready To Merge does not bypass Git or settled-agent checks. Bead closure after verified integration remains active with all these preferences off. Removing a checkout also closes its Herdr workspace. Settings load/save errors remain visible; failed saves preserve the last successfully saved settings. See the [settings guide](settings.md) for recovery.
 
@@ -125,7 +125,7 @@ Dependencies appear as a compact flow chart rooted at the selected Bead. **Block
 
 ontrack automatically polls the board and selected issue's details in the background, starting another refresh roughly one second after the previous refresh completes. Changes made by another terminal or agent appear without manual input or configuring events, a watcher, or extra dependencies. Slow `bd` commands increase the delay; updates are not instantaneous or event-driven. Successful create/edit/move/close/delete actions trigger an immediate refresh. In the `w` drawer, `r` refreshes tracked worktrees.
 
-Context-specific hints point to `Ctrl+?` for the full key reference. Errors and action notices remain visible without replacing shortcuts; confirmation instructions stay in their dialogs. Worktree recovery actions remain in the drawer. Refresh retains cached cards/details while loading and preserves the selected ID when possible, active column, drawer context, bounded scroll positions, and active form input. Failed refreshes retain the last loaded data alongside the error and retry automatically. An empty workspace still shows all six column headings and zero counts.
+Context-specific hints point to `Shift+?` for the full key reference. Errors and action notices remain visible without replacing shortcuts; confirmation instructions stay in their dialogs. Worktree recovery actions remain in the drawer. Refresh retains cached cards/details while loading and preserves the selected ID when possible, active column, drawer context, bounded scroll positions, and active form input. Failed refreshes retain the last loaded data alongside the error and retry automatically. An empty workspace still shows all six column headings and zero counts.
 
 ## Update OnTrack
 
