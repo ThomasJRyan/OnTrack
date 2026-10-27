@@ -1426,7 +1426,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
                             .border_style(Style::default().fg(if selected {
-                                palette.accent
+                                palette.selected_foreground
                             } else {
                                 palette.border
                             })),
@@ -2568,6 +2568,106 @@ mod tests {
                     crate::theme::priority_color(theme, priority)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn selected_card_border_contrasts_with_fill_in_every_theme() {
+        for theme in crate::settings::Theme::ALL {
+            let mut a = app();
+            let mut unselected = a.beads[0].clone();
+            unselected.id = "demo-2".into();
+            unselected.title = "Unselected card".into();
+            a.beads.push(unselected);
+            a.theme = theme;
+            let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let card = a
+                .board_cards
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .unwrap()
+                .1;
+            let palette = crate::theme::definition(theme).palette;
+            for (x, y, glyph) in (card.x..card.right())
+                .flat_map(|x| {
+                    [
+                        (
+                            x,
+                            card.y,
+                            if x == card.x {
+                                "╭"
+                            } else if x + 1 == card.right() {
+                                "╮"
+                            } else {
+                                "─"
+                            },
+                        ),
+                        (
+                            x,
+                            card.bottom() - 1,
+                            if x == card.x {
+                                "╰"
+                            } else if x + 1 == card.right() {
+                                "╯"
+                            } else {
+                                "─"
+                            },
+                        ),
+                    ]
+                })
+                .chain(
+                    (card.y + 1..card.bottom() - 1)
+                        .flat_map(|y| [(card.x, y, "│"), (card.right() - 1, y, "│")]),
+                )
+            {
+                let cell = &buffer[(x, y)];
+                assert_eq!(cell.symbol(), glyph);
+                assert_eq!(cell.fg, palette.selected_foreground);
+                assert_eq!(cell.bg, palette.selected_background);
+                assert_ne!(cell.fg, cell.bg);
+            }
+            let unselected_card = a
+                .board_cards
+                .iter()
+                .find(|(index, _)| *index == 1)
+                .unwrap()
+                .1;
+            assert_eq!(unselected_card.width, card.width);
+            assert_eq!(unselected_card.height, card.height);
+            for (x, y) in (unselected_card.x..unselected_card.right())
+                .flat_map(|x| [(x, unselected_card.y), (x, unselected_card.bottom() - 1)])
+                .chain(
+                    (unselected_card.y + 1..unselected_card.bottom() - 1)
+                        .flat_map(|y| [(unselected_card.x, y), (unselected_card.right() - 1, y)]),
+                )
+            {
+                let cell = &buffer[(x, y)];
+                assert_ne!(cell.symbol(), " ");
+                assert_eq!(cell.fg, palette.border);
+            }
+            let title_x = card.x + 1;
+            let title_y = card.y + 1;
+            let title_cell = &buffer[(title_x, title_y)];
+            assert_eq!(title_cell.bg, palette.selected_background);
+            assert_eq!(title_cell.fg, palette.selected_foreground);
+            let selected_position = a
+                .board_cards
+                .iter()
+                .find(|(index, _)| *index == 0)
+                .unwrap()
+                .1;
+            assert_eq!(selected_position, card);
+            let rendered = buffer
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("Title is visible"));
+            assert!(rendered.contains("demo-1"));
         }
     }
 
