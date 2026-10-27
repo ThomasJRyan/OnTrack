@@ -125,6 +125,7 @@ pub struct App {
     pub detail: Option<serde_json::Value>,
     pub focus_detail: bool,
     pub detail_offset: u16,
+    pub drawer_opened_at: Option<Instant>,
     pub list_loading: bool,
     pub detail_loading: bool,
     pub list_error: Option<String>,
@@ -612,6 +613,7 @@ impl App {
             detail: None,
             focus_detail: false,
             detail_offset: 0,
+            drawer_opened_at: None,
             list_loading: true,
             detail_loading: false,
             list_error: None,
@@ -954,20 +956,30 @@ impl App {
             return;
         }
         let index = index.min(self.beads.len() - 1);
-        let previous_column = self.focused_column;
         self.focused_column = status_order(display_status(&self.beads[index]));
-        self.column_rows[self.focused_column] = self
-            .column_indices(self.focused_column)
-            .iter()
-            .position(|&i| i == index)
-            .unwrap_or(0);
-        if previous_column != self.focused_column
-            || !self.board_cards.iter().any(|&(i, _)| i == index)
-        {
-            self.column_offsets[self.focused_column] = self.column_rows[self.focused_column];
-        }
+        let indices = self.column_indices(self.focused_column);
+        self.column_rows[self.focused_column] =
+            indices.iter().position(|&i| i == index).unwrap_or(0);
         if self.selected == Some(index) {
             return;
+        }
+        let capacity = self
+            .board_cards
+            .iter()
+            .filter(|&&(i, _)| {
+                self.beads
+                    .get(i)
+                    .is_some_and(|bead| status_order(display_status(bead)) == self.focused_column)
+            })
+            .count();
+        if capacity > 0 {
+            let row = self.column_rows[self.focused_column];
+            let offset = &mut self.column_offsets[self.focused_column];
+            if row < *offset {
+                *offset = row;
+            } else if row >= offset.saturating_add(capacity) {
+                *offset = row + 1 - capacity;
+            }
         }
         self.selected = Some(index);
         self.detail_seq = self.detail_seq.wrapping_add(1);
@@ -1799,7 +1811,7 @@ impl App {
             }
         }
     }
-    fn key(&mut self, k: KeyEvent) -> bool {
+    pub(crate) fn key(&mut self, k: KeyEvent) -> bool {
         if self.mutation_busy && !self.ready_pending {
             return false;
         }
@@ -1863,6 +1875,7 @@ impl App {
                 KeyCode::Char('w') | KeyCode::Esc | KeyCode::Backspace => {
                     self.worktrees_view = false;
                     self.focus_detail = false;
+                    self.drawer_opened_at = None;
                 }
                 KeyCode::Up | KeyCode::Char('k') => {
                     self.selected_worktree = self.selected_worktree.saturating_sub(1);
@@ -1901,6 +1914,7 @@ impl App {
             KeyCode::Char('w') => {
                 self.worktrees_view = true;
                 self.focus_detail = false;
+                self.drawer_opened_at = Some(Instant::now());
                 if let Some(index) =
                     self.selected
                         .and_then(|i| self.beads.get(i))
@@ -2020,10 +2034,17 @@ impl App {
                 }
             }
             KeyCode::Char('h') => self.open_launch(),
-            KeyCode::Esc => self.focus_detail = false,
-            KeyCode::Tab => self.focus_detail = !self.focus_detail && self.selected.is_some(),
+            KeyCode::Esc => {
+                self.focus_detail = false;
+                self.drawer_opened_at = None;
+            }
+            KeyCode::Tab => {
+                self.focus_detail = !self.focus_detail && self.selected.is_some();
+                self.drawer_opened_at = self.focus_detail.then(Instant::now);
+            }
             KeyCode::Enter if !self.focus_detail && self.selected.is_some() => {
-                self.focus_detail = true
+                self.focus_detail = true;
+                self.drawer_opened_at = Some(Instant::now());
             }
             KeyCode::Left | KeyCode::Right
                 if !self.focus_detail && k.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -2373,10 +2394,10 @@ impl App {
                 match key.code {
                     Tab | BackTab => {
                         *dropdown_open = false;
-                        *focus = (*focus + if key.code == Tab { 1 } else { 7 }) % 8;
+                        *focus = (*focus + if key.code == Tab { 1 } else { 8 }) % 9;
                     }
                     Up | Down => {
-                        *focus = (*focus + if key.code == Down { 1 } else { 7 }) % 8;
+                        *focus = (*focus + if key.code == Down { 1 } else { 8 }) % 9;
                         *dropdown_open = false;
                     }
                     Left | Right if *focus == 0 => {
@@ -2401,16 +2422,17 @@ impl App {
                     Enter | Char(' ') if *focus <= 2 => {
                         *dropdown_open = true;
                     }
-                    Enter | Char(' ') if (3..=6).contains(focus) => {
+                    Enter | Char(' ') if (3..=7).contains(focus) => {
                         match *focus {
                             3 => draft.auto_merge = !draft.auto_merge,
                             4 => draft.auto_merge_children = !draft.auto_merge_children,
                             5 => draft.auto_close_workspace = !draft.auto_close_workspace,
-                            _ => draft.auto_remove_checkout = !draft.auto_remove_checkout,
+                            6 => draft.auto_remove_checkout = !draft.auto_remove_checkout,
+                            _ => draft.animate_drawers = !draft.animate_drawers,
                         }
                         save_settings = Some(*draft);
                     }
-                    Enter | Char(' ') if *focus == 7 => {
+                    Enter | Char(' ') if *focus == 8 => {
                         self.modal = None;
                     }
                     _ => {}
@@ -2418,6 +2440,9 @@ impl App {
             }
             if let Some(settings) = save_settings {
                 self.save_settings(settings);
+                if !self.settings.animate_drawers {
+                    self.drawer_opened_at = None;
+                }
             }
             return false;
         }
@@ -2862,7 +2887,7 @@ impl App {
             self.toast = Some(Toast::result(message, error));
         }
     }
-    fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
+    pub(crate) fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
         if self.modal.is_some() || self.help.is_some() {
             return;
         }
@@ -3283,6 +3308,41 @@ mod tests {
     }
 
     #[test]
+    fn selection_scrolls_minimally_in_both_directions_and_keeps_column_offsets() {
+        let mut a = app();
+        a.beads.extend((4..8).map(|i| Bead {
+            dependency_ready: true,
+            blocked_by: Vec::new(),
+            id: format!("b{i}"),
+            title: format!("issue {i}"),
+            status: "open".into(),
+            priority: 2,
+            data: json!({"id": format!("b{i}")}),
+        }));
+        a.board_cards.truncate(3);
+        a.selected = Some(0);
+        a.step(1);
+        assert_eq!((a.selected, a.column_offsets[0]), (Some(1), 0));
+        a.step(1);
+        assert_eq!((a.selected, a.column_offsets[0]), (Some(2), 0));
+        a.step(1);
+        assert_eq!((a.selected, a.column_offsets[0]), (Some(3), 1));
+        a.step(1);
+        assert_eq!((a.selected, a.column_offsets[0]), (Some(4), 2));
+        a.step(-1);
+        assert_eq!((a.selected, a.column_offsets[0]), (Some(3), 2));
+        a.column_offsets[1] = 7;
+        a.focused_column = 1;
+        a.board_columns.clear();
+        a.select(0);
+        assert_eq!(a.column_offsets[1], 7);
+        a.step(-1);
+        assert_eq!(a.selected, Some(0));
+        a.step(1);
+        assert_eq!(a.column_offsets[1], 7);
+    }
+
+    #[test]
     fn closed_group_uses_completion_recency_instead_of_id_or_parent_order() {
         let bead = |id: &str, status: &str, data: serde_json::Value| Bead {
             dependency_ready: true,
@@ -3395,6 +3455,7 @@ mod tests {
             detail: Some(json!({"id": "b0", "description": "detail 0"})),
             focus_detail: false,
             detail_offset: 0,
+            drawer_opened_at: None,
             list_loading: false,
             detail_loading: false,
             list_error: None,
@@ -6074,7 +6135,7 @@ mod tests {
             "reopening does not change the saved theme"
         );
         assert!(matches!(a.modal, Some(Modal::Settings { .. })));
-        for _ in 0..7 {
+        for _ in 0..8 {
             press(&mut a, KeyCode::Tab);
         }
         press(&mut a, KeyCode::Enter);
@@ -6126,7 +6187,7 @@ mod tests {
         a.settings_path = Some(path.clone());
         press(&mut a, KeyCode::Char('s'));
         press(&mut a, KeyCode::Up);
-        assert!(matches!(a.modal, Some(Modal::Settings { focus: 7, .. })));
+        assert!(matches!(a.modal, Some(Modal::Settings { focus: 8, .. })));
         press(&mut a, KeyCode::Down);
         assert!(matches!(a.modal, Some(Modal::Settings { focus: 0, .. })));
         press(&mut a, KeyCode::Down);
@@ -6147,12 +6208,22 @@ mod tests {
         assert!(a.modal.is_none());
         assert!(a.settings.auto_merge);
         press(&mut a, KeyCode::Char('s'));
-        press(&mut a, KeyCode::Up);
-        press(&mut a, KeyCode::Down);
-        assert!(matches!(a.modal, Some(Modal::Settings { focus: 0, .. })));
-        assert_eq!(a.theme, Theme::Dark);
-        assert!(a.settings.auto_merge);
+        assert!(a.settings.animate_drawers);
+        for _ in 0..7 {
+            press(&mut a, KeyCode::Down);
+        }
+        a.drawer_opened_at = Some(Instant::now());
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.settings.animate_drawers);
+        assert!(a.drawer_opened_at.is_none());
+        assert!(!settings::load_from(&path).unwrap().animate_drawers);
         press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('s'));
+        for _ in 0..8 {
+            press(&mut a, KeyCode::Tab);
+        }
+        press(&mut a, KeyCode::Enter);
+        assert!(a.modal.is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -6289,6 +6360,34 @@ mod tests {
         assert!(!a.focus_detail);
         press(&mut a, KeyCode::Tab);
         assert!(a.focus_detail);
+    }
+    #[test]
+    fn drawer_open_keys_reset_and_clear_transition_for_both_drawers() {
+        let mut a = app();
+        press(&mut a, KeyCode::Tab);
+        let tab_start = a.drawer_opened_at.unwrap();
+        press(&mut a, KeyCode::Tab);
+        assert!(a.drawer_opened_at.is_none());
+        press(&mut a, KeyCode::Tab);
+        assert!(a.drawer_opened_at.unwrap() >= tab_start);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.drawer_opened_at.is_none());
+
+        press(&mut a, KeyCode::Enter);
+        assert!(a.focus_detail);
+        assert!(a.drawer_opened_at.is_some());
+        press(&mut a, KeyCode::Char('w'));
+        assert!(a.worktrees_view);
+        assert!(!a.focus_detail);
+        let worktree_start = a.drawer_opened_at.unwrap();
+        press(&mut a, KeyCode::Esc);
+        assert!(!a.worktrees_view);
+        assert!(a.drawer_opened_at.is_none());
+        press(&mut a, KeyCode::Char('w'));
+        assert!(a.worktrees_view);
+        assert!(a.drawer_opened_at.unwrap() >= worktree_start);
+        press(&mut a, KeyCode::Esc);
+        assert!(a.drawer_opened_at.is_none());
     }
     #[test]
     fn board_arrows_are_safe_when_empty_and_modal_arrows_remain_form_controls() {
