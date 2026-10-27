@@ -34,7 +34,7 @@ A brief splash precedes the browser. A terminal-drawn anime girl blinks and wave
 
 Once the browser opens in your Herdr project workspace:
 
-1. Use `←` / `→` to choose a column and `↑` / `↓` to select a Bead. Press `Enter` to open its detail drawer; arrows and Page keys scroll the description, comments, and relationships. `Esc` restores your board selection.
+1. Use `←` / `→` to choose a column and `↑` / `↓` to select a Bead. Press `Enter` to open its detail drawer; press `Enter` again, `Tab`, or `Esc` to return to the same board selection. Arrows and Page keys scroll the description, comments, and relationships.
 2. Press `n` to create a task, or `e` to refine the selected Bead. Give the agent a clear description and choose its harness. Use `Shift+N` on an open task to split off a child task.
 3. Move the task to Ready with `Shift+←` / `Shift+→` or choose Ready with `m`. Run the scheduler from the main checkout; it waits for eligible work, an available agent slot, and a usable harness. For an immediate manual handoff, press `h`.
 4. Press `w` to open the worktree drawer. `Enter` focuses its Herdr workspace; within this drawer, `m` requests a merge. The agent commits and checks work before signalling Ready To Merge. OnTrack closes the Bead after verified integration, independently of automatic merge/cleanup preferences. Use drawer actions `c` or `x` only to close the integrated workspace or remove its checkout. `Esc` returns to your board selection.
@@ -86,7 +86,7 @@ An Open or Ready issue shows `· sent` beside its status after Herdr confirms th
 | `←` / `→` on the board | Switch columns, including empty ones; scroll horizontally when needed. |
 | `Shift+←` / `Shift+→` on the board | Move the selected Bead to an adjacent column without moving its children. Closed requires verified integration. |
 | `m` on the board | Choose a destination column for the selected Bead. |
-| `Enter` on the board | Open the selected Bead in the right-side detail drawer. |
+| `Enter` | Open or close the selected Bead's right-side detail drawer. |
 | `Tab` | Open or close the selected Bead's detail drawer. |
 | Arrow keys / `PageUp` / `PageDown` in Bead details | Scroll drawer content. |
 | `r` / `Shift+R` on the board or in Bead details | Toggle Ready for an open issue and its open descendants, subject to handoff guards. |

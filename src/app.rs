@@ -2022,9 +2022,8 @@ impl App {
             KeyCode::Char('h') => self.open_launch(),
             KeyCode::Esc => self.focus_detail = false,
             KeyCode::Tab => self.focus_detail = !self.focus_detail && self.selected.is_some(),
-            KeyCode::Enter if !self.focus_detail && self.selected.is_some() => {
-                self.focus_detail = true
-            }
+            KeyCode::Enter if self.focus_detail => self.focus_detail = false,
+            KeyCode::Enter if self.selected.is_some() => self.focus_detail = true,
             KeyCode::Left | KeyCode::Right
                 if !self.focus_detail && k.modifiers.contains(KeyModifiers::SHIFT) =>
             {
@@ -3652,6 +3651,11 @@ mod tests {
         ];
         press(&mut a, KeyCode::Enter);
         assert!(a.focus_detail && !a.worktrees_view);
+        let selected = a.selected;
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.focus_detail && a.selected == selected);
+        press(&mut a, KeyCode::Enter);
+        assert!(a.focus_detail && a.selected == selected);
         a.key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
         press(&mut a, KeyCode::Char('m'));
         press(&mut a, KeyCode::Down);
@@ -3672,6 +3676,13 @@ mod tests {
         press(&mut a, KeyCode::Tab);
         press(&mut a, KeyCode::Esc);
         assert!(!a.focus_detail);
+        a.beads[0].data["issue_type"] = json!("epic");
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        assert!(!a.focus_detail && a.selected == Some(0));
+        press(&mut a, KeyCode::Char('w'));
+        press(&mut a, KeyCode::Enter);
+        assert!(a.worktrees_view && !a.focus_detail);
     }
 
     #[test]
