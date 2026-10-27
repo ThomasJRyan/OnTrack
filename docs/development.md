@@ -11,7 +11,7 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 | `src/main.rs` | Dispatches `update` and `uninstall` before checking the Herdr launch context and Beads workspace; initializes, runs, and restores the browser terminal. |
 | `src/startup.rs` | Requires the Herdr pane marker, then discovers the active workspace through Beads; prints manual initialization guidance and exits when none exists. |
 | `src/uninstall.rs` | Validates and removes the running executable and user settings after explicit CLI confirmation, before Beads discovery or terminal setup. |
-| `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, and worktree-cleanup preferences under the user's XDG config directory. |
+| `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, animation, and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
 | `src/beads.rs` | Builds issue CLI commands, validates JSON, preserves returned records, and exposes guarded per-Bead board moves. |
 | `src/screenshots.rs` | Reads clipboard images, writes local screenshots into the shared Beads workspace, and parses description references for agent prompts. |
@@ -33,7 +33,7 @@ The board has exactly six full-view vertical columns: Open, Ready, Blocked, In P
 
 Keep the board's bottom border row outside the content viewport: headings, empty/resize messages, and cards must never paint over the status-colored rounded bottom edge. The compact-height path must still advance each column's horizontal position. `kanban_outer_bottom_borders_keep_status_colors_and_cards_stay_inside` checks empty and populated boards, compact and exact-fit heights, narrow layouts, and all bundled themes using the rendered buffer.
 
-Enter opens the selected Bead's right-side detail drawer; `w` opens the right-side worktree drawer with all-handoffs recovery access. Esc closes the drawer and restores board selection. Detail arrows and Page keys scroll rather than moving board selection. Keep create/edit, handoff, settings, and help actions and the worktree focus/merge/close-workspace/remove/continue/restart guards. Drawers use existing Ratatui `Clear`; no overlay dependency or new module split is required.
+Enter opens or closes the selected Bead's right-side detail drawer, restoring the same board selection; `w` opens the right-side worktree drawer with all-handoffs recovery access, where Enter focuses the selected workspace. Esc closes the drawer and restores board selection. Detail arrows and Page keys scroll rather than moving board selection. Keep create/edit, handoff, settings, and help actions and the worktree focus/merge/close-workspace/remove/continue/restart guards. Drawers use existing Ratatui `Clear`; no overlay dependency or new module split is required.
 
 `src/ui.rs` renders the supplied centered ONTRACK wordmark and a terminal-drawn anime girl during the 1.2-second startup splash. `girl_frame` chooses the blink and wave pose from elapsed time supplied by `app::run`'s existing redraw loop, so the animation needs no separate timer or state. If the full wordmark and character do not fit, the renderer uses the compact ONTRACK title with the character when possible, then a text-only fallback. Width checks use terminal cell widths; preserve the wordmark verbatim, keep the splash centered and theme-aware, and ensure it yields to the normal browser view after startup.
 
@@ -61,11 +61,19 @@ The create/edit Description field uses `description_layout` to insert visual lin
 
 The hotkey reference is a separate `App::help` overlay, not a modal replacement. `App::key` handles its toggle and scroll keys before dispatching to the board, drawer, or dialog; the mutation lock still takes precedence. `hotkeys::Context` captures that context when opened and owns its key/action list. Update it alongside input handling. `ui::render_help` wraps actions, clamps scrolling, and renders over the board/drawers or forms. Enhanced reports distinguish `Ctrl+?` or `Ctrl+Shift+/`; legacy plain Backspace must remain text deletion/navigation, not open help.
 
-The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, default agent, or agent limit, and Enter / Space toggles cleanup preferences. Failed saves must not update committed settings. The default-agent setting uses stable supported kind IDs; `automatic` preserves the old Codex/first-available form behavior, `unassigned` selects no harness, and an unavailable preferred kind falls back only for the current form. Agent limit controls automatic Ready-task scheduling. See the [settings guide](settings.md) for details.
+The `s` settings dialog saves each theme/preference change immediately, writing the complete Settings value. Up / Down navigates rows, Left / Right changes theme, default agent, or agent limit, and Enter / Space toggles preferences. Drawer-opening animation defaults on and older settings files default it on. Failed saves must not update committed settings. The default-agent setting uses stable supported kind IDs; `automatic` preserves the old Codex/first-available form behavior, `unassigned` selects no harness, and an unavailable preferred kind falls back only for the current form. Agent limit controls automatic Ready-task scheduling. See the [settings guide](settings.md) for details.
 Settings rows in `src/ui.rs` share a two-thirds title column and one-third
 value column. `settings_row` aligns titles to the left and centers controls
 by terminal cell width; keep dropdown entries on the same value boundary and
 retain the existing compact-terminal fallback when changing this layout.
+
+The shared modal path dims the already-rendered board and drawers by darkening
+their cell foreground and background colors before drawing the dialog. Keep
+the modal's Clear/frame/content after this pass so its theme styles stay intact;
+help and toast overlays alone must not invoke it. Tiny-terminal modal guidance
+remains readable and does not run through the standard shared backdrop path.
+The legacy fullscreen planning editor returns before this shared modal path and
+is intentionally excluded.
 
 ## Beads CLI contract
 
@@ -114,7 +122,7 @@ Create returns a JSON object containing the created ID; update, close, and delet
 The board `c` shortcut captures the selected non-closed ID/title for confirmation and queues guarded `worktrees::close_integrated_bead(id)` off the terminal loop. Fresh tracked integration proof is mandatory, not merely a displayed Integrated state, label, or agent observation. No tracked handoff means no proof and no close. Success refreshes the board/details; failure retains target/error for retry. Beads close validates the ID, uses no force/cascade flags, and remains subject to Beads guards. Empty columns and closed cards have no close action. Worktree drawer `c` still closes the Herdr workspace, not the Bead.
 
 
-Card rendering must preserve issue identity, type, priority, title, and useful parent cues within legible column widths. The selected rounded outline uses the selected foreground so it remains distinct from the highlighted fill in every bundled theme. Hierarchy does not change column membership or make per-Bead moves cascade. Keep selection and mouse hit testing keyed to the same card geometry as rendering; empty columns must not inherit a stale detail/delete identity.
+Card rendering must preserve issue identity, type, priority, title, and useful parent cues within legible column widths. Rounded card outlines use `theme::issue_type_color` for selected and unselected cards; selected cards keep their highlighted fill. Bug is danger red, feature/story use the theme's blue Ready color, and unknown/missing types are muted. Preserve the status-coloured column outlines/status labels independently. Hierarchy does not change column membership or make per-Bead moves cascade. Keep selection and mouse hit testing keyed to the same card geometry as rendering; empty columns must not inherit a stale detail/delete identity.
 
 `Shift+N` opens the create form with an immutable selected parent ID. Child creation passes `--parent=PARENT_ID` as its own argument, so Beads records the hierarchy and list/show JSON exposes the child's `parent` field. It fetches parent labels, uses `--no-inherit-labels`, and carries over ordinary labels, excluding Ready, Ready To Merge, harness, and explicit Unassigned markers so the child starts Open with its own harness. OnTrack reads the uncapped live list to find open descendants before a parent starts or merges. Beads rejects a `blocks` dependency from parent to descendant because it would also block that child; OnTrack therefore enforces its own child-first gate.
 

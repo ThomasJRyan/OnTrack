@@ -7,7 +7,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 const ASCII_LOGO: [&str; 8] = [
     "    ███████               ███████████                              █████     ",
     "  ███▒▒▒▒▒███            ▒█▒▒▒███▒▒▒█                             ▒▒███      ",
@@ -137,7 +137,7 @@ fn row_issue_type(bead: &crate::beads::Bead) -> String {
 fn settings_hint(dropdown_open: bool, focus: usize) -> &'static str {
     if dropdown_open {
         "↑ / ↓ move · ← / → choice · Enter / Space select · Tab moves · Esc close"
-    } else if focus == 7 {
+    } else if focus == 8 {
         "↑ / ↓ move · Enter / Space close · Tab moves · Esc close"
     } else if focus >= 3 {
         "↑ / ↓ move · Enter / Space toggle · Tab moves · Esc close"
@@ -335,9 +335,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     render_header_feedback(f, v[0], feedback.as_deref(), app.theme);
     render_kanban(f, v[1], app);
     if app.focus_detail {
-        render_detail_drawer(f, a, app);
+        render_detail_drawer(f, a, app, Instant::now());
     } else if app.worktrees_view {
-        render_worktree_drawer(f, a, app);
+        render_worktree_drawer(f, a, app, Instant::now());
     }
     f.render_widget(
         Paragraph::new(footer_text(v[2].width as usize))
@@ -345,6 +345,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
         v[2],
     );
     if let Some(modal) = &app.modal {
+        // Recolor the complete rendered view, including drawers, before the
+        // dialog's Clear and normal themed rendering restore its own styles.
+        dim_background(f, a);
         let width = match modal {
             crate::app::Modal::Create(_) | crate::app::Modal::Edit { .. } => {
                 FORM_DESCRIPTION_WIDTH as u16 + 6
@@ -717,6 +720,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "Remove checkout + close Herdr workspace",
                         draft.auto_remove_checkout,
                     ),
+                    ("Animate drawer opening", draft.animate_drawers),
                 ]
                 .into_iter()
                 .enumerate()
@@ -745,11 +749,10 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     ))
                     .alignment(Alignment::Center),
                 );
-                lines.push(Line::from(""));
                 lines.push(
                     Line::from(Span::styled(
                         "[ Close ]",
-                        if *focus == 7 {
+                        if *focus == 8 {
                             selected_style
                         } else {
                             value_style
@@ -1210,6 +1213,29 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     render_help(f, app);
 }
 
+fn dim_background(frame: &mut Frame, area: Rect) {
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            if let Some(cell) = frame.buffer_mut().cell_mut((x, y)) {
+                let style = cell.style();
+                cell.set_style(Style {
+                    fg: style.fg.map(dim_color),
+                    bg: style.bg.map(dim_color),
+                    ..style
+                });
+            }
+        }
+    }
+}
+
+fn dim_color(color: Color) -> Color {
+    match color {
+        Color::Rgb(r, g, b) => Color::Rgb(r / 2, g / 2, b / 2),
+        Color::Reset => Color::Rgb(0, 0, 0),
+        other => other,
+    }
+}
+
 fn status_label(status: &str) -> &'static str {
     match status {
         "open" => "OPEN",
@@ -1426,11 +1452,11 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                         Block::default()
                             .borders(Borders::ALL)
                             .border_type(BorderType::Rounded)
-                            .border_style(Style::default().fg(if selected {
-                                palette.selected_foreground
-                            } else {
-                                palette.border
-                            })),
+                            .border_style(
+                                Style::default()
+                                    .fg(crate::theme::issue_type_color(app.theme, &kind)),
+                            )
+                            .style(Style::default().bg(palette.panel_alt)),
                     )
                     .style(style),
                 card,
@@ -1440,17 +1466,35 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
-fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App) {
+fn drawer_width(screen_width: u16, started: Option<Instant>, enabled: bool, now: Instant) -> u16 {
+    let target = screen_width.min((screen_width * 2 / 5).max(36));
+    let Some(started) = started.filter(|_| enabled) else {
+        return target;
+    };
+    let progress = (now.saturating_duration_since(started).as_secs_f32() / 0.22).clamp(0.0, 1.0);
+    let eased = 1.0 - (1.0 - progress).powi(3);
+    (f32::from(target) * eased).round() as u16
+}
+
+fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
     let palette = crate::theme::definition(app.theme).palette;
-    let width = screen.width.min((screen.width * 2 / 5).max(36));
+    let width = drawer_width(
+        screen.width,
+        app.drawer_opened_at,
+        app.settings.animate_drawers,
+        now,
+    );
     let area = Rect::new(
         screen.x + screen.width.saturating_sub(width),
         screen.y + 2,
         width,
         screen.height.saturating_sub(3),
     );
-    f.render_widget(Clear, area);
     app.detail_rect = area;
+    if width < 4 {
+        return;
+    }
+    f.render_widget(Clear, area);
     let selected = app.selected.and_then(|i| app.beads.get(i));
     let title = selected
         .map(|b| {
@@ -1536,15 +1580,25 @@ fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App) {
     );
 }
 
-fn render_worktree_drawer(f: &mut Frame, screen: Rect, app: &mut App) {
+fn render_worktree_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
     let palette = crate::theme::definition(app.theme).palette;
-    let width = screen.width.min((screen.width * 2 / 5).max(36));
+    let width = drawer_width(
+        screen.width,
+        app.drawer_opened_at,
+        app.settings.animate_drawers,
+        now,
+    );
     let area = Rect::new(
         screen.x + screen.width.saturating_sub(width),
         screen.y + 2,
         width,
         screen.height.saturating_sub(3),
     );
+    if width < 4 {
+        app.list_rect = Rect::default();
+        app.detail_rect = area;
+        return;
+    }
     f.render_widget(Clear, area);
     f.render_widget(
         Block::default()
@@ -2304,6 +2358,7 @@ mod tests {
             detail: None,
             focus_detail: false,
             detail_offset: 0,
+            drawer_opened_at: None,
             list_loading: false,
             detail_loading: false,
             list_error: None,
@@ -2382,6 +2437,26 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect()
     }
+    fn draw_drawer(size: (u16, u16), app: &mut App, now: Instant) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let screen = frame.area();
+                if app.focus_detail {
+                    render_detail_drawer(frame, screen, app, now);
+                } else {
+                    render_worktree_drawer(frame, screen, app, now);
+                }
+            })
+            .unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
     #[test]
     fn bordered_screens_render_without_square_corners() {
         let mut app = app();
@@ -2400,6 +2475,122 @@ mod tests {
                     .chars()
                     .any(|corner| matches!(corner, '┌' | '┐' | '└' | '┘')),
                 "{screen} contains a square corner"
+            );
+        }
+    }
+    #[test]
+    fn shared_modal_dims_background_but_not_modal_and_restores_after_close() {
+        for theme in [crate::settings::Theme::Dark, crate::settings::Theme::Light] {
+            for settings in [false, true] {
+                let mut app = app();
+                app.theme = theme;
+                app.focus_detail = true;
+                let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                    .unwrap();
+                let normal = terminal.backend().buffer().content().to_vec();
+                let backdrop_index = 2 + 4 * 100;
+                let background = &normal[backdrop_index];
+                let drawer_index = 85 + 8 * 100;
+                let drawer_before = &normal[drawer_index];
+
+                app.modal = Some(if settings {
+                    crate::app::Modal::Settings {
+                        draft: app.settings,
+                        error: None,
+                        dropdown_open: false,
+                        focus: 0,
+                    }
+                } else {
+                    crate::app::Modal::Create(crate::app::CreateForm::default())
+                });
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let backdrop = &buffer.content()[backdrop_index];
+                assert_eq!(backdrop.symbol(), background.symbol());
+                assert_eq!(
+                    backdrop.fg,
+                    dim_color(background.fg),
+                    "{theme:?} foreground"
+                );
+                assert_eq!(
+                    backdrop.bg,
+                    dim_color(background.bg),
+                    "{theme:?} background"
+                );
+                let drawer_after = &buffer.content()[drawer_index];
+                assert_eq!(
+                    drawer_after.bg,
+                    dim_color(drawer_before.bg),
+                    "{theme:?} drawer background"
+                );
+                assert_eq!(
+                    drawer_after.fg,
+                    dim_color(drawer_before.fg),
+                    "{theme:?} drawer foreground"
+                );
+
+                assert!(
+                    buffer.content().iter().any(|cell| {
+                        cell.symbol() == "╭"
+                            && cell.fg == crate::theme::definition(theme).palette.border
+                    }),
+                    "{theme:?} modal border should retain its themed color"
+                );
+                assert!(
+                    buffer.content().iter().any(|cell| {
+                        cell.symbol() != " "
+                            && cell.bg == crate::theme::definition(theme).palette.panel
+                            && cell.fg == crate::theme::definition(theme).palette.foreground
+                    }),
+                    "{theme:?} dialog text should retain its themed style"
+                );
+
+                app.modal = None;
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                    .unwrap();
+                assert_eq!(terminal.backend().buffer().content(), normal.as_slice());
+            }
+        }
+    }
+    #[test]
+    fn help_toast_and_compact_modal_fallback_keep_their_normal_styles() {
+        for theme in [crate::settings::Theme::Dark, crate::settings::Theme::Light] {
+            let mut app = app();
+            app.theme = theme;
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let background = terminal.backend().buffer()[(2, 4)].clone();
+            app.help = Some(crate::hotkeys::Help {
+                context: crate::hotkeys::Context::Issues,
+                offset: 0,
+            });
+            app.toast = Some(crate::app::Toast {
+                message: "launching".into(),
+                error: false,
+                expires_at: None,
+            });
+            terminal
+                .draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            assert_eq!(terminal.backend().buffer()[(2, 4)].bg, background.bg);
+            assert_eq!(terminal.backend().buffer()[(2, 4)].fg, background.fg);
+
+            app.modal = Some(crate::app::Modal::Create(crate::app::CreateForm::default()));
+            let mut tiny = Terminal::new(TestBackend::new(20, 6)).unwrap();
+            tiny.draw(|f| render(f, Duration::from_secs(2), &mut app))
+                .unwrap();
+            let cells = tiny.backend().buffer().content();
+            assert!(
+                cells
+                    .iter()
+                    .any(|cell| cell.fg == crate::theme::definition(theme).palette.muted)
             );
         }
     }
@@ -2579,6 +2770,7 @@ mod tests {
             let mut unselected = a.beads[0].clone();
             unselected.id = "demo-2".into();
             unselected.title = "Unselected card".into();
+            unselected.data["issue_type"] = serde_json::Value::String("feature".into());
             a.beads.push(unselected);
             a.theme = theme;
             let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
@@ -2627,8 +2819,8 @@ mod tests {
             {
                 let cell = &buffer[(x, y)];
                 assert_eq!(cell.symbol(), glyph);
-                assert_eq!(cell.fg, palette.selected_foreground);
-                assert_eq!(cell.bg, palette.selected_background);
+                assert_eq!(cell.fg, crate::theme::issue_type_color(theme, "task"));
+                assert_eq!(cell.bg, palette.panel_alt);
                 assert_ne!(cell.fg, cell.bg);
             }
             let unselected_card = a
@@ -2648,7 +2840,7 @@ mod tests {
             {
                 let cell = &buffer[(x, y)];
                 assert_ne!(cell.symbol(), " ");
-                assert_eq!(cell.fg, palette.border);
+                assert_eq!(cell.fg, crate::theme::issue_type_color(theme, "feature"));
             }
             let title_x = card.x + 1;
             let title_y = card.y + 1;
@@ -2669,6 +2861,41 @@ mod tests {
                 .collect::<String>();
             assert!(rendered.contains("Title is visible"));
             assert!(rendered.contains("demo-1"));
+        }
+    }
+
+    #[test]
+    fn card_border_uses_legacy_and_fallback_issue_types() {
+        for theme in crate::settings::Theme::ALL {
+            for (field, value, expected) in [
+                ("issue_type", None, "unknown"),
+                ("type", Some("bug"), "bug"),
+                ("issue_type", Some("custom"), "custom"),
+            ] {
+                let mut a = app();
+                if field == "type" {
+                    a.beads[0]
+                        .data
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("issue_type");
+                }
+                if let Some(value) = value {
+                    a.beads[0].data[field] = serde_json::Value::String(value.into());
+                } else {
+                    a.beads[0].data.as_object_mut().unwrap().remove(field);
+                }
+                a.theme = theme;
+                let mut terminal = Terminal::new(TestBackend::new(180, 40)).unwrap();
+                terminal
+                    .draw(|f| render(f, Duration::from_secs(2), &mut a))
+                    .unwrap();
+                let card = a.board_cards[0].1;
+                let cell = &terminal.backend().buffer()[(card.x, card.y)];
+                assert_eq!(cell.symbol(), "╭");
+                assert_eq!(cell.fg, crate::theme::issue_type_color(theme, expected));
+                assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel_alt);
+            }
         }
     }
 
@@ -3523,7 +3750,7 @@ mod tests {
         assert!(a.modal_ready);
         assert_eq!(
             buffer[(0, 3)].bg,
-            crate::theme::definition(Theme::Light).palette.panel
+            dim_color(crate::theme::definition(Theme::Light).palette.panel)
         );
         assert!(a.modal_ready);
         a.theme = Theme::Dark;
@@ -4443,5 +4670,71 @@ mod tests {
         assert!(screen.contains("READY TO MERGE"));
         assert!(screen.contains("↑/↓ choose · Enter move · Esc cancel"));
         assert!(screen.contains("CLOSED"));
+    }
+
+    #[test]
+    fn drawer_width_eases_from_right_to_final_width_and_can_be_disabled() {
+        let start = Instant::now();
+        assert_eq!(drawer_width(100, Some(start), true, start), 0);
+        assert!(drawer_width(100, Some(start), true, start + Duration::from_millis(110)) > 0);
+        assert_eq!(
+            drawer_width(100, Some(start), true, start + Duration::from_millis(220)),
+            40
+        );
+        assert_eq!(drawer_width(100, Some(start), false, start), 40);
+    }
+
+    #[test]
+    fn both_drawers_render_through_animation_resize_and_static_geometry() {
+        for worktrees in [false, true] {
+            let mut a = app();
+            a.focus_detail = !worktrees;
+            a.worktrees_view = worktrees;
+            a.detail_offset = 7;
+            let start = Instant::now();
+            a.drawer_opened_at = Some(start);
+
+            let initial_text = draw_drawer((100, 30), &mut a, start);
+            let initial = a.detail_rect;
+            assert!(initial.width < 4);
+            assert_eq!(a.detail_offset, 7, "unusable frames must not clamp scroll");
+            assert!(initial.x + initial.width <= 100);
+            assert!(a.list_rect.x + a.list_rect.width <= 100);
+            assert!(!initial_text.contains(if worktrees {
+                "WORKTREES ·"
+            } else {
+                "BEAD DETAILS"
+            }));
+
+            let halfway = start + Duration::from_millis(110);
+            a.drawer_opened_at = Some(start);
+            let middle_text = draw_drawer((60, 18), &mut a, halfway);
+            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 36);
+            assert!(a.detail_rect.x + a.detail_rect.width <= 60);
+            assert!(a.list_rect.x + a.list_rect.width <= 60);
+            assert!(middle_text.contains(if worktrees {
+                "WORKTREES"
+            } else {
+                "BEAD DETAILS"
+            }));
+
+            let _ = draw_drawer((100, 30), &mut a, halfway);
+            assert!(a.detail_rect.x + a.detail_rect.width <= 100);
+            assert!(a.list_rect.x + a.list_rect.width <= 100);
+
+            let complete = start + Duration::from_millis(300);
+            let final_text = draw_drawer((100, 30), &mut a, complete);
+            let animated_final = a.detail_rect;
+            assert!(animated_final.width > 0);
+            assert!(final_text.contains(if worktrees {
+                "WORKTREES"
+            } else {
+                "BEAD DETAILS"
+            }));
+            a.settings.animate_drawers = false;
+            let static_text = draw_drawer((100, 30), &mut a, start);
+            assert_eq!(a.detail_rect, animated_final);
+            assert_eq!(static_text, final_text);
+        }
     }
 }

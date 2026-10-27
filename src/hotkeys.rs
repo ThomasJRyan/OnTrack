@@ -109,7 +109,7 @@ impl Context {
                 ("↑ / ↓", "Scroll issue details one line"),
                 ("PgUp / PgDn", "Scroll issue details one page"),
                 (
-                    "Tab / Esc",
+                    "Enter / Tab / Esc",
                     "Close the detail drawer and return to the board",
                 ),
                 ("r", "Toggle Ready for an open issue; Epic includes tasks"),
@@ -250,7 +250,7 @@ mod tests {
             Context::Details
                 .entries()
                 .iter()
-                .any(|&(key, _)| key == "Tab / Esc")
+                .any(|&(key, _)| key == "Enter / Tab / Esc")
         );
         assert!(
             Context::Move
