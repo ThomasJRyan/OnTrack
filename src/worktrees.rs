@@ -1983,69 +1983,72 @@ fn dispatch_next_merge(registry: &mut Registry, executor: &mut impl Executor) ->
     {
         return Ok(());
     }
+    // Drop queued work already settled by Git, even when an unrelated active
+    // request still holds the queue. Its prompt/settlement fence stays intact.
+    for index in 0..registry.entries.len() {
+        if registry.entries[index]["merge_queue"].is_object()
+            && matches!(
+                inspect(&registry.repo, &registry.entries[index]).status,
+                WorktreeStatus::Integrated
+                    | WorktreeStatus::WorkspaceClosed
+                    | WorktreeStatus::CheckoutRemoved
+            )
+        {
+            registry.entries[index]["merge_queue"] = Value::Null;
+            registry.entries[index]["detail"] = Value::Null;
+            registry.save()?;
+        }
+    }
     if active_merge(registry, executor)? {
         return Ok(());
     }
-    loop {
-        let Some((index, _)) = registry
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| {
-                entry["merge_queue"]["order"]
-                    .as_u64()
-                    .map(|order| (index, order))
-            })
-            .min_by_key(|(_, order)| *order)
-        else {
-            return Ok(());
-        };
-        if registry.entries[index]["merge_queue"]["blocked"] == true {
-            return Ok(());
-        }
-        if matches!(
-            inspect(&registry.repo, &registry.entries[index]).status,
-            WorktreeStatus::Integrated
-                | WorktreeStatus::WorkspaceClosed
-                | WorktreeStatus::CheckoutRemoved
-        ) {
-            registry.entries[index]["merge_queue"] = Value::Null;
-            registry.entries[index]["detail"] = Value::Null;
-            registry.save()?;
-            continue;
-        }
-        let automatic = registry.entries[index]["merge_queue"]["provenance"] == "automatic";
-        let order = registry.entries[index]["merge_queue"]["order"].clone();
-        let result = (|| {
-            if automatic {
-                let entry = &registry.entries[index];
-                let bead = executor.show_bead(field(entry, "bead_id")?)?;
-                if bead["id"] != entry["bead_id"] || !merge_ready(&bead) {
-                    return Err(error(
-                        "Queued automatic merge deferred: Bead is not ready to merge",
-                    ));
-                }
-            }
-            request_merge(registry, index, executor, automatic)
-        })();
-        if registry.entries[index]["merge_request"].is_object() {
-            registry.entries[index]["merge_request"]["queue_order"] = order;
-            registry.entries[index]["merge_queue"] = Value::Null;
-            registry.save()?;
-        } else if result.is_ok() {
-            // Git may have integrated the branch between queue inspection and
-            // dispatch; no prompt is needed for that completed request.
-            registry.entries[index]["merge_queue"] = Value::Null;
-            registry.entries[index]["detail"] = Value::Null;
-            registry.save()?;
-        } else if let Err(error) = &result {
-            registry.entries[index]["merge_queue"]["blocked"] = json!(true);
-            registry.entries[index]["detail"] =
-                json!(format!("Queued merge needs review before retry: {error}"));
-            registry.save()?;
-        }
-        return result;
+    let Some((index, _)) = registry
+        .entries
+        .iter()
+        .enumerate()
+        .filter_map(|(index, entry)| {
+            entry["merge_queue"]["order"]
+                .as_u64()
+                .map(|order| (index, order))
+        })
+        .min_by_key(|(_, order)| *order)
+    else {
+        return Ok(());
+    };
+    if registry.entries[index]["merge_queue"]["blocked"] == true {
+        return Ok(());
     }
+    let automatic = registry.entries[index]["merge_queue"]["provenance"] == "automatic";
+    let order = registry.entries[index]["merge_queue"]["order"].clone();
+    let result = (|| {
+        if automatic {
+            let entry = &registry.entries[index];
+            let bead = executor.show_bead(field(entry, "bead_id")?)?;
+            if bead["id"] != entry["bead_id"] || !merge_ready(&bead) {
+                return Err(error(
+                    "Queued automatic merge deferred: Bead is not ready to merge",
+                ));
+            }
+        }
+        request_merge(registry, index, executor, automatic)
+    })();
+    if registry.entries[index]["merge_request"].is_object() {
+        registry.entries[index]["merge_request"]["queue_order"] = order;
+        registry.entries[index]["merge_queue"] = Value::Null;
+        registry.save()?;
+    } else if result.is_ok() {
+        // Git may have integrated the branch between queue inspection and
+        // dispatch; no prompt is needed for that completed request.
+        registry.entries[index]["merge_queue"] = Value::Null;
+        registry.entries[index]["detail"] = Value::Null;
+        registry.save()?;
+    } else if let Err(error) = &result {
+        registry.entries[index]["merge_queue"]["blocked"] = json!(true);
+        registry.entries[index]["detail"] =
+            json!(format!("Queued merge needs review before retry: {error}"));
+        registry.save()?;
+    }
+    result
 }
 
 fn finalize(registry: &mut Registry, index: usize, executor: &mut impl Executor) -> io::Result<()> {
@@ -3166,6 +3169,40 @@ mod tests {
         let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
         assert_eq!(rows[0].status, WorktreeStatus::MergeRequested);
         assert_eq!(rows[1].status, WorktreeStatus::MergeQueued);
+        assert!(
+            !executor
+                .calls
+                .iter()
+                .any(|args| args.get(1).is_some_and(|s| s == "prompt"))
+        );
+    }
+
+    #[test]
+    fn integrated_queued_entry_is_cleared_while_active_request_still_holds_queue() {
+        let fixture = Fixture::managed();
+        let second = fixture.second_managed();
+        Fixture::commit_at(&fixture.source, "first-task", "first\n");
+        Fixture::commit_at(&second, "second-task", "second\n");
+        fixture.request();
+        assert_eq!(
+            act_with(
+                &fixture.main,
+                "ot-second",
+                Action::RequestMerge,
+                &mut Fake::default(),
+            )
+            .unwrap()
+            .status,
+            WorktreeStatus::MergeQueued
+        );
+
+        git(&fixture.main, &["merge", "--ff-only", "ontrack/ot-second"]).unwrap();
+        let mut executor = Fake::default();
+        let mut registry = Registry::open(&fixture.main).unwrap();
+        dispatch_next_merge(&mut registry, &mut executor).unwrap();
+        assert!(registry.entries[1]["merge_queue"].is_null());
+        assert!(registry.entries[1]["detail"].is_null());
+        assert!(registry.entries[0]["merge_request"].is_object());
         assert!(
             !executor
                 .calls
