@@ -9,7 +9,9 @@ use crate::{
     settings::{self, DefaultAgent, Settings, Theme},
     ui,
 };
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+};
 use ratatui::layout::Rect;
 use std::{
     collections::{HashMap, HashSet},
@@ -142,6 +144,8 @@ pub struct App {
     pub detail_rect: Rect,
     pub modal: Option<Modal>,
     pub help: Option<Help>,
+    pub(crate) easter_egg: bool,
+    pub(super) easter_egg_progress: usize,
     pub settings: Settings,
     pub theme: Theme,
     pub settings_path: Option<PathBuf>,
@@ -629,6 +633,8 @@ impl App {
             detail_rect: Rect::default(),
             modal: None,
             help: None,
+            easter_egg: false,
+            easter_egg_progress: 0,
             settings,
             theme,
             settings_path,
@@ -1811,7 +1817,32 @@ impl App {
             }
         }
     }
+    fn input(&mut self, input: Event) -> bool {
+        match input {
+            Event::Key(key) => return self.key(key),
+            Event::Mouse(mouse) => self.mouse(mouse.kind, mouse.column, mouse.row),
+            Event::Paste(_) => self.easter_egg_progress = 0,
+            _ => {}
+        }
+        false
+    }
     pub(crate) fn key(&mut self, k: KeyEvent) -> bool {
+        if self.help.is_some()
+            || self.modal.is_some()
+            || (self.mutation_busy && !self.ready_pending)
+        {
+            self.easter_egg_progress = 0;
+        }
+        if k.kind == KeyEventKind::Release {
+            return false;
+        }
+        if self.easter_egg {
+            self.easter_egg_progress = 0;
+            if k.code == KeyCode::Esc {
+                self.easter_egg = false;
+            }
+            return event::is_quit(k);
+        }
         if self.mutation_busy && !self.ready_pending {
             return false;
         }
@@ -1834,6 +1865,7 @@ impl App {
             return false;
         }
         if hotkeys::is_help_key(k) {
+            self.easter_egg_progress = 0;
             self.help = Some(Help {
                 context: hotkeys::Context::current(self),
                 offset: 0,
@@ -1845,6 +1877,36 @@ impl App {
         }
         if event::is_quit(k) {
             return true;
+        }
+        if k.kind == KeyEventKind::Press {
+            use KeyCode::*;
+            const SEQUENCE: [KeyCode; 10] = [
+                Up,
+                Up,
+                Down,
+                Down,
+                Left,
+                Right,
+                Left,
+                Right,
+                Char('b'),
+                Char('a'),
+            ];
+            self.easter_egg_progress = if !k.modifiers.is_empty() {
+                0
+            } else if k.code == SEQUENCE[self.easter_egg_progress] {
+                self.easter_egg_progress + 1
+            } else if k.code == Up {
+                // Only the leading Up pair can overlap a mismatched prefix.
+                if self.easter_egg_progress == 2 { 2 } else { 1 }
+            } else {
+                0
+            };
+            if self.easter_egg_progress == SEQUENCE.len() {
+                self.easter_egg_progress = 0;
+                self.easter_egg = true;
+                return false;
+            }
         }
         // Keep browsing available during Ready and moves, but exclude mutations
         // and handoffs against a partially updated snapshot.
@@ -2892,7 +2954,11 @@ impl App {
         }
     }
     pub(crate) fn mouse(&mut self, k: MouseEventKind, x: u16, y: u16) {
-        if self.modal.is_some() || self.help.is_some() {
+        if self.mutation_busy && !self.ready_pending {
+            self.easter_egg_progress = 0;
+        }
+        if self.easter_egg || self.modal.is_some() || self.help.is_some() {
+            self.easter_egg_progress = 0;
             return;
         }
         if self.worktrees_view {
@@ -3159,20 +3225,10 @@ pub fn run(t: &mut Tui) -> std::io::Result<()> {
         app.poll_agent_observations(Instant::now());
         app.poll_scheduler();
         t.draw(|f| ui::render(f, start.elapsed(), &mut app))?;
-        if let Some(e) = event::poll_event(Duration::from_millis(35))? {
-            match e {
-                crossterm::event::Event::Key(k)
-                    if matches!(
-                        k.kind,
-                        crossterm::event::KeyEventKind::Press
-                            | crossterm::event::KeyEventKind::Repeat
-                    ) && app.key(k) =>
-                {
-                    break;
-                }
-                crossterm::event::Event::Mouse(m) => app.mouse(m.kind, m.column, m.row),
-                _ => {}
-            }
+        if let Some(e) = event::poll_event(Duration::from_millis(35))?
+            && app.input(e)
+        {
+            break;
         }
     }
     Ok(())
@@ -3183,6 +3239,343 @@ mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
     use serde_json::json;
+
+    const EGG_KEYS: [KeyCode; 10] = [
+        KeyCode::Up,
+        KeyCode::Up,
+        KeyCode::Down,
+        KeyCode::Down,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Char('b'),
+        KeyCode::Char('a'),
+    ];
+
+    fn egg_keys(app: &mut App, keys: &[KeyCode]) {
+        for &code in keys {
+            assert!(!app.input(Event::Key(KeyEvent::new(code, KeyModifiers::NONE))));
+        }
+    }
+
+    #[test]
+    fn easter_egg_exact_sequence_works_in_all_browser_views_and_consumes_final_a() {
+        for view in 0..3 {
+            let (mut a, requests, _) = connected_app();
+            assert!(!a.easter_egg);
+            a.focus_detail = view == 1;
+            a.worktrees_view = view == 2;
+            a.worktrees
+                .push(observed_row("b0", worktrees::WorktreeStatus::InProgress));
+            egg_keys(&mut a, &EGG_KEYS[..9]);
+            assert!(!a.easter_egg);
+            while requests.try_recv().is_ok() {}
+            egg_keys(&mut a, &EGG_KEYS[9..]);
+            assert!(a.easter_egg);
+            assert_eq!(a.easter_egg_progress, 0);
+            assert!(a.modal.is_none());
+            assert!(requests.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn easter_egg_partial_keys_keep_ordinary_navigation() {
+        let mut a = app();
+        egg_keys(&mut a, &EGG_KEYS[..4]);
+        assert_eq!(a.selected, Some(2));
+        assert!(!a.easter_egg);
+
+        a.focus_detail = true;
+        a.detail_offset = 10;
+        egg_keys(&mut a, &[KeyCode::Up]);
+        assert_eq!(a.detail_offset, 9);
+        assert!(!a.easter_egg);
+    }
+
+    #[test]
+    fn easter_egg_wrong_reordered_and_uppercase_sequences_reset() {
+        for wrong in [
+            KeyCode::Right,
+            KeyCode::Char('x'),
+            KeyCode::Char('B'),
+            KeyCode::Char('A'),
+        ] {
+            let mut a = app();
+            egg_keys(&mut a, &EGG_KEYS[..8]);
+            egg_keys(&mut a, &[wrong]);
+            assert_eq!(a.easter_egg_progress, 0);
+            egg_keys(&mut a, &EGG_KEYS[8..]);
+            assert!(!a.easter_egg);
+            egg_keys(&mut a, &EGG_KEYS);
+            assert!(a.easter_egg);
+        }
+        for index in 2..EGG_KEYS.len() {
+            if EGG_KEYS[index - 1] == EGG_KEYS[index] {
+                continue;
+            }
+            let mut a = app();
+            let mut reordered = EGG_KEYS;
+            reordered.swap(index - 1, index);
+            egg_keys(&mut a, &reordered);
+            assert!(!a.easter_egg, "swapped keys at {index}");
+        }
+        for (index, code) in [(8, KeyCode::Char('B')), (9, KeyCode::Char('A'))] {
+            let mut a = app();
+            let mut uppercase = EGG_KEYS;
+            uppercase[index] = code;
+            egg_keys(&mut a, &uppercase);
+            assert!(!a.easter_egg);
+        }
+    }
+
+    #[test]
+    fn easter_egg_modified_keys_never_advance_and_reset_progress() {
+        for modifiers in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::CONTROL,
+        ] {
+            for index in 0..EGG_KEYS.len() {
+                let mut a = app();
+                a.focus_detail = true;
+                egg_keys(&mut a, &EGG_KEYS[..index]);
+                a.key(KeyEvent::new(EGG_KEYS[index], modifiers));
+                assert_eq!(a.easter_egg_progress, 0);
+                egg_keys(&mut a, &EGG_KEYS[index + 1..]);
+                assert!(!a.easter_egg, "modified key {index}: {modifiers:?}");
+                egg_keys(&mut a, &EGG_KEYS);
+                assert!(a.easter_egg);
+            }
+        }
+    }
+
+    #[test]
+    fn easter_egg_overlapping_up_prefixes_keep_the_valid_suffix() {
+        for leading_ups in 1..5 {
+            let mut a = app();
+            egg_keys(&mut a, &vec![KeyCode::Up; leading_ups]);
+            egg_keys(&mut a, &EGG_KEYS);
+            assert!(a.easter_egg);
+        }
+        for prefix in 3..EGG_KEYS.len() {
+            let mut a = app();
+            egg_keys(&mut a, &EGG_KEYS[..prefix]);
+            egg_keys(&mut a, &[KeyCode::Up]);
+            assert_eq!(a.easter_egg_progress, 1);
+            egg_keys(&mut a, &EGG_KEYS[1..]);
+            assert!(a.easter_egg);
+        }
+    }
+
+    #[test]
+    fn easter_egg_help_forms_confirmations_and_mutation_lock_reset_progress() {
+        for context in 0..4 {
+            let mut a = app();
+            egg_keys(&mut a, &EGG_KEYS[..2]);
+            match context {
+                0 => {
+                    a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+                }
+                1 => press(&mut a, KeyCode::Char('n')),
+                2 => press(&mut a, KeyCode::Char('d')),
+                _ => {
+                    a.mutation_busy = true;
+                    press(&mut a, KeyCode::Up);
+                }
+            }
+            assert_eq!(a.easter_egg_progress, 0);
+            egg_keys(&mut a, &EGG_KEYS);
+            assert!(!a.easter_egg);
+            assert_eq!(a.easter_egg_progress, 0);
+            a.help = None;
+            a.modal = None;
+            a.mutation_busy = false;
+            egg_keys(&mut a, &EGG_KEYS[2..]);
+            assert!(!a.easter_egg);
+            egg_keys(&mut a, &EGG_KEYS);
+            assert!(a.easter_egg);
+        }
+    }
+
+    #[test]
+    fn easter_egg_repeat_and_release_do_not_advance_or_interrupt_presses() {
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            let mut a = app();
+            for code in EGG_KEYS {
+                a.input(Event::Key(KeyEvent::new_with_kind(
+                    code,
+                    KeyModifiers::NONE,
+                    kind,
+                )));
+            }
+            assert_eq!(a.easter_egg_progress, 0);
+            assert!(!a.easter_egg);
+            for code in EGG_KEYS {
+                egg_keys(&mut a, &[code]);
+                a.input(Event::Key(KeyEvent::new_with_kind(
+                    KeyCode::Char('x'),
+                    KeyModifiers::NONE,
+                    kind,
+                )));
+            }
+            assert!(a.easter_egg);
+        }
+    }
+
+    #[test]
+    fn easter_egg_dismissal_preserves_the_underlying_view_and_resets_progress() {
+        for view in 0..3 {
+            let mut a = app();
+            a.focus_detail = view == 1;
+            a.worktrees_view = view == 2;
+            a.drawer_opened_at = Some(Instant::now());
+            a.detail_offset = 12;
+            egg_keys(&mut a, &EGG_KEYS[..9]);
+            let before = (
+                a.focus_detail,
+                a.worktrees_view,
+                a.drawer_opened_at,
+                a.selected,
+                a.focused_column,
+                a.detail_offset,
+                a.selected_worktree,
+                a.worktree_detail_offset,
+            );
+            egg_keys(&mut a, &EGG_KEYS[9..]);
+            a.key(KeyEvent::new_with_kind(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+                KeyEventKind::Release,
+            ));
+            assert!(a.easter_egg);
+            egg_keys(&mut a, &[KeyCode::Esc]);
+            assert!(!a.easter_egg);
+            assert_eq!(a.easter_egg_progress, 0);
+            assert_eq!(
+                before,
+                (
+                    a.focus_detail,
+                    a.worktrees_view,
+                    a.drawer_opened_at,
+                    a.selected,
+                    a.focused_column,
+                    a.detail_offset,
+                    a.selected_worktree,
+                    a.worktree_detail_offset,
+                )
+            );
+            egg_keys(&mut a, &EGG_KEYS[9..]);
+            assert!(!a.easter_egg);
+            egg_keys(&mut a, &EGG_KEYS);
+            assert!(a.easter_egg);
+        }
+    }
+
+    #[test]
+    fn easter_egg_blocks_hidden_keyboard_mouse_and_paste_actions_but_allows_quit() {
+        for view in 0..3 {
+            let (mut a, requests, _) = connected_app();
+            a.focus_detail = view == 1;
+            a.worktrees_view = view == 2;
+            a.worktrees = vec![
+                observed_row("b0", worktrees::WorktreeStatus::InProgress),
+                observed_row("b1", worktrees::WorktreeStatus::InProgress),
+            ];
+            egg_keys(&mut a, &EGG_KEYS);
+            while requests.try_recv().is_ok() {}
+            let before = (
+                a.selected,
+                a.focused_column,
+                a.focus_detail,
+                a.worktrees_view,
+                a.detail_offset,
+                a.selected_worktree,
+                a.worktree_detail_offset,
+            );
+            for code in [
+                KeyCode::Enter,
+                KeyCode::Tab,
+                KeyCode::Down,
+                KeyCode::Left,
+                KeyCode::Char('n'),
+                KeyCode::Char('N'),
+                KeyCode::Char('e'),
+                KeyCode::Char('d'),
+                KeyCode::Char('h'),
+                KeyCode::Char('m'),
+                KeyCode::Char('s'),
+                KeyCode::Char('c'),
+                KeyCode::Char('r'),
+                KeyCode::Char('w'),
+                KeyCode::Char('a'),
+            ] {
+                egg_keys(&mut a, &[code]);
+            }
+            for code in [KeyCode::Char('?'), KeyCode::Char('v')] {
+                assert!(!a.key(KeyEvent::new(code, KeyModifiers::CONTROL)));
+            }
+            for (kind, column, row) in [
+                (MouseEventKind::Down(MouseButton::Left), 1, 3),
+                (MouseEventKind::ScrollDown, 1, 3),
+                (MouseEventKind::ScrollDown, 31, 3),
+            ] {
+                assert!(!a.input(Event::Mouse(crossterm::event::MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                })));
+            }
+            assert!(!a.input(Event::Paste("nq\u{1b}[Aba".into())));
+            assert!(a.easter_egg);
+            assert_eq!(
+                before,
+                (
+                    a.selected,
+                    a.focused_column,
+                    a.focus_detail,
+                    a.worktrees_view,
+                    a.detail_offset,
+                    a.selected_worktree,
+                    a.worktree_detail_offset,
+                )
+            );
+            assert!(a.modal.is_none() && a.help.is_none());
+            assert!(!a.mutation_busy && !a.paste_pending);
+            assert!(requests.try_recv().is_err());
+            // The screen keeps quit shortcuts even if background work locks input.
+            a.mutation_busy = true;
+            for key in [
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            ] {
+                assert!(a.input(Event::Key(key)));
+            }
+        }
+    }
+
+    #[test]
+    fn easter_egg_paste_does_not_supply_keys_or_carry_partial_progress() {
+        let mut a = app();
+        egg_keys(&mut a, &EGG_KEYS[..9]);
+        assert!(!a.input(Event::Paste("a".into())));
+        assert_eq!(a.easter_egg_progress, 0);
+        egg_keys(&mut a, &EGG_KEYS[9..]);
+        assert!(!a.easter_egg);
+    }
+
+    #[test]
+    fn easter_egg_locked_mouse_input_resets_partial_progress() {
+        let mut a = app();
+        egg_keys(&mut a, &EGG_KEYS[..2]);
+        a.mutation_busy = true;
+        a.mouse(MouseEventKind::ScrollDown, 1, 3);
+        assert_eq!(a.easter_egg_progress, 0);
+        a.mutation_busy = false;
+        egg_keys(&mut a, &EGG_KEYS[2..]);
+        assert!(!a.easter_egg);
+    }
 
     #[test]
     fn update_key_no_longer_opens_browser_action() {
@@ -3475,6 +3868,8 @@ mod tests {
             detail_rect: Rect::new(30, 0, 50, 8),
             modal: None,
             help: None,
+            easter_egg: false,
+            easter_egg_progress: 0,
             settings: Settings::default(),
             theme: Theme::Dark,
             settings_path: None,

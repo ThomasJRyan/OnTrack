@@ -29,6 +29,8 @@ If `bd` is missing or workspace discovery fails, OnTrack stops before raw mode a
 
 A brief splash precedes the browser. A terminal-drawn anime girl blinks and waves beneath the ONTRACK wordmark; narrower terminals use a compact title, and very small terminals show text only. The animation lasts about 1.2 seconds and uses the selected theme. Issue loading starts in the background; quit keys work during startup too.
 
+If you find the hidden egg screen, press `Esc` to return to browsing.
+
 
 ## Your first task
 

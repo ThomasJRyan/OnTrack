@@ -19,6 +19,19 @@ const ASCII_LOGO: [&str; 8] = [
     "   ▒▒▒▒▒▒▒    ▒▒▒▒ ▒▒▒▒▒    ▒▒▒▒▒    ▒▒▒▒▒      ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒  ▒▒▒▒ ▒▒▒▒▒ ",
 ];
 const SPLASH_DURATION: Duration = Duration::from_millis(1200);
+const EGG_ART: [&str; 11] = [
+    ".-^^-.",
+    ".'      '.",
+    "/          \\",
+    "/            \\",
+    "|              |",
+    "|              |",
+    "|              |",
+    "\\            /",
+    "\\          /",
+    "'.        .'",
+    "'------'",
+];
 const GIRL_FRAMES: [[&str; 10]; 3] = [
     [
         "          .-\"\"\"-.          ",
@@ -250,6 +263,36 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     app.detail_rect = Rect::default();
     app.board_columns.clear();
     app.board_cards.clear();
+    if app.easter_egg {
+        app.modal_ready = false;
+        let lines = if a.width >= 20 && a.height >= 13 {
+            EGG_ART
+                .iter()
+                .map(|line| Line::from(Span::styled(*line, Style::default().fg(teal))))
+                .chain([
+                    Line::raw(""),
+                    Line::from(Span::styled("Esc to return", Style::default().fg(muted))),
+                ])
+                .collect::<Vec<_>>()
+        } else if a.width >= 3 && a.height >= 1 {
+            vec![Line::from(Span::styled("(o)", Style::default().fg(teal)))]
+        } else {
+            Vec::new()
+        };
+        let height = lines.len() as u16;
+        if height > 0 {
+            f.render_widget(
+                Paragraph::new(lines).alignment(Alignment::Center),
+                Rect::new(
+                    a.x,
+                    a.y + a.height.saturating_sub(height) / 2,
+                    a.width,
+                    height,
+                ),
+            );
+        }
+        return;
+    }
     if a.width < 24 || a.height < 7 {
         app.modal_ready = false;
         f.render_widget(
@@ -2430,6 +2473,8 @@ mod tests {
             mutation_busy: false,
             ready_pending: false,
             planning_epics: Default::default(),
+            easter_egg: false,
+            easter_egg_progress: 0,
             modal_ready: true,
             paste_seq: 0,
             paste_pending: false,
@@ -2660,6 +2705,40 @@ mod tests {
         let help = draw_at((60, 18), Duration::ZERO, &mut app);
         assert!(help.contains("HOTKEYS"));
         assert!(!help.contains(".-\"\"\"-."));
+    }
+    #[test]
+    fn easter_egg_is_centered_themed_and_responsive() {
+        let mut app = app();
+        app.easter_egg = true;
+        let expected = crate::theme::definition(app.theme).palette.accent;
+        let mut large = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        large.draw(|f| render(f, Duration::ZERO, &mut app)).unwrap();
+        let buffer = large.backend().buffer();
+        let art = buffer
+            .content()
+            .iter()
+            .position(|cell| cell.symbol() == "'")
+            .unwrap();
+        assert_eq!(buffer.content()[art].fg, expected);
+        let output: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(output.contains("Esc to return"));
+        assert!(!output.contains("Title is visible"));
+        let at = output.find(".-^^-.").unwrap();
+        assert_eq!(at % 100 + ".-^^-.".len() / 2, 50);
+        assert_eq!(at / 100, 8, "full art is vertically centered");
+        let widest = output.find("|              |").unwrap();
+        assert_eq!(widest % 100 + "|              |".len() / 2, 50);
+
+        let compact = draw_at((30, 10), Duration::ZERO, &mut app);
+        assert!(compact.contains("(o)"));
+        assert!(!compact.contains("Esc to return"));
+        assert!(!compact.contains("Title is visible"));
+        for size in [(4, 2), (1, 1), (0, 0)] {
+            let output = draw_at(size, Duration::ZERO, &mut app);
+            assert!(!output.contains("Title is visible"));
+        }
+        assert_eq!(app.list_rect, Rect::default());
+        assert!(app.board_cards.is_empty());
     }
     #[test]
     fn hotkey_reference_has_columns_and_scrolls_in_compact_terminals() {
