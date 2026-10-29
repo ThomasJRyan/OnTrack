@@ -19,18 +19,58 @@ const ASCII_LOGO: [&str; 8] = [
     "   ▒▒▒▒▒▒▒    ▒▒▒▒ ▒▒▒▒▒    ▒▒▒▒▒    ▒▒▒▒▒      ▒▒▒▒▒▒▒▒  ▒▒▒▒▒▒  ▒▒▒▒ ▒▒▒▒▒ ",
 ];
 const SPLASH_DURATION: Duration = Duration::from_millis(1200);
-const EGG_ART: [&str; 11] = [
-    ".-^^-.",
-    ".'      '.",
-    "/          \\",
-    "/            \\",
-    "|              |",
-    "|              |",
-    "|              |",
-    "\\            /",
-    "\\          /",
-    "'.        .'",
-    "'------'",
+const EGG_ART: [&str; 51] = [
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣀⣀⣀⣀⣀⣀⣼⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠻⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣽⣭⣭⣭⣭⣭⣭⣿⣿⣷⣶⣶⣶⣤⣤⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⣹⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣟⠋⠉⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⢞⡻⣽⣻⢿⡿⣿⢿⡿⣿⠿⡿⠿⠿⠟⡿⠿⠿⠟⠓⢄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠞⢡⠊⡕⠢⠙⠊⠓⠉⠀⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠑⠄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⠋⠄⢃⠠⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠢⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡞⢁⠢⠘⠠⠐⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⠄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡏⢰⠈⡆⢉⢀⠁⠆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⡞⢠⠃⡜⢠⠃⡰⢈⠠⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⡏⢰⢡⠚⡌⢆⡱⠐⢂⠔⡀⠂⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⡞⣌⠣⣎⠳⣉⠖⠤⡉⠆⡄⠐⠠⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡾⠰⣌⠳⣌⠳⡥⣊⠵⣈⠒⡠⠁⠄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⠣⡝⣬⠳⣬⢳⡱⢥⠒⡤⢃⠔⠡⠈⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣠⣴⠾⠿⠿⢶⣄⠀⠀⠀⠀⠀⠀⠀⠘⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⡏⡵⣙⢦⣛⡴⣣⣷⣮⣷⣰⡣⡜⡠⢁⠈⠀⠀⠀⠀⠀⠀⠀⠀⣠⡴⠛⢉⣀⠤⠀⠀⠀⠉⠳⡄⠀⠀⠀⠀⠀⠀⢱⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⣾⡘⢶⣩⢶⣻⣾⣿⣿⣿⣿⣿⣿⣿⣷⣥⣊⡄⢁⠀⡄⠐⣠⣴⠞⣡⡶⠟⠉⠀⠀⠀⠀⠀⠀⠀⠙⠂⠀⠀⠀⠀⠀⠀⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⢰⢧⡙⣶⣹⣾⣿⡟⡿⣽⡿⣏⠉⠙⠛⢿⣿⣿⣿⣷⣷⡇⠙⠫⣃⠈⢴⣾⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠸⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⣼⢢⡝⡲⣟⠫⠑⠈⠙⣿⣽⣾⣷⣶⣶⣤⣝⣿⣾⢯⣿⠇⠀⠀⠀⠠⣿⣿⣿⣿⣿⡗⠢⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⢀⡟⢦⡙⠵⡀⠂⠀⠀⠀⠈⠻⣿⣿⣿⣿⣏⠜⠻⠟⣿⠟⠀⠀⠀⠀⠀⢹⣿⣿⣿⣿⠧⠚⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢱⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠸⣟⢢⣙⢢⡑⡬⢠⢀⠀⠀⠀⠀⠉⠉⠋⠉⠀⠀⢈⣿⣁⠀⠀⠀⠀⠀⠀⠈⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⢸⣇⠳⣬⣳⣽⡳⣏⣦⢃⡆⣄⡀⢀⠀⠀⠀⣀⣤⣾⣿⣿⣷⣦⣄⡀⢰⣦⣤⣀⣀⢀⣀⣀⣀⠀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⢸⣜⡳⣧⣟⡾⣽⣻⡼⣯⣿⣟⣿⣿⣿⣿⣿⢿⡻⣿⣿⣿⣾⣿⣿⠿⠊⠉⠛⠻⠿⠿⢾⣷⣯⣟⣶⡡⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⢸⣎⣷⣻⢾⣻⡽⣷⣛⠦⠙⢿⡟⣿⣾⣝⡮⢓⠙⠓⠉⠉⠉⢣⠀⠀⠀⠀⠀⠀⢀⣀⠴⠈⠙⢛⠮⡓⢌⠠⠀⠀⠀⠀⠀⠀⠀⠀⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⣸⣟⣮⣟⡿⣽⣻⢷⣏⠷⡀⠀⠹⣶⢯⡿⣿⣿⣾⣶⣶⣶⣤⣤⣴⣶⡶⠿⢟⣛⡿⠁⠀⠀⠀⠀⠂⠡⢂⠂⠄⠀⠀⠀⠀⠀⠀⠀⢳⡀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⢾⣿⡽⣾⣽⣻⣽⣯⡿⣞⣯⢵⢢⢄⠩⣛⢾⣳⢯⣟⡿⣷⣾⣭⣽⣴⣦⣶⠿⠋⠁⠀⠀⠀⠀⠀⠀⠈⠀⠄⠀⠂⠀⠀⠀⠀⠀⠀⠀⢸⣿⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⢸⣿⣹⢷⣏⡿⣷⣏⣿⢿⡾⣏⣷⡎⣷⠈⢶⠉⡾⢉⠿⡉⠿⠹⠏⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⣿⡆⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⣿⣿⣯⣟⣾⢿⣯⢿⣾⣻⢿⡽⣾⡽⡾⣝⡦⡑⡄⠃⡄⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⠏⢣⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⣼⣟⣿⣿⣾⢯⣿⢾⣟⣷⣯⢿⣻⢷⣻⣽⢯⡷⣝⢦⢣⡐⠌⡀⢀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⣿⠁⣠⣦⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠸⣿⣟⡾⣿⣿⣟⣯⣿⣟⣾⡽⣿⣽⣻⡽⣾⢯⣟⣯⣟⣧⡝⣦⣑⢂⠆⡠⢀⠀⡀⢀⠀⡀⢀⠀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⠏⠀⣿⣿⠇⠀⠀⠀⠀⠀",
+    "⠀⠀⢀⣤⣾⣿⣿⣿⢽⣿⣿⣿⣽⣾⣯⢿⣟⣾⣽⣻⣽⣻⣯⢿⣾⢯⣿⢶⣯⡞⣽⣰⢃⡮⣐⡆⢦⡱⢈⡐⠠⠀⠄⡀⠄⠠⠀⢀⠀⠀⠀⡀⢤⣿⠃⢀⣴⣿⣿⣷⣤⡀⠀⠀⠀",
+    "⠀⣴⣿⣿⣿⣿⠿⢻⣧⣛⣿⣿⣿⣷⣿⣟⣿⢾⣳⣟⡾⣷⣻⣯⢿⣻⣽⡿⣞⣿⡷⣯⣟⡾⢧⣛⠣⢆⠡⠄⠡⡈⠄⡐⠠⢀⠡⠀⠠⢈⠐⣸⡿⠋⠀⡾⠛⠿⣿⣿⣿⣿⣦⡀⠀",
+    "⣾⣿⣿⣿⠋⠁⠀⠀⢿⣿⣮⠹⢿⣿⣿⣿⣯⣿⡿⣽⣿⡽⣷⣻⣟⣯⡷⣿⣻⢷⡻⢯⠽⣍⡳⣌⠣⢎⡔⢩⠐⡁⠆⡐⣁⠂⠤⢡⢁⣦⡿⠋⠀⣠⡾⠀⠀⠀⠈⠛⢿⣿⣿⣿⣆",
+    "⠛⣿⣿⣿⣷⣄⡀⠀⠈⢿⣿⣷⣮⣭⡿⣿⣿⣿⣿⣿⣾⣿⢿⣽⣾⢯⣟⡷⣯⢷⣻⣭⢻⡼⣱⢭⡙⣦⡘⡥⢚⡄⣓⠰⢤⣉⣶⡵⠛⠁⠀⠀⣠⣿⠁⠀⠀⠀⠀⣠⣾⣿⣯⣿⠟",
+    "⠀⠀⠙⠿⣿⣿⣿⣶⣤⣸⣿⣿⣿⣿⣷⣭⢟⡻⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣽⣯⢷⣯⢷⣝⣳⣎⢷⡲⣝⡼⣣⣞⣴⠿⠖⠋⠁⢀⣤⣤⣶⣿⣿⠃⠀⣀⣤⣶⣿⣿⣿⡷⠛⠁⠀",
+    "⠀⠀⠀⠀⠈⠛⢿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣯⣷⣷⣮⣽⣝⡻⢛⠛⠿⠿⠿⠿⢿⡿⣿⠿⠾⠷⠿⠟⠛⠛⠛⠉⠁⠀⠀⠀⣀⣤⣿⣿⣿⣿⣿⣷⣶⣿⣿⣿⣿⡷⠛⠉⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠙⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣶⣦⣤⣠⣀⣀⣀⣀⣠⣶⣦⣄⣄⣤⣤⣶⣾⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠋⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠙⠋⠀⢹⣿⣿⣿⣿⣿⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠟⢿⣿⣿⡟⠉⠻⠏⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠀⠀⠙⢿⣧⠈⠙⠿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⡿⠟⠋⢹⣿⠁⠀⠀⠉⠉⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠻⠇⠀⠀⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⣿⠃⠀⠀⠘⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣿⠇⠀⠀⠀⠉⠉⠉⠉⠉⠀⠀⠀⢸⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⣛⠄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠘⣿⣿⣿⣿⡧⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢿⣿⣿⣿⡟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢈⣿⣿⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣿⣿⡏⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢨⣿⣿⣾⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣿⡿⢹⠃⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠐⣿⣿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⠇⢸⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⣿⣿⣟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣾⣟⠀⢺⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣾⣿⡿⣿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⡼⠋⠀⠳⡄⠱⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢰⣿⣿⣿⣁⠸⠷⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⣶⣉⠉⠁⠤⢀⣠⣶⣆⣼⠆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⣿⣿⣿⣿⣦⣴⣶⣿⣦⣄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣴⣿⣿⡿⣿⣿⣷⣶⣶⡿⠿⢿⡿⠇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠁⠉⠛⢿⣿⣿⣿⣿⣿⣷⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
+    "⠀⠀⠀⠀⠀⠀⠀⠀⠀⣴⣿⣿⣿⢻⣽⣿⣿⠟⠋⠁⡀⠀⠀⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⢿⣿⣿⣿⣻⣿⢿⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀",
 ];
 const GIRL_FRAMES: [[&str; 10]; 3] = [
     [
@@ -265,7 +305,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     app.board_cards.clear();
     if app.easter_egg {
         app.modal_ready = false;
-        let lines = if a.width >= 20 && a.height >= 13 {
+        let lines = if a.width >= 65 && a.height >= EGG_ART.len() as u16 + 2 {
             EGG_ART
                 .iter()
                 .map(|line| Line::from(Span::styled(*line, Style::default().fg(teal))))
@@ -2708,37 +2748,108 @@ mod tests {
     }
     #[test]
     fn easter_egg_is_centered_themed_and_responsive() {
-        let mut app = app();
-        app.easter_egg = true;
-        let expected = crate::theme::definition(app.theme).palette.accent;
-        let mut large = Terminal::new(TestBackend::new(100, 30)).unwrap();
-        large.draw(|f| render(f, Duration::ZERO, &mut app)).unwrap();
-        let buffer = large.backend().buffer();
-        let art = buffer
-            .content()
-            .iter()
-            .position(|cell| cell.symbol() == "'")
-            .unwrap();
-        assert_eq!(buffer.content()[art].fg, expected);
-        let output: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
-        assert!(output.contains("Esc to return"));
-        assert!(!output.contains("Title is visible"));
-        let at = output.find(".-^^-.").unwrap();
-        assert_eq!(at % 100 + ".-^^-.".len() / 2, 50);
-        assert_eq!(at / 100, 8, "full art is vertically centered");
-        let widest = output.find("|              |").unwrap();
-        assert_eq!(widest % 100 + "|              |".len() / 2, 50);
-
-        let compact = draw_at((30, 10), Duration::ZERO, &mut app);
-        assert!(compact.contains("(o)"));
-        assert!(!compact.contains("Esc to return"));
-        assert!(!compact.contains("Title is visible"));
-        for size in [(4, 2), (1, 1), (0, 0)] {
-            let output = draw_at(size, Duration::ZERO, &mut app);
-            assert!(!output.contains("Title is visible"));
+        assert_eq!(EGG_ART.len(), 51);
+        for (row, line) in EGG_ART.iter().enumerate() {
+            assert_eq!(Span::raw(*line).width(), 65, "art row {row}");
         }
-        assert_eq!(app.list_rect, Rect::default());
-        assert!(app.board_cards.is_empty());
+        for theme in [Theme::Dark, Theme::Light] {
+            let mut app = app();
+            app.theme = theme;
+            let palette = crate::theme::definition(theme).palette;
+            // Populate browser hit targets before entering the exclusive screen.
+            draw((100, 60), &mut app);
+            assert!(!app.board_cards.is_empty());
+            app.easter_egg = true;
+            app.help = Some(crate::hotkeys::Help {
+                context: crate::hotkeys::Context::Issues,
+                offset: 0,
+            });
+            app.toast = Some(crate::app::Toast {
+                message: "hidden toast".into(),
+                error: false,
+                expires_at: None,
+            });
+            for (width, height) in [(100, 60), (101, 60), (65, 53)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| render(f, Duration::ZERO, &mut app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let left = width / 2 - 65 / 2;
+                let top = (height - 53) / 2;
+                let hint = "Esc to return";
+                let hint_left = width / 2 - Span::raw(hint).width() as u16 / 2;
+                for y in 0..height {
+                    let expected = if (top..top + 51).contains(&y) {
+                        format!(
+                            "{}{}{}",
+                            " ".repeat(left as usize),
+                            EGG_ART[(y - top) as usize],
+                            " ".repeat((width - left - 65) as usize)
+                        )
+                    } else if y == top + 52 {
+                        format!(
+                            "{}{}{}",
+                            " ".repeat(hint_left as usize),
+                            hint,
+                            " ".repeat((width - hint_left - 13) as usize)
+                        )
+                    } else {
+                        " ".repeat(width as usize)
+                    };
+                    let actual: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+                    assert_eq!(actual, expected, "{theme:?} {width}x{height} row {y}");
+                    for x in 0..width {
+                        let cell = &buffer[(x, y)];
+                        assert_eq!(cell.bg, palette.background);
+                        if (top..top + 51).contains(&y) && (left..left + 65).contains(&x) {
+                            assert_eq!(cell.fg, palette.accent);
+                        } else if y == top + 52 && (hint_left..hint_left + 13).contains(&x) {
+                            assert_eq!(cell.fg, palette.muted);
+                        }
+                    }
+                }
+                assert_eq!(app.list_rect, Rect::default());
+                assert_eq!(app.detail_rect, Rect::default());
+                assert!(app.board_columns.is_empty());
+                assert!(app.board_cards.is_empty());
+                assert!(!app.modal_ready);
+            }
+            for (width, height) in [(64, 53), (65, 52), (30, 10), (3, 1)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| render(f, Duration::ZERO, &mut app))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let left = width / 2 - 1;
+                let top = (height - 1) / 2;
+                for y in 0..height {
+                    let expected = if y == top {
+                        format!(
+                            "{}(o){}",
+                            " ".repeat(left as usize),
+                            " ".repeat((width - left - 3) as usize)
+                        )
+                    } else {
+                        " ".repeat(width as usize)
+                    };
+                    let actual: String = (0..width).map(|x| buffer[(x, y)].symbol()).collect();
+                    assert_eq!(actual, expected, "{theme:?} {width}x{height} row {y}");
+                    for x in 0..width {
+                        assert_eq!(buffer[(x, y)].bg, palette.background);
+                        if y == top && (left..left + 3).contains(&x) {
+                            assert_eq!(buffer[(x, y)].fg, palette.accent);
+                        }
+                    }
+                }
+            }
+            for size in [(4, 2), (1, 1), (0, 0)] {
+                let output = draw_at(size, Duration::ZERO, &mut app);
+                assert!(!output.contains("Title is visible"));
+                assert!(!output.contains("HOTKEYS"));
+                assert!(!output.contains("hidden toast"));
+            }
+        }
     }
     #[test]
     fn hotkey_reference_has_columns_and_scrolls_in_compact_terminals() {
