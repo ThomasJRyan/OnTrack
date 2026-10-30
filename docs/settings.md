@@ -89,7 +89,7 @@ Bead keeps its stored agent choice.
 
 Press `s` to open Settings. `Up` / `Down` moves among Theme, Default agent for
 new issues, Agent limit, top-level merge, child merge, workspace close, checkout
-removal, drawer opening animation, and Close.
+removal, drawer animation, and Close.
 The dialog places setting titles in a wider, left-aligned column and centers
 theme, agent, limit, and cleanup controls in the right column. The choice lists open beneath
 its value; on narrow supported terminals, long titles and values may be
@@ -101,8 +101,8 @@ or closed. The bounded lists scroll to keep the current choice visible. `Enter`
 or `Space` opens the focused list; while it is open, either key saves the selected
 choice again and closes the list, which also lets you retry a failed save. `Esc` closes
 an open list without reverting a successful change; `Esc` again closes Settings.
-`Enter` / `Space` toggles a preference. Drawer opening animation is on by default;
-turn it off to open both right-side drawers immediately. Changes take effect at
+`Enter` / `Space` toggles a preference. Drawer animation is on by default;
+turn it off to open and close both right-side drawers immediately. Changes take effect at
 once and save with the rest of Settings. Every change saves all settings
 together. The removal preference is labeled “Remove checkout + close Herdr workspace”;
 removing the checkout also closes its Herdr workspace. Cleanup remains

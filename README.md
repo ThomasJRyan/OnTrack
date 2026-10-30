@@ -13,11 +13,16 @@ Browse six Kanban columns: **Open, Ready, Blocked, In Progress, Ready To Merge, 
 
 Mark tasks **Ready** and let OnTrack dispatch eligible work to Herdr agents in separate Git worktrees, with a concurrency limit you control. Need to start something immediately? Hand the selected Bead to an agent with `h`.
 
-Agents commit and check their work, then signal **Ready To Merge**, not Closed. OnTrack closes a tracked Bead only after verifying integration into its recorded target. The worktree drawer preserves workspace focus, confirmed merge and cleanup, continue (`a`), and restart (`Shift+R`) actions. Automatic merging and cleanup are optional; verified integration still closes the Bead when both are disabled.
+Agents commit and check their work, then signal **Ready To Merge**, not Closed. OnTrack closes a tracked Bead only after verifying integration into its recorded target. The worktree drawer preserves workspace focus, confirmed merge and cleanup, continue (`a`), force removal (`Shift+X`, discards uncommitted files), and restart (`Shift+R`) actions. Automatic merging and cleanup are optional; verified integration still closes the Bead when both are disabled.
 
-The board refreshes automatically, scrolls horizontally on narrow terminals, and scrolls each column vertically. Children integrate into their parent branch before closing. Settings include themes, a default agent, and a concurrent-agent limit. Run `ontrack update` to install a verified compatible release.
+The board refreshes automatically, reflows into 3×2 and 2×3 grids on narrower terminals, and scrolls each column vertically. Children integrate into their parent branch before closing. Settings include themes, a default agent, and a concurrent-agent limit. Run `ontrack update` to install a verified compatible release.
 
 ## Get started
+
+OnTrack requires both commands on your `PATH`:
+
+- **Beads (`bd`)** for issue tracking — [install Beads](https://beads.gascity.com/getting-started/installation).
+- **Herdr (`herdr`)** for the shell and agent workspaces — [install Herdr](https://herdr.dev/docs/install/).
 
 For macOS or Ubuntu 24.04-compatible Linux, with Bash, `curl`, and Python 3:
 
@@ -45,7 +50,7 @@ See [installation and updates](docs/installation.md) for supported architectures
 | `n` / `Shift+N`, `e` | Create a Bead / child task, or edit the selection |
 | `h` | Hand the selected Bead to a Herdr agent |
 | `w` | Open worktree drawer; `Enter` focuses the selected Herdr workspace |
-| `s`, `Ctrl+?` | Open settings or context-specific hotkey help |
+| `s`, `Shift+?` | Open settings or context-specific hotkey help |
 | `Esc`, `q` / `Ctrl+C` | Go back; quit when no dialog is open |
 
 All six columns retain empty counts. Moving to Ready schedules eligible agents; other moves do not start or stop them, and individual moves never cascade to children. Closed moves and `c` require fresh tracked integration proof; `d` permanently deletes after confirmation. See the [user guide](docs/user-guide.md), [settings](docs/settings.md), [development guide](docs/development.md), [CI checks](docs/ci.md), and [release guide](docs/releases.md).

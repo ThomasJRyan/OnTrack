@@ -137,6 +137,10 @@ impl Context {
                 ("m", "Request merge for selected handoff"),
                 ("c", "Close integrated Herdr workspace"),
                 ("x", "Remove integrated checkout"),
+                (
+                    "Shift+X",
+                    "Force remove checkout (discard uncommitted files)",
+                ),
                 ("a", "Ask original idle agent to continue in this checkout"),
                 ("Shift+R", "Restart selected active task"),
                 ("r", "Refresh outstanding worktrees"),
@@ -207,7 +211,7 @@ impl Context {
             ],
         };
         rows.extend([
-            ("Ctrl+?", "Open or close this hotkey reference"),
+            ("Shift+?", "Open or close this hotkey reference"),
             ("↑ / k · ↓ / j", "Scroll this reference while it is open"),
             ("PgUp / PgDn", "Scroll this reference by ten lines"),
             ("Home / End", "Jump to start / end of this reference"),
@@ -224,11 +228,9 @@ impl Context {
 }
 
 pub fn is_help_key(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(
-            key.code,
-            KeyCode::Char('?') | KeyCode::Char('/') | KeyCode::Char('_')
-        )
+    (key.code == KeyCode::Char('?')
+        && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT))
+        || (key.code == KeyCode::Char('/') && key.modifiers == KeyModifiers::SHIFT)
 }
 
 #[cfg(test)]
@@ -272,20 +274,26 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_reported_help_keys_without_stealing_text_editing() {
+    fn recognizes_question_mark_help_and_rejects_old_control_shortcuts() {
         for (code, modifiers) in [
-            (KeyCode::Char('?'), KeyModifiers::CONTROL),
-            (
-                KeyCode::Char('/'),
-                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-            ),
-            (KeyCode::Char('/'), KeyModifiers::CONTROL),
-            (KeyCode::Char('_'), KeyModifiers::CONTROL),
+            (KeyCode::Char('?'), KeyModifiers::NONE),
+            (KeyCode::Char('?'), KeyModifiers::SHIFT),
+            (KeyCode::Char('/'), KeyModifiers::SHIFT),
         ] {
             assert!(is_help_key(KeyEvent::new(code, modifiers)));
         }
-        for code in [KeyCode::Char('?'), KeyCode::Char('/'), KeyCode::Backspace] {
+        for code in [KeyCode::Char('/'), KeyCode::Backspace] {
             assert!(!is_help_key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+        for modifiers in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            KeyModifiers::ALT,
+            KeyModifiers::ALT | KeyModifiers::SHIFT,
+        ] {
+            for code in [KeyCode::Char('?'), KeyCode::Char('/'), KeyCode::Char('_')] {
+                assert!(!is_help_key(KeyEvent::new(code, modifiers)));
+            }
         }
     }
 }

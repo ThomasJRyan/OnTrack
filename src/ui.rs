@@ -417,11 +417,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
     };
     render_header_feedback(f, v[0], feedback.as_deref(), app.theme);
     render_kanban(f, v[1], app);
-    if app.focus_detail {
-        render_detail_drawer(f, a, app, Instant::now());
-    } else if app.worktrees_view {
-        render_worktree_drawer(f, a, app, Instant::now());
-    }
+    render_drawer(f, a, app, Instant::now());
     f.render_widget(
         Paragraph::new(footer_text(v[2].width as usize))
             .style(Style::default().fg(muted).bg(palette.panel_alt)),
@@ -528,7 +524,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             | crate::app::Modal::ConfirmDelete { .. } => confirmation_lines
                 .as_ref()
                 .map_or(10, |lines| (lines.len() + 2).max(10) as u16),
-            crate::app::Modal::ConfirmWorktree { action: 3, .. } => 12,
+            crate::app::Modal::ConfirmWorktree { action: 3 | 5, .. } => 12,
             crate::app::Modal::ConfirmWorktree { action: 4, .. } => 11,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
         };
@@ -589,6 +585,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
                 crate::app::Modal::ConfirmWorktree { action: 4, .. } => " CONTINUE TASK? ",
+                crate::app::Modal::ConfirmWorktree { action: 5, .. } => " FORCE REMOVE WORKTREE? ",
                 crate::app::Modal::ConfirmWorktree { .. } => " CONFIRM WORKTREE ACTION ",
                 _ => " DELETE BEAD? ",
             })
@@ -803,7 +800,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                         "Remove checkout + close Herdr workspace",
                         draft.auto_remove_checkout,
                     ),
-                    ("Animate drawer opening", draft.animate_drawers),
+                    ("Animate drawers", draft.animate_drawers),
                 ]
                 .into_iter()
                 .enumerate()
@@ -1247,6 +1244,9 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     2 => {
                         "Remove integrated checkout and close its Herdr workspace? Branch is preserved."
                     }
+                    5 => {
+                        "Discard all uncommitted checkout changes?\n\nThe Herdr workspace will close and its\ncheckout will be removed without merging.\nThe branch is kept. The Bead stays open.\nNo replacement agent will start."
+                    }
                     4 => {
                         "Ask the original idle agent to continue in this checkout? Existing changes are preserved. Verify its work before merging."
                     }
@@ -1348,44 +1348,40 @@ fn column_heading_parts(
     )
 }
 
+fn board_columns(width: u16) -> u16 {
+    if width >= 144 {
+        6
+    } else if width >= 54 {
+        3
+    } else {
+        2
+    }
+}
+
 fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
     let statuses = crate::app::BOARD_STATUSES;
     let palette = crate::theme::definition(app.theme).palette;
-    let previous_card_capacity = std::array::from_fn::<_, 6, _>(|column| {
-        app.board_cards
-            .iter()
-            .filter(|(index, _)| {
-                app.beads.get(*index).is_some_and(|bead| {
-                    statuses
-                        .iter()
-                        .position(|status| *status == crate::app::display_status(bead))
-                        == Some(column)
-                })
-            })
-            .count()
-    });
-    let previously_visible_selection = app
-        .selected
-        .is_some_and(|selected| app.board_cards.iter().any(|(index, _)| *index == selected));
-    let visible = (area.width / 18).clamp(1, 6) as usize;
-    if app.focused_column < app.board_column_offset {
-        app.board_column_offset = app.focused_column;
-    }
-    if app.focused_column >= app.board_column_offset + visible {
-        app.board_column_offset = app.focused_column + 1 - visible;
-    }
-    app.board_column_offset = app.board_column_offset.min(6 - visible);
+    let columns = board_columns(area.width);
+    let rows = 6 / columns;
     app.board_columns.clear();
     app.board_cards.clear();
-    let width = area.width / visible as u16;
-    let rem = area.width % visible as u16;
-    let mut x = area.x;
-    for slot in 0..visible {
-        let column = app.board_column_offset + slot;
-        let col_width = width + u16::from((slot as u16) < rem);
-        let rect = Rect::new(x, area.y, col_width, area.height);
+    for (column, status) in statuses.iter().copied().enumerate() {
+        let col = column as u16 % columns;
+        let row = column as u16 / columns;
+        let width = area.width / columns;
+        let height = area.height / rows;
+        let extra_width = area.width % columns;
+        let extra_height = area.height % rows;
+        let rect = Rect::new(
+            area.x + col * width + col.min(extra_width),
+            area.y + row * height + row.min(extra_height),
+            width + u16::from(col < extra_width),
+            height + u16::from(row < extra_height),
+        );
         app.board_columns.push((column, rect));
-        let status = statuses[column];
+        if rect.width < 2 || rect.height < 3 {
+            continue;
+        }
         let mut indices = crate::app::list_layout(&app.beads, &Default::default())
             .groups
             .into_iter()
@@ -1406,8 +1402,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
             0
         };
         if can_show_cards
-            && previously_visible_selection
-            && previous_card_capacity[column] > visible_cards
+            && app.focused_column == column
             && let Some(row) = app
                 .selected
                 .and_then(|selected| indices.iter().position(|&index| index == selected))
@@ -1489,13 +1484,12 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
             app.column_offsets[column] = 0;
             f.render_widget(
                 Paragraph::new(truncate_display(
-                    "Resize to 10 rows to show cards",
+                    &format!("Resize to {} rows to show cards", rows * 8 + 3),
                     inner.width as usize,
                 ))
                 .style(Style::default().fg(palette.muted)),
                 inner,
             );
-            x += col_width;
             continue;
         }
         for (n, &index) in indices.iter().enumerate().skip(offset).take(visible_cards) {
@@ -1513,9 +1507,7 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                     .bg(palette.selected_background)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
-                    .fg(palette.foreground)
-                    .bg(palette.panel_alt)
+                Style::default().fg(palette.foreground).bg(palette.panel)
             };
             let kind = row_issue_type(bead);
             let title_width = card.width.saturating_sub(2) as usize;
@@ -1568,34 +1560,44 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                                 Style::default()
                                     .fg(crate::theme::issue_type_color(app.theme, &kind)),
                             )
-                            .style(Style::default().bg(palette.panel_alt)),
+                            .style(Style::default().bg(palette.panel)),
                     )
                     .style(style),
                 card,
             );
         }
-        x += col_width;
     }
 }
 
-fn drawer_width(screen_width: u16, started: Option<Instant>, enabled: bool, now: Instant) -> u16 {
-    let target = screen_width.min((screen_width * 2 / 5).max(36));
-    let Some(started) = started.filter(|_| enabled) else {
-        return target;
+fn render_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
+    let closing = app.drawer_animation.as_ref().filter(|animation| {
+        app.settings.animate_drawers && animation.to == 0.0 && animation.fraction(now) > 0.0
+    });
+    if app.focus_detail || closing.is_some_and(|animation| !animation.worktrees) {
+        render_detail_drawer(f, screen, app, now);
+    } else if app.worktrees_view || closing.is_some_and(|animation| animation.worktrees) {
+        render_worktree_drawer(f, screen, app, now);
+    }
+}
+
+fn drawer_width(screen_width: u16, app: &App, now: Instant) -> u16 {
+    let percent = match board_columns(screen_width) {
+        6 => 40,
+        3 => 70,
+        _ => 100,
     };
-    let progress = (now.saturating_duration_since(started).as_secs_f32() / 0.22).clamp(0.0, 1.0);
-    let eased = 1.0 - (1.0 - progress).powi(3);
-    (f32::from(target) * eased).round() as u16
+    let target = screen_width.min((u32::from(screen_width) * percent / 100).max(36) as u16);
+    let fraction = app
+        .drawer_animation
+        .as_ref()
+        .filter(|_| app.settings.animate_drawers)
+        .map_or(1.0, |animation| animation.fraction(now));
+    (f32::from(target) * fraction).round() as u16
 }
 
 fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
     let palette = crate::theme::definition(app.theme).palette;
-    let width = drawer_width(
-        screen.width,
-        app.drawer_opened_at,
-        app.settings.animate_drawers,
-        now,
-    );
+    let width = drawer_width(screen.width, app, now);
     let area = Rect::new(
         screen.x + screen.width.saturating_sub(width),
         screen.y + 2,
@@ -1694,12 +1696,7 @@ fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant
 
 fn render_worktree_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant) {
     let palette = crate::theme::definition(app.theme).palette;
-    let width = drawer_width(
-        screen.width,
-        app.drawer_opened_at,
-        app.settings.animate_drawers,
-        now,
-    );
+    let width = drawer_width(screen.width, app, now);
     let area = Rect::new(
         screen.x + screen.width.saturating_sub(width),
         screen.y + 2,
@@ -1892,7 +1889,7 @@ fn render_worktree_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Insta
                 footer.width as usize,
             )),
             Line::from(truncate_display(
-                "x remove · a continue · R restart",
+                "x remove · X force · a continue · R restart",
                 footer.width as usize,
             )),
         ])
@@ -2110,7 +2107,7 @@ fn render_help(f: &mut Frame, app: &mut App) {
     let footer = if area.width < 45 {
         "Esc close · ↑↓ scroll"
     } else {
-        "Esc / Ctrl+? close · ↑↓ / PgUp PgDn scroll"
+        "Esc / Shift+? close · ↑↓ / PgUp PgDn scroll"
     };
     f.render_widget(
         Paragraph::new(truncate_display(
@@ -2461,7 +2458,6 @@ mod tests {
                 data: json!({"issue_type":"task","unknown":{"n":5},"comments":[{"body":"hello comment"}],"unicode":"界界界界界界界界界界"}),
             }],
             focused_column: 5,
-            board_column_offset: 0,
             column_offsets: [0; 6],
             board_columns: Vec::new(),
             board_cards: Vec::new(),
@@ -2470,7 +2466,7 @@ mod tests {
             detail: None,
             focus_detail: false,
             detail_offset: 0,
-            drawer_opened_at: None,
+            drawer_animation: None,
             list_loading: false,
             detail_loading: false,
             list_error: None,
@@ -2556,11 +2552,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let screen = frame.area();
-                if app.focus_detail {
-                    render_detail_drawer(frame, screen, app, now);
-                } else {
-                    render_worktree_drawer(frame, screen, app, now);
-                }
+                render_drawer(frame, screen, app, now);
             })
             .unwrap();
         terminal
@@ -2860,6 +2852,7 @@ mod tests {
         });
         let (wide, _) = draw((80, 15), &mut a);
         assert!(wide.contains("HOTKEYS · Create / edit form"));
+        assert!(wide.contains("Esc / Shift+? close"));
         assert!(wide.contains("Text / Space"));
         assert!(wide.contains("Type in title or description"));
         a.help.as_mut().unwrap().offset = usize::MAX;
@@ -3039,7 +3032,7 @@ mod tests {
                 let cell = &buffer[(x, y)];
                 assert_eq!(cell.symbol(), glyph);
                 assert_eq!(cell.fg, crate::theme::issue_type_color(theme, "task"));
-                assert_eq!(cell.bg, palette.panel_alt);
+                assert_eq!(cell.bg, palette.panel);
                 assert_ne!(cell.fg, cell.bg);
             }
             let unselected_card = a
@@ -3113,7 +3106,7 @@ mod tests {
                 let cell = &terminal.backend().buffer()[(card.x, card.y)];
                 assert_eq!(cell.symbol(), "╭");
                 assert_eq!(cell.fg, crate::theme::issue_type_color(theme, expected));
-                assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel_alt);
+                assert_eq!(cell.bg, crate::theme::definition(theme).palette.panel);
             }
         }
     }
@@ -3344,17 +3337,17 @@ mod tests {
         a.focused_column = 0;
         for height in [7, 8, 9] {
             a.board_cards.push((99, Rect::new(1, 1, 1, 1)));
-            let screen = draw((120, height), &mut a).0;
+            let screen = draw((144, height), &mut a).0;
             assert!(
-                screen.contains("Resize to 10 rows"),
+                screen.contains("Resize to 11 rows"),
                 "height {height}: {screen}"
             );
             assert!(a.board_cards.is_empty(), "stale cards at height {height}");
         }
-        let screen = draw((120, 10), &mut a).0;
-        assert!(screen.contains("Resize to 10 rows"), "{screen}");
+        let screen = draw((144, 10), &mut a).0;
+        assert!(screen.contains("Resize to 11 rows"), "{screen}");
         assert!(a.board_cards.is_empty());
-        let screen = draw((120, 12), &mut a).0;
+        let screen = draw((144, 12), &mut a).0;
         assert!(screen.contains("Title is visible"), "{screen}");
         assert!(
             a.board_cards
@@ -3556,6 +3549,21 @@ mod tests {
         assert!(rendered.contains("Discard all uncommitted checkout changes."));
         assert!(rendered.contains("Worktree: ot-selected"));
         assert!(rendered.contains("y confirm"));
+    }
+    #[test]
+    fn force_remove_dialog_shows_data_loss_warning_and_handoff_id() {
+        let mut app = app();
+        app.worktrees_view = true;
+        app.modal = Some(crate::app::Modal::ConfirmWorktree {
+            id: "ot-selected".into(),
+            action: 5,
+        });
+        let rendered = draw((100, 30), &mut app).0;
+        assert!(rendered.contains("FORCE REMOVE WORKTREE?"));
+        assert!(rendered.contains("Discard all uncommitted checkout changes?"));
+        assert!(rendered.contains("Worktree: ot-selected"));
+        assert!(rendered.contains("y confirm"));
+        assert!(rendered.contains("The branch is kept. The Bead stays open."));
     }
     #[test]
     fn continue_dialog_names_existing_checkout_and_keeps_confirmation_visible() {
@@ -4402,6 +4410,124 @@ mod tests {
     }
 
     #[test]
+    fn split_pane_board_keeps_full_headings_and_cards_readable() {
+        let mut a = overflowing_board();
+        let (screen, _) = draw((112, 55), &mut a);
+        for (column, status) in crate::app::BOARD_STATUSES.iter().enumerate() {
+            assert!(screen.contains(status_label(status)));
+            assert!(screen.contains(&format!("Card {column}-00")));
+            let rect = a.board_columns[column].1;
+            assert!(rect.width >= 37);
+            assert_eq!(rect.y, if column < 3 { 2 } else { 28 });
+        }
+    }
+
+    #[test]
+    fn board_grid_reflows_at_width_boundaries_and_tiles_offset_area() {
+        for (width, columns) in [
+            (24, 2),
+            (53, 2),
+            (54, 3),
+            (55, 3),
+            (107, 3),
+            (108, 3),
+            (109, 3),
+            (112, 3),
+            (120, 3),
+            (143, 3),
+            (144, 6),
+            (145, 6),
+        ] {
+            let mut a = overflowing_board();
+            let area = Rect::new(3, 2, width, 49);
+            let mut terminal = Terminal::new(TestBackend::new(width + 6, 53)).unwrap();
+            terminal.draw(|f| render_kanban(f, area, &mut a)).unwrap();
+            assert_eq!(a.board_columns.len(), 6);
+            let mut cells = std::collections::HashSet::new();
+            for (column, &(status, rect)) in a.board_columns.iter().enumerate() {
+                assert_eq!(column, status);
+                assert_eq!(rect.x, a.board_columns[column % columns].1.x);
+                assert_eq!(rect.y, a.board_columns[column / columns * columns].1.y);
+                for y in rect.y..rect.bottom() {
+                    for x in rect.x..rect.right() {
+                        assert!(area.contains((x, y).into()));
+                        assert!(cells.insert((x, y)), "overlapping columns");
+                    }
+                }
+                let cards = a
+                    .board_cards
+                    .iter()
+                    .filter(|(i, _)| i / 12 == column)
+                    .collect::<Vec<_>>();
+                assert!(!cards.is_empty());
+                for (_, card) in cards {
+                    assert!(card.x > rect.x && card.right() < rect.right());
+                    assert!(card.y > rect.y && card.bottom() < rect.bottom());
+                }
+            }
+            assert_eq!(cells.len(), usize::from(width) * 49);
+        }
+        for width in [0, 1, 2, 24, 53, 54, 107, 108, 143, 144] {
+            for height in 0..8 {
+                let mut a = overflowing_board();
+                a.board_cards.push((999, Rect::new(1, 1, 1, 1)));
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|f| render_kanban(f, f.area(), &mut a))
+                    .unwrap();
+                assert!(a.board_cards.is_empty(), "{width}x{height}");
+            }
+        }
+    }
+
+    #[test]
+    fn grid_resize_preserves_selection_and_lower_row_mouse_navigation() {
+        use crossterm::event::{KeyCode, MouseButton, MouseEventKind};
+
+        let mut a = overflowing_board();
+        a.focused_column = 4;
+        a.selected = Some(56);
+        a.column_rows[4] = 8;
+        a.column_offsets[4] = 7;
+        for size in [
+            (144, 50),
+            (143, 50),
+            (112, 50),
+            (80, 50),
+            (40, 50),
+            (40, 9),
+            (112, 50),
+            (144, 50),
+        ] {
+            draw(size, &mut a);
+            assert_eq!(a.selected, Some(56));
+            assert_eq!(a.focused_column, 4);
+            if size.1 == 50 {
+                assert!(a.board_cards.iter().any(|(i, _)| *i == 56));
+            } else {
+                assert!(a.board_cards.is_empty());
+            }
+        }
+        for size in [(112, 50), (80, 50), (40, 50)] {
+            draw(size, &mut a);
+            let (index, card) = *a.board_cards.iter().find(|(i, _)| i / 12 == 5).unwrap();
+            a.mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                card.x + 1,
+                card.y + 1,
+            );
+            assert_eq!(a.focused_column, 5);
+            assert_eq!(a.selected, Some(index));
+            a.mouse(MouseEventKind::ScrollDown, card.x + 1, card.y + 1);
+            assert_eq!(a.selected, Some(index + 1));
+            board_key(&mut a, KeyCode::Left);
+            assert_eq!(a.focused_column, 4);
+            board_key(&mut a, KeyCode::Right);
+            assert_eq!(a.selected, Some(index + 1));
+        }
+    }
+
+    #[test]
     fn board_cards_and_hit_rectangles_stay_inside_bottom_column_border() {
         for height in 8..=24 {
             let mut a = overflowing_board();
@@ -4413,11 +4539,14 @@ mod tests {
                 let column = a
                     .board_columns
                     .iter()
-                    .find(|(_, column)| card.x > column.x && card.right() < column.right())
+                    .find(|(_, column)| column.contains((card.x, card.y).into()))
                     .unwrap()
                     .1;
                 assert!(
-                    card.y > column.y && card.bottom() < column.bottom(),
+                    card.x > column.x
+                        && card.right() < column.right()
+                        && card.y > column.y
+                        && card.bottom() < column.bottom(),
                     "height {height}: {card:?} in {column:?}"
                 );
             }
@@ -4440,8 +4569,10 @@ mod tests {
             .draw(|frame| render_kanban(frame, frame.area(), &mut a))
             .unwrap();
         assert!(a.board_cards.is_empty());
-        for pair in a.board_columns.windows(2) {
-            assert_eq!(pair[0].1.right(), pair[1].1.x);
+        for row in a.board_columns.chunks(3) {
+            for pair in row.windows(2) {
+                assert_eq!(pair[0].1.right(), pair[1].1.x);
+            }
         }
         let buffer = terminal.backend().buffer();
         for (_, column) in &a.board_columns {
@@ -4454,7 +4585,7 @@ mod tests {
         use crossterm::event::KeyCode;
 
         let mut a = overflowing_board();
-        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(144, 24)).unwrap();
         terminal
             .draw(|frame| render_kanban(frame, frame.area(), &mut a))
             .unwrap();
@@ -4465,7 +4596,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(a.selected, Some(3));
-        let mut small = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        let mut small = Terminal::new(TestBackend::new(144, 12)).unwrap();
         small
             .draw(|frame| render_kanban(frame, frame.area(), &mut a))
             .unwrap();
@@ -4485,7 +4616,7 @@ mod tests {
                 .iter()
                 .any(|(index, _)| Some(*index) == a.selected)
         );
-        let mut large = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut large = Terminal::new(TestBackend::new(144, 24)).unwrap();
         large
             .draw(|frame| render_kanban(frame, frame.area(), &mut a))
             .unwrap();
@@ -4545,14 +4676,9 @@ mod tests {
                     .draw(|f| render(f, Duration::from_secs(2), &mut a))
                     .unwrap();
                 let buffer = terminal.backend().buffer();
-                assert!(
-                    a.board_columns
-                        .windows(2)
-                        .all(|pair| pair[0].1.right() == pair[1].1.x)
-                );
-                if size.0 == 80 {
-                    assert_eq!(a.board_columns.last().unwrap().0, 5);
-                    assert!(a.board_columns.first().unwrap().0 > 0);
+                assert_eq!(a.board_columns.len(), 6);
+                for row in a.board_columns.chunks(if size.0 == 80 { 3 } else { 6 }) {
+                    assert!(row.windows(2).all(|pair| pair[0].1.right() == pair[1].1.x));
                 }
                 let mut total_cards = 0;
                 for &(column, rect) in &a.board_columns {
@@ -4574,24 +4700,48 @@ mod tests {
                     let cards = a
                         .board_cards
                         .iter()
-                        .filter(|(_, card)| card.x >= rect.x && card.right() <= rect.right())
+                        .filter(|(_, card)| {
+                            rect.contains(card.as_position()) && card.bottom() <= rect.bottom()
+                        })
                         .count();
                     let expected = (rect.height.saturating_sub(3) as usize / 5).min(3);
                     assert_eq!(cards, expected, "{theme:?} {size:?} column {column}");
                     total_cards += cards;
                 }
                 assert_eq!(total_cards, a.board_cards.len());
-                for (_, card) in &a.board_cards {
+                for (index, card) in &a.board_cards {
                     let column = a
                         .board_columns
                         .iter()
-                        .find(|(_, rect)| card.x >= rect.x && card.right() <= rect.right())
+                        .find(|(_, rect)| {
+                            rect.contains(card.as_position()) && card.bottom() <= rect.bottom()
+                        })
                         .unwrap()
                         .1;
                     assert!(
                         card.bottom() < column.bottom(),
                         "card overlaps bottom border at {size:?}"
                     );
+                    let palette = crate::theme::definition(theme).palette;
+                    for y in card.y..card.bottom() {
+                        for x in card.x..card.right() {
+                            let selected_interior = a.selected == Some(*index)
+                                && x > card.x
+                                && x + 1 < card.right()
+                                && y > card.y
+                                && y + 1 < card.bottom();
+                            let expected = if selected_interior {
+                                palette.selected_background
+                            } else {
+                                buffer[(column.x, column.y + 1)].bg
+                            };
+                            assert_eq!(
+                                buffer[(x, y)].bg,
+                                expected,
+                                "{theme:?} {size:?} card {index} at ({x}, {y})"
+                            );
+                        }
+                    }
                 }
                 a.beads.clear();
                 terminal
@@ -4627,18 +4777,18 @@ mod tests {
         (down, up): (crossterm::event::Event, crossterm::event::Event),
     ) {
         let mut a = overflowing_board();
-        draw((120, 24), &mut a);
+        draw((144, 24), &mut a);
         assert_board_viewport(&a, 0, 0);
         for row in 1..=2 {
             board_event(&mut a, down.clone());
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(row), "after {down:?}");
             assert_board_viewport(&a, 0, 0);
         }
         let bottom = a.board_cards.iter().find(|(i, _)| *i == 2).unwrap().1;
         for row in 3..=4 {
             board_event(&mut a, down.clone());
-            let screen = draw((120, 24), &mut a).0;
+            let screen = draw((144, 24), &mut a).0;
             assert_eq!(a.selected, Some(row), "after {down:?}");
             assert_board_viewport(&a, 0, row - 2);
             assert_eq!(
@@ -4649,7 +4799,7 @@ mod tests {
         }
         for row in (0..4).rev() {
             board_event(&mut a, up.clone());
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(row), "after {up:?}");
             assert_board_viewport(&a, 0, row.min(2));
             if row < 2 {
@@ -4660,7 +4810,7 @@ mod tests {
             }
         }
         board_event(&mut a, up);
-        draw((120, 24), &mut a);
+        draw((144, 24), &mut a);
         assert_eq!(a.selected, Some(0));
         assert_board_viewport(&a, 0, 0);
     }
@@ -4669,10 +4819,10 @@ mod tests {
     fn board_navigation_does_not_wrap_at_first_or_last_card() {
         for (down, up) in board_navigation_events() {
             let mut a = overflowing_board();
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             for step in 1usize..=14 {
                 board_event(&mut a, down.clone());
-                draw((120, 24), &mut a);
+                draw((144, 24), &mut a);
                 let row = step.min(11);
                 assert_eq!(a.selected, Some(row));
                 assert_board_viewport(&a, 0, row.saturating_sub(2));
@@ -4680,7 +4830,7 @@ mod tests {
             }
             for step in 1usize..=14 {
                 board_event(&mut a, up.clone());
-                draw((120, 24), &mut a);
+                draw((144, 24), &mut a);
                 let row = 11usize.saturating_sub(step);
                 assert_eq!(a.selected, Some(row));
                 assert_board_viewport(&a, 0, row.min(9));
@@ -4693,33 +4843,33 @@ mod tests {
     fn board_navigation_batches_events_without_using_stale_card_positions() {
         for (down, up) in board_navigation_events() {
             let mut a = overflowing_board();
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             for _ in 0..2 {
                 board_event(&mut a, down.clone());
             }
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(2));
             assert_board_viewport(&a, 0, 0);
             for _ in 0..3 {
                 board_event(&mut a, down.clone());
             }
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(5));
             assert_board_viewport(&a, 0, 3);
             for _ in 0..5 {
                 board_event(&mut a, up.clone());
             }
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(0));
             assert_board_viewport(&a, 0, 0);
         }
     }
 
     #[test]
-    fn board_navigation_retains_independent_offsets_when_columns_leave_the_screen() {
+    fn board_navigation_retains_independent_offsets_across_grid_rows() {
         use crossterm::event::KeyCode;
 
-        for size in [(120, 24), (36, 24)] {
+        for size in [(144, 24), (120, 45), (60, 45), (36, 66)] {
             let mut a = overflowing_board();
             draw(size, &mut a);
             for _ in 0..6 {
@@ -4742,11 +4892,6 @@ mod tests {
                 draw(size, &mut a);
             }
             assert_eq!(a.focused_column, 5);
-            if size.0 == 36 {
-                assert!(a.board_column_offset > 0);
-                assert!(a.board_columns.iter().all(|(column, _)| *column != 0));
-                assert!(a.board_cards.iter().all(|(index, _)| *index >= 12));
-            }
             for _ in 0..5 {
                 board_key(&mut a, KeyCode::Down);
                 draw(size, &mut a);
@@ -4764,7 +4909,6 @@ mod tests {
             assert_eq!(a.selected, Some(6));
             assert_board_viewport(&a, 0, 4);
             assert_eq!(a.column_offsets, [4, 2, 0, 0, 0, 3]);
-            assert_eq!(a.board_column_offset, 0);
         }
     }
 
@@ -4790,7 +4934,7 @@ mod tests {
                     assert!(a.column_offsets.iter().all(|offset| *offset < 12));
                 }
             }
-            draw((120, 24), &mut a);
+            draw((144, 24), &mut a);
             assert_eq!(a.selected, Some(0));
             assert_board_viewport(&a, 0, 0);
         }
@@ -4816,7 +4960,7 @@ mod tests {
                     priority: 2,
                     data: match *status {
                         "ready" => json!({"issue_type":"task","labels":[crate::beads::READY_LABEL]}),
-                        "ready_to_merge" => json!({"issue_type":"task","labels":[crate::beads::READY_TO_MERGE_LABEL]}),
+                        "ready_to_merge" => json!({"issue_type":"task","status":"in_progress","labels":[crate::beads::READY_TO_MERGE_LABEL]}),
                         _ => json!({"issue_type":"task"}),
                     },
                 })
@@ -4891,7 +5035,7 @@ mod tests {
     }
 
     #[test]
-    fn narrow_board_brings_focused_column_into_view_and_keeps_column_scroll_independent() {
+    fn narrow_board_keeps_all_columns_visible_and_column_scroll_independent() {
         let mut a = app();
         a.beads = (0..12)
             .map(|i| Bead {
@@ -4905,11 +5049,11 @@ mod tests {
             })
             .collect();
         a.focused_column = 5;
+        a.selected = None;
         a.column_offsets[0] = 8;
         draw((60, 20), &mut a);
-        assert!(a.board_columns.len() < 6);
+        assert_eq!(a.board_columns.len(), 6);
         assert!(a.board_columns.iter().any(|(column, _)| *column == 5));
-        assert!(a.board_column_offset > 0);
         assert_eq!(a.column_offsets[0], 8);
 
         a.focused_column = 0;
@@ -4997,15 +5141,100 @@ mod tests {
     }
 
     #[test]
-    fn drawer_width_eases_from_right_to_final_width_and_can_be_disabled() {
+    fn both_drawers_follow_board_breakpoints_when_resizing() {
+        for worktrees in [false, true] {
+            let mut a = app();
+            a.focus_detail = !worktrees;
+            a.worktrees_view = worktrees;
+            a.settings.animate_drawers = false;
+            let selected = a.selected;
+            for (width, columns, expected) in [
+                (180, 6, 72),
+                (144, 6, 57),
+                (143, 3, 100),
+                (100, 3, 70),
+                (54, 3, 37),
+                (53, 2, 53),
+                (144, 6, 57),
+            ] {
+                assert_eq!(board_columns(width), columns);
+                assert_eq!(drawer_width(width, &a, Instant::now()), expected);
+                let text = draw((width, 30), &mut a).0;
+                let rect = a.detail_rect;
+                let inset = u16::from(worktrees);
+                assert_eq!(rect.width, expected - 2 * inset);
+                assert_eq!(rect.x, width - expected + inset);
+                assert_eq!(rect.right(), width - inset);
+                assert!(text.contains(if worktrees {
+                    "WORKTREES"
+                } else {
+                    "BEAD DETAILS"
+                }));
+                assert_eq!(a.selected, selected);
+                assert_eq!(a.board_columns.len(), 6);
+            }
+        }
+        let a = app();
+        for width in [0, 1, 3, 20, u16::MAX] {
+            assert!(drawer_width(width, &a, Instant::now()) <= width);
+        }
+    }
+
+    #[test]
+    fn drawer_width_eases_in_both_directions_and_can_be_disabled() {
         let start = Instant::now();
-        assert_eq!(drawer_width(100, Some(start), true, start), 0);
-        assert!(drawer_width(100, Some(start), true, start + Duration::from_millis(110)) > 0);
-        assert_eq!(
-            drawer_width(100, Some(start), true, start + Duration::from_millis(220)),
-            40
-        );
-        assert_eq!(drawer_width(100, Some(start), false, start), 40);
+        let mut a = app();
+        for (from, to) in [(0.0, 1.0), (1.0, 0.0)] {
+            a.drawer_animation = Some(crate::app::DrawerAnimation {
+                worktrees: false,
+                started: start,
+                from,
+                to,
+            });
+            assert_eq!(drawer_width(100, &a, start), (70.0 * from) as u16);
+            let middle = drawer_width(100, &a, start + Duration::from_millis(110));
+            assert!(middle > 0 && middle < 70);
+            assert_eq!(
+                drawer_width(100, &a, start + Duration::from_millis(220)),
+                (70.0 * to) as u16
+            );
+        }
+        a.settings.animate_drawers = false;
+        assert_eq!(drawer_width(100, &a, start), 70);
+    }
+
+    #[test]
+    fn both_drawers_remain_visible_while_closing_then_disappear() {
+        for worktrees in [false, true] {
+            let mut a = app();
+            let start = Instant::now();
+            a.drawer_animation = Some(crate::app::DrawerAnimation {
+                worktrees,
+                started: start,
+                from: 1.0,
+                to: 0.0,
+            });
+            let title = if worktrees {
+                "WORKTREES"
+            } else {
+                "BEAD DETAILS"
+            };
+            assert!(draw_drawer((100, 30), &mut a, start).contains(title));
+            assert_eq!(a.detail_rect.width, if worktrees { 68 } else { 70 });
+            let middle = start + Duration::from_millis(40);
+            assert!(draw_drawer((100, 30), &mut a, middle).contains(title));
+            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 70);
+            for size in [(60, 18), (20, 8), (100, 30)] {
+                draw_drawer(size, &mut a, middle);
+                assert!(a.detail_rect.width > 0 && a.detail_rect.width <= size.0);
+                assert!(a.detail_rect.right() <= size.0);
+            }
+            let complete = start + Duration::from_millis(220);
+            assert_eq!(drawer_width(100, &a, complete), 0);
+            assert!(!draw_drawer((100, 30), &mut a, complete).contains(title));
+            a.settings.animate_drawers = false;
+            assert!(!draw_drawer((100, 30), &mut a, start).contains(title));
+        }
     }
 
     #[test]
@@ -5016,7 +5245,12 @@ mod tests {
             a.worktrees_view = worktrees;
             a.detail_offset = 7;
             let start = Instant::now();
-            a.drawer_opened_at = Some(start);
+            a.drawer_animation = Some(crate::app::DrawerAnimation {
+                worktrees,
+                started: start,
+                from: 0.0,
+                to: 1.0,
+            });
 
             let initial_text = draw_drawer((100, 30), &mut a, start);
             let initial = a.detail_rect;
@@ -5031,9 +5265,14 @@ mod tests {
             }));
 
             let halfway = start + Duration::from_millis(110);
-            a.drawer_opened_at = Some(start);
+            a.drawer_animation = Some(crate::app::DrawerAnimation {
+                worktrees,
+                started: start,
+                from: 0.0,
+                to: 1.0,
+            });
             let middle_text = draw_drawer((60, 18), &mut a, halfway);
-            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 36);
+            assert!(a.detail_rect.width > 0 && a.detail_rect.width < 42);
             assert!(a.detail_rect.x + a.detail_rect.width <= 60);
             assert!(a.list_rect.x + a.list_rect.width <= 60);
             assert!(middle_text.contains(if worktrees {

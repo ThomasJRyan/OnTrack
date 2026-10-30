@@ -1,4 +1,4 @@
-//! Read-only browsing and explicit issue mutations through the Beads CLI.
+//! Browsing, closed-parent repair, and explicit issue mutations through the Beads CLI.
 
 use std::io;
 use std::process::{Command, Output};
@@ -101,9 +101,55 @@ const BLOCKED_ARGS: &[&str] = &["--readonly", "--no-color", "blocked", "--json"]
 /// Fetch graph eligibility together with the browser snapshot. Any failed read
 /// rejects the snapshot so scheduling never treats an unknown graph as ready.
 pub fn list_browser_beads() -> io::Result<Vec<Bead>> {
-    let mut beads = list_beads()?;
-    let ready = parse_records(&run_bd(READY_ARGS)?)?;
-    let blocked = parse_records(&run_bd(BLOCKED_ARGS)?)?;
+    list_browser_beads_with(run_bd)
+}
+
+fn list_browser_beads_with(
+    mut run: impl FnMut(&[&str]) -> io::Result<Vec<u8>>,
+) -> io::Result<Vec<Bead>> {
+    let mut beads = parse_list(&run(LIST_ARGS)?)?;
+    let closed: std::collections::HashSet<_> = beads
+        .iter()
+        .filter(|bead| bead.status == "closed")
+        .map(|bead| bead.id.as_str())
+        .collect();
+    let mut repaired = false;
+    for child in &beads {
+        let Some(parent) = child.data["parent"].as_str() else {
+            continue;
+        };
+        if child.status == "closed" || !closed.contains(parent) {
+            continue;
+        }
+        validate_id(&child.id)?;
+        validate_id(parent)?;
+        let current = parse_show(&run(&show_args(&format!("--id={}", child.id)))?, &child.id)?;
+        let status = required_string(&current, "status")?;
+        if status == "closed" || current["parent"].as_str() != Some(parent) {
+            continue;
+        }
+        let current_parent = parse_show(&run(&show_args(&format!("--id={parent}")))?, parent)?;
+        if required_string(&current_parent, "status")? != "closed" {
+            continue;
+        }
+        // shortcut: bd has no parent/revision guard; use one if the CLI adds it.
+        run(&[
+            "--no-color",
+            "update",
+            "--parent=",
+            "--if-status",
+            &status,
+            "--json",
+            "--",
+            &child.id,
+        ])?;
+        repaired = true;
+    }
+    if repaired {
+        beads = parse_list(&run(LIST_ARGS)?)?;
+    }
+    let ready = parse_records(&run(READY_ARGS)?)?;
+    let blocked = parse_records(&run(BLOCKED_ARGS)?)?;
     apply_readiness(&mut beads, &ready, &blocked)?;
     Ok(beads)
 }
@@ -800,6 +846,174 @@ mod tests {
     }
     use super::*;
     use serde_json::json;
+
+    fn browser_script(steps: Vec<(Vec<&str>, io::Result<Value>)>) -> io::Result<Vec<Bead>> {
+        let mut steps = std::collections::VecDeque::from(steps);
+        let result = list_browser_beads_with(|args| {
+            let (expected, response) = steps.pop_front().expect("unexpected bd call");
+            assert_eq!(args, expected);
+            response.map(|value| serde_json::to_vec(&value).unwrap())
+        });
+        assert!(steps.is_empty(), "missing bd calls: {steps:?}");
+        result
+    }
+
+    #[test]
+    fn browser_repairs_unfinished_children_and_reloads_before_readiness() {
+        for status in ["open", "in_progress", "blocked", "deferred"] {
+            let parent = json!({"id":"parent", "title":"Parent", "status":"closed"});
+            let child = json!({"id":"child;$(ignored)", "title":"Child", "status":status,
+                "parent":"parent", "labels":[READY_LABEL],
+                "dependencies":[{"depends_on_id":"other", "type":"blocks"}]});
+            let mut detached = child.clone();
+            detached.as_object_mut().unwrap().remove("parent");
+            let beads = browser_script(vec![
+                (LIST_ARGS.to_vec(), Ok(json!([parent, child]))),
+                (
+                    show_args("--id=child;$(ignored)").to_vec(),
+                    Ok(json!([child])),
+                ),
+                (show_args("--id=parent").to_vec(), Ok(json!([parent]))),
+                (
+                    vec![
+                        "--no-color",
+                        "update",
+                        "--parent=",
+                        "--if-status",
+                        status,
+                        "--json",
+                        "--",
+                        "child;$(ignored)",
+                    ],
+                    Ok(json!([])),
+                ),
+                (LIST_ARGS.to_vec(), Ok(json!([parent, detached]))),
+                (READY_ARGS.to_vec(), Ok(json!([]))),
+                (
+                    BLOCKED_ARGS.to_vec(),
+                    Ok(json!([
+                        {"id":"child;$(ignored)", "blocked_by":["other"]}
+                    ])),
+                ),
+            ])
+            .unwrap();
+            assert_eq!(beads[1].data, detached);
+            assert_eq!(beads[1].blocked_by, ["other"]);
+            assert!(!beads[1].dependency_ready);
+        }
+    }
+
+    #[test]
+    fn browser_preserves_history_active_parents_and_unknown_parents() {
+        let snapshot = json!([
+            {"id":"closed-parent", "title":"Closed", "status":"closed"},
+            {"id":"active-parent", "title":"Active", "status":"in_progress"},
+            {"id":"history", "title":"History", "status":"closed", "parent":"closed-parent"},
+            {"id":"active-child", "title":"Child", "status":"open", "parent":"active-parent"},
+            {"id":"unknown-child", "title":"Child", "status":"open", "parent":"missing"},
+            {"id":"root", "title":"Root", "status":"open"}
+        ]);
+        let beads = browser_script(vec![
+            (LIST_ARGS.to_vec(), Ok(snapshot.clone())),
+            (READY_ARGS.to_vec(), Ok(json!([]))),
+            (BLOCKED_ARGS.to_vec(), Ok(json!([]))),
+        ])
+        .unwrap();
+        assert_eq!(
+            json!(beads.iter().map(|bead| &bead.data).collect::<Vec<_>>()),
+            snapshot
+        );
+    }
+
+    #[test]
+    fn browser_revalidates_child_and_parent_before_detaching() {
+        let parent = json!({"id":"parent", "title":"Parent", "status":"closed"});
+        let child = json!({"id":"child", "title":"Child", "status":"open", "parent":"parent"});
+        for change in [
+            json!({"status":"closed"}),
+            json!({"parent":"new-parent"}),
+            json!({"parent":null}),
+            json!({"parent_reopened":true}),
+        ] {
+            let mut current = child.clone();
+            let reopened = change["parent_reopened"] == true;
+            if !reopened {
+                current
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(change.as_object().unwrap().clone());
+            }
+            let mut steps = vec![
+                (LIST_ARGS.to_vec(), Ok(json!([parent, child]))),
+                (show_args("--id=child").to_vec(), Ok(json!([current]))),
+            ];
+            if reopened {
+                steps.push((
+                    show_args("--id=parent").to_vec(),
+                    Ok(json!([{"id":"parent", "status":"open"}])),
+                ));
+            }
+            steps.extend([
+                (READY_ARGS.to_vec(), Ok(json!([]))),
+                (BLOCKED_ARGS.to_vec(), Ok(json!([]))),
+            ]);
+            browser_script(steps).unwrap();
+        }
+    }
+
+    #[test]
+    fn browser_repair_errors_reject_snapshot_and_next_refresh_retries() {
+        let parent = json!({"id":"parent", "title":"Parent", "status":"closed"});
+        let child = json!({"id":"child", "title":"Child", "status":"open", "parent":"parent"});
+        let calls = [
+            LIST_ARGS.to_vec(),
+            show_args("--id=child").to_vec(),
+            show_args("--id=parent").to_vec(),
+            vec![
+                "--no-color",
+                "update",
+                "--parent=",
+                "--if-status",
+                "open",
+                "--json",
+                "--",
+                "child",
+            ],
+            LIST_ARGS.to_vec(),
+        ];
+        let responses = [
+            json!([parent, child]),
+            json!([child]),
+            json!([parent]),
+            json!([]),
+            json!([]),
+        ];
+        for failure in 0..calls.len() {
+            let mut steps = calls[..failure]
+                .iter()
+                .cloned()
+                .zip(responses[..failure].iter().cloned().map(Ok))
+                .collect::<Vec<_>>();
+            steps.push((
+                calls[failure].clone(),
+                Err(io::Error::other("repair failed")),
+            ));
+            assert_eq!(
+                browser_script(steps).unwrap_err().to_string(),
+                "repair failed"
+            );
+        }
+        let mut steps = calls
+            .into_iter()
+            .zip(responses.into_iter().map(Ok))
+            .collect::<Vec<_>>();
+        steps.extend([
+            (READY_ARGS.to_vec(), Ok(json!([]))),
+            (BLOCKED_ARGS.to_vec(), Ok(json!([]))),
+        ]);
+        assert!(browser_script(steps).unwrap().is_empty());
+    }
+
     #[test]
     fn graph_readiness_is_authoritative_and_preserves_ready_intent() {
         let mut beads = parse_list(
