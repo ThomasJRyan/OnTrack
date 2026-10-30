@@ -59,6 +59,7 @@ pub(super) enum Request {
     CreateChild(CreateBead, String),
     Update(UpdateBead),
     SetReady(String, bool),
+    ResetFailedHandoff(u64, String, String),
     SetTreeReady(String, bool, HashSet<String>, HashSet<String>),
     Move(String, String),
     Close(String),
@@ -89,6 +90,7 @@ pub(super) enum Response {
     EpicFinished(String, std::io::Result<Vec<String>>),
     Updated(String, std::io::Result<()>),
     ReadySet(String, bool, std::io::Result<Vec<String>>),
+    FailedHandoffReset(u64, String, String, std::io::Result<()>),
     Moved(String, String, std::io::Result<()>),
     Closed(String, std::io::Result<()>),
     Deleted(std::io::Result<()>),
@@ -490,6 +492,10 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
         Request::PlanCreate(seq, plan) => {
             Response::PlanCreated(seq, crate::planning::create(&plan))
         }
+        Request::ResetFailedHandoff(seq, id, message) => {
+            let result = beads::set_ready(&id, false);
+            Response::FailedHandoffReset(seq, id, message, result)
+        }
         Request::SetReady(id, ready) => Response::ReadySet(
             id.clone(),
             ready,
@@ -587,7 +593,10 @@ fn start_workers(
                 if managed.send(request).is_err() {
                     break;
                 }
-            } else if matches!(request, Request::SetReady(..) | Request::SetTreeReady(..)) {
+            } else if matches!(
+                request,
+                Request::SetReady(..) | Request::SetTreeReady(..) | Request::ResetFailedHandoff(..)
+            ) {
                 if ready.send(request).is_err() {
                     break;
                 }
@@ -1359,6 +1368,23 @@ impl App {
                         }
                     }
                 }
+                Response::FailedHandoffReset(seq, id, message, result) => {
+                    let message = match result {
+                        Ok(()) => {
+                            for bead in self.beads.iter_mut().filter(|bead| bead.id == id) {
+                                if let Some(labels) = bead.data["labels"].as_array_mut() {
+                                    labels.retain(|label| label != beads::READY_LABEL);
+                                }
+                            }
+                            format!("{message}; {id} removed from Ready")
+                        }
+                        Err(error) => {
+                            format!("{message}; could not remove Ready from {id}: {error}")
+                        }
+                    };
+                    self.handoff_feedback(seq, message, true);
+                    self.refresh_at(now);
+                }
                 Response::ReadySet(id, ready, result) => {
                     self.mutation_busy = false;
                     self.ready_pending = false;
@@ -1530,33 +1556,30 @@ impl App {
                                         Request::Launch(seq, context, agent, bead)
                                     };
                                     if self.requests.send(request).is_err() {
-                                        self.handoff.remove(&seq);
                                         let message =
                                             "Handoff could not be queued; try again".to_owned();
-                                        self.handoff_feedback(seq, message, true);
+                                        self.fail_handoff(seq, message);
                                     }
                                 } else {
-                                    self.handoff.remove(&seq);
                                     let message = if let Some(kind) = chosen {
                                         format!(
-                                            "Harness {kind} for {} is unavailable; change it or toggle Ready to retry",
+                                            "Harness {kind} for {} is unavailable; change it or mark Ready to retry",
                                             pending.bead.id
                                         )
                                     } else if pending.scheduled {
                                         format!(
-                                            "Selected harness for {} is unavailable; change it or toggle Ready to retry",
+                                            "Selected harness for {} is unavailable; change it or mark Ready to retry",
                                             pending.bead.id
                                         )
                                     } else {
                                         "No Herdr agents are available in this workspace".to_owned()
                                     };
-                                    self.handoff_feedback(seq, message, true);
+                                    self.fail_handoff(seq, message);
                                 }
                             }
                             Err(error) => {
-                                self.handoff.remove(&seq);
                                 let message = format!("Handoff discovery failed: {error}");
-                                self.handoff_feedback(seq, message, true);
+                                self.fail_handoff(seq, message);
                             }
                         }
                     }
@@ -1573,9 +1596,9 @@ impl App {
                             .filter(|item| beads::is_ready(&item.bead))
                             .map(|item| item.bead.id.clone());
                         let bead_id = self.handoff[&seq].bead.id.clone();
-                        self.handoff.remove(&seq);
                         match result {
                             Ok(outcome) => {
+                                self.handoff.remove(&seq);
                                 self.known_handoffs.insert(bead_id.clone());
                                 if !outcome.reserved {
                                     self.handoff_capacity.insert(bead_id);
@@ -1600,7 +1623,7 @@ impl App {
                             }
                             Err(error) => {
                                 let message = format!("Handoff failed: {error}");
-                                self.handoff_feedback(seq, message, true);
+                                self.fail_handoff(seq, message);
                                 // A failed launch can still have a durable partial
                                 // intent/remote worktree. Always inspect it again.
                                 if self.worktrees_inflight {
@@ -2971,11 +2994,27 @@ impl App {
             },
         );
         if self.requests.send(Request::Discover(seq)).is_err() {
-            self.handoff.remove(&seq);
             let message = "Workspace discovery could not be queued; try again".to_owned();
-            self.notice = Some(message.clone());
-            self.toast = Some(Toast::result(message, true));
+            self.fail_handoff(seq, message);
         }
+    }
+    fn fail_handoff(&mut self, seq: u64, mut message: String) {
+        if let Some(pending) = self.handoff.remove(&seq)
+            && beads::is_ready(&pending.bead)
+        {
+            let id = pending.bead.id;
+            self.scheduler_attempted.insert(id.clone());
+            if self
+                .requests
+                .send(Request::ResetFailedHandoff(seq, id, message.clone()))
+                .is_err()
+            {
+                message.push_str(
+                    "; Ready removal could not be queued; inspect and remove Ready manually",
+                );
+            }
+        }
+        self.handoff_feedback(seq, message, true);
     }
     fn handoff_feedback(&mut self, seq: u64, message: String, error: bool) {
         if seq == self.launch_seq {
@@ -3405,7 +3444,7 @@ mod tests {
             egg_keys(&mut a, &EGG_KEYS[..2]);
             match context {
                 0 => {
-                    a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+                    a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT));
                 }
                 1 => press(&mut a, KeyCode::Char('n')),
                 2 => press(&mut a, KeyCode::Char('d')),
@@ -3459,13 +3498,20 @@ mod tests {
             let mut a = app();
             a.focus_detail = view == 1;
             a.worktrees_view = view == 2;
-            a.drawer_opened_at = Some(Instant::now());
+            a.drawer_animation = Some(DrawerAnimation {
+                worktrees: view == 2,
+                started: Instant::now(),
+                from: 0.0,
+                to: 1.0,
+            });
             a.detail_offset = 12;
             egg_keys(&mut a, &EGG_KEYS[..9]);
             let before = (
                 a.focus_detail,
                 a.worktrees_view,
-                a.drawer_opened_at,
+                a.drawer_animation
+                    .as_ref()
+                    .map(|a| (a.worktrees, a.started, a.from, a.to)),
                 a.selected,
                 a.focused_column,
                 a.detail_offset,
@@ -3487,7 +3533,9 @@ mod tests {
                 (
                     a.focus_detail,
                     a.worktrees_view,
-                    a.drawer_opened_at,
+                    a.drawer_animation
+                        .as_ref()
+                        .map(|a| (a.worktrees, a.started, a.from, a.to)),
                     a.selected,
                     a.focused_column,
                     a.detail_offset,
@@ -4511,6 +4559,9 @@ mod tests {
             ))
             .unwrap();
         a.receive();
+        assert!(
+            matches!(queued.try_recv(), Ok(Request::ResetFailedHandoff(_, id, _)) if id == "b0")
+        );
         a.poll_scheduler();
         assert!(queued.try_recv().is_err());
         assert!(a.notice.as_deref().unwrap().contains("Herdr unavailable"));
@@ -4537,6 +4588,7 @@ mod tests {
         out.send(Response::Discovered(seq, Ok(launch_context())))
             .unwrap();
         a.receive();
+        assert!(matches!(rx.try_recv(), Ok(Request::ResetFailedHandoff(_, id, _)) if id == "b0"));
         assert!(rx.try_recv().is_err());
         assert!(a.notice.as_deref().unwrap().contains("unavailable"));
         a.poll_scheduler();
@@ -5864,6 +5916,146 @@ mod tests {
         );
     }
     #[test]
+    fn failed_ready_handoffs_remove_only_the_failed_issues_ready_label() {
+        for scheduled in [false, true] {
+            for stage in ["discovery", "harness", "launch"] {
+                let (mut a, requests, replies) = connected_app();
+                for bead in &mut a.beads {
+                    bead.data["labels"] = json!([beads::READY_LABEL, "keep"]);
+                }
+                a.start_launch(a.beads[0].clone(), scheduled);
+                let Request::Discover(seq) = requests.try_recv().unwrap() else {
+                    panic!()
+                };
+                let response = match stage {
+                    "discovery" => {
+                        Response::Discovered(seq, Err(std::io::Error::other("original error")))
+                    }
+                    "harness" => {
+                        let mut context = launch_context();
+                        context.agents.clear();
+                        Response::Discovered(seq, Ok(context))
+                    }
+                    _ => {
+                        replies
+                            .send(Response::Discovered(seq, Ok(launch_context())))
+                            .unwrap();
+                        a.receive();
+                        assert!(matches!(
+                            requests.try_recv(),
+                            Ok(Request::Launch(..) | Request::LaunchReady(..))
+                        ));
+                        Response::Launched(
+                            seq,
+                            Err(std::io::Error::other("original error; inspect worktree")),
+                        )
+                    }
+                };
+                replies.send(response).unwrap();
+                a.receive();
+                let Request::ResetFailedHandoff(reset_seq, id, message) =
+                    requests.try_recv().unwrap()
+                else {
+                    panic!()
+                };
+                assert_eq!(reset_seq, seq);
+                assert_eq!(id, "b0");
+                assert!(a.handoff.is_empty());
+                assert!(beads::is_ready(&a.beads[0]), "wait for confirmed mutation");
+                replies
+                    .send(Response::FailedHandoffReset(
+                        seq,
+                        id,
+                        message.clone(),
+                        Ok(()),
+                    ))
+                    .unwrap();
+                a.receive();
+                assert_eq!(display_status(&a.beads[0]), "open");
+                assert_eq!(a.beads[0].data["labels"], json!(["keep"]));
+                assert!(beads::is_ready(&a.beads[1]), "do not cascade");
+                assert!(a.notice.as_ref().unwrap().contains(&message));
+                assert!(a.toast.as_ref().unwrap().error);
+                assert!(matches!(requests.try_recv(), Ok(Request::List)));
+                assert!(a.scheduler_attempted.contains("b0"));
+            }
+        }
+    }
+
+    #[test]
+    fn failed_handoff_reset_preserves_advanced_status_and_reports_reset_errors() {
+        for fails in [false, true] {
+            let (mut a, requests, replies) = connected_app();
+            a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+            a.beads[0].status = "in_progress".into();
+            a.mutation_busy = true;
+            a.ready_pending = true;
+            let result = if fails {
+                Err(std::io::Error::other("database unavailable"))
+            } else {
+                Ok(())
+            };
+            replies
+                .send(Response::FailedHandoffReset(
+                    0,
+                    "b0".into(),
+                    "launch error".into(),
+                    result,
+                ))
+                .unwrap();
+            a.receive();
+            assert_eq!(a.beads[0].status, "in_progress");
+            assert!(
+                a.mutation_busy && a.ready_pending,
+                "preserve unrelated mutation"
+            );
+            assert_eq!(
+                a.beads[0].data["labels"].as_array().unwrap().len(),
+                usize::from(fails)
+            );
+            assert!(a.notice.as_ref().unwrap().contains("launch error"));
+            if fails {
+                assert!(a.notice.as_ref().unwrap().contains("database unavailable"));
+            }
+            assert!(matches!(requests.try_recv(), Ok(Request::List)));
+        }
+    }
+
+    #[test]
+    fn ready_handoff_queue_failures_explain_when_ready_cannot_be_removed() {
+        for discovery in [false, true] {
+            let (mut a, requests, replies) = connected_app();
+            a.beads[0].data["labels"] = json!([beads::READY_LABEL]);
+            if discovery {
+                drop(requests);
+                a.start_launch(a.beads[0].clone(), false);
+            } else {
+                a.start_launch(a.beads[0].clone(), false);
+                let Request::Discover(seq) = requests.try_recv().unwrap() else {
+                    panic!()
+                };
+                drop(requests);
+                replies
+                    .send(Response::Discovered(seq, Ok(launch_context())))
+                    .unwrap();
+                a.receive();
+            }
+            assert!(a.handoff.is_empty());
+            assert!(
+                a.notice
+                    .as_ref()
+                    .unwrap()
+                    .contains("Ready removal could not be queued")
+            );
+            assert!(
+                beads::is_ready(&a.beads[0]),
+                "never claim an unconfirmed reset"
+            );
+            assert!(a.scheduler_attempted.contains("b0"));
+        }
+    }
+
+    #[test]
     fn failed_handoff_shows_recovery_error_without_modal() {
         let (mut a, rx, tx) = connected_app();
         press(&mut a, KeyCode::Char('h'));
@@ -5884,6 +6076,10 @@ mod tests {
         .unwrap();
         a.receive();
         assert!(a.handoff.is_empty());
+        assert!(
+            rx.try_recv().is_err(),
+            "non-Ready handoff must not change labels"
+        );
         assert!(a.modal.is_none());
         assert!(
             a.toast.as_ref().is_some_and(
