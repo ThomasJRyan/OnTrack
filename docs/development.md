@@ -57,6 +57,13 @@ Worktree discovery has no progress placeholder in `ui::render`: empty-state list
 
 Board and drawer footers show context-specific shortcut hints without consuming errors, notices, focus feedback, or confirmation text. Header feedback remains separate and confirmations stay in dialogs. Worktree selection and details belong to the drawer, not a second full-screen browser. Keep hints within terminal cell width and preserve focus, merge, cleanup, continue, restart, detail scrolling, and help controls. Update `hotkeys` alongside input handling so board `m` (move chooser) and drawer `m` (merge request) are unambiguous.
 
+The catalog now includes 40 themes, with 28 additional choices adapted from
+MMOGame-TUI. Keep imported fixed colors readable using the catalog contrast
+checks; System and Lucent Orng use terminal-default surfaces, whose contrast
+cannot be measured without the terminal palette. Tests verify those surface
+roles explicitly instead. Keep the OpenCode license notice with redistributed
+palettes; provenance and semantic role adaptations are in [settings](settings.md).
+
 Theme is explicit app state (`App::theme`) threaded into rendering; do not introduce global or thread-local palette state. Keep Dark as the existing default look. New colors need readable Light equivalents for surfaces, text, semantic metadata, startup splash, details, and dialogs. Settings changes immediately attempt persistence; update `App::settings` and the active theme only after `settings::save_to` succeeds. Failed writes retain the candidate for retry without changing the active theme. Tests should use isolated settings paths rather than changing process-wide environment variables.
 
 Choice controls use the shared `cycle_choice` helper for Left / Right navigation. Both directions wrap at the ends; a closed focused dropdown changes immediately, while an open dropdown previews changes until Enter accepts or Esc restores its opening value. Keep this consistent for future dropdown controls. Up / Down behavior remains control-specific.

@@ -2,7 +2,7 @@
 
 OnTrack stores theme, default-agent, agent-limit, animation, and cleanup preferences
 globally for your Linux user, not in the workspace or Beads database. OnTrack
-Dark is the default theme. Twelve built-in themes are available:
+Dark is the default theme. Forty built-in themes are available:
 
 | Stable ID | Display name | Style |
 | --- | --- | --- |
@@ -18,6 +18,39 @@ Dark is the default theme. Twelve built-in themes are available:
 | `solarized-dark` | Solarized Dark | Dark |
 | `solarized-light` | Solarized Light | Light |
 | `rose-pine` | Rosé Pine | Dark |
+| `field-journal` | Field Journal | Dark |
+| `opencode` | OpenCode | Dark |
+| `aura` | Aura | Dark |
+| `ayu` | Ayu | Dark |
+| `carbonfox` | Carbonfox | Dark |
+| `catppuccin-frappe` | Catppuccin Frappé | Dark |
+| `catppuccin-macchiato` | Catppuccin Macchiato | Dark |
+| `cobalt2` | Cobalt2 | Dark |
+| `cursor` | Cursor | Dark |
+| `everforest` | Everforest | Dark |
+| `flexoki` | Flexoki | Dark |
+| `github` | GitHub | Dark |
+| `kanagawa` | Kanagawa | Dark |
+| `lucent-orng` | Lucent Orng | Terminal |
+| `material` | Material | Dark |
+| `matrix` | Matrix | Dark |
+| `mercury` | Mercury | Dark |
+| `monokai` | Monokai | Dark |
+| `night-owl` | Night Owl | Dark |
+| `one-dark` | One Dark | Dark |
+| `orng` | Orng | Dark |
+| `osaka-jade` | Osaka Jade | Dark |
+| `palenight` | Palenight | Dark |
+| `synthwave-84` | Synthwave ’84 | Dark |
+| `vercel` | Vercel | Dark |
+| `vesper` | Vesper | Dark |
+| `zenburn` | Zenburn | Dark |
+| `system` | System | Terminal |
+
+Lucent Orng retains the terminal background with fixed orange accents. System
+uses terminal foreground/background defaults and ANSI accents. Their appearance
+and contrast depend on your terminal palette; use a fixed theme if these choices
+are hard to read. System keeps OnTrack's blue Ready/feature color.
 
 ## Palette references and attribution
 
@@ -40,8 +73,19 @@ affiliated with these projects. See their upstream references and licenses:
 These references are attribution, not an affiliation claim. Any exact upstream
 palette data reused or adapted must keep its required copyright and license
 notices with the redistributed data; consult the current upstream license.
+The 28 additional choices are adapted from MMOGame-TUI's local theme catalog.
+Its OpenCode palettes trace to [commit
+171dbd6abe416cc1d9adaab8752bc3d60b133725](https://github.com/anomalyco/opencode/tree/171dbd6abe416cc1d9adaab8752bc3d60b133725/packages/tui/src/theme).
+The required [OpenCode MIT notice](../assets/themes/OPENCODE-LICENSE.txt) ships
+with the palettes. Field Journal comes from MMOGame-TUI's original palette.
+
 The OnTrack-specific role mapping and contrast choices are maintained in
-`src/theme.rs`.
+`src/theme.rs`. Imported backgrounds, panel colors, borders, and primary accents
+retain their source identity. Text and semantic colors are brightened where
+needed for contrast. Primary accents also color selections; the base background
+becomes selection text. Warnings use OnTrack's gold and Ready To Merge uses
+purple so lifecycle states remain distinct even in monochromatic source themes.
+Existing equivalent themes keep their original OnTrack palettes and IDs.
 
 ## Location and format
 

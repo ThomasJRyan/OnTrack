@@ -4230,7 +4230,7 @@ mod tests {
         let mut app = app();
         app.modal = Some(crate::app::Modal::Settings {
             draft: crate::settings::Settings {
-                theme: crate::settings::Theme::RosePine,
+                theme: crate::settings::Theme::System,
                 ..crate::settings::Settings::default()
             },
             error: None,
@@ -4238,7 +4238,8 @@ mod tests {
             focus: 0,
         });
         let late = draw((80, 24), &mut app).0;
-        assert!(late.contains("Rosé Pine"));
+        assert!(late.contains("System"));
+        assert!(!late.contains("↓ later themes"));
         assert!(late.contains("↑ earlier themes"));
         assert!(!late.contains("OnTrack Dark"));
         assert!(app.modal_ready);
