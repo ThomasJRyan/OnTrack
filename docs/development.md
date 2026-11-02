@@ -397,9 +397,13 @@ The display check makes read-only Beads and Herdr calls during worktree refresh;
 it does not change merge, finalization, or cleanup gates. A legacy launch without
 a recorded session can show `READY TO MERGE` from weaker display evidence.
 Automatic reconciliation separately requires a later native session on the same
-recorded terminal and persists it before acting. Without that evidence, automatic
-merge remains deferred. Explicit manual merge confirmation remains available
-for `InProgress` rows and is still subject to the existing Git and agent checks.
+recorded terminal and persists it before acting. Merge completion then requires a
+settled matching agent, a confirmed prompt, and Git ancestry proving that the
+source contains both commits recorded for the request. That ancestry is sufficient
+even when Herdr does not report a newer lifecycle sequence after the merge prompt;
+without the Git proof or settled agent, automatic merge remains deferred. Explicit
+manual merge confirmation remains available for InProgress rows and is still
+subject to the existing Git and agent checks.
 The launch journal records `state_change_seq` and `terminal_id` from the
 pre-prompt `agent get` response even when `agent_session` has not appeared yet.
 Reconciliation can recover those observations from the retained `ready`

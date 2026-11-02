@@ -964,6 +964,25 @@ fn task_commits(repo: &RepositoryIdentity, entry: &Value, source_tip: &str) -> i
     Ok(())
 }
 
+fn requested_merge_tips_in_source(
+    repo: &RepositoryIdentity,
+    entry: &Value,
+    source_tip: &str,
+) -> io::Result<()> {
+    let request = &entry["merge_request"];
+    if !request.is_object() {
+        return Ok(());
+    }
+    for key in ["source_tip", "target_tip"] {
+        if !ancestor(&repo.main_root, field(request, key)?, source_tip)? {
+            return Err(error(
+                "Source no longer contains both commits recorded for the merge request",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_identity(repo: &RepositoryIdentity, entry: &Value) -> io::Result<Verified> {
     let actual = SystemExecutor.git_identity(&repo.main_root)?;
     if actual != *repo
@@ -2072,19 +2091,7 @@ fn finalize(registry: &mut Registry, index: usize, executor: &mut impl Executor)
             "Target advanced; another explicit resolution request is required",
         ));
     }
-    if !ancestor(
-        &registry.repo.main_root,
-        field(request, "source_tip")?,
-        &verified.source_tip,
-    )? || !ancestor(
-        &registry.repo.main_root,
-        &verified.target_tip,
-        &verified.source_tip,
-    )? {
-        return Err(error(
-            "Source does not yet contain requested source and current target commits; resolve and commit on source",
-        ));
-    }
+    requested_merge_tips_in_source(&registry.repo, entry, &verified.source_tip)?;
     // Manual confirmation authorizes ff-only from verified CURRENT Git history;
     // optional native session/sequence metadata must not disable that workflow.
     // Unknown/legacy provenance remains conservative, like automatic requests.
@@ -2149,18 +2156,12 @@ fn verify_merge_completion(entry: &Value, completed: &Value) -> io::Result<()> {
             "Merge request agent session changed; integration deferred",
         ));
     }
-    if request["provenance"] != "manual" {
-        let before = request["lifecycle_seq"].as_u64().ok_or_else(|| {
-            error("Automatic integration deferred: no recorded native merge-request lifecycle sequence")
-        })?;
-        if completed["state_change_seq"]
-            .as_u64()
-            .is_none_or(|now| now <= before)
-        {
-            return Err(error(
-                "Automatic integration deferred: no native lifecycle change after merge dispatch. Idle/sequence changes are safety gates, not proof that this particular prompt completed",
-            ));
-        }
+    // settled() verifies activity after launch; exact requested ancestry is the
+    // completion evidence, so a second lifecycle increment after dispatch is unnecessary.
+    if request["provenance"] != "manual" && request["lifecycle_seq"].as_u64().is_none() {
+        return Err(error(
+            "Automatic integration deferred: no recorded native merge-request lifecycle sequence",
+        ));
     }
     Ok(())
 }
@@ -2251,6 +2252,7 @@ fn close_integrated(
     }
     let verified = verify(&registry.repo, entry)?;
     task_commits(&registry.repo, entry, &verified.source_tip)?;
+    requested_merge_tips_in_source(&registry.repo, entry, &verified.source_tip)?;
     if !ancestor(
         &registry.repo.main_root,
         &verified.source_tip,
@@ -4432,7 +4434,7 @@ mod tests {
                 .detail
                 .as_ref()
                 .unwrap()
-                .contains("does not yet contain")
+                .contains("no longer contains both commits recorded")
         );
         assert_eq!(tip(&fixture.main, "HEAD").unwrap(), before);
         git(&fixture.source, &["merge", "--no-edit", "trunk"]).unwrap();
@@ -4450,10 +4452,37 @@ mod tests {
     }
 
     #[test]
-    fn automatic_dispatch_and_stale_idle_are_not_completion() {
+    fn automatic_merge_accepts_git_proof_without_post_dispatch_sequence_increment() {
         let fixture = Fixture::managed();
         Fixture::commit_at(&fixture.source, "task", "implemented\n");
-        let before = tip(&fixture.main, "HEAD").unwrap();
+        Fixture::commit_at(&fixture.main, "target", "target advanced\n");
+
+        let mut dispatch = Fake::default();
+        dispatch.json(fixture.agent(12, "idle"));
+        dispatch.json(fixture.prompt_result());
+        {
+            let mut registry = Registry::open(&fixture.main).unwrap();
+            request_merge(&mut registry, 0, &mut dispatch, true).unwrap();
+            assert_eq!(registry.entries[0]["merge_request"]["lifecycle_seq"], 12);
+        }
+
+        git(&fixture.source, &["merge", "--no-ff", "--no-edit", "trunk"]).unwrap();
+        let resolved_source = tip(&fixture.source, "HEAD").unwrap();
+        let mut executor = Fake::default();
+        executor.json(fixture.agent(12, "done"));
+        executor.json(fixture.agent(12, "done"));
+        let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
+
+        assert_eq!(rows[0].status, WorktreeStatus::Integrated);
+        assert_eq!(tip(&fixture.main, "HEAD").unwrap(), resolved_source);
+        assert!(executor.closed.contains("Bead-1"));
+        assert_eq!(branch(&fixture.main).unwrap(), "trunk");
+    }
+
+    #[test]
+    fn automatic_dispatch_requires_git_resolution_and_rejects_unsettled_or_mismatched_agents() {
+        let fixture = Fixture::managed();
+        Fixture::commit_at(&fixture.source, "task", "implemented\n");
         let mut request = Fake::default();
         request.json(fixture.agent(12, "idle"));
         request.json(fixture.prompt_result());
@@ -4462,26 +4491,19 @@ mod tests {
             request_merge(&mut registry, 0, &mut request, true).unwrap();
         }
         let mut executor = Fake::default();
-        executor.json(fixture.agent(12, "idle"));
+        for _ in 0..2 {
+            executor.json(fixture.agent(12, "idle"));
+        }
         let rows = reconcile_with(&fixture.main, CleanupPolicy::default(), &mut executor).unwrap();
-        assert!(
-            rows[0]
-                .detail
-                .as_ref()
-                .unwrap()
-                .contains("not proof that this particular prompt completed")
+        assert_eq!(rows[0].status, WorktreeStatus::Integrated);
+        assert_eq!(
+            tip(&fixture.main, "HEAD").unwrap(),
+            tip(&fixture.source, "HEAD").unwrap()
         );
-        assert_eq!(tip(&fixture.main, "HEAD").unwrap(), before);
         git(&fixture.main, &["merge", "--ff-only", BRANCH]).unwrap();
         let request_evidence =
             Registry::open(&fixture.main).unwrap().entries[0]["merge_request"].clone();
-        for mode in [
-            "stale",
-            "working",
-            "session",
-            "request_session",
-            "missing_sequence",
-        ] {
+        for mode in ["working", "session", "request_session", "missing_sequence"] {
             {
                 let mut registry = Registry::open(&fixture.main).unwrap();
                 registry.entries[0]["merge_request"] = request_evidence.clone();
@@ -4493,18 +4515,15 @@ mod tests {
                 }
                 registry.save().unwrap();
             }
-            let mut observed = fixture.agent(
-                if mode == "stale" { 12 } else { 14 },
-                if mode == "working" { "working" } else { "idle" },
-            );
+            let mut observed =
+                fixture.agent(14, if mode == "working" { "working" } else { "idle" });
             if mode == "session" {
                 observed["result"]["agent"]["agent_session"]["value"] = json!("replacement");
             }
             let mut executor = Fake::default();
-            executor.json(observed.clone());
-            executor
-                .outputs
-                .push_back(Err(error("Unexpected cleanup after incomplete request")));
+            for _ in 0..4 {
+                executor.json(observed.clone());
+            }
             let rows = reconcile_with(
                 &fixture.main,
                 CleanupPolicy {
@@ -4528,19 +4547,25 @@ mod tests {
             );
             assert!(fixture.source.exists());
             let mut explicit = Fake::default();
-            explicit.json(observed.clone());
+            for _ in 0..3 {
+                explicit.json(observed.clone());
+            }
             assert!(
                 close_integrated_bead_with(&fixture.main, "Bead-1", &mut explicit).is_err(),
                 "explicit {mode}"
             );
             let mut cleanup = Fake::default();
-            cleanup.json(observed.clone());
+            for _ in 0..3 {
+                cleanup.json(observed.clone());
+            }
             assert!(
                 act_with(&fixture.main, ID, Action::CloseWorkspace, &mut cleanup).is_err(),
                 "cleanup {mode}"
             );
             let mut legacy_cleanup = Fake::legacy_closed();
-            legacy_cleanup.json(observed);
+            for _ in 0..3 {
+                legacy_cleanup.json(observed.clone());
+            }
             assert!(
                 act_with(
                     &fixture.main,
