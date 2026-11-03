@@ -3405,7 +3405,7 @@ mod tests {
             egg_keys(&mut a, &EGG_KEYS[..2]);
             match context {
                 0 => {
-                    a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::CONTROL));
+                    a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
                 }
                 1 => press(&mut a, KeyCode::Char('n')),
                 2 => press(&mut a, KeyCode::Char('d')),
@@ -3457,15 +3457,15 @@ mod tests {
     fn easter_egg_dismissal_preserves_the_underlying_view_and_resets_progress() {
         for view in 0..3 {
             let mut a = app();
-            a.focus_detail = view == 1;
-            a.worktrees_view = view == 2;
-            a.drawer_opened_at = Some(Instant::now());
+            a.set_drawer(view == 2, view != 0, Instant::now());
             a.detail_offset = 12;
             egg_keys(&mut a, &EGG_KEYS[..9]);
             let before = (
                 a.focus_detail,
                 a.worktrees_view,
-                a.drawer_opened_at,
+                a.drawer_animation
+                    .as_ref()
+                    .map(|animation| animation.started),
                 a.selected,
                 a.focused_column,
                 a.detail_offset,
@@ -3487,7 +3487,9 @@ mod tests {
                 (
                     a.focus_detail,
                     a.worktrees_view,
-                    a.drawer_opened_at,
+                    a.drawer_animation
+                        .as_ref()
+                        .map(|animation| animation.started),
                     a.selected,
                     a.focused_column,
                     a.detail_offset,
