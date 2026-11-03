@@ -23,7 +23,7 @@ To browse another workspace, build with `cargo build`, change to that workspace,
 
 After confirming the Herdr launch marker and before opening the terminal interface, OnTrack asks Beads to locate the active workspace. If none exists, it prints “No Beads workspace found. Run bd init in your project, then launch OnTrack again.” and exits successfully. The command **`bd init`** appears in bold on terminal stdout; redirected output contains plain text. OnTrack does not ask setup questions, read input, initialize Beads, or change its configuration. Initialize the workspace yourself, then launch OnTrack again.
 
-Existing workspaces retain their configuration, including JSONL auto-export. OnTrack preferences such as theme, default agent, agent limit and cleanup remain available with `s` in the browser.
+Existing workspaces retain their configuration, including JSONL auto-export. On the first successful start, OnTrack adds `.beads/screenshots/` to the `.gitignore` beside the shared `.beads` directory, creating the file if needed. Later starts leave that rule and other ignore entries unchanged. OnTrack preferences such as theme, default agent, agent limit and cleanup remain available with `s` in the browser.
 
 If `bd` is missing or workspace discovery fails, OnTrack stops before raw mode and reports the launch directory and failing step. Discovery, permission, and database failures do not trigger initialization guidance or replacement initialization.
 
