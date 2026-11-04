@@ -112,8 +112,48 @@ const GIRL_FRAMES: [[&str; 10]; 3] = [
 ];
 
 fn girl_frame(elapsed: Duration) -> &'static [&'static str; 10] {
-    // The existing redraw loop runs every 35 ms, so elapsed time is enough state.
     &GIRL_FRAMES[(elapsed.as_millis() / 300 % GIRL_FRAMES.len() as u128) as usize]
+}
+
+/// Return the next instant at which rendering can visibly change without input.
+pub fn next_visual_update(app: &App, start: Instant, now: Instant) -> Option<Instant> {
+    let mut next = None;
+    let mut schedule = |deadline: Instant| {
+        if deadline > now {
+            next = Some(next.map_or(deadline, |current: Instant| current.min(deadline)));
+        }
+    };
+
+    if !app.easter_egg
+        && app.modal.is_none()
+        && app.help.is_none()
+        && now.saturating_duration_since(start) < SPLASH_DURATION
+    {
+        let elapsed = now.saturating_duration_since(start);
+        let frame = elapsed.as_millis() / 300;
+        schedule(start + Duration::from_millis(((frame + 1) * 300) as u64));
+        schedule(start + SPLASH_DURATION);
+    }
+
+    if let Some(animation) = app
+        .drawer_animation
+        .as_ref()
+        .filter(|_| app.settings.animate_drawers)
+    {
+        let end = animation.started + Duration::from_millis(220);
+        if now < end {
+            // Match the event loop's 35ms animation cadence, plus always schedule its final frame.
+            let elapsed = now.saturating_duration_since(animation.started);
+            let step = elapsed.as_millis() / 35 + 1;
+            schedule((animation.started + Duration::from_millis((step * 35) as u64)).min(end));
+            schedule(end);
+        }
+    }
+
+    if let Some(expires_at) = app.toast.as_ref().and_then(|toast| toast.expires_at) {
+        schedule(expires_at);
+    }
+    next
 }
 
 fn splash_lines(
@@ -5300,5 +5340,67 @@ mod tests {
             assert_eq!(a.detail_rect, animated_final);
             assert_eq!(static_text, final_text);
         }
+    }
+
+    #[test]
+    fn visual_update_deadlines_cover_splash_drawer_and_toast_without_busy_polling() {
+        let start = Instant::now();
+        let mut a = app();
+        assert_eq!(
+            next_visual_update(&a, start, start + Duration::from_millis(299)),
+            Some(start + Duration::from_millis(300))
+        );
+        assert_eq!(
+            next_visual_update(&a, start, start + Duration::from_millis(300)),
+            Some(start + Duration::from_millis(600))
+        );
+        assert_eq!(
+            next_visual_update(&a, start, start + Duration::from_millis(600)),
+            Some(start + Duration::from_millis(900))
+        );
+        assert_eq!(
+            next_visual_update(&a, start, start + Duration::from_millis(900)),
+            Some(start + SPLASH_DURATION)
+        );
+        assert_eq!(next_visual_update(&a, start, start + SPLASH_DURATION), None);
+        assert_eq!(
+            next_visual_update(&a, start, start + Duration::from_secs(2)),
+            None
+        );
+        let animation_start = start + Duration::from_secs(3);
+        a.drawer_animation = Some(crate::app::DrawerAnimation {
+            worktrees: false,
+            started: animation_start,
+            from: 0.0,
+            to: 1.0,
+        });
+        assert_eq!(
+            next_visual_update(&a, start, animation_start),
+            Some(animation_start + Duration::from_millis(35))
+        );
+        assert_eq!(
+            next_visual_update(&a, start, animation_start + Duration::from_millis(35)),
+            Some(animation_start + Duration::from_millis(70))
+        );
+        assert_eq!(
+            next_visual_update(&a, start, animation_start + Duration::from_millis(210)),
+            Some(animation_start + Duration::from_millis(220))
+        );
+        assert_eq!(
+            next_visual_update(&a, start, animation_start + Duration::from_millis(220)),
+            None
+        );
+        a.drawer_animation = None;
+        let expiry = start + Duration::from_secs(5);
+        a.toast = Some(crate::app::Toast {
+            message: "temporary".into(),
+            error: false,
+            expires_at: Some(expiry),
+        });
+        assert_eq!(
+            next_visual_update(&a, start, expiry - Duration::from_nanos(1)),
+            Some(expiry)
+        );
+        assert_eq!(next_visual_update(&a, start, expiry), None);
     }
 }

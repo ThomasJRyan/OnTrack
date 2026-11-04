@@ -731,23 +731,25 @@ impl App {
             self.start_refresh(now);
         }
     }
-    fn poll_refresh(&mut self, now: Instant) {
+    fn poll_refresh(&mut self, now: Instant) -> bool {
         if !self.refresh_inflight && now >= self.next_refresh {
             self.start_refresh(now);
+            return !self.refresh_inflight;
         }
+        false
     }
-    fn poll_planning(&mut self, now: Instant) {
+    fn poll_planning(&mut self, now: Instant) -> bool {
         let Some(Modal::Planning(form)) = self.modal.as_mut() else {
-            return;
+            return false;
         };
         if !matches!(form.stage, PlanningStage::Waiting)
             || form.poll_inflight
             || now < form.next_poll
         {
-            return;
+            return false;
         }
         let Some(session) = form.session.clone() else {
-            return;
+            return false;
         };
         form.poll_inflight = true;
         form.next_poll = now + Duration::from_secs(2);
@@ -758,11 +760,14 @@ impl App {
         {
             form.poll_inflight = false;
             form.stage = PlanningStage::Failed("Agent output read could not be queued".into());
+            return true;
         }
+        false
     }
-    fn poll_scheduler(&mut self) {
+    /// Report progress so the loop can drain eligible work without idle scans.
+    fn poll_scheduler(&mut self) -> bool {
         if !self.worktrees_discovered || self.mutation_busy || self.list_error.is_some() {
-            return;
+            return false;
         }
         // A child must branch from its managed parent checkout. Preparing a
         // parent only reserves that checkout; it does not occupy an agent slot.
@@ -798,7 +803,7 @@ impl App {
         {
             self.scheduler_attempted.insert(parent.id.clone());
             self.start_launch(parent, true);
-            return;
+            return true;
         }
         let active_agents =
             self.worktrees
@@ -835,7 +840,7 @@ impl App {
                     })
                     .count();
         if !self.settings.agent_limit.allows(active_agents) {
-            return;
+            return false;
         }
         let next = self
             .beads
@@ -868,7 +873,9 @@ impl App {
             } else {
                 self.start_launch(bead, true);
             }
+            return true;
         }
+        false
     }
     fn scheduler_eligible(&self, bead: &Bead) -> bool {
         if self
@@ -921,7 +928,7 @@ impl App {
                     )
             })
     }
-    fn poll_worktrees(&mut self, now: Instant) {
+    fn poll_worktrees(&mut self, now: Instant) -> bool {
         let automatic = self.settings.auto_merge
             || self.settings.auto_merge_children
             || self.settings.auto_close_workspace
@@ -937,6 +944,7 @@ impl App {
             && now >= self.worktrees_next_refresh
         {
             self.worktrees_inflight = true;
+            let was_loading = self.worktrees_loading;
             // Only the initial scan hides empty-state guidance. A refresh or
             // retry keeps the settled view visible while the request is in flight.
             self.worktrees_loading = !self.worktrees_discovered && self.worktrees_error.is_none();
@@ -959,8 +967,11 @@ impl App {
                 self.worktrees_loading = false;
                 self.worktrees_error = Some("Worktree refresh could not be queued".into());
                 self.worktrees_next_refresh = now + REFRESH_INTERVAL;
+                return true;
             }
+            return was_loading != self.worktrees_loading;
         }
+        false
     }
     fn poll_agent_observations(&mut self, now: Instant) {
         if self.agent_observation_inflight
@@ -1112,11 +1123,13 @@ impl App {
             self.modal = None;
         }
     }
-    fn receive(&mut self) {
-        self.receive_at(Instant::now());
+    fn receive(&mut self) -> bool {
+        self.receive_at(Instant::now())
     }
-    fn receive_at(&mut self, now: Instant) {
+    fn receive_at(&mut self, now: Instant) -> bool {
+        let mut received = false;
         while let Ok(r) = self.responses.try_recv() {
+            received = true;
             match r {
                 Response::List(res) => {
                     self.refresh_inflight = false;
@@ -1874,6 +1887,7 @@ impl App {
                 }
             }
         }
+        received
     }
     fn input(&mut self, input: Event) -> bool {
         match input {
@@ -3286,18 +3300,34 @@ pub fn list_layout(beads: &[Bead], collapsed: &HashSet<String>) -> ListLayout {
 pub fn run(t: &mut Tui) -> std::io::Result<()> {
     let start = Instant::now();
     let mut app = App::new();
+    let mut redraw = true;
+    let mut scheduler_dirty = true;
+    let mut next_visual_update = None;
     loop {
-        app.receive();
-        app.poll_refresh(Instant::now());
-        app.poll_planning(Instant::now());
-        app.poll_worktrees(Instant::now());
-        app.poll_agent_observations(Instant::now());
-        app.poll_scheduler();
-        t.draw(|f| ui::render(f, start.elapsed(), &mut app))?;
-        if let Some(e) = event::poll_event(Duration::from_millis(35))?
-            && app.input(e)
+        let received = app.receive();
+        redraw |= received;
+        scheduler_dirty |= received;
+        let now = Instant::now();
+        redraw |= app.poll_refresh(now);
+        redraw |= app.poll_planning(now);
+        redraw |= app.poll_worktrees(now);
+        app.poll_agent_observations(now);
+        if scheduler_dirty {
+            scheduler_dirty = app.poll_scheduler();
+            redraw |= scheduler_dirty;
+        }
+        if event::redraw_due(redraw, next_visual_update, now) {
+            t.draw(|f| ui::render(f, now.saturating_duration_since(start), &mut app))?;
+            redraw = false;
+            next_visual_update = ui::next_visual_update(&app, start, now);
+        }
+        if let Some(e) = event::poll_event(event::wait_timeout(next_visual_update, Instant::now()))?
         {
-            break;
+            if app.input(e) {
+                break;
+            }
+            redraw = true;
+            scheduler_dirty = true;
         }
     }
     Ok(())
@@ -3496,14 +3526,7 @@ mod tests {
     fn easter_egg_dismissal_preserves_the_underlying_view_and_resets_progress() {
         for view in 0..3 {
             let mut a = app();
-            a.focus_detail = view == 1;
-            a.worktrees_view = view == 2;
-            a.drawer_animation = Some(DrawerAnimation {
-                worktrees: view == 2,
-                started: Instant::now(),
-                from: 0.0,
-                to: 1.0,
-            });
+            a.set_drawer(view == 2, view != 0, Instant::now());
             a.detail_offset = 12;
             egg_keys(&mut a, &EGG_KEYS[..9]);
             let before = (
@@ -6100,6 +6123,90 @@ mod tests {
         a.requests = requests;
         a.responses = responses;
         (a, rx, tx)
+    }
+
+    #[test]
+    fn receive_reports_drained_responses_even_when_stale_or_failed() {
+        let (mut a, _requests, replies) = connected_app();
+        let now = Instant::now();
+        assert!(!a.receive_at(now));
+        replies
+            .send(Response::Show("stale".into(), 99, Ok(json!({}))))
+            .unwrap();
+        replies
+            .send(Response::List(Err(std::io::Error::other("offline"))))
+            .unwrap();
+        assert!(event::redraw_due(a.receive_at(now), None, now));
+        assert_eq!(a.list_error.as_deref(), Some("offline"));
+        assert!(!a.receive_at(now));
+        drop(replies);
+        assert!(!a.receive_at(now));
+    }
+
+    #[test]
+    fn polling_reports_visible_loading_and_queue_errors_but_not_background_reads() {
+        let (mut a, requests, _replies) = connected_app();
+        let now = Instant::now();
+        a.next_refresh = now;
+        a.worktrees_next_refresh = now;
+        assert!(!a.poll_refresh(now));
+        assert!(!a.poll_worktrees(now));
+        assert!(matches!(requests.try_recv().unwrap(), Request::List));
+        assert!(requests.try_recv().is_ok());
+        a.worktrees_inflight = false;
+        a.worktrees_discovered = false;
+        assert!(a.poll_worktrees(now));
+        assert!(a.worktrees_loading);
+        assert!(!a.poll_worktrees(now));
+
+        drop(requests);
+        a.refresh_inflight = false;
+        a.worktrees_inflight = false;
+        assert!(a.poll_refresh(now));
+        assert!(a.list_error.is_some());
+        assert!(a.poll_worktrees(now));
+        assert!(!a.worktrees_loading);
+        assert!(a.worktrees_error.is_some());
+        assert!(!a.poll_refresh(now));
+        assert!(!a.poll_worktrees(now));
+    }
+
+    #[test]
+    fn scheduler_reports_progress_until_eligible_work_is_drained() {
+        let (mut a, _requests, _replies) = connected_app();
+        for bead in &mut a.beads {
+            bead.data["labels"] = json!(["ontrack:ready", "ontrack:unassigned"]);
+        }
+        for count in 1..=a.beads.len() {
+            assert!(a.poll_scheduler());
+            assert_eq!(a.scheduler_attempted.len(), count);
+            assert!(a.toast.as_ref().unwrap().error);
+        }
+        assert!(!a.poll_scheduler());
+    }
+
+    #[test]
+    fn settled_render_consumes_toast_deadline_without_an_expired_timer_spin() {
+        let (mut a, _requests, _replies) = connected_app();
+        let start = Instant::now();
+        let now = start + Duration::from_secs(2);
+        let expires = now + Duration::from_millis(50);
+        a.toast = Some(Toast {
+            message: "Done".into(),
+            error: false,
+            expires_at: Some(expires),
+        });
+        let deadline = ui::next_visual_update(&a, start, now);
+        assert_eq!(deadline, Some(expires));
+        assert!(!event::redraw_due(false, deadline, now));
+        assert!(event::redraw_due(false, deadline, expires));
+        let deadline = ui::next_visual_update(&a, start, expires);
+        assert_eq!(deadline, None);
+        assert!(!event::redraw_due(false, deadline, expires));
+        assert_eq!(
+            event::wait_timeout(deadline, expires),
+            Duration::from_millis(100)
+        );
     }
 
     #[test]

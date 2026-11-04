@@ -1,7 +1,9 @@
-//! Launch-context checks and read-only workspace discovery, completed before raw mode.
+//! Launch-context checks and workspace setup, completed before raw mode.
 use std::{
     ffi::OsStr,
+    fs::{self, OpenOptions},
     io::{self, IsTerminal, Write},
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
 
@@ -33,25 +35,34 @@ pub fn ensure_workspace() -> io::Result<bool> {
                 .output()
         },
     );
-    result.map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!(
-                "Beads startup in {}: {error}. Check bd and workspace permissions, then retry",
-                directory.display()
-            ),
-        )
-    })
+    result
+        .and_then(|workspace| {
+            if let Some(directory) = workspace {
+                ensure_screenshots_ignored(&directory)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "Beads startup in {}: {error}. Check bd and workspace permissions, then retry",
+                    directory.display()
+                ),
+            )
+        })
 }
 
 fn setup(
     highlight: bool,
     output: &mut impl Write,
     mut execute: impl FnMut(&[&str]) -> io::Result<Output>,
-) -> io::Result<bool> {
+) -> io::Result<Option<PathBuf>> {
     let discovery = execute(&["--no-color", "where", "--json"])?;
-    if workspace_exists(&discovery)? {
-        return Ok(true);
+    if let Some(directory) = workspace_path(&discovery)? {
+        return Ok(Some(directory));
     }
     let command = "bd init";
     if highlight {
@@ -67,33 +78,61 @@ fn setup(
         )?;
     }
     output.flush()?;
-    Ok(false)
+    Ok(None)
 }
 
-fn workspace_exists(output: &Output) -> io::Result<bool> {
+fn workspace_path(output: &Output) -> io::Result<Option<PathBuf>> {
     let value = serde_json::from_slice::<serde_json::Value>(&output.stdout).ok();
     if output.status.success() {
         // Discovery belongs to bd, including ancestors, redirects and worktrees.
-        if value
+        if let Some(path) = value
             .as_ref()
             .and_then(|value| value["path"].as_str())
-            .is_some_and(|path| !path.trim().is_empty())
+            .filter(|path| !path.trim().is_empty())
         {
-            return Ok(true);
+            let path = PathBuf::from(path);
+            if path.is_absolute() && path.file_name() == Some(OsStr::new(".beads")) {
+                return Ok(Some(path));
+            }
         }
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            "bd where returned invalid workspace JSON; expected a nonempty path",
+            "bd where returned invalid workspace JSON; expected an absolute .beads path",
         ));
     }
     if value.as_ref().and_then(|value| value["error"].as_str()) == Some("no_beads_directory") {
-        return Ok(false);
+        return Ok(None);
     }
     Err(io::Error::other(format!(
         "Could not discover Beads workspace: {} {}",
         String::from_utf8_lossy(&output.stderr).trim(),
         String::from_utf8_lossy(&output.stdout).trim()
     )))
+}
+
+fn ensure_screenshots_ignored(beads_directory: &Path) -> io::Result<()> {
+    let ignore = beads_directory
+        .parent()
+        .expect("absolute .beads path")
+        .join(".gitignore");
+    let contents = match fs::read(&ignore) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => return Err(error),
+    };
+    let rule = b".beads/screenshots/";
+    if contents
+        .split(|&byte| byte == b'\n')
+        .any(|line| line.trim_ascii() == rule)
+    {
+        return Ok(());
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(ignore)?;
+    if !contents.is_empty() && !contents.ends_with(b"\n") {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(rule)?;
+    file.write_all(b"\n")
 }
 
 #[cfg(all(test, unix))]
@@ -131,12 +170,13 @@ mod tests {
             let mut calls = 0;
             let mut transcript = Vec::new();
             assert!(
-                !setup(highlight, &mut transcript, |args| {
+                setup(highlight, &mut transcript, |args| {
                     calls += 1;
                     assert_eq!(args, &["--no-color", "where", "--json"]);
                     Ok(response(1, r#"{"error":"no_beads_directory"}"#, ""))
                 })
                 .unwrap()
+                .is_none()
             );
             assert_eq!(calls, 1);
             let transcript = String::from_utf8(transcript).unwrap();
@@ -152,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn existing_inherited_or_redirected_workspace_has_no_writes_or_prompts() {
+    fn existing_inherited_or_redirected_workspace_returns_its_beads_path() {
         for path in [
             "/project/.beads",
             "/ancestor/.beads",
@@ -160,7 +200,7 @@ mod tests {
         ] {
             let mut calls = 0;
             let mut transcript = Vec::new();
-            assert!(
+            assert_eq!(
                 setup(false, &mut transcript, |args| {
                     calls += 1;
                     assert_eq!(args, &["--no-color", "where", "--json"]);
@@ -170,7 +210,8 @@ mod tests {
                         "",
                     ))
                 })
-                .unwrap()
+                .unwrap(),
+                Some(PathBuf::from(path))
             );
             assert_eq!(calls, 1);
             assert!(transcript.is_empty());
@@ -179,7 +220,14 @@ mod tests {
 
     #[test]
     fn malformed_successful_discovery_is_an_error() {
-        for stdout in ["", "bad json", "{}", r#"{"path":" "}"#] {
+        for stdout in [
+            "",
+            "bad json",
+            "{}",
+            r#"{"path":" "}"#,
+            r#"{"path":"relative/.beads"}"#,
+            r#"{"path":"/project/other"}"#,
+        ] {
             let mut transcript = Vec::new();
             assert_eq!(
                 setup(false, &mut transcript, |_| Ok(response(0, stdout, "")))
@@ -220,5 +268,44 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
         assert!(transcript.is_empty());
+    }
+
+    #[test]
+    fn screenshot_ignore_is_created_once_and_preserves_existing_content() {
+        let root = std::env::temp_dir().join(format!(
+            "ontrack-ignore-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        let beads = root.join(".beads");
+        let ignore = root.join(".gitignore");
+
+        ensure_screenshots_ignored(&beads).unwrap();
+        assert_eq!(
+            fs::read_to_string(&ignore).unwrap(),
+            ".beads/screenshots/\n"
+        );
+        ensure_screenshots_ignored(&beads).unwrap();
+        assert_eq!(
+            fs::read_to_string(&ignore).unwrap(),
+            ".beads/screenshots/\n"
+        );
+
+        fs::write(&ignore, "target/\n# keep this").unwrap();
+        ensure_screenshots_ignored(&beads).unwrap();
+        assert_eq!(
+            fs::read_to_string(&ignore).unwrap(),
+            "target/\n# keep this\n.beads/screenshots/\n"
+        );
+        ensure_screenshots_ignored(&beads).unwrap();
+        assert_eq!(
+            fs::read_to_string(&ignore).unwrap(),
+            "target/\n# keep this\n.beads/screenshots/\n"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

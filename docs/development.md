@@ -9,7 +9,7 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 | File | Responsibility |
 | --- | --- |
 | `src/main.rs` | Dispatches `update` and `uninstall` before checking the Herdr launch context and Beads workspace; initializes, runs, and restores the browser terminal. |
-| `src/startup.rs` | Requires the Herdr pane marker, then discovers the active workspace through Beads; prints manual initialization guidance and exits when none exists. |
+| `src/startup.rs` | Requires the Herdr pane marker, discovers the active workspace through Beads, ensures local screenshots are Git-ignored, and prints manual initialization guidance when no workspace exists. |
 | `src/uninstall.rs` | Validates and removes the running executable and user settings after explicit CLI confirmation, before Beads discovery or terminal setup. |
 | `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, animation, and worktree-cleanup preferences under the user's XDG config directory. |
 | `src/theme.rs` | Defines the bundled theme catalog, stable IDs, display names, and semantic color palettes. |
@@ -90,11 +90,11 @@ is intentionally excluded.
 
 For an interactive browser launch, `main` first calls `startup::ensure_herdr_workspace`. It accepts only `HERDR_ENV=1`, the marker Herdr supplies to managed pane processes. Missing or other values return an error with launch guidance before any `bd` command, raw mode, or splash. Help and uninstall dispatch before this guard. The guard checks the inherited marker and does not query Herdr's socket or infer a workspace from global focus.
 
-Before terminal initialization, `startup::ensure_workspace` runs only `bd --no-color where --json`. Successful discovery reuses the existing workspace with no configuration writes. Only the structured `no_beads_directory` error prints manual initialization guidance and returns `Ok(false)`; `main` then exits successfully before raw mode, the splash, or browser startup. Permission, malformed-output, and other discovery failures remain errors. Beads owns ancestor, worktree, and redirect discovery.
+Before terminal initialization, `startup::ensure_workspace` runs `bd --no-color where --json`. Successful discovery uses its absolute `.beads` path to ensure the adjacent `.gitignore` contains `.beads/screenshots/`, creating or appending only when needed; Beads configuration is untouched. Only the structured `no_beads_directory` error prints manual initialization guidance and returns `Ok(false)`; `main` then exits successfully before raw mode, the splash, or browser startup. Permission, malformed-output, ignore-file, and other discovery failures remain errors. Beads owns ancestor, worktree, and redirect discovery.
 
 Missing-workspace guidance asks the user to run the literal command `bd init`, as requested by the startup UX contract. The command is bold on terminal stdout and plain in redirected output. Startup reads no stdin and never invokes init, init help, or configuration writes. Existing workspace settings, including JSONL auto-export, are preserved; `.beads/issues.jsonl` remains optional interchange data, never the source of truth. Global OnTrack preferences remain separate.
 
-Focused `cargo test startup::tests` covers accepted and rejected Herdr markers, then injects command execution and captures output to cover missing-workspace early exit, terminal highlighting, plain redirected output, the single discovery command, existing/inherited/redirected workspace bypass, malformed discovery, other discovery errors, and an unavailable CLI. No live project initialization occurs in unit tests. For a manual terminal check, run the built binary from a disposable directory with no ancestor Beads workspace inside Herdr: verify the highlighted instruction, immediate successful exit, and absence of setup prompts, alternate-screen entry, or workspace files. Redirect stdout to verify plain output. Launch from an existing workspace to verify normal splash/browser startup and terminal cleanup on quit.
+Focused `cargo test startup::tests` covers accepted and rejected Herdr markers, then injects command execution and captures output to cover missing-workspace early exit, terminal highlighting, plain redirected output, the single discovery command, existing/inherited/redirected workspace paths, malformed discovery, other discovery errors, and an unavailable CLI. A temporary directory test covers ignore-file creation, preservation, and repeated startup. No live project initialization occurs in unit tests. For a manual terminal check, run the built binary from a disposable directory with no ancestor Beads workspace inside Herdr: verify the highlighted instruction, immediate successful exit, and absence of setup prompts, alternate-screen entry, or workspace files. Redirect stdout to verify plain output. Launch from an existing workspace to verify normal splash/browser startup and terminal cleanup on quit.
 
 `ontrack uninstall` is dispatched before workspace discovery and terminal setup. It uses the running executable path and `settings::config_path` to select only the current installation and OnTrack user settings; preflight rejects unexpected file types and symlinks. The executable is removed last and checked again against its original file identity. `cargo test --test uninstall` copies the built binary into disposable directories and verifies confirmation, cancellation, missing settings, unsafe paths, and preservation of sibling `bd` and Herdr fixtures.
 
@@ -224,7 +224,19 @@ untouched. A running browser process continues using its old image; restart it
 after success. `curl` and `tar` are runtime prerequisites for this command,
 while normal browsing does not need them.
 
-`App` uses standard-library channels with separate serial browser-Beads, Ready-mutation, and managed-work queues. Herdr discovery, harness discovery, manual/Ready launches, workspace focus, screenshot reads, and display-only agent observations are independent detached jobs. The UI loop receives available responses, draws, and polls input with a short timeout rather than waiting for subprocess completion. While any handoff is pending, worktree polling chooses the read-only list path instead of reconciliation. List and reconciliation display passes copy registry entries and release its lock before Git, Beads, or Herdr display checks; this lets another launch record its intent during a slow status lookup. Reconciliation still holds its lock while applying managed mutations, so launch journaling retains its bounded lock retry and recovery error.
+`App` uses standard-library channels with separate serial browser-Beads, Ready-mutation, and managed-work queues. Herdr discovery, harness discovery, manual/Ready launches, workspace focus, screenshot reads, and display-only agent observations are independent detached jobs. The UI loop checks available responses and polls input rather than waiting for subprocess completion. While any handoff is pending, worktree polling chooses the read-only list path instead of reconciliation. List and reconciliation display passes copy registry entries and release its lock before Git, Beads, or Herdr display checks; this lets another launch record its intent during a slow status lookup. Reconciliation still holds its lock while applying managed mutations, so launch journaling retains its bounded lock retry and recovery error.
+
+Rendering is dirty/deadline-driven: draw initially, after terminal input or worker responses, after visible poll-induced loading/errors, and when `ui::next_visual_update` is due. Recompute the visual deadline after each draw, including the final splash/drawer frame and toast expiry; settled or expired visual state must return no deadline rather than spin. `event::wait_timeout` caps response checks at 100 ms and shortens that wait for visual deadlines; Crossterm wakes immediately on keyboard, mouse, or resize input. Cheap refresh eligibility checks retain completion-based, non-overlapping board/planning/worktree/agent polling. The Ready scheduler scans only after input, responses, or its own dispatch/notice progress, stopping once eligible work is drained instead of rescanning on idle timeouts. Terminal cleanup and detached worker behavior are unchanged.
+
+A settled unchanged view does not continuously render. This removes idle rendering/scheduler work, not the cost of retained background `bd`, Git, or Herdr subprocesses. Measure TUI process CPU separately from child/backend CPU with the same PTY dimensions and fixture; backend size and command latency still affect overall resource use. Deterministic inline event/app tests use supplied `Instant`s to check idle suppression, response redraws, visual wakeups/expiry, poll loading/errors, and scheduler progress without sleeping.
+
+For `ontrack-hwe`, a Linux 120×40 PTY with 100 synthetic issues and no managed
+worktrees measured application CPU for 12 seconds after a six-second warmup.
+Release-build CPU fell from 2.33% to 0.42% of one core (82% less); debug-build
+CPU fell from 14.83% to 1.42% (90% less). These are single samples with 10 ms
+CPU accounting and stubbed CLI backends, not measurements of live backend cost.
+Both versions passed navigation, drawer, resize, quit, and terminal-restoration
+smoke checks; a headless PTY does not establish visual appearance.
 
 The separate agent-observation response may relabel only an `InProgress` managed row as `Blocked` when its recorded pane, workspace, agent kind, native session, and terminal match and Herdr reports `blocked` or `error`. Other or failed observations restore `InProgress`; a worktree refresh carries a verified blocked observation forward until the next poll. Git-based statuses retain precedence. The observation remains presentation data and does not change Beads or the mutation gates.
 
@@ -406,9 +418,13 @@ The display check makes read-only Beads and Herdr calls during worktree refresh;
 it does not change merge, finalization, or cleanup gates. A legacy launch without
 a recorded session can show `READY TO MERGE` from weaker display evidence.
 Automatic reconciliation separately requires a later native session on the same
-recorded terminal and persists it before acting. Without that evidence, automatic
-merge remains deferred. Explicit manual merge confirmation remains available
-for `InProgress` rows and is still subject to the existing Git and agent checks.
+recorded terminal and persists it before acting. Merge completion then requires a
+settled matching agent, a confirmed prompt, and Git ancestry proving that the
+source contains both commits recorded for the request. That ancestry is sufficient
+even when Herdr does not report a newer lifecycle sequence after the merge prompt;
+without the Git proof or settled agent, automatic merge remains deferred. Explicit
+manual merge confirmation remains available for InProgress rows and is still
+subject to the existing Git and agent checks.
 The launch journal records `state_change_seq` and `terminal_id` from the
 pre-prompt `agent get` response even when `agent_session` has not appeared yet.
 Reconciliation can recover those observations from the retained `ready`
