@@ -129,6 +129,8 @@ Dependencies appear as a compact flow chart rooted at the selected Bead. **Block
 
 ontrack automatically polls the board and selected issue's details in the background, starting another refresh roughly one second after the previous refresh completes. Changes made by another terminal or agent appear without manual input or configuring events, a watcher, or extra dependencies. Slow `bd` commands increase the delay; updates are not instantaneous or event-driven. Successful create/edit/move/close/delete actions trigger an immediate refresh. In the `w` drawer, `r` refreshes tracked worktrees.
 
+A settled unchanged screen does not continuously redraw. Input wakes the browser immediately; completed worker results are checked at least every 100 ms while otherwise idle. Splash/drawer animation and toast expiry still redraw when due. Automatic refresh and background `bd`, Git, and Herdr commands continue, so their CPU and latency costs remain even when the screen is quiet; this is not a promise of zero total backend activity.
+
 Context-specific hints point to `Shift+?` for the full key reference. Errors and action notices remain visible without replacing shortcuts; confirmation instructions stay in their dialogs. Worktree recovery actions remain in the drawer. Refresh retains cached cards/details while loading and preserves the selected ID when possible, active column, drawer context, bounded scroll positions, and active form input. Failed refreshes retain the last loaded data alongside the error and retry automatically. An empty workspace still shows all six column headings and zero counts.
 
 ## Update OnTrack
