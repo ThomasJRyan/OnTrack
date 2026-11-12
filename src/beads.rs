@@ -886,24 +886,26 @@ mod tests {
 
     #[test]
     fn discussion_withdraws_only_readiness_with_live_status_guard() {
-        let bead = json!({"id":"Bead-1","status":"in_progress"});
-        withdraw_merge_readiness_with("Bead-1", &bead, |argv| {
-            assert_eq!(
-                argv,
-                [
-                    "--no-color",
-                    "update",
-                    "--if-status=in_progress",
-                    "--status=in_progress",
-                    "--remove-label=ontrack:ready-to-merge",
-                    "--json",
-                    "--",
-                    "Bead-1"
-                ]
-            );
-            Ok(Vec::new())
-        })
-        .unwrap();
+        for status in ["open", "in_progress"] {
+            let bead = json!({"id":"Bead-1","status":status});
+            withdraw_merge_readiness_with("Bead-1", &bead, |argv| {
+                assert_eq!(
+                    argv,
+                    [
+                        "--no-color",
+                        "update",
+                        &format!("--if-status={status}"),
+                        &format!("--status={status}"),
+                        "--remove-label=ontrack:ready-to-merge",
+                        "--json",
+                        "--",
+                        "Bead-1"
+                    ]
+                );
+                Ok(Vec::new())
+            })
+            .unwrap();
+        }
         for bead in [
             json!({"id":"wrong","status":"open"}),
             json!({"id":"Bead-1","status":"closed"}),
