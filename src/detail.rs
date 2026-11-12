@@ -117,46 +117,143 @@ fn entries(v: &Value) -> Vec<&Value> {
         .unwrap_or_else(|| vec![v])
 }
 
+fn card_row(spans: Vec<Span<'static>>, cells: usize, width: usize, border: Style) -> Line<'static> {
+    let mut row = vec![Span::styled("│ ", border)];
+    row.extend(spans);
+    row.push(Span::raw(" ".repeat(width.saturating_sub(cells))));
+    row.push(Span::styled(" │", border));
+    Line::from(row)
+}
+
+fn card_text(line: Line<'static>, width: usize, border: Style) -> Vec<Line<'static>> {
+    let mut rows = Vec::new();
+    let mut spans = Vec::new();
+    let mut cells = 0;
+    for span in line.spans {
+        let mut chunk = String::new();
+        for ch in span.content.chars() {
+            let size = Span::raw(ch.to_string()).width();
+            if cells + size > width && cells > 0 {
+                if !chunk.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut chunk), span.style));
+                }
+                rows.push(card_row(std::mem::take(&mut spans), cells, width, border));
+                cells = 0;
+            }
+            chunk.push(ch);
+            cells += size;
+        }
+        if !chunk.is_empty() {
+            spans.push(Span::styled(chunk, span.style));
+        }
+    }
+    rows.push(card_row(spans, cells, width, border));
+    rows
+}
+
+fn managed_comment(body: &str) -> (bool, &str) {
+    let Some((marker, text)) = body.split_once("\n\n") else {
+        return (false, body);
+    };
+    let Some(marker) = marker
+        .strip_prefix("[ontrack-message ")
+        .and_then(|s| s.strip_suffix(']'))
+    else {
+        return (false, body);
+    };
+    let Ok(value) = serde_json::from_str::<Value>(marker) else {
+        return (false, body);
+    };
+    if value["v"] != 1 || !value["id"].is_string() || !value["handoff"].is_string() {
+        return (false, body);
+    }
+    match value["kind"].as_str() {
+        Some("question" | "response") => (true, text),
+        Some("save" | "user") => (false, text),
+        _ => (false, body),
+    }
+}
+
 fn comments(v: &Value, width: u16) -> Vec<Line<'static>> {
     let mut output = Vec::new();
     for (index, comment) in entries(v).into_iter().enumerate() {
         if index > 0 {
             output.push(Line::default());
         }
-        if let Some(object) = comment.as_object() {
-            for key in ["author", "created_at", "date"] {
-                if let Some(value) = object.get(key) {
-                    output.extend(metadata(key, value));
-                }
-            }
-            let body_key = if object.contains_key("body") {
-                "body"
-            } else {
-                "text"
-            };
-            if let Some(body) = object.get(body_key) {
-                output.extend(narrative_value(body, width));
-            }
-            let extras: Vec<_> = object
-                .iter()
-                .filter(|(key, _)| {
-                    !["author", "created_at", "date", body_key].contains(&key.as_str())
-                })
-                .collect();
-            if !extras.is_empty() {
-                output.extend(json_value(
-                    &Value::Object(
-                        extras
-                            .into_iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    ),
-                    width,
+        let object = comment.as_object();
+        let body = object
+            .and_then(|o| o.get("body").or_else(|| o.get("text")))
+            .or_else(|| comment.as_str().map(|_| comment))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let (agent, body) = managed_comment(body);
+        let author = if agent {
+            Some("Agent")
+        } else {
+            object
+                .and_then(|o| o.get("author"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+        };
+        let timestamp = object
+            .and_then(|o| o.get("created_at").or_else(|| o.get("date")))
+            .and_then(Value::as_str)
+            .filter(|s| !s.trim().is_empty());
+        let border = Style::default().fg(if agent {
+            Color::Indexed(4)
+        } else {
+            Color::Indexed(5)
+        });
+        let inner = usize::from(width.saturating_sub(4));
+        if width < 6 {
+            if let Some(author) = author {
+                output.push(Line::styled(
+                    author.to_owned(),
+                    border.add_modifier(Modifier::BOLD),
                 ));
             }
-        } else {
-            output.extend(json_value(comment, width));
+            if let Some(timestamp) = timestamp {
+                output.push(Line::styled(
+                    timestamp.to_owned(),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            output.extend(md(body, width).lines);
+            continue;
         }
+        output.push(Line::styled(
+            format!("╭{}╮", "─".repeat(usize::from(width) - 2)),
+            border,
+        ));
+        if author.is_some() || timestamp.is_some() {
+            let mut header = Vec::new();
+            if let Some(author) = author {
+                header.push(Span::styled(
+                    author.to_owned(),
+                    border.add_modifier(Modifier::BOLD),
+                ));
+            }
+            if let Some(timestamp) = timestamp {
+                if author.is_some() {
+                    header.push(Span::raw(" · "));
+                }
+                header.push(Span::styled(
+                    timestamp.to_owned(),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            output.extend(card_text(Line::from(header), inner, border));
+        }
+        output.extend(
+            md(body, inner as u16)
+                .lines
+                .into_iter()
+                .flat_map(|line| card_text(line, inner, border)),
+        );
+        output.push(Line::styled(
+            format!("╰{}╯", "─".repeat(usize::from(width) - 2)),
+            border,
+        ));
     }
     output
 }
@@ -350,7 +447,6 @@ pub fn render(value: &Value, selected_title: Option<&str>, width: u16) -> Text<'
                 out.push(Line::default());
             }
             out.push(heading("COMMENTS"));
-            out.push(Line::styled("comments", Style::default().fg(MUTED)));
             out.extend(comments(v, width));
         }
         if RELATION_FIELDS.iter().any(|key| obj.contains_key(*key)) {
@@ -644,12 +740,66 @@ mod tests {
             "other-1",
             "Blocked by ← prerequisites",
             "Other",
-            "extra",
-            "Alternate body retained",
         ] {
             assert!(text.contains(expected), "missing {expected}: {text}");
         }
         assert!(!text.contains("**bold**"));
+        assert!(!text.contains("Alternate body retained"));
+        assert!(!text.contains("extra"));
+    }
+
+    #[test]
+    fn comment_cards_hide_internal_json_and_distinguish_agent_from_user() {
+        let marker = |kind| {
+            format!(
+                "[ontrack-message {{\"v\":1,\"id\":\"handoff:m1\",\"handoff\":\"handoff\",\"kind\":\"{kind}\"}}]\n\nA **bold** comment with 界界界界界"
+            )
+        };
+        let value = json!({"comments": [
+            {"author":"Thomas", "created_at":"today", "body":marker("response"), "id":"hidden-id", "extra":{"secret":"hidden-json"}},
+            {"author":"Thomas", "created_at":"tomorrow", "body":marker("user")},
+            {"author":"Ada", "date":"later", "body":"Plain **note**"}
+        ]});
+        let lines = render(&value, None, 22).lines;
+        let plain = Text::from(lines.clone()).to_string();
+        for expected in [
+            "Agent",
+            "Thomas",
+            "Ada",
+            "today",
+            "tomorrow",
+            "later",
+            "bold",
+            "Plain note",
+        ] {
+            assert!(plain.contains(expected), "missing {expected}: {plain}");
+        }
+        for hidden in [
+            "ontrack-message",
+            "handoff:m1",
+            "hidden-id",
+            "hidden-json",
+            "extra",
+            "**bold**",
+        ] {
+            assert!(!plain.contains(hidden), "unexpected {hidden}: {plain}");
+        }
+        assert_eq!(plain.matches('╭').count(), 3);
+        assert!(lines.iter().all(|line| line.width() <= 22));
+        let agent = lines
+            .iter()
+            .find(|line| line.to_string().contains("Agent"))
+            .unwrap();
+        let user = lines
+            .iter()
+            .find(|line| line.to_string().contains("Thomas"))
+            .unwrap();
+        assert_eq!(agent.spans[0].style.fg, Some(Color::Indexed(4)));
+        assert_eq!(agent.spans[1].style.fg, Some(Color::Indexed(4)));
+        assert_eq!(user.spans[0].style.fg, Some(Color::Indexed(5)));
+        assert_eq!(user.spans[1].style.fg, Some(Color::Indexed(5)));
+        let narrow = render(&value, None, 5).to_string();
+        assert!(narrow.contains("Agent") && narrow.contains("today"));
     }
 
     #[test]
