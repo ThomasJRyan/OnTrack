@@ -1,12 +1,12 @@
 # User guide
 
-ontrack browses Beads issues on a six-column Kanban board with right-side detail and worktree drawers. It can create, edit, move, close after verified integration, or permanently delete one issue at a time. It uses the public `bd` CLI and the current working directory to select the workspace. It does not access the Beads database directly.
+ontrack browses Beads issues on a six-column Kanban board with right-side detail and worktree drawers. It can create, edit, discuss, move, close after verified integration, or permanently delete one issue at a time. It uses the public `bd` CLI and the current working directory to select the workspace. It does not access the Beads database directly.
 
 ## Requirements and startup
 
 - Rust 1.88 or newer to build this Rust 2024 project.
 - `bd` available on `PATH`, with support for the JSON commands shown in the [development guide](development.md#beads-cli-contract).
-- Run the browser from a Herdr-managed shell, which supplies `HERDR_ENV=1`. Outside Herdr, OnTrack exits before Beads discovery or terminal setup and tells you to open a Herdr workspace. `--help`, `update`, and `uninstall` remain available outside Herdr.
+- Run the browser from a Herdr-managed shell, which supplies `HERDR_ENV=1`. Outside Herdr, browser startup exits before Beads discovery or terminal setup and tells you to open a Herdr workspace. Non-interactive `--help`, `update`, `uninstall`, advisory `status`, and [discussion commands](discussions.md#agent-workflow) dispatch before this marker check; managed-checkout and live-session requirements still apply to the relevant commands.
 - If no Beads workspace is accessible from the launch directory, OnTrack tells you to run **`bd init`** and exits. Existing workspaces, including inherited and redirected ones, are reused with their configuration intact.
 - An interactive terminal supporting raw mode and the alternate screen; mouse support is needed for clicking and wheel input.
 - For `ontrack update`, `curl` and `tar` must be on `PATH`, and the executable's directory must be writable for replacement. This command needs neither Herdr nor a Beads workspace.
@@ -42,6 +42,16 @@ Once the browser opens in your Herdr project workspace:
 4. Press `w` to open the worktree drawer. `Enter` focuses its Herdr workspace; within this drawer, `m` requests a merge. The agent commits and checks work before signalling Ready To Merge. OnTrack closes the Bead after verified integration, independently of automatic merge/cleanup preferences. Use drawer actions `c` or `x` only to close the integrated workspace or remove its checkout. `Esc` returns to your board selection.
 
 Press `Shift+?` whenever you need the controls for the current view. See the scheduling and worktree sections below for eligibility, confirmation, and recovery details.
+
+## Discuss a ticket
+
+Press `t` on the board or in Bead details to compose a comment; existing comments remain in the detail drawer. **Save comment** adds ordinary Beads history without waking an agent, including before launch. **Send to agent** queues input for an open ticket's original accepted managed handoff; it does not start a new agent or bypass a busy or blocked session.
+
+Use `Shift+Enter` for a newline. Plain `Enter` in the text focuses Save without submitting; `Tab` / `Shift+Tab` cycles text and actions, and `Enter` activates the focused action. `Esc` cancels unless submission is running. Discussion states distinguish **Needs your input**, **Pending delivery**, **Awaiting agent reply**, and **Delivery uncertain**. Unresolved or pending discussion holds merge, closure, and cleanup; resolving it does not automatically restore Ready To Merge.
+
+Save never answers a pending question. If write durability is uncertain before a durable receipt exists, the draft stays open with both submission actions blocked; editing and `Esc` remain available. Inspect comments/journal evidence before recreating or resending it. Later delivery failures after durable intent close the composer with a pending/uncertain receipt instead. An outstanding prompt submission still holds integration even if the agent acknowledges early.
+
+Comments are durable project data: do not include secrets. Before launch, Save writes plain Beads comments; managed comments also retain correlated journal evidence. See the [discussion guide](discussions.md) for delivery limits, agent commands, schema compatibility, and recovery. For native approvals or authentication, use `w`, select the handoff, and press `Enter` to focus its recorded Herdr workspace.
 
 ## Kanban board and moves
 
@@ -106,6 +116,7 @@ An Open or Ready issue shows `· sent` beside its status after Herdr confirms th
 | `n` | Open the new-bead form. Tab / Shift+Tab moves through Title, Type, Priority, Agent harness, Description, Create, and Cancel. Left / Right cycles any focused dropdown choice with wraparound, immediately when closed or as a preview while open. Enter (or Space) opens the choice list; Up / Down previews options, Enter commits, and Esc restores the opening choice. In Description, Shift+Enter inserts a newline and Enter focuses Create; press Enter again to submit. An empty title shows a required message. |
 | `Shift+N` | On a selected open task, open the same form for a child task. The form names its parent; creation records a Beads parent-child relationship. |
 | `e` | Load the selected bead's current details and open the edit form. Edit Title, Type, Priority, Agent harness, and Description with the same controls as the new-bead form; Save updates that bead, while Esc or Cancel discards the draft. The loading dialog offers `e` to retry a failed detail load. |
+| `t` on the board or in Bead details | Open the ticket discussion composer. Save a comment without agent work, or send to the original managed handoff when eligible. See [discussions](discussions.md). |
 | `c` on the board | Confirm closing only the selected Bead after freshly verified tracked integration; untracked or unintegrated work is refused. Confirm with `y`; cancel with `n`, Enter, or Esc. Beads guards still apply; errors remain available for retry. |
 | `d` | Ask to permanently delete the selected bead. `y` confirms; `n` or Enter cancels. Deletion does not cascade; dependency links are removed and dependents may be orphaned. |
 | `h` | Immediately hand the selected bead to Herdr in the background. The top-right toast shows discovery, launch, and the result. No dialog or second confirmation appears. Repeated `h` for the same pending Bead is ignored; different Beads can launch concurrently. |

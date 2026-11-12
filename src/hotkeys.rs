@@ -19,6 +19,7 @@ pub enum Context {
     GenerateEpic,
     WorktreeConfirm,
     Planning,
+    Discussion,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,6 +32,7 @@ impl Context {
     pub fn current(app: &App) -> Self {
         match app.modal.as_ref() {
             Some(Modal::Planning(_)) => Self::Planning,
+            Some(Modal::Discussion(_)) => Self::Discussion,
             Some(Modal::Create(form) | Modal::Edit { form, .. }) if form.dropdown.is_some() => {
                 Self::FormChoices
             }
@@ -70,6 +72,7 @@ impl Context {
             Self::Delete => "Delete confirmation",
             Self::WorktreeConfirm => "Worktree confirmation",
             Self::Planning => "Plan new work",
+            Self::Discussion => "Ticket discussion",
         }
     }
 
@@ -103,6 +106,7 @@ impl Context {
                     "Toggle Ready for an open issue; Epic includes tasks",
                 ),
                 ("w", "Open outstanding worktrees"),
+                ("t", "Discuss selected ticket"),
                 ("Esc", "Stay in the issue browser"),
             ],
             Self::Details | Self::EpicDetails => vec![
@@ -128,6 +132,7 @@ impl Context {
                 ("d", "Delete selected bead after confirmation"),
                 ("h", "Hand selected bead to Herdr"),
                 ("w", "Open outstanding worktrees"),
+                ("t", "Discuss this ticket"),
             ],
             Self::Worktrees => vec![
                 ("↑ / k", "Select previous worktree"),
@@ -208,6 +213,14 @@ impl Context {
                 ("y", "Create the reviewed Beads"),
                 ("r", "Request a plan revision or retry reading output"),
                 ("Esc", "Cancel planning"),
+            ],
+            Self::Discussion => vec![
+                ("Text", "Write a multiline ticket comment"),
+                ("Enter", "Focus Save comment; does not submit from text"),
+                ("Shift+Enter", "Insert a newline"),
+                ("Tab / Shift+Tab", "Choose Save comment or Send to agent"),
+                ("Enter", "Submit the focused action"),
+                ("Esc", "Close discussion unless submitting"),
             ],
         };
         rows.extend([

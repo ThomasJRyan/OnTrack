@@ -54,6 +54,7 @@ pub(super) enum Request {
     List,
     Show(String, u64),
     LoadEdit(String, u64),
+    PostComment(u64, String, String, bool, Option<String>),
     Create(CreateBead),
     GenerateEpic(String),
     CreateChild(CreateBead, String),
@@ -85,6 +86,7 @@ pub(super) enum Response {
     List(std::io::Result<Vec<Bead>>),
     Show(String, u64, std::io::Result<serde_json::Value>),
     EditLoaded(String, u64, std::io::Result<serde_json::Value>),
+    CommentPosted(u64, String, std::io::Result<String>),
     Created(std::io::Result<String>),
     EpicLaunched(String, std::io::Result<crate::epic::Session>),
     EpicFinished(String, std::io::Result<Vec<String>>),
@@ -149,6 +151,8 @@ pub struct App {
     pub detail_error: Option<String>,
     pub(super) detail_seq: u64,
     pub(super) edit_seq: u64,
+    pub(super) discussion_seq: u64,
+    pub(super) discussion_pending: Option<(u64, String)>,
     pub(super) harness_seq: u64,
     pub(super) launch_seq: u64,
     pub(super) handoff: HashMap<u64, PendingHandoff>,
@@ -206,6 +210,7 @@ pub enum Modal {
     #[allow(dead_code)] // Legacy modal is retained but has no browser entry point.
     Planning(PlanningForm),
     Create(CreateForm),
+    Discussion(DiscussionForm),
     EditLoading {
         id: String,
         seq: u64,
@@ -243,6 +248,19 @@ pub enum Modal {
         id: String,
         action: u8,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscussionForm {
+    pub id: String,
+    pub title: String,
+    pub text: String,
+    pub cursor: usize,
+    pub focus: usize,
+    pub can_send: bool,
+    pub reply_to: Option<String>,
+    pub submission_blocked: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -466,6 +484,10 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
         Request::List => Response::List(beads::list_browser_beads()),
         Request::Show(id, seq) => Response::Show(id.clone(), seq, beads::show_bead(&id)),
         Request::LoadEdit(id, seq) => Response::EditLoaded(id.clone(), seq, beads::show_bead(&id)),
+        Request::PostComment(seq, id, text, send_to_agent, reply_to) => {
+            let result = worktrees::post_comment(&id, &text, send_to_agent, reply_to.as_deref());
+            Response::CommentPosted(seq, id, result)
+        }
         Request::Create(input) => Response::Created(beads::create_bead(&input)),
         Request::GenerateEpic(id) => {
             spawn_epic_planning(id, out.clone());
@@ -536,7 +558,7 @@ fn execute_request(request: Request, out: &mpsc::Sender<Response>) {
     let _ = out.send(response);
 }
 
-/// Board moves/closes share the managed FIFO with reconciliation and cleanup.
+/// Board moves/closes and comments share the managed FIFO with reconciliation and cleanup.
 /// Browser reads, Ready cascades, and independent Herdr jobs stay separate.
 /// Detached jobs are not joined or cancelled when the terminal app exits.
 fn start_workers(
@@ -583,6 +605,7 @@ fn start_workers(
             } else if matches!(
                 request,
                 Request::ListWorktrees
+                    | Request::PostComment(..)
                     | Request::Move(..)
                     | Request::Close(_)
                     | Request::WorktreeAction(..)
@@ -668,6 +691,8 @@ impl App {
             detail_error: None,
             detail_seq: 0,
             edit_seq: 0,
+            discussion_seq: 0,
+            discussion_pending: None,
             harness_seq: 0,
             launch_seq: 0,
             handoff: HashMap::new(),
@@ -1221,6 +1246,51 @@ impl App {
                         {
                             Ok(form) => self.modal = Some(Modal::Edit { id, form }),
                             Err(message) => *error = Some(message),
+                        }
+                    }
+                }
+                Response::CommentPosted(seq, id, result) => {
+                    if !self
+                        .discussion_pending
+                        .as_ref()
+                        .is_some_and(|(pending_seq, pending_id)| {
+                            *pending_seq == seq && *pending_id == id
+                        })
+                    {
+                        continue;
+                    }
+                    self.discussion_pending = None;
+                    self.mutation_busy = false;
+                    let current = self.discussion_seq == seq
+                        && matches!(&self.modal, Some(Modal::Discussion(form)) if form.id == id);
+                    match result {
+                        Ok(receipt) => {
+                            if current {
+                                self.modal = None;
+                            }
+                            self.notice = Some(receipt.clone());
+                            self.toast = Some(Toast::result(receipt, false));
+                            self.refresh_at(now);
+                            self.refresh_detail();
+                            if self.worktrees_inflight {
+                                self.worktrees_refresh_pending = true;
+                            } else {
+                                self.worktrees_discovered = false;
+                                self.worktrees_next_refresh = now;
+                            }
+                        }
+                        Err(error) => {
+                            if current && let Some(Modal::Discussion(form)) = self.modal.as_mut() {
+                                form.submission_blocked =
+                                    worktrees::discussion_submission_uncertain(&error);
+                                form.error = Some(if form.submission_blocked {
+                                    format!(
+                                        "{error}. Submission blocked: inspect Beads comments and the discussion journal before resubmitting. Copy the draft, then Esc to discard."
+                                    )
+                                } else {
+                                    error.to_string()
+                                });
+                            }
                         }
                     }
                 }
@@ -1893,7 +1963,32 @@ impl App {
         match input {
             Event::Key(key) => return self.key(key),
             Event::Mouse(mouse) => self.mouse(mouse.kind, mouse.column, mouse.row),
-            Event::Paste(_) => self.easter_egg_progress = 0,
+            Event::Paste(text) => {
+                self.easter_egg_progress = 0;
+                if !self.easter_egg
+                    && self.help.is_none()
+                    && !self.mutation_busy
+                    && self.modal_ready
+                    && let Some(Modal::Discussion(form)) = self.modal.as_mut()
+                    && form.focus == 0
+                {
+                    let text: String = text
+                        .replace("\r\n", "\n")
+                        .replace('\r', "\n")
+                        .chars()
+                        .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+                        .collect();
+                    form.cursor = form.cursor.min(form.text.len());
+                    while !form.text.is_char_boundary(form.cursor) {
+                        form.cursor -= 1;
+                    }
+                    form.text.insert_str(form.cursor, &text);
+                    form.cursor += text.len();
+                    if !form.submission_blocked {
+                        form.error = None;
+                    }
+                }
+            }
             _ => {}
         }
         false
@@ -1999,6 +2094,7 @@ impl App {
                         | 'x'
                         | 'R'
                         | 'a'
+                        | 't'
                 )
             )
         {
@@ -2063,6 +2159,7 @@ impl App {
                 self.poll_worktrees(Instant::now());
             }
             KeyCode::Char('r' | 'R') => self.toggle_ready(),
+            KeyCode::Char('t') if k.modifiers.is_empty() => self.open_discussion(),
             KeyCode::Char('s') => {
                 let load_error = self
                     .settings_load_error
@@ -2473,6 +2570,10 @@ impl App {
         }
         if self.paste_pending {
             self.notice = Some("Wait for screenshot paste or press Esc to cancel".into());
+            return false;
+        }
+        if matches!(self.modal, Some(Modal::Discussion(_))) {
+            self.discussion_key(key);
             return false;
         }
         if let Some(Modal::Move {
@@ -2920,6 +3021,175 @@ impl App {
             }
         }
     }
+    pub fn discussion_status(&self, bead_id: &str) -> Option<&str> {
+        self.worktrees
+            .iter()
+            .find(|item| item.bead_id == bead_id)
+            .and_then(|item| item.discussion.as_deref())
+    }
+
+    fn open_discussion(&mut self) {
+        if self.mutation_busy || self.discussion_pending.is_some() {
+            return;
+        }
+        let Some(bead) = self.selected.and_then(|index| self.beads.get(index)) else {
+            return;
+        };
+        self.discussion_seq = self.discussion_seq.wrapping_add(1);
+        self.modal = Some(Modal::Discussion(DiscussionForm {
+            id: bead.id.clone(),
+            title: bead.title.clone(),
+            text: String::new(),
+            cursor: 0,
+            focus: 0,
+            can_send: bead.status != "closed"
+                && (self.accepted_handoffs.contains(&bead.id)
+                    || self
+                        .worktrees
+                        .iter()
+                        .any(|item| item.bead_id == bead.id && item.handoff_accepted)),
+            reply_to: self
+                .worktrees
+                .iter()
+                .find(|item| item.bead_id == bead.id)
+                .and_then(|item| item.discussion_question.clone()),
+            submission_blocked: false,
+            error: None,
+        }));
+        self.modal_ready = false;
+    }
+
+    fn discussion_key(&mut self, key: KeyEvent) {
+        use KeyCode::*;
+        let Some(Modal::Discussion(form)) = self.modal.as_mut() else {
+            return;
+        };
+        form.cursor = form.cursor.min(form.text.len());
+        while !form.text.is_char_boundary(form.cursor) {
+            form.cursor -= 1;
+        }
+        match key.code {
+            Tab | BackTab => {
+                form.focus = cycle_choice(
+                    form.focus,
+                    if form.can_send { 3 } else { 2 },
+                    key.code == Tab && !key.modifiers.contains(KeyModifiers::SHIFT),
+                );
+            }
+            Left | Right if form.focus != 0 => {
+                form.focus = 1 + cycle_choice(
+                    form.focus - 1,
+                    if form.can_send { 2 } else { 1 },
+                    key.code == Right,
+                );
+            }
+            Enter if form.focus == 0 && key.modifiers == KeyModifiers::SHIFT => {
+                form.text.insert(form.cursor, '\n');
+                form.cursor += 1;
+                if !form.submission_blocked {
+                    form.error = None;
+                }
+            }
+            Enter if form.focus == 0 => form.focus = 1,
+            Enter if form.focus == 1 || (form.focus == 2 && form.can_send) => {
+                if form.submission_blocked {
+                    return;
+                }
+                if form.text.trim().is_empty() {
+                    form.error = Some("Comment text is required".into());
+                    return;
+                }
+                if self.discussion_pending.is_some() {
+                    return;
+                }
+                self.discussion_seq = self.discussion_seq.wrapping_add(1);
+                let seq = self.discussion_seq;
+                let id = form.id.clone();
+                let send = form.focus == 2;
+                let request = Request::PostComment(
+                    seq,
+                    id.clone(),
+                    form.text.clone(),
+                    send,
+                    if send { form.reply_to.clone() } else { None },
+                );
+                form.error = None;
+                self.mutation_busy = true;
+                self.discussion_pending = Some((seq, id));
+                if self.requests.send(request).is_err() {
+                    self.mutation_busy = false;
+                    self.discussion_pending = None;
+                    form.error = Some("Comment could not be queued; try again".into());
+                }
+            }
+            Left if form.focus == 0 => {
+                form.cursor = previous_boundary(&form.text, form.cursor);
+            }
+            Right if form.focus == 0 => form.cursor = next_boundary(&form.text, form.cursor),
+            Home if form.focus == 0 => {
+                form.cursor = form.text[..form.cursor].rfind('\n').map_or(0, |i| i + 1);
+            }
+            End if form.focus == 0 => {
+                form.cursor = form.text[form.cursor..]
+                    .find('\n')
+                    .map_or(form.text.len(), |i| form.cursor + i);
+            }
+            Up | Down if form.focus == 0 => {
+                let start = form.text[..form.cursor].rfind('\n').map_or(0, |i| i + 1);
+                let column = form.text[start..form.cursor].chars().count();
+                let target = if key.code == Up {
+                    start.checked_sub(1).map(|end| {
+                        let start = form.text[..end].rfind('\n').map_or(0, |i| i + 1);
+                        (start, end)
+                    })
+                } else {
+                    form.text[form.cursor..].find('\n').map(|end| {
+                        let start = form.cursor + end + 1;
+                        let end = form.text[start..]
+                            .find('\n')
+                            .map_or(form.text.len(), |i| start + i);
+                        (start, end)
+                    })
+                };
+                if let Some((start, end)) = target {
+                    form.cursor = form.text[start..end]
+                        .char_indices()
+                        .nth(column)
+                        .map_or(end, |(i, _)| start + i);
+                }
+            }
+            Backspace if form.focus == 0 && form.cursor > 0 => {
+                let previous = previous_boundary(&form.text, form.cursor);
+                form.text.drain(previous..form.cursor);
+                form.cursor = previous;
+                if !form.submission_blocked {
+                    form.error = None;
+                }
+            }
+            Delete if form.focus == 0 && form.cursor < form.text.len() => {
+                let next = next_boundary(&form.text, form.cursor);
+                form.text.drain(form.cursor..next);
+                if !form.submission_blocked {
+                    form.error = None;
+                }
+            }
+            Char(c)
+                if form.focus == 0
+                    && !c.is_control()
+                    && !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+            {
+                form.text.insert(form.cursor, c);
+                form.cursor += c.len_utf8();
+                if !form.submission_blocked {
+                    form.error = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn selected_is_epic(&self) -> bool {
         self.selected
             .and_then(|i| self.beads.get(i))
@@ -3726,6 +3996,8 @@ mod tests {
             bead_id: id.into(),
             parent_bead_id: parent.map(str::to_owned),
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: id.into(),
@@ -3959,6 +4231,8 @@ mod tests {
             detail_error: None,
             detail_seq: 0,
             edit_seq: 0,
+            discussion_seq: 0,
+            discussion_pending: None,
             harness_seq: 0,
             launch_seq: 0,
             handoff: HashMap::new(),
@@ -4009,6 +4283,484 @@ mod tests {
             responses,
         }
     }
+    #[test]
+    fn discussion_opens_on_board_and_detail_with_captured_target_and_send_guard() {
+        for detail in [false, true] {
+            let (mut a, rx, _) = connected_app();
+            a.focus_detail = detail;
+            a.accepted_handoffs.insert("b0".into());
+            press(&mut a, KeyCode::Char('t'));
+            assert!(matches!(&a.modal, Some(Modal::Discussion(form))
+                if form.id == "b0" && form.title == "issue 0" && form.can_send && form.focus == 0));
+            a.select(1);
+            take_show(&rx, "b1");
+            a.input(Event::Paste("captured comment".into()));
+            press(&mut a, KeyCode::Enter);
+            assert!(rx.try_recv().is_err());
+            press(&mut a, KeyCode::Enter);
+            assert!(
+                matches!(rx.try_recv(), Ok(Request::PostComment(_, id, text, false, None))
+                if id == "b0" && text == "captured comment")
+            );
+            assert_bead(&a, "b1");
+        }
+        let mut a = app();
+        a.beads[0].status = "closed".into();
+        a.accepted_handoffs.insert("b0".into());
+        press(&mut a, KeyCode::Char('t'));
+        assert!(matches!(&a.modal, Some(Modal::Discussion(form)) if !form.can_send));
+        press(&mut a, KeyCode::Esc);
+        a.clear_selection();
+        press(&mut a, KeyCode::Char('t'));
+        assert!(a.modal.is_none());
+    }
+
+    #[test]
+    fn discussion_save_is_default_and_send_requires_explicit_enabled_action() {
+        for can_send in [false, true] {
+            for send in [false, true] {
+                let (mut a, rx, _) = connected_app();
+                if can_send {
+                    a.accepted_handoffs.insert("b0".into());
+                }
+                press(&mut a, KeyCode::Char('t'));
+                a.input(Event::Paste("hello".into()));
+                press(&mut a, KeyCode::Enter);
+                assert!(matches!(&a.modal, Some(Modal::Discussion(form)) if form.focus == 1));
+                if send {
+                    press(&mut a, KeyCode::Right);
+                }
+                press(&mut a, KeyCode::Enter);
+                assert!(
+                    matches!(rx.try_recv(), Ok(Request::PostComment(_, _, text, actual, None))
+                    if text == "hello" && actual == (send && can_send))
+                );
+                assert!(a.mutation_busy);
+            }
+        }
+    }
+
+    #[test]
+    fn discussion_captures_question_identity_without_resolving_newer_or_unrelated_questions() {
+        for question in [None, Some("question-old")] {
+            for send in [false, true] {
+                let (mut a, rx, tx) = connected_app();
+                let mut other = observed_row("b1", worktrees::WorktreeStatus::InProgress);
+                other.discussion_question = Some("unrelated-question".into());
+                let mut selected = observed_row("b0", worktrees::WorktreeStatus::InProgress);
+                selected.discussion_question = question.map(str::to_owned);
+                a.worktrees = vec![other, selected];
+                press(&mut a, KeyCode::Char('t'));
+                assert!(matches!(&a.modal, Some(Modal::Discussion(form))
+                    if form.reply_to.as_deref() == question));
+                a.worktrees[1].discussion_question = Some("question-new".into());
+                a.select(1);
+                take_show(&rx, "b1");
+                a.input(Event::Paste("answer".into()));
+                press(&mut a, KeyCode::Enter);
+                if send {
+                    press(&mut a, KeyCode::Right);
+                }
+                press(&mut a, KeyCode::Enter);
+                let Request::PostComment(seq, id, text, actual_send, reply_to) =
+                    rx.try_recv().unwrap()
+                else {
+                    panic!("comment not queued")
+                };
+                assert_eq!(id, "b0");
+                assert_eq!(text, "answer");
+                assert_eq!(actual_send, send);
+                assert_eq!(reply_to.as_deref(), if send { question } else { None });
+                tx.send(Response::CommentPosted(
+                    seq,
+                    id.clone(),
+                    Err(std::io::Error::other("offline")),
+                ))
+                .unwrap();
+                a.receive();
+                press(&mut a, KeyCode::Enter);
+                let Request::PostComment(retry, _, _, retry_send, retry_reply_to) =
+                    rx.try_recv().unwrap()
+                else {
+                    panic!("retry not queued")
+                };
+                assert_eq!(retry_send, send);
+                assert_eq!(
+                    retry_reply_to.as_deref(),
+                    if send { question } else { None }
+                );
+                tx.send(Response::CommentPosted(retry, id, Ok("saved".into())))
+                    .unwrap();
+                a.receive();
+                assert_eq!(
+                    a.worktrees[1].discussion_question.as_deref(),
+                    Some("question-new")
+                );
+                assert_eq!(
+                    a.worktrees[0].discussion_question.as_deref(),
+                    Some("unrelated-question")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn discussion_save_omits_question_reference_and_send_keeps_captured_reference() {
+        let (mut a, rx, tx) = connected_app();
+        let mut selected = observed_row("b0", worktrees::WorktreeStatus::InProgress);
+        selected.discussion_question = Some("question-captured".into());
+        a.worktrees.push(selected);
+        press(&mut a, KeyCode::Char('t'));
+        a.input(Event::Paste("answer".into()));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        let Request::PostComment(seq, id, _, send, reply_to) = rx.try_recv().unwrap() else {
+            panic!("save not queued")
+        };
+        assert!(!send);
+        assert!(reply_to.is_none(), "backend rejects Save with a reference");
+        assert!(matches!(&a.modal, Some(Modal::Discussion(form))
+            if form.reply_to.as_deref() == Some("question-captured")));
+        tx.send(Response::CommentPosted(
+            seq,
+            id,
+            Err(std::io::Error::other("offline")),
+        ))
+        .unwrap();
+        a.receive();
+        a.worktrees[0].discussion_question = Some("question-new".into());
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::PostComment(_, _, _, true, Some(reply_to)))
+            if reply_to == "question-captured")
+        );
+    }
+
+    #[test]
+    fn discussion_tab_and_button_arrows_cycle_only_enabled_fields() {
+        for can_send in [false, true] {
+            let mut a = app();
+            if can_send {
+                a.accepted_handoffs.insert("b0".into());
+            }
+            press(&mut a, KeyCode::Char('t'));
+            let last = if can_send { 2 } else { 1 };
+            press(&mut a, KeyCode::BackTab);
+            assert!(matches!(&a.modal, Some(Modal::Discussion(form)) if form.focus == last));
+            press(&mut a, KeyCode::Tab);
+            assert!(matches!(&a.modal, Some(Modal::Discussion(form)) if form.focus == 0));
+            press(&mut a, KeyCode::Tab);
+            press(&mut a, KeyCode::Left);
+            assert!(matches!(&a.modal, Some(Modal::Discussion(form)) if form.focus == last));
+            press(&mut a, KeyCode::Right);
+            assert!(matches!(&a.modal, Some(Modal::Discussion(form)) if form.focus == 1));
+            press(&mut a, KeyCode::Esc);
+            assert!(a.modal.is_none());
+        }
+    }
+
+    #[test]
+    fn discussion_rejects_empty_draft_and_preserves_it_on_queue_failure() {
+        let (mut a, rx, _) = connected_app();
+        press(&mut a, KeyCode::Char('t'));
+        a.input(Event::Paste(" \n\t".into()));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(&a.modal, Some(Modal::Discussion(form)) if form.error.is_some()));
+        assert!(!a.mutation_busy);
+        assert!(a.discussion_pending.is_none());
+        assert!(rx.try_recv().is_err());
+        drop(rx);
+        press(&mut a, KeyCode::BackTab);
+        a.input(Event::Paste("draft".into()));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        assert!(matches!(&a.modal, Some(Modal::Discussion(form))
+            if form.text == " \n\tdraft" && form.error.as_deref().unwrap().contains("queued")));
+        assert!(!a.mutation_busy);
+        assert!(a.discussion_pending.is_none());
+    }
+
+    #[test]
+    fn discussion_multiline_unicode_paste_and_editing_keep_character_boundaries() {
+        let (mut a, rx, _) = connected_app();
+        press(&mut a, KeyCode::Char('t'));
+        a.input(Event::Paste("é猫\r\n🦀z\rfin\u{1b}".into()));
+        assert!(matches!(&a.modal, Some(Modal::Discussion(form))
+            if form.text == "é猫\n🦀z\nfin" && form.cursor == form.text.len()));
+        press(&mut a, KeyCode::Home);
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Right);
+        press(&mut a, KeyCode::Delete);
+        press(&mut a, KeyCode::Backspace);
+        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        a.input(Event::Paste("界".into()));
+        press(&mut a, KeyCode::Up);
+        press(&mut a, KeyCode::Left);
+        press(&mut a, KeyCode::Down);
+        press(&mut a, KeyCode::End);
+        assert!(matches!(&a.modal, Some(Modal::Discussion(form))
+            if form.text == "é猫\n\n界\nfin" && form.text.is_char_boundary(form.cursor)));
+        press(&mut a, KeyCode::Enter);
+        assert!(rx.try_recv().is_err());
+        press(&mut a, KeyCode::Enter);
+        assert!(
+            matches!(rx.try_recv(), Ok(Request::PostComment(_, _, text, false, None))
+            if text == "é猫\n\n界\nfin")
+        );
+    }
+
+    #[test]
+    fn discussion_locks_submission_and_ignores_stale_responses_until_explicit_retry() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('t'));
+        a.input(Event::Paste("keep draft".into()));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        let Request::PostComment(seq, id, _, _, _) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        let draft = a.modal.clone();
+        for key in [
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::BackTab,
+            KeyCode::Char('x'),
+        ] {
+            press(&mut a, key);
+        }
+        a.input(Event::Paste("locked".into()));
+        assert_eq!(a.modal, draft);
+        assert!(rx.try_recv().is_err());
+        tx.send(Response::CommentPosted(
+            seq.wrapping_sub(1),
+            id.clone(),
+            Ok("old".into()),
+        ))
+        .unwrap();
+        tx.send(Response::CommentPosted(
+            seq,
+            "other".into(),
+            Ok("wrong target".into()),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(a.mutation_busy);
+        tx.send(Response::CommentPosted(
+            seq,
+            id.clone(),
+            Err(std::io::Error::other("offline")),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(!a.mutation_busy);
+        assert!(matches!(&a.modal, Some(Modal::Discussion(form))
+            if form.text == "keep draft" && !form.submission_blocked
+                && form.error.as_deref() == Some("offline")));
+        assert!(
+            rx.try_recv().is_err(),
+            "failed comments must not retry automatically"
+        );
+        press(&mut a, KeyCode::Enter);
+        let Request::PostComment(retry, _, text, _, _) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        assert_ne!(seq, retry);
+        assert_eq!(text, "keep draft");
+        tx.send(Response::CommentPosted(
+            seq,
+            id,
+            Ok("duplicate old receipt".into()),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(a.mutation_busy);
+        assert!(a.modal.is_some());
+    }
+
+    #[test]
+    fn discussion_uncertain_submission_retains_editable_draft_but_blocks_save_and_send() {
+        for send in [false, true] {
+            let (mut a, rx, tx) = connected_app();
+            a.accepted_handoffs.insert("b0".into());
+            press(&mut a, KeyCode::Char('t'));
+            a.input(Event::Paste("keep draft".into()));
+            press(&mut a, KeyCode::Enter);
+            if send {
+                press(&mut a, KeyCode::Right);
+            }
+            press(&mut a, KeyCode::Enter);
+            let Request::PostComment(seq, id, _, _, _) = rx.try_recv().unwrap() else {
+                panic!("comment not queued")
+            };
+            tx.send(Response::CommentPosted(
+                seq,
+                id,
+                Err(std::io::Error::other(
+                    worktrees::DiscussionSubmissionUncertain(
+                        "journal persistence uncertain".into(),
+                    ),
+                )),
+            ))
+            .unwrap();
+            a.receive();
+            assert!(!a.mutation_busy);
+            assert!(a.discussion_pending.is_none());
+            let Some(Modal::Discussion(form)) = &a.modal else {
+                panic!("draft lost")
+            };
+            assert_eq!(form.text, "keep draft");
+            assert!(form.submission_blocked);
+            let error = form.error.clone();
+            let message = error.as_deref().unwrap();
+            for expected in [
+                "inspect",
+                "comments",
+                "journal",
+                "before resubmitting",
+                "Esc",
+            ] {
+                assert!(message.contains(expected));
+            }
+            press(&mut a, KeyCode::Enter);
+            press(&mut a, if send { KeyCode::Tab } else { KeyCode::BackTab });
+            for input in [
+                Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE)),
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)),
+                Event::Paste("edited".into()),
+            ] {
+                a.input(input);
+                assert!(matches!(&a.modal, Some(Modal::Discussion(form))
+                    if form.submission_blocked && form.error == error));
+            }
+            assert!(matches!(&a.modal, Some(Modal::Discussion(form))
+                if form.text != "keep draft" && form.text.contains("edited")));
+            press(&mut a, KeyCode::Tab);
+            press(&mut a, KeyCode::Enter);
+            press(&mut a, KeyCode::Right);
+            press(&mut a, KeyCode::Enter);
+            assert!(rx.try_recv().is_err());
+            assert!(!a.mutation_busy);
+            assert!(a.discussion_pending.is_none());
+            press(&mut a, KeyCode::Esc);
+            assert!(a.modal.is_none());
+        }
+    }
+
+    #[test]
+    fn discussion_stale_uncertainty_cannot_block_a_newer_form() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('t'));
+        a.input(Event::Paste("old draft".into()));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        let Request::PostComment(seq, id, _, _, _) = rx.try_recv().unwrap() else {
+            panic!("comment not queued")
+        };
+        tx.send(Response::CommentPosted(
+            seq,
+            id.clone(),
+            Err(std::io::Error::other("offline")),
+        ))
+        .unwrap();
+        a.receive();
+        press(&mut a, KeyCode::Esc);
+        press(&mut a, KeyCode::Char('t'));
+        a.input(Event::Paste("new draft".into()));
+        let reopened = a.modal.clone();
+        tx.send(Response::CommentPosted(
+            seq,
+            id,
+            Err(std::io::Error::other(
+                worktrees::DiscussionSubmissionUncertain("late uncertainty".into()),
+            )),
+        ))
+        .unwrap();
+        a.receive();
+        assert_eq!(a.modal, reopened);
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        let Request::PostComment(current_seq, current_id, _, _, _) = rx.try_recv().unwrap() else {
+            panic!("new draft was blocked")
+        };
+        let pending = a.modal.clone();
+        for (response_seq, response_id) in [(seq, current_id), (current_seq, "wrong target".into())]
+        {
+            tx.send(Response::CommentPosted(
+                response_seq,
+                response_id,
+                Err(std::io::Error::other(
+                    worktrees::DiscussionSubmissionUncertain("stale uncertainty".into()),
+                )),
+            ))
+            .unwrap();
+        }
+        a.receive();
+        assert!(a.mutation_busy);
+        assert_eq!(a.modal, pending);
+    }
+
+    #[test]
+    fn discussion_success_refreshes_without_switching_target_or_overwriting_reopened_modal() {
+        let (mut a, rx, tx) = connected_app();
+        press(&mut a, KeyCode::Char('t'));
+        a.input(Event::Paste("saved".into()));
+        press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Enter);
+        let Request::PostComment(seq, id, _, _, _) = rx.try_recv().unwrap() else {
+            panic!()
+        };
+        a.select(1);
+        take_show(&rx, "b1");
+        tx.send(Response::CommentPosted(
+            seq,
+            id.clone(),
+            Ok("Comment saved; delivery queued".into()),
+        ))
+        .unwrap();
+        a.receive();
+        assert!(a.modal.is_none());
+        assert!(!a.mutation_busy);
+        assert_bead(&a, "b1");
+        assert!(a.preferred_id.is_none());
+        assert!(matches!(rx.try_recv(), Ok(Request::List)));
+        take_show(&rx, "b1");
+        assert!(!a.worktrees_discovered);
+        a.poll_worktrees(Instant::now());
+        assert!(matches!(rx.try_recv(), Ok(Request::ListWorktrees)));
+        a.select(0);
+        take_show(&rx, "b0");
+        press(&mut a, KeyCode::Char('t'));
+        a.input(Event::Paste("new draft".into()));
+        let reopened = a.modal.clone();
+        tx.send(Response::CommentPosted(
+            seq,
+            id,
+            Err(std::io::Error::other("late failure")),
+        ))
+        .unwrap();
+        a.receive();
+        assert_eq!(a.modal, reopened);
+        tx.send(Response::List(Ok(a.beads.clone()))).unwrap();
+        a.receive();
+        take_show(&rx, "b0");
+        assert_eq!(a.modal, reopened);
+    }
+
+    #[test]
+    fn discussion_status_exposes_managed_delivery_receipt() {
+        let mut a = app();
+        let mut item = observed_row("b0", worktrees::WorktreeStatus::InProgress);
+        item.discussion = Some("Queued for agent".into());
+        a.worktrees.push(item);
+        assert_eq!(a.discussion_status("b0"), Some("Queued for agent"));
+        assert_eq!(a.discussion_status("b1"), None);
+    }
+
     fn assert_bead(a: &App, id: &str) {
         let bead = &a.beads[a.selected.expect("selected bead")];
         assert_eq!(bead.id, id);
@@ -4480,6 +5232,8 @@ mod tests {
             bead_id: "other".into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: "ontrack/other".into(),
@@ -4521,6 +5275,8 @@ mod tests {
                 bead_id: "b0".into(),
                 parent_bead_id: None,
                 handoff_accepted: false,
+                discussion: None,
+                discussion_question: None,
                 bead_title: None,
                 bead_description: None,
                 branch: "ontrack/parent".into(),
@@ -4635,6 +5391,8 @@ mod tests {
             bead_id: "other".into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: "ontrack/other".into(),
@@ -4670,6 +5428,8 @@ mod tests {
             bead_id: "other".into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: "ontrack/other".into(),
@@ -4696,6 +5456,8 @@ mod tests {
                 bead_id: "b0".into(),
                 parent_bead_id: None,
                 handoff_accepted: true,
+                discussion: None,
+                discussion_question: None,
                 bead_title: None,
                 bead_description: None,
                 branch: "ontrack/b0".into(),
@@ -5159,6 +5921,8 @@ mod tests {
             bead_id: "b0".into(),
             parent_bead_id: None,
             handoff_accepted: false,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: "ontrack/parent".into(),
@@ -5219,6 +5983,8 @@ mod tests {
             bead_id: bead.into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: format!("ontrack/{bead}"),
@@ -5356,7 +6122,7 @@ mod tests {
     }
 
     #[test]
-    fn moves_and_closes_serialize_with_reconciliation_without_blocking_reads_or_ready() {
+    fn moves_closes_and_comments_serialize_with_reconciliation_without_blocking_reads_or_ready() {
         for reconcile_first in [true, false] {
             let (release, blocked) = mpsc::channel();
             let blocked = std::sync::Mutex::new(blocked);
@@ -5390,6 +6156,10 @@ mod tests {
                         steps.send("close").unwrap();
                         Response::Closed(id, Ok(()))
                     }
+                    Request::PostComment(seq, id, _, _, _) => {
+                        steps.send("comment").unwrap();
+                        Response::CommentPosted(seq, id, Ok("saved".into()))
+                    }
                     Request::List => Response::List(Ok(vec![])),
                     Request::Show(id, seq) => Response::Show(id, seq, Ok(json!({}))),
                     Request::SetReady(id, ready) => {
@@ -5416,6 +6186,15 @@ mod tests {
             requests.send(second).unwrap();
             requests.send(Request::Close("task".into())).unwrap();
             requests
+                .send(Request::PostComment(
+                    1,
+                    "task".into(),
+                    "hello".into(),
+                    true,
+                    None,
+                ))
+                .unwrap();
+            requests
                 .send(Request::SetReady("other".into(), true))
                 .unwrap();
             requests.send(Request::List).unwrap();
@@ -5438,9 +6217,9 @@ mod tests {
             assert!(completed.try_recv().is_err());
             release.send(()).unwrap();
             let expected = if reconcile_first {
-                ["reconcile", "move", "close"]
+                ["reconcile", "move", "close", "comment"]
             } else {
-                ["move", "reconcile", "close"]
+                ["move", "reconcile", "close", "comment"]
             };
             for step in expected {
                 assert_eq!(
@@ -5452,7 +6231,12 @@ mod tests {
                     "reconcile" => assert!(matches!(response, Response::Worktrees(Ok(_)))),
                     "move" => assert!(matches!(response, Response::Moved(id, target, Ok(()))
                         if id == "task" && target == "in_progress")),
-                    _ => assert!(matches!(response, Response::Closed(id, Ok(())) if id == "task")),
+                    "close" => {
+                        assert!(matches!(response, Response::Closed(id, Ok(())) if id == "task"))
+                    }
+                    _ => assert!(
+                        matches!(response, Response::CommentPosted(1, id, Ok(_)) if id == "task")
+                    ),
                 }
             }
         }
@@ -6566,6 +7350,17 @@ mod tests {
     fn unchanged_polls_preserve_detail_scroll_drawers_columns_and_modals() {
         for modal in [
             None,
+            Some(Modal::Discussion(DiscussionForm {
+                id: "b0".into(),
+                title: "issue 0".into(),
+                text: "unfinished comment".into(),
+                cursor: 3,
+                focus: 0,
+                can_send: true,
+                reply_to: None,
+                submission_blocked: false,
+                error: None,
+            })),
             Some(Modal::Create(CreateForm {
                 title: "unfinished draft".into(),
                 description: "keep this".into(),
@@ -8207,6 +9002,8 @@ mod tests {
                 bead_id: "b1".into(),
                 parent_bead_id: None,
                 handoff_accepted: true,
+                discussion: None,
+                discussion_question: None,
                 bead_title: None,
                 bead_description: None,
                 branch: "ontrack/b1".into(),
@@ -8244,6 +9041,8 @@ mod tests {
             bead_id: "b1".into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: "ontrack/b1".into(),
@@ -8290,6 +9089,8 @@ mod tests {
             bead_id: "b1".into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: "ontrack/b1".into(),
@@ -8321,6 +9122,8 @@ mod tests {
             bead_id: "b1".into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: Some("Task".into()),
             bead_description: None,
             branch: "ontrack/b1".into(),
@@ -8351,6 +9154,8 @@ mod tests {
             bead_id: "b1".into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: Some("Task".into()),
             bead_description: None,
             branch: "ontrack/b1".into(),
@@ -8384,6 +9189,8 @@ mod tests {
             bead_id: "b1".into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: Some("Task".into()),
             bead_description: None,
             branch: "ontrack/b1".into(),
@@ -8510,6 +9317,8 @@ mod tests {
                 bead_id: format!("bead-{index}"),
                 parent_bead_id: None,
                 handoff_accepted: true,
+                discussion: None,
+                discussion_question: None,
                 bead_title: Some(format!("Title {index}")),
                 bead_description: Some("A long description".into()),
                 branch: format!("ontrack/bead-{index}"),
@@ -8594,6 +9403,8 @@ mod tests {
             bead_id: "bead".into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: "ontrack/task".into(),
@@ -8622,6 +9433,8 @@ mod tests {
             bead_id: a.beads[0].id.clone(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: "ontrack/b0".into(),
@@ -8645,6 +9458,8 @@ mod tests {
             bead_id: format!("bead-{id}"),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: format!("ontrack/{id}"),
@@ -8700,6 +9515,8 @@ mod tests {
             bead_id: format!("bead-{id}"),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: format!("ontrack/{id}"),
@@ -8734,6 +9551,8 @@ mod tests {
             bead_id: "b0".into(),
             parent_bead_id: None,
             handoff_accepted: true,
+            discussion: None,
+            discussion_question: None,
             bead_title: None,
             bead_description: None,
             branch: "ontrack/b0".into(),

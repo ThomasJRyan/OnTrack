@@ -20,6 +20,24 @@ mod worktrees;
 use std::{error::Error, io};
 
 fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args
+        .first()
+        .is_some_and(|a| a == "inbox" || a == "ask" || a == "respond")
+    {
+        let args = args
+            .into_iter()
+            .map(|a| {
+                a.into_string()
+                    .map_err(|_| "Conversation arguments must be UTF-8")
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        println!(
+            "{}",
+            worktrees::discussion_cli(&std::env::current_dir()?, &args)?
+        );
+        return Ok(());
+    }
     match std::env::args_os().skip(1).collect::<Vec<_>>().as_slice() {
         [] => {}
         [command] if command == "update" => {
@@ -49,6 +67,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             return Ok(());
         }
         [flag] if flag == "--help" || flag == "-h" => {
+            println!("Ticket conversation (from the managed checkout):\n  ontrack inbox [--json]\n  ontrack ask [--reply-to MESSAGE_ID ...] TEXT\n  ontrack respond --reply-to MESSAGE_ID [...] TEXT\nQuote TEXT as one argument. Ask then yield; inbox does not acknowledge.\n");
             println!(
                 "Usage: ontrack [update | uninstall [--yes] | status <working|merging|blocked|clear> [detail]]\n\nRun without arguments to browse the current Beads workspace.\nUpdate checks for a newer compatible release and asks before installing it.\nStatus reports advisory activity for the current managed checkout; clear removes it.\nUninstall removes the running OnTrack executable and user settings after confirmation."
             );

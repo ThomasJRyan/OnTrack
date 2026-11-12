@@ -8,7 +8,7 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Dispatches `update` and `uninstall` before checking the Herdr launch context and Beads workspace; initializes, runs, and restores the browser terminal. |
+| `src/main.rs` | Dispatches discussion, advisory status, update, and uninstall commands before browser startup guards; initializes, runs, and restores the browser terminal. |
 | `src/startup.rs` | Requires the Herdr pane marker, discovers the active workspace through Beads, ensures local screenshots are Git-ignored, and prints manual initialization guidance when no workspace exists. |
 | `src/uninstall.rs` | Validates and removes the running executable and user settings after explicit CLI confirmation, before Beads discovery or terminal setup. |
 | `src/settings.rs` | Loads and atomically saves theme, default-agent, agent-limit, animation, and worktree-cleanup preferences under the user's XDG config directory. |
@@ -18,6 +18,7 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 | `src/herdr.rs` | Discovers integrations, maps/focuses Herdr workspaces, creates tracked worktrees, and starts/prompts agents to signal Ready To Merge after checks and commits, never close before merge. |
 | `src/planning.rs` and `src/epic.rs` | Retain legacy agent-planning code with no browser launch control. |
 | `src/worktrees.rs` | Journals handoffs and merge lifecycle, verifies Git/Herdr evidence, closes integrated Beads, and guards cleanup. |
+| `src/worktrees/discussion.rs` | Implements managed discussion commands, per-handoff message/delivery state, and discussion lifecycle guards. |
 | `src/app.rs` | Holds board column/card selection, per-column scrolling, drawer/navigation state, forms, handoff toasts, cached data, errors, and hit tests; handles input and background worker requests/responses. |
 | `src/event.rs` | Polls crossterm events with a timeout and recognizes quit keys. |
 | `src/update.rs` | Reads the official GitHub release, selects a compatible asset, verifies SHA-256, and atomically replaces the executable. |
@@ -28,6 +29,10 @@ Tagged builds and release asset naming are documented in the [release guide](rel
 | `src/terminal.rs` | Manages raw mode, alternate screen, mouse capture, and cleanup, including initialization failures and panic handling. |
 
 The browser does not dispatch agent planning. Its `p` and `g` keys have no planning action, and the create form always uses ordinary Beads creation, including for Epics. Legacy planning handlers remain in source but have no UI entry point. Keep those controls absent from the keyboard reference, footer, and forms.
+
+## Ticket discussions
+
+See the [discussion guide](discussions.md) for user controls, agent CLI workflow, durable state boundaries, and the [developer contract and checks](discussions.md#developer-contract-and-checks). Discussion CLI commands dispatch before browser startup guards and terminal setup. `ask` and `respond` verify the original native session; `inbox` reads the matching managed checkout's journal without acknowledging input. Keep comments in Beads and delivery/control state in the repository journal; neither transport acceptance nor advisory `ontrack status` is an agent acknowledgement. Registry v1 is accepted and upgraded to v2 on save; per-entry discussion control is v1, and unsupported versions fail closed. Pending or unresolved discussion must guard merge, Bead closure, and cleanup, including reconciliation with automatic preferences disabled.
 
 The board has exactly six status columns: Open, Ready, Blocked, In Progress, Ready To Merge, Closed. Keep headings and counts even when empty. Do not add Deferred/custom columns or collapse state: legacy `deferred` and unknown statuses map to Open for display only, with raw status retained in details and no bulk data rewrite. Left / Right changes columns including empty ones; Up / Down and the mouse wheel move one card within the focused column without wrapping. Shift+Left / Shift+Right moves the selected Bead adjacent; board `m` chooses a destination. Navigation, hit testing, and rendering must share card geometry. Cards use a five-row height and the available viewport reserves the heading and both column borders; never draw or register a partial card over a border. The renderer chooses a row-major 6×1 grid at board widths >=144 cells, 3×2 at 54–143, and 2×3 below 54, requiring 24 cells per column before using a single row while preserving the 54-cell narrow-layout breakpoint. Divide available width and height evenly and give remainder cells to the first columns/rows. Each column retains its own vertical viewport offset. Reconcile the focused selection against the current card capacity on every draw, including after shrinking and restoring tiny viewports. Rows below three cells skip content; rows below eight cells cannot fit a complete card. Resize guidance accounts for all grid rows plus the header/footer. Crossing a viewport edge adjusts only enough to keep selection visible, not back to the top. Empty-column focus must not retain an actionable Bead ID.
 
@@ -88,7 +93,7 @@ is intentionally excluded.
 
 ## Beads CLI contract
 
-For an interactive browser launch, `main` first calls `startup::ensure_herdr_workspace`. It accepts only `HERDR_ENV=1`, the marker Herdr supplies to managed pane processes. Missing or other values return an error with launch guidance before any `bd` command, raw mode, or splash. Help and uninstall dispatch before this guard. The guard checks the inherited marker and does not query Herdr's socket or infer a workspace from global focus.
+For an interactive browser launch, `main` first calls `startup::ensure_herdr_workspace`. It accepts only `HERDR_ENV=1`, the marker Herdr supplies to managed pane processes. Missing or other values return an error with launch guidance before any `bd` command, raw mode, or splash. Help, update, uninstall, advisory status, and discussion commands dispatch before this guard. The guard checks the inherited marker and does not query Herdr's socket or infer a workspace from global focus.
 
 Before terminal initialization, `startup::ensure_workspace` runs `bd --no-color where --json`. Successful discovery uses its absolute `.beads` path to ensure the adjacent `.gitignore` contains `.beads/screenshots/`, creating or appending only when needed; Beads configuration is untouched. Only the structured `no_beads_directory` error prints manual initialization guidance and returns `Ok(false)`; `main` then exits successfully before raw mode, the splash, or browser startup. Permission, malformed-output, ignore-file, and other discovery failures remain errors. Beads owns ancestor, worktree, and redirect discovery.
 

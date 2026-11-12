@@ -13,6 +13,8 @@ Browse six Kanban columns: **Open, Ready, Blocked, In Progress, Ready To Merge, 
 
 Mark tasks **Ready** and let OnTrack dispatch eligible work to Herdr agents in separate Git worktrees, with a concurrency limit you control. Need to start something immediately? Hand the selected Bead to an agent with `h`.
 
+Press `t` to [discuss a ticket](docs/discussions.md): save a durable Beads comment, or send input to its original managed agent. Questions and pending delivery stay visible and hold integration until resolved.
+
 Agents commit and check their work, then signal **Ready To Merge**, not Closed. OnTrack closes a tracked Bead only after verifying integration into its recorded target. The worktree drawer preserves workspace focus, confirmed merge and cleanup, continue (`a`), force removal (`Shift+X`, discards uncommitted files), and restart (`Shift+R`) actions. Automatic merging and cleanup are optional; verified integration still closes the Bead when both are disabled.
 
 The board refreshes automatically, reflows into 3×2 and 2×3 grids on narrower terminals, and scrolls each column vertically. Children integrate into their parent branch before closing. Settings include [40 themes](docs/settings.md), a default agent, and a concurrent-agent limit. Run `ontrack update` to install a verified compatible release.
@@ -49,8 +51,9 @@ See [installation and updates](docs/installation.md) for supported architectures
 | `Enter` | Open Bead details; arrows / Page keys scroll the drawer |
 | `n` / `Shift+N`, `e` | Create a Bead / child task, or edit the selection |
 | `h` | Hand the selected Bead to a Herdr agent |
+| `t` | Open the ticket discussion composer from the board or Bead details |
 | `w` | Open worktree drawer; `Enter` focuses the selected Herdr workspace |
 | `s`, `Shift+?` | Open settings or context-specific hotkey help |
 | `Esc`, `q` / `Ctrl+C` | Go back; quit when no dialog is open |
 
-All six columns retain empty counts. Moving to Ready schedules eligible agents; other moves do not start or stop them, and individual moves never cascade to children. Closed moves and `c` require fresh tracked integration proof; `d` permanently deletes after confirmation. See the [user guide](docs/user-guide.md), [settings](docs/settings.md), [development guide](docs/development.md), [CI checks](docs/ci.md), and [release guide](docs/releases.md).
+All six columns retain empty counts. Moving to Ready schedules eligible agents; other moves do not start or stop them, and individual moves never cascade to children. Closed moves and `c` require fresh tracked integration proof; `d` permanently deletes after confirmation. See the [user guide](docs/user-guide.md), [discussions](docs/discussions.md), [settings](docs/settings.md), [development guide](docs/development.md), [CI checks](docs/ci.md), and [release guide](docs/releases.md).

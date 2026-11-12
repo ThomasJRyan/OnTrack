@@ -200,6 +200,59 @@ pub fn show_bead(id: &str) -> io::Result<Value> {
     parse_show(&run_bd(&args)?, id)
 }
 
+pub(crate) fn validate_comment(text: &str) -> io::Result<()> {
+    if text.trim().is_empty() || text.len() > 32_768 || text.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Comment must be nonempty, at most 32768 bytes, and contain no NUL",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn add_comment(id: &str, text: &str) -> io::Result<()> {
+    add_comment_with(id, text, run_bd)
+}
+
+fn add_comment_with(
+    id: &str,
+    text: &str,
+    mut run: impl FnMut(&[&str]) -> io::Result<Vec<u8>>,
+) -> io::Result<()> {
+    validate_id(id)?;
+    validate_comment(text)?;
+    // Values remain argv data, including leading dashes and shell metacharacters.
+    run(&["--no-color", "comments", "add", "--json", "--", id, text])?;
+    Ok(())
+}
+
+pub(crate) fn withdraw_merge_readiness(id: &str, expected: &Value) -> io::Result<()> {
+    withdraw_merge_readiness_with(id, expected, run_bd)
+}
+
+fn withdraw_merge_readiness_with(
+    id: &str,
+    expected: &Value,
+    mut run: impl FnMut(&[&str]) -> io::Result<Vec<u8>>,
+) -> io::Result<()> {
+    validate_id(id)?;
+    if expected["id"] != id || !matches!(expected["status"].as_str(), Some("open" | "in_progress"))
+    {
+        return Err(invalid_data("Discussion requires a live open Bead"));
+    }
+    let status = required_string(expected, "status")?;
+    run(&[
+        "--no-color",
+        "update",
+        &format!("--if-status={status}"),
+        "--remove-label=ontrack:ready-to-merge",
+        "--json",
+        "--",
+        id,
+    ])?;
+    Ok(())
+}
+
 pub fn create_bead(input: &CreateBead) -> io::Result<String> {
     let args = create_args(input)?;
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -784,6 +837,82 @@ fn parse_show(bytes: &[u8], id: &str) -> io::Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn discussion_comment_is_validated_and_keeps_arbitrary_text_in_one_argv_value() {
+        let text = "--flag='x'\n$(touch /never-run)";
+        add_comment_with("Bead-1", text, |argv| {
+            assert_eq!(
+                argv,
+                [
+                    "--no-color",
+                    "comments",
+                    "add",
+                    "--json",
+                    "--",
+                    "Bead-1",
+                    text
+                ]
+            );
+            Ok(Vec::new())
+        })
+        .unwrap();
+        for text in [
+            "".to_string(),
+            " \n".into(),
+            "bad\0text".into(),
+            "x".repeat(32769),
+        ] {
+            assert!(
+                add_comment_with("Bead-1", &text, |_| panic!(
+                    "Invalid comments must not run bd"
+                ))
+                .is_err()
+            );
+        }
+        assert!(
+            add_comment_with("--unsafe", "Text", |_| panic!(
+                "Invalid IDs must not run bd"
+            ))
+            .is_err()
+        );
+        assert!(
+            add_comment_with("Bead-1", "Text", |_| Err(io::Error::other(
+                "uncertain write"
+            )))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn discussion_withdraws_only_readiness_with_live_status_guard() {
+        let bead = json!({"id":"Bead-1","status":"in_progress"});
+        withdraw_merge_readiness_with("Bead-1", &bead, |argv| {
+            assert_eq!(
+                argv,
+                [
+                    "--no-color",
+                    "update",
+                    "--if-status=in_progress",
+                    "--remove-label=ontrack:ready-to-merge",
+                    "--json",
+                    "--",
+                    "Bead-1"
+                ]
+            );
+            Ok(Vec::new())
+        })
+        .unwrap();
+        for bead in [
+            json!({"id":"wrong","status":"open"}),
+            json!({"id":"Bead-1","status":"closed"}),
+        ] {
+            assert!(
+                withdraw_merge_readiness_with("Bead-1", &bead, |_| panic!("No unguarded write"))
+                    .is_err()
+            );
+        }
+    }
+
     #[test]
     fn kanban_moves_are_guarded_and_only_change_workflow_fields() {
         let live = serde_json::json!({"id":"test-1", "status":"closed", "labels":["team:core"], "metadata":{"keep":true}});

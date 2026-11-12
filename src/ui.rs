@@ -567,6 +567,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
             crate::app::Modal::ConfirmWorktree { action: 3 | 5, .. } => 12,
             crate::app::Modal::ConfirmWorktree { action: 4, .. } => 11,
             crate::app::Modal::ConfirmWorktree { .. } => 8,
+            crate::app::Modal::Discussion(_) => 15,
         };
         let min_width = if matches!(
             modal,
@@ -623,6 +624,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                 crate::app::Modal::ConfirmGenerateEpic { .. } => " GENERATE EPIC TASKS? ",
                 crate::app::Modal::ConfirmClose { .. } => " CLOSE BEAD? ",
                 crate::app::Modal::Settings { .. } => " SETTINGS ",
+                crate::app::Modal::Discussion(_) => " TICKET DISCUSSION ",
                 crate::app::Modal::ConfirmWorktree { action: 3, .. } => " RESTART TASK? ",
                 crate::app::Modal::ConfirmWorktree { action: 4, .. } => " CONTINUE TASK? ",
                 crate::app::Modal::ConfirmWorktree { action: 5, .. } => " FORCE REMOVE WORKTREE? ",
@@ -1303,6 +1305,127 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     inner,
                 );
             }
+            crate::app::Modal::Discussion(form) => {
+                let rows = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(5),
+                        Constraint::Length(1),
+                        Constraint::Length(2),
+                        Constraint::Min(1),
+                    ])
+                    .split(inner);
+                f.render_widget(
+                    Paragraph::new(if let Some(reply_to) = &form.reply_to {
+                        format!("{} · {} · Replying to {reply_to}", form.id, form.title)
+                    } else {
+                        format!("{} · {}", form.id, form.title)
+                    })
+                    .style(Style::default().fg(muted)),
+                    rows[0],
+                );
+                let text_width = rows[1].width.saturating_sub(2).max(1) as usize;
+                let (wrapped, cursor_x, cursor_y, _) =
+                    description_layout(&form.text, form.cursor, text_width);
+                let text_height = rows[1].height.saturating_sub(2).max(1);
+                let scroll = cursor_y.saturating_sub(text_height.saturating_sub(1) as usize);
+                f.render_widget(
+                    Paragraph::new(wrapped)
+                        .scroll((scroll.min(u16::MAX as usize) as u16, 0))
+                        .block(
+                            Block::default()
+                                .borders(Borders::ALL)
+                                .border_type(BorderType::Rounded)
+                                .title(" Comment "),
+                        )
+                        .style(Style::default().fg(ink)),
+                    rows[1],
+                );
+                if form.focus == 0 {
+                    f.set_cursor_position(Position::new(
+                        rows[1]
+                            .x
+                            .saturating_add(1 + cursor_x.min(text_width - 1) as u16),
+                        rows[1]
+                            .y
+                            .saturating_add(1 + cursor_y.saturating_sub(scroll) as u16),
+                    ));
+                }
+                let save = if form.submission_blocked {
+                    " Save disabled "
+                } else if form.focus == 1 {
+                    "[ Save comment ]"
+                } else {
+                    " Save comment "
+                };
+                let send = if form.submission_blocked {
+                    " Send disabled "
+                } else if !form.can_send {
+                    " Send unavailable "
+                } else if form.focus == 2 {
+                    "[ Send to agent ]"
+                } else {
+                    " Send to agent "
+                };
+                f.render_widget(
+                    Paragraph::new(Line::from(vec![
+                        Span::styled(
+                            save,
+                            Style::default()
+                                .fg(if form.submission_blocked {
+                                    muted
+                                } else if form.focus == 1 {
+                                    palette.selected_foreground
+                                } else {
+                                    teal
+                                })
+                                .bg(if !form.submission_blocked && form.focus == 1 {
+                                    palette.selected_background
+                                } else {
+                                    Color::Reset
+                                }),
+                        ),
+                        Span::raw("   "),
+                        Span::styled(
+                            send,
+                            Style::default()
+                                .fg(if form.submission_blocked {
+                                    muted
+                                } else if form.focus == 2 && form.can_send {
+                                    palette.selected_foreground
+                                } else if form.can_send {
+                                    gold
+                                } else {
+                                    muted
+                                })
+                                .bg(
+                                    if !form.submission_blocked && form.focus == 2 && form.can_send
+                                    {
+                                        palette.selected_background
+                                    } else {
+                                        Color::Reset
+                                    },
+                                )
+                                .add_modifier(
+                                    if !form.submission_blocked && form.focus == 2 && form.can_send
+                                    {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    },
+                                ),
+                        ),
+                    ])),
+                    rows[2],
+                );
+                f.render_widget(Paragraph::new(if form.submission_blocked { "Submission outcome is uncertain. Inspect the journal and ticket comments before submitting again; your draft is retained." } else if app.mutation_busy { "Saving comment…" } else if let Some(error) = &form.error { error.as_str() } else if !form.can_send { "Send to agent unavailable: no accepted current managed agent or ticket is closed." } else { "Save adds a note; Send queues input for the agent." }).wrap(Wrap { trim: false }).style(Style::default().fg(if form.submission_blocked || form.error.is_some() { gold } else { muted })), rows[3]);
+                f.render_widget(
+                    Paragraph::new("Tab choose · Enter action · Shift+Enter newline · Esc close")
+                        .style(Style::default().fg(muted)),
+                    rows[4],
+                );
+            }
             crate::app::Modal::Move {
                 id,
                 title,
@@ -1570,7 +1693,9 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                     Span::raw(format!(" P{}", bead.priority)),
                 ]),
                 Line::from(Span::styled(
-                    if !bead.blocked_by.is_empty() {
+                    if let Some(discussion) = app.discussion_status(&bead.id) {
+                        discussion.to_owned()
+                    } else if !bead.blocked_by.is_empty() {
                         format!("WAIT:{}", bead.blocked_by.join(","))
                     } else if bead.status == "open"
                         && (app.accepted_handoffs.contains(&bead.id)
@@ -1583,7 +1708,9 @@ fn render_kanban(f: &mut Frame, area: Rect, app: &mut App) {
                     } else {
                         status_label(status).to_owned()
                     },
-                    Style::default().fg(if bead.blocked_by.is_empty() {
+                    Style::default().fg(if app.discussion_status(&bead.id).is_some() {
+                        palette.warning
+                    } else if bead.blocked_by.is_empty() {
                         border
                     } else {
                         palette.warning
@@ -1681,6 +1808,17 @@ fn render_detail_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Instant
             Line::default(),
         ];
         text.lines.splice(0..0, metadata);
+        if let Some(status) = app.discussion_status(&bead.id) {
+            text.lines.insert(
+                4,
+                Line::from(Span::styled(
+                    format!("Discussion: {status}"),
+                    Style::default()
+                        .fg(palette.warning)
+                        .add_modifier(Modifier::BOLD),
+                )),
+            );
+        }
     }
     for line in &mut text.lines {
         for span in &mut line.spans {
@@ -1872,6 +2010,12 @@ fn render_worktree_drawer(f: &mut Frame, screen: Rect, app: &mut App, now: Insta
         if let Some(detail) = &item.detail {
             lines.push(Line::from(Span::styled(
                 detail.clone(),
+                Style::default().fg(palette.warning),
+            )));
+        }
+        if let Some(discussion) = &item.discussion {
+            lines.push(Line::from(Span::styled(
+                format!("Discussion: {discussion}"),
                 Style::default().fg(palette.warning),
             )));
         }
@@ -2207,7 +2351,7 @@ fn render_toast(f: &mut Frame, app: &App) {
 }
 fn footer_text(width: usize) -> String {
     truncate_display(
-        "↑↓ select · ←→ column · ⇧←→ move · m move · Enter details · w worktrees · n new · e edit · q quit",
+        "↑↓ select · ←→ column · ⇧←→ move · m move · t discuss · Enter details · w worktrees · n new · e edit · q quit",
         width,
     )
 }
@@ -2517,6 +2661,8 @@ mod tests {
             launch_seq: 0,
             handoff: Default::default(),
             handoff_capacity: Default::default(),
+            discussion_seq: 0,
+            discussion_pending: None,
             toast: None,
             list_rect: Rect::default(),
             detail_rect: Rect::default(),
@@ -2602,6 +2748,82 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+    #[test]
+    fn discussion_composer_renders_reply_text_and_distinct_actions() {
+        let mut app = app();
+        app.modal = Some(crate::app::Modal::Discussion(crate::app::DiscussionForm {
+            id: "demo-1".into(),
+            title: "Title is visible".into(),
+            text: "first line\n界🙂 second line".into(),
+            cursor: "first line\n界🙂".len(),
+            focus: 2,
+            can_send: true,
+            reply_to: Some("comment-7".into()),
+            error: None,
+            submission_blocked: false,
+        }));
+        let text = draw((80, 24), &mut app).0;
+        assert!(text.contains("Replying to comment-7"));
+        assert!(text.contains("Save comment"));
+        assert!(text.contains("Send to agent"));
+        assert!(
+            description_layout("first line\n界🙂 second line", "first line\n界🙂".len(), 30)
+                .0
+                .contains("界🙂")
+        );
+
+        if let Some(crate::app::Modal::Discussion(form)) = app.modal.as_mut() {
+            form.can_send = false;
+            form.focus = 1;
+        }
+        let text = draw((80, 24), &mut app).0;
+        assert!(text.contains("Send unavailable"));
+        assert!(text.contains("Save comment"));
+    }
+
+    #[test]
+    fn discussion_composer_and_status_are_safe_in_compact_draws() {
+        let mut app = app();
+        app.modal = Some(crate::app::Modal::Discussion(crate::app::DiscussionForm {
+            id: "demo-1".into(),
+            title: "Title".into(),
+            text: "line one\n界🙂\nline three".into(),
+            cursor: "line one\n界🙂\nline three".len(),
+            focus: 0,
+            can_send: false,
+            reply_to: None,
+            error: None,
+            submission_blocked: false,
+        }));
+        let compact = draw((28, 9), &mut app).0;
+        assert!(compact.contains("Expand terminal"));
+        let wide = draw((72, 22), &mut app).0;
+        assert!(wide.contains("line three"));
+    }
+
+    #[test]
+    fn uncertain_discussion_submission_keeps_draft_and_disables_both_actions() {
+        let mut app = app();
+        let draft = "Retained multiline\ncomment 界";
+        app.modal = Some(crate::app::Modal::Discussion(crate::app::DiscussionForm {
+            id: "demo-1".into(),
+            title: "Title".into(),
+            text: draft.into(),
+            cursor: draft.len(),
+            focus: 2,
+            can_send: true,
+            reply_to: None,
+            error: None,
+            submission_blocked: true,
+        }));
+        let rendered = draw((80, 24), &mut app).0;
+        assert!(rendered.contains("Retained multiline"));
+        assert!(rendered.contains("comment 界"));
+        assert!(rendered.contains("Save disabled"));
+        assert!(rendered.contains("Send disabled"));
+        assert!(rendered.contains("outcome is uncertain"));
+        assert!(rendered.contains("Inspect the journal"));
     }
     #[test]
     fn bordered_screens_render_without_square_corners() {
@@ -2932,12 +3154,27 @@ mod tests {
             handoff_accepted: false,
             bead_title: None,
             bead_description: None,
+            discussion: None,
+            discussion_question: None,
             branch: "ontrack/demo-1".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),
             status: crate::worktrees::WorktreeStatus::NeedsAttention,
             detail: None,
         });
+        a.worktrees[0].discussion = Some("Needs your input".into());
+        let card = draw((90, 30), &mut a).0;
+        assert!(card.contains("Needs your input"));
+        a.worktrees_view = true;
+        let drawer = draw_drawer((100, 30), &mut a, Instant::now());
+        assert!(drawer.contains("Needs your input"));
+        a.worktrees_view = false;
+        a.worktrees[0].discussion = Some("Needs your input".into());
+        a.focus_detail = true;
+        let detail = draw_drawer((100, 30), &mut a, Instant::now());
+        assert!(detail.contains("Discussion: Needs your input"));
+        a.focus_detail = false;
+        a.worktrees[0].discussion = None;
         assert!(!draw((80, 24), &mut a).0.contains("· sent"));
         a.worktrees[0].handoff_accepted = true;
         assert!(draw((80, 24), &mut a).0.contains("SENT"));
@@ -3667,6 +3904,8 @@ mod tests {
             handoff_accepted: true,
             bead_title: Some("Review handoff".into()),
             bead_description: Some("First line\nSecond line".into()),
+            discussion: None,
+            discussion_question: None,
             branch: "ontrack/closed-1".into(),
             target_branch: "main".into(),
             workspace_id: "ws-7".into(),
@@ -3745,6 +3984,8 @@ mod tests {
                     handoff_accepted: true,
                     bead_title: None,
                     bead_description: None,
+                    discussion: None,
+                    discussion_question: None,
                     branch: format!("ontrack/bead-{index}"),
                     target_branch: "main".into(),
                     workspace_id: format!("ws-{index}"),
@@ -3781,6 +4022,8 @@ mod tests {
             handoff_accepted: true,
             bead_title: Some("First task".into()),
             bead_description: Some("Line one\nLine two".into()),
+            discussion: None,
+            discussion_question: None,
             branch: "ontrack/bead-1".into(),
             target_branch: "main".into(),
             workspace_id: "ws-1".into(),
@@ -3794,6 +4037,8 @@ mod tests {
             parent_bead_id: None,
             bead_title: Some("Second task".into()),
             bead_description: Some("Another description".into()),
+            discussion: None,
+            discussion_question: None,
             ..first
         });
         let first_screen = draw((100, 23), &mut app).0;
@@ -3823,6 +4068,8 @@ mod tests {
             handoff_accepted: false,
             bead_title: None,
             bead_description: None,
+            discussion: None,
+            discussion_question: None,
             branch: "ontrack/old-bead".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),
@@ -3854,6 +4101,8 @@ mod tests {
             handoff_accepted: true,
             bead_title: Some("Original title".into()),
             bead_description: Some("Original description".into()),
+            discussion: None,
+            discussion_question: None,
             branch: "ontrack/demo-1".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),
@@ -3883,6 +4132,8 @@ mod tests {
                 handoff_accepted: true,
                 bead_title: None,
                 bead_description: None,
+                discussion: None,
+                discussion_question: None,
                 branch: format!("ontrack/bead-{index}"),
                 target_branch: "main".into(),
                 workspace_id: format!("ws-{index}"),
@@ -3913,6 +4164,8 @@ mod tests {
             handoff_accepted: true,
             bead_title: None,
             bead_description: None,
+            discussion: None,
+            discussion_question: None,
             branch: "ontrack/b".into(),
             target_branch: "main".into(),
             workspace_id: "ws".into(),
@@ -5137,6 +5390,8 @@ mod tests {
             handoff_accepted: true,
             bead_title: Some("Captured title".into()),
             bead_description: Some("Captured handoff notes".into()),
+            discussion: None,
+            discussion_question: None,
             branch: "ontrack/demo-1".into(),
             target_branch: "main".into(),
             workspace_id: "workspace-1".into(),
