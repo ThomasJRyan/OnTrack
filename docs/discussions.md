@@ -9,13 +9,15 @@ Select a ticket and press `t` on the board or in its detail drawer. Existing com
 | Control | Action |
 | --- | --- |
 | `Shift+Enter` in text | Insert a newline. Requires a terminal that reports modified Enter keys. |
-| `Enter` in text | Focus **Save comment**, without submitting. |
+| `Enter` in text | Focus **Send to agent** when available, otherwise **Save comment**, without submitting. |
 | `Tab` / `Shift+Tab` | Cycle text and enabled actions; unavailable Send is skipped. |
 | `Left` / `Right` on an action | Switch between enabled actions. |
 | `Enter` on an action | Execute the focused action, if available. |
 | `Esc` | Discard the draft, except while submission is running. |
 
 **Save comment** records ordinary Beads history. It always omits the composer's captured question reply reference, so saving a note while a question is pending neither answers nor acknowledges it. It does not prompt an agent. You can save comments before launch; there is no prelaunch discussion agent. The normal handoff supplies issue context, including comments, when an agent is later launched.
+
+For a ticket with an accepted managed handoff, **Send to agent** is the default action after pressing `Enter` in the text field. Select **Save comment** explicitly to leave a note for the thread. If Send is unavailable, **Save comment** remains the default.
 
 Before a managed record exists, Save writes plain text directly to Beads without creating a discussion journal. When exactly one non-restarted managed record matches the ticket, Save also journals a correlated message and writes an OnTrack metadata marker with the comment. A confirmed Save alone creates no agent obligation or readiness change; an uncertain managed comment write still holds integration until its persistence is resolved.
 
@@ -94,6 +96,7 @@ See the [user guide](user-guide.md#launch-an-agent-with-herdr) for worktree reco
 
 - `src/main.rs` dispatches `inbox`, `ask`, and `respond` before interactive terminal setup. Keep validation errors out of raw mode and avoid changing the ordinary browser startup path.
 - `src/beads.rs` owns public Beads comment CLI arguments and response validation. Thread text lives in durable Beads comments; do not access the Beads database directly.
+- Its guarded readiness withdrawal includes the current status as an update field. Beads 1.3.1 rejects `--if-status` for a label-only edit; the status value remains unchanged and the guard still rejects a concurrent status change.
 - `src/worktrees/discussion.rs` and `src/worktrees.rs` own per-entry discussion control, message IDs, delivery evidence, original session/worktree validation, and lifecycle gates in the repository journal. Preserve the existing registry locking and possibly-sent fences rather than treating comment history as a transport queue.
 - `src/herdr.rs` supplies conversation instructions in the initial agent prompt. `src/worktrees/discussion.rs` validates native identity and submits pane-targeted discussion prompts through the worktree executor; never substitute global focus or treat native blocked state as permission to inject approval input.
 - `src/app.rs`, `src/hotkeys.rs`, and `src/ui.rs` own the `t` composer, captured question identity, worker responses, controls/help, and visible discussion state. CLI/Beads/Herdr work must stay off the terminal input loop, and stale responses must not overwrite a newer ticket or composer.

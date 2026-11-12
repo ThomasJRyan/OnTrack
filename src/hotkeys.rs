@@ -216,7 +216,10 @@ impl Context {
             ],
             Self::Discussion => vec![
                 ("Text", "Write a multiline ticket comment"),
-                ("Enter", "Focus Save comment; does not submit from text"),
+                (
+                    "Enter",
+                    "Focus Send if available, else Save; does not submit",
+                ),
                 ("Shift+Enter", "Insert a newline"),
                 ("Tab / Shift+Tab", "Choose Save comment or Send to agent"),
                 ("Enter", "Submit the focused action"),

@@ -3090,7 +3090,7 @@ impl App {
                     form.error = None;
                 }
             }
-            Enter if form.focus == 0 => form.focus = 1,
+            Enter if form.focus == 0 => form.focus = if form.can_send { 2 } else { 1 },
             Enter if form.focus == 1 || (form.focus == 2 && form.can_send) => {
                 if form.submission_blocked {
                     return;
@@ -4299,7 +4299,7 @@ mod tests {
             assert!(rx.try_recv().is_err());
             press(&mut a, KeyCode::Enter);
             assert!(
-                matches!(rx.try_recv(), Ok(Request::PostComment(_, id, text, false, None))
+                matches!(rx.try_recv(), Ok(Request::PostComment(_, id, text, true, None))
                 if id == "b0" && text == "captured comment")
             );
             assert_bead(&a, "b1");
@@ -4316,7 +4316,7 @@ mod tests {
     }
 
     #[test]
-    fn discussion_save_is_default_and_send_requires_explicit_enabled_action() {
+    fn discussion_send_is_default_when_available_and_save_remains_explicit() {
         for can_send in [false, true] {
             for send in [false, true] {
                 let (mut a, rx, _) = connected_app();
@@ -4326,9 +4326,10 @@ mod tests {
                 press(&mut a, KeyCode::Char('t'));
                 a.input(Event::Paste("hello".into()));
                 press(&mut a, KeyCode::Enter);
-                assert!(matches!(&a.modal, Some(Modal::Discussion(form)) if form.focus == 1));
-                if send {
-                    press(&mut a, KeyCode::Right);
+                assert!(matches!(&a.modal, Some(Modal::Discussion(form))
+                    if form.focus == if can_send { 2 } else { 1 }));
+                if send != can_send {
+                    press(&mut a, KeyCode::Left);
                 }
                 press(&mut a, KeyCode::Enter);
                 assert!(
@@ -4358,8 +4359,8 @@ mod tests {
                 take_show(&rx, "b1");
                 a.input(Event::Paste("answer".into()));
                 press(&mut a, KeyCode::Enter);
-                if send {
-                    press(&mut a, KeyCode::Right);
+                if !send {
+                    press(&mut a, KeyCode::Left);
                 }
                 press(&mut a, KeyCode::Enter);
                 let Request::PostComment(seq, id, text, actual_send, reply_to) =
@@ -4413,6 +4414,7 @@ mod tests {
         press(&mut a, KeyCode::Char('t'));
         a.input(Event::Paste("answer".into()));
         press(&mut a, KeyCode::Enter);
+        press(&mut a, KeyCode::Left);
         press(&mut a, KeyCode::Enter);
         let Request::PostComment(seq, id, _, send, reply_to) = rx.try_recv().unwrap() else {
             panic!("save not queued")
@@ -4587,8 +4589,8 @@ mod tests {
             press(&mut a, KeyCode::Char('t'));
             a.input(Event::Paste("keep draft".into()));
             press(&mut a, KeyCode::Enter);
-            if send {
-                press(&mut a, KeyCode::Right);
+            if !send {
+                press(&mut a, KeyCode::Left);
             }
             press(&mut a, KeyCode::Enter);
             let Request::PostComment(seq, id, _, _, _) = rx.try_recv().unwrap() else {
