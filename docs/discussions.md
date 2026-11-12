@@ -9,13 +9,15 @@ Select a ticket and press `t` on the board or in its detail drawer. Existing com
 | Control | Action |
 | --- | --- |
 | `Shift+Enter` in text | Insert a newline. Requires a terminal that reports modified Enter keys. |
-| `Enter` in text | Focus **Save comment**, without submitting. |
+| `Enter` in text | Focus **Send to agent** when available, otherwise **Save comment**, without submitting. |
 | `Tab` / `Shift+Tab` | Cycle text and enabled actions; unavailable Send is skipped. |
 | `Left` / `Right` on an action | Switch between enabled actions. |
 | `Enter` on an action | Execute the focused action, if available. |
 | `Esc` | Discard the draft, except while submission is running. |
 
 **Save comment** records ordinary Beads history. It always omits the composer's captured question reply reference, so saving a note while a question is pending neither answers nor acknowledges it. It does not prompt an agent. You can save comments before launch; there is no prelaunch discussion agent. The normal handoff supplies issue context, including comments, when an agent is later launched.
+
+For a ticket with an accepted managed handoff, **Send to agent** is the default action after pressing `Enter` in the text field. Select **Save comment** explicitly to leave a note for the thread. If Send is unavailable, **Save comment** remains the default.
 
 Before a managed record exists, Save writes plain text directly to Beads without creating a discussion journal. When exactly one non-restarted managed record matches the ticket, Save also journals a correlated message and writes an OnTrack metadata marker with the comment. A confirmed Save alone creates no agent obligation or readiness change; an uncertain managed comment write still holds integration until its persistence is resolved.
 

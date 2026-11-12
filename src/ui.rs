@@ -1419,7 +1419,7 @@ pub fn render(f: &mut Frame, elapsed: Duration, app: &mut App) {
                     ])),
                     rows[2],
                 );
-                f.render_widget(Paragraph::new(if form.submission_blocked { "Submission outcome is uncertain. Inspect the journal and ticket comments before submitting again; your draft is retained." } else if app.mutation_busy { "Saving comment…" } else if let Some(error) = &form.error { error.as_str() } else if !form.can_send { "Send to agent unavailable: no accepted current managed agent or ticket is closed." } else { "Save adds a note; Send queues input for the agent." }).wrap(Wrap { trim: false }).style(Style::default().fg(if form.submission_blocked || form.error.is_some() { gold } else { muted })), rows[3]);
+                f.render_widget(Paragraph::new(if form.submission_blocked { "Submission outcome is uncertain. Inspect the journal and ticket comments before submitting again; your draft is retained." } else if app.mutation_busy { "Saving comment…" } else if let Some(error) = &form.error { error.as_str() } else if !form.can_send { "Send to agent unavailable: no accepted current managed agent or ticket is closed." } else { "Enter from text selects Send; Save adds a note instead." }).wrap(Wrap { trim: false }).style(Style::default().fg(if form.submission_blocked || form.error.is_some() { gold } else { muted })), rows[3]);
                 f.render_widget(
                     Paragraph::new("Tab choose · Enter action · Shift+Enter newline · Esc close")
                         .style(Style::default().fg(muted)),
